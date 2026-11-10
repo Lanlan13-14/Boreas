@@ -1,94 +1,64 @@
-# Boreas (Βορέας)
+# Boreas
 
-<p align="center">
-  <strong>Ultra-High-Performance Post-Quantum L3 Overlay Network</strong><br>
-  <strong>超高性能抗量子三层虚拟互联网络</strong>
-</p>
+Boreas is a lightweight Layer 3 VPN over WebSocket with post-quantum encryption, designed for CDN traversal and high-latency links.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Status-Coming%20Soon-orange?style=flat-square" alt="Status: Coming Soon">
-  <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License: GPL-3.0">
-  <img src="https://img.shields.io/badge/Language-Rust-dea584?style=flat-square" alt="Language: Rust">
-  <img src="https://img.shields.io/badge/Security-ML--KEM--768%20%2B%20X25519-blue?style=flat-square" alt="Post-Quantum Security">
-  <img src="https://img.shields.io/badge/Transport-Multi--Stream%20WSS-green?style=flat-square" alt="Transport">
-</p>
+Boreas 是一个基于 WebSocket 传输并支持后量子加密的轻量级三层 VPN，专为穿透 CDN 边缘与高延迟长链路设计。
 
 ---
 
-## Status / 当前状态
+## Status / 项目状态
 
-> **English**: **`Coming Soon`** — *Boreas* is currently under active architecture validation and core engine development. Source code, static artifacts, and deployment guides will be made available upon initial milestone completion.
->
-> **中文**：**`即将推出 (Coming Soon)`** —— *Boreas* 目前处于架构验证与核心引擎研发阶段。完整源码、静态发行产物及部署指引将在首个工程里程碑就绪后发布。
+Coming Soon (Under development) / 开发中（即将推出）
 
----
+Architecture design and protocol specifications are finalized. The core engine and test suites are currently being built.
 
-## Overview / 项目概述
-
-### English
-**Boreas** (named after the Ancient Greek god of the north wind, in family alignment with *Zephyr*) is an ultra-high-performance Layer 3 Overlay VPN engine engineered specifically for traversing CDN edge networks (AWS CloudFront, Cloudflare) and cross-continental high-latency links. 
-
-Unlike generic full-mesh P2P systems burdened by excessive state-machine layers, background DHTs, and nested loopback context switches that saturate 1-vCPU VPS instances, Boreas is forged from the ground up in **Rust** with a single mandate: **achieving line-rate throughput and instantaneous speed-up under high latency with minimal CPU footprint**.
-
-### 中文
-**Boreas**（源自古希腊北风之神，与 *Zephyr* 西风呼应）是专为穿透 CDN 边缘网络（AWS CloudFront、Cloudflare）及跨洋跨洲高延迟链路打造的**底层极速三层 Overlay VPN 引擎**。
-
-针对通用 P2P 组网在单核机器上层叠反代、系统调用风暴与上下文切换过载（在 1 vCPU 规格下吞吐卡死）的物理痛点，Boreas 采用纯 **Rust** 从零设计，专注于纯粹的底层网络互联：**以极低 CPU 消耗攻克跨洋高延时带宽时延积（BDP）瓶颈，实现毫秒级顶格起速与线速吞吐**。
+架构设计与协议规范已完成，核心引擎与测试套件正在开发中。
 
 ---
 
-## Key Architectural Highlights / 核心架构亮点
+## Motivation / 背景
 
-### 1. Dual-Layer Transport Engine / 双层极速传输架构
-- **Parallel Tunnel Concurrency (多流并发条带化)**:
-  - Dynamically establishes parallel WSS physical streams (default 4–8) to shatter the Bandwidth-Delay Product (BDP) bottleneck and bypass strict single-connection TCP window caps imposed by CDN edge servers.
-  - **5-Tuple Flow Affinity (五元组流亲和调度)**: Packet striping based on `(SrcIP, DstIP, Proto, SrcPort, DstPort)` hashes ensures that packets belonging to the same internal flow stay strictly ordered, preventing TCP retransmissions while multi-stream aggregation saturates physical bandwidth within 0.5s.
-- **In-Stream Micro-Framing Multiplexing (流内微帧多路复用)**:
-  - Carries ultra-compact 4-byte frame headers (`StreamID: 2B + Length: 2B`) within each physical WSS tunnel, multiplexing L3 packets without the overhead of repetitive TCP handshakes.
+Running traditional full-mesh P2P VPNs over TCP or WebSocket on low-resource instances (such as 1 vCPU VPS) often incurs high CPU overhead. The combination of multi-layer encapsulation, user/kernel context switches, and nested reverse proxies (e.g. Nginx, Caddy, or cloudflared) can significantly limit throughput. Furthermore, single TCP streams over cross-continental links often suffer from Bandwidth-Delay Product (BDP) constraints and small buffer windows.
 
-### 2. Zero-Copy Kernel & Packet Batching / 零拷贝内核与批处理优化
-- **Linux TUN Batching with GSO/GRO (`IFF_VNET_HDR`)**:
-  - Leverages Linux Generic Segmentation/Receive Offload (`IFF_VNET_HDR`), allowing the kernel to aggregate packets into super-packets (up to 64KB) per I/O event.
-  - Drops syscall frequencies by over 80% (from ~23,000 syscalls/sec down to <1,500/sec at peak load), eliminating the `sy + si` CPU bottleneck on 1-vCPU nodes.
-- **Slab RingBuffer Zero-Allocation Pipeline**:
-  - Employs pre-allocated ring buffers and unshared buffer pools (`bytes::BytesMut`), executing in-place cryptographic operations and direct Tokio async socket writes without per-packet heap allocation.
+Boreas is designed to solve these specific constraints with a single, standalone binary written in Rust.
 
-### 3. Native CDN-Ready TLS Termination / 内置原生 CDN TLS 终结
-- **Direct Edge Ingress (彻底拔除 Nginx/Caddy 反代)**:
-  - Native pure-Rust TLS termination (`rustls`) listening directly on public ports (`0.0.0.0:443` or custom origin ports).
-  - Eliminates intermediate reverse proxies (Nginx / Caddy / cloudflared) and localhost socket loops, cutting intra-host context switches to absolute zero.
-- **User-Supplied Certificate Mode (自备证书，保持内核轻量)**:
-  - Users provide their own standard PEM certificates and keys (e.g., Cloudflare 15-year Origin CA certificate, self-signed certificates, or custom domain certs) without bloating the network binary with complex ACME / Let's Encrypt automation logic.
+在低配实例（如 1 vCPU VPS）上通过 TCP 或 WebSocket 运行传统全网格 P2P 组网时，常因多层封装、频繁的上下文切换以及叠加外部反代（如 Nginx、Caddy 或 cloudflared）而产生高 CPU 占用，导致吞吐受限。此外，跨洋高延迟链路下的单条 TCP 连接也容易受带宽时延积（BDP）和较小窗口限制而无法有效利用带宽。
 
-### 4. ZSL/2 Post-Quantum Hybrid Security / ZSL/2 混合后量子安全体系
-- **Hybrid PQXDH Key Encapsulation**:
-  - Combines classical **X25519** with **ML-KEM-768** (NIST FIPS 203 standard, Kyber768) via `HKDF-SHA256` key derivation, providing verifiable post-quantum forward secrecy against future harvest-now-decrypt-later adversaries.
-- **Hardware-Accelerated Encryption & 0ms Silent Rekeying**:
-  - Auto-selects **ChaCha20-Poly1305** or hardware-accelerated **AES-256-GCM** (AES-NI).
-  - Automatically executes in-band silent key rotation (Rekey) every 1 GB of data or every 1 hour with zero disconnection and 0ms downtime.
-- **RFC-005 Zero-Residency Ephemeral Join Tickets (一次性内存票据)**:
-  - Hub exposes an ephemeral `/join/<token>` endpoint (256-bit token with a 15-minute TTL).
-  - Single-use consumption burns the token immediately in memory, returning the node's assigned Virtual IP (VIP), subnet, and Hub public key, before atomically upgrading the connection into a multi-stream WSS data tunnel.
-
-### 5. Symmetrical Node Topology / 对称节点架构
-- **Single Unified Binary (单一二进制)**:
-  - Does not enforce a rigid client-versus-server dichotomy. All nodes execute the exact same statically compiled binary.
-  - Node roles are fluidly determined by configuration: listening on WSS (`listeners`), dialing outbound peers (`peers`), or concurrently doing both.
-- **Seamless Lifecycle (一键入网与干净解绑)**:
-  - Nodes join via an instant one-line command (`boreas join <url>`) and can cleanly detach (`boreas leave`), triggering active `NodeLeave` control frames that instantly purge routing tables and DNS entries across peers without orphaned routes.
-
-### 6. Embedded Virtual Mesh DNS / 内置轻量虚拟内网 DNS
-- Embedded asynchronous UDP/TCP DNS service bound solely to the internal gateway VIP (e.g. `10.20.0.1:53`).
-- Dynamically resolves mesh node hostnames (e.g., `hk-halo.boreas` → `10.20.0.2`), transparently recursing external domains to the host's upstream DNS.
-- *Strictly decoupled from any public media unlock or geo-routing DNS systems.*
+Boreas 采用纯 Rust 编写为单独立二进制，旨在针对这些特定约束提供轻量、高效的解决方案。
 
 ---
 
-## Topology Alignment / 拓扑定位
+## Key Features / 主要特性
 
-Boreas serves as the neutral, ultra-high-speed foundational L3 substrate. Users can seamlessly construct:
-- **Radial Hub-and-Spoke Backbones**: Interconnecting cloud nodes across AWS, CloudFront, Aliyun, and regional data centers (HK, SG, JP, US, TW, AU).
-- **Direct Multi-Point Interconnects**: Future-proof architecture supporting direct point-to-point mesh overlays without changing the underlying protocol primitives.
+### 1. Transport / 传输设计
+- **Multi-Stream Pooling (多流并发)**: Establishes parallel WSS connections to improve throughput on high-latency links, using 5-tuple hashing to keep packets of the same flow in order.
+  通过并行建立多条 WSS 连接改善高延迟链路吞吐，利用五元组哈希确保同一数据流的包序一致。
+- **In-Stream Multiplexing (流内复用)**: Multiplexes packets within connections using a minimal 4-byte header (`StreamID` and `Length`), avoiding repetitive handshakes.
+  在单连接内部通过 4 字节紧凑帧头（`StreamID` 与 `Length`）复用虚拟流，减少握手损耗。
+
+### 2. Performance / 性能优化
+- **Single Binary with Native TLS (单二进制与内置 TLS)**: Native TLS termination (`rustls`) listening directly on public ports with user-provided certificates. No external reverse proxy required.
+  基于 `rustls` 原生终结 TLS，直接监听公网端口（用户提供证书），无需额外前置 Nginx 或 Caddy。
+- **Packet Batching (数据包批处理)**: Supports Linux TUN `IFF_VNET_HDR` and GSO/GRO to process aggregated packets, reducing syscall frequency under high throughput.
+  支持 Linux TUN `IFF_VNET_HDR` 与 GSO/GRO 大包批处理，降低高吞吐场景下的系统调用频率。
+- **Buffer Reuse (内存重用)**: Uses pre-allocated memory buffers (`bytes::BytesMut`) to minimize per-packet heap allocations.
+  基于预分配缓冲池减少每个数据包的内存分配开销。
+
+### 3. Security / 安全与认证
+- **Hybrid Post-Quantum Key Exchange (混合后量子密钥协商)**: Combines X25519 and ML-KEM-768 (FIPS 203) for post-quantum forward secrecy, derived via HKDF-SHA256.
+  结合 X25519 与 ML-KEM-768（FIPS 203），通过 HKDF-SHA256 派生会话密钥，具备抗量子前向安全。
+- **Authenticated Encryption (对称加密与轮换)**: Supports ChaCha20-Poly1305 and AES-256-GCM, with periodic in-band key rotation (rekeying).
+  支持 ChaCha20-Poly1305 与 AES-256-GCM，支持传输过程中定时进行带内密钥轮换。
+- **Ephemeral Join Links (一次性入网链接)**: Supports one-time invite tokens with a short TTL, consumed directly in memory without saving plaintext credentials to disk.
+  支持短有效期的一次性入网 Token，内存验证即焚，避免明文静态凭据长期落盘。
+
+### 4. Topology & Management / 拓扑与管理
+- **Symmetrical Nodes (对称节点)**: A single binary handles both listening (`listeners`) and dialing (`peers`). Nodes can act as hubs, spokes, or both.
+  全网统一二进制，通过配置监听（`listeners`）或主动连接（`peers`）决定运行行为，既可作汇聚点也可作边缘节点。
+- **Internal DNS (内置内网 DNS)**: Embedded DNS resolver listening on the private gateway IP to resolve node hostnames to virtual IPs (`*.boreas`). Fully isolated from public DNS or media unblock services.
+  仅监听内网虚拟网关 IP，用于将节点主机名解析为虚拟 IP（`*.boreas`），与任何外部公共 DNS 或媒体解锁项目完全隔离。
+- **Clean Lifecycle (便捷生命周期)**: One-command join and clean exit (`leave`), immediately notifying connected peers to clear routes and internal DNS mappings.
+  支持一键加入与主动解绑退出（`leave`），退出时通知对端即时清空路由表与内网 DNS 映射。
 
 ---
 
