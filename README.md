@@ -7,14 +7,15 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Status-Coming%20Soon-orange?style=flat-square" alt="Status: Coming Soon">
-  <img src="https://img.shields.io/badge/Language-Rust-dea584?style=flat-square&logo=rust" alt="Language: Rust">
+  <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License: GPL-3.0">
+  <img src="https://img.shields.io/badge/Language-Rust-dea584?style=flat-square" alt="Language: Rust">
   <img src="https://img.shields.io/badge/Security-ML--KEM--768%20%2B%20X25519-blue?style=flat-square" alt="Post-Quantum Security">
   <img src="https://img.shields.io/badge/Transport-Multi--Stream%20WSS-green?style=flat-square" alt="Transport">
 </p>
 
 ---
 
-## ⚡ Status / 当前状态
+## Status / 当前状态
 
 > **English**: **`Coming Soon`** — *Boreas* is currently under active architecture validation and core engine development. Source code, static artifacts, and deployment guides will be made available upon initial milestone completion.
 >
@@ -22,7 +23,7 @@
 
 ---
 
-## 🌐 Overview / 项目概述
+## Overview / 项目概述
 
 ### English
 **Boreas** (named after the Ancient Greek god of the north wind, in family alignment with *Zephyr*) is an ultra-high-performance Layer 3 Overlay VPN engine engineered specifically for traversing CDN edge networks (AWS CloudFront, Cloudflare) and cross-continental high-latency links. 
@@ -36,7 +37,7 @@ Unlike generic full-mesh P2P systems burdened by excessive state-machine layers,
 
 ---
 
-## 🚀 Key Architectural Highlights / 核心架构亮点
+## Key Architectural Highlights / 核心架构亮点
 
 ### 1. Dual-Layer Transport Engine / 双层极速传输架构
 - **Parallel Tunnel Concurrency (多流并发条带化)**:
@@ -83,7 +84,7 @@ Unlike generic full-mesh P2P systems burdened by excessive state-machine layers,
 
 ---
 
-## 🗺️ Topology Alignment / 拓扑定位
+## Topology Alignment / 拓扑定位
 
 Boreas serves as the neutral, ultra-high-speed foundational L3 substrate. Users can seamlessly construct:
 - **Radial Hub-and-Spoke Backbones**: Interconnecting cloud nodes across AWS, CloudFront, Aliyun, and regional data centers (HK, SG, JP, US, TW, AU).
@@ -91,6 +92,6 @@ Boreas serves as the neutral, ultra-high-speed foundational L3 substrate. Users 
 
 ---
 
-## 📄 License / 开源许可证
+## License / 开源许可证
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0). See `LICENSE` for details.
