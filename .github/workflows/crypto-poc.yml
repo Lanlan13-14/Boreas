@@ -80,7 +80,9 @@ jobs:
         with:
           name: openssl-${{ env.OPENSSL_VERSION }}-crypto-poc-${{ github.run_id }}
           path: |
-            crypto-poc-artifacts/
+            crypto-poc-artifacts/*.txt
+            crypto-poc-artifacts/*.cnf
+            crypto-poc-artifacts/*.sanitized.txt
             crypto-poc-linkage.txt
             openssl.tar.gz
           if-no-files-found: warn
