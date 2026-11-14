@@ -8,7 +8,7 @@ use std::{net::IpAddr, time::Duration};
 
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
-    socket::tcp,
+    socket::tcp::{self, SocketBuffer},
     wire::{IpAddress, IpListenEndpoint},
 };
 
@@ -141,8 +141,8 @@ impl TcpDnsServer {
         let mut added_handles = Vec::with_capacity(config.max_connections);
         for _ in 0..config.max_connections {
             let socket = tcp::Socket::new(
-                vec![0; config.rx_bytes_per_connection],
-                vec![0; config.tx_bytes_per_connection],
+                SocketBuffer::new(vec![0u8; config.rx_bytes_per_connection]),
+                SocketBuffer::new(vec![0u8; config.tx_bytes_per_connection]),
             );
             let handle = sockets.add(socket);
             added_handles.push(handle);
@@ -353,8 +353,8 @@ fn extract_frames(
 
 fn remote_ip(endpoint: Option<smoltcp::wire::IpEndpoint>) -> IpAddr {
     match endpoint.map(|e| e.addr) {
-        Some(IpAddress::Ipv4(a)) => IpAddr::V4(std::net::Ipv4Addr::from(a.0)),
-        Some(IpAddress::Ipv6(a)) => IpAddr::V6(std::net::Ipv6Addr::from(a.0)),
+        Some(IpAddress::Ipv4(a)) => IpAddr::V4(a),
+        Some(IpAddress::Ipv6(a)) => IpAddr::V6(a),
         _ => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
     }
 }
