@@ -2,13 +2,13 @@
 
 [English](#english) | [简体中文](#简体中文)
 
-> **Status / 状态:** design baseline plus a small Phase 0 policy/parser foundation only. No daemon, TLS backend, network engine, or frozen wire protocol is implemented. See the [v1.11.0 master plan](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md) and the [implementation status and gate ledger](docs/engineering/implementation-status.md).
+> **Status / 状态:** v1.11.0 design baseline with several pure policy and packet-processing primitives; this is not a production VPN or frozen wire protocol. VirtualTun, ICMP/PTB construction and IPv4 fragmentation, and UDP/IP DNS packet handling exist, but end-to-end data-plane and release gates remain unaccepted. See the [master plan](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md), [implementation status and gate ledger](docs/engineering/implementation-status.md), and [recent GitHub Actions run](https://github.com/Lanlan13-14/Boreas/actions/runs/43604239086).
 
 ---
 
 ## English
 
-Boreas is a design for a Rust Layer 3 overlay engine using WebSocket transport. The current repository is **not a usable VPN**: it now contains pure policy/parser foundations for application framing, identity/authorization and TLS policy, prefix/routing decisions, L3 packet validation/PMTU, authoritative DNS wire messages, and an upgrade transaction journal, plus a minimal CLI status command. These do not implement a TLS backend, authenticated network path, real TUN device or socket service. All roadmap phases and acceptance gates remain unverified; Phase 0 is not complete.
+Boreas is a design for a Rust Layer 3 overlay engine using WebSocket transport. The current repository is **not a production-ready VPN**. Main-branch code includes a VirtualTun, ICMP/PTB construction, IPv4 fragmentation and UDP/IP DNS packet handling, alongside policy and parser foundations. These primitives are not a validated full data plane. An OpenSSL source download/hash/build and an AES client-side HTTP path have succeeded, but the mTLS server assertion is still pending: `G-CRYPTO` has not passed, and this does not establish Boreas end-to-end TLS acceptance. All roadmap phases and acceptance gates remain unverified; Phase 0 is not complete.
 
 The v1.11.0 plan is the authoritative architecture baseline, not a frozen production protocol or security certification. Its security design calls for standard TLS 1.3 hybrid key exchange and ML-DSA authentication, and explicitly retires the historical custom handshake designs. Application framing and deterministic object encoding remain candidates until Phase 0 review and independent test vectors are complete. There is no legacy 4-byte `StreamID`/`Length` framing in the current implementation.
 
@@ -18,11 +18,11 @@ The v1.11.0 plan is the authoritative architecture baseline, not a frozen produc
 
 ### Verification boundary
 
-CI runs formatting, check, Clippy, and tests on Windows and Ubuntu. This is not evidence of Linux `x86_64` and `aarch64` static TLS builds, real Linux operation, CDN compatibility, cryptographic interoperability, or security acceptance. See the [gate ledger](docs/engineering/implementation-status.md) for every open gate and required follow-up.
+GitHub Actions has successfully allocated five native runner targets. In the latest reported run, Clippy passed, and 17 DNS wire/packet tests passed; the workspace test run then failed one TUN test, so later tunnel tests did not run. The matrix is not green and complete artifacts are not yet available. This is not evidence of Linux `x86_64` and `aarch64` static TLS builds, production operation, CDN compatibility, cryptographic interoperability, or security acceptance. See the [gate ledger](docs/engineering/implementation-status.md) and [Actions run history](https://github.com/Lanlan13-14/Boreas/actions/runs/43604239086) for current evidence and open gates.
 
 ## 简体中文
 
-Boreas 是一个基于 Rust 的三层 Overlay 引擎设计，计划使用 WebSocket 承载。**当前仓库不是可用的 VPN**：目前只有最小 CLI 状态基础，没有 TLS 后端，也没有网络引擎。所有路线阶段和验收门禁仍未验证，Phase 0 尚未完成。
+Boreas 是一个基于 Rust 的三层 Overlay 引擎设计，计划使用 WebSocket 承载。**当前仓库尚非生产可用的 VPN**：主分支已有 VirtualTun、ICMP/PTB构造、IPv4分片及UDP/IP DNS报文处理，也有若干纯策略与解析模块，但这不等于已验收的完整数据面。OpenSSL源码下载/hash/build及AES客户端HTTP路径已成功；mTLS服务端断言仍待验证，因此 `G-CRYPTO` 未通过，也不能据此宣称 Boreas 端到端 TLS 已验收。所有路线阶段和验收门禁仍未完成，Phase 0 尚未完成。
 
 [v1.11.0 主计划](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md)是架构设计基线，并非已冻结的生产协议或安全认证。仓库已有应用帧解析、身份/授权及TLS策略、前缀/路由裁决、L3报文校验与PMTU、权威DNS报文、升级事务日志等纯策略/解析基础，但没有TLS后端、认证网络路径、真实TUN设备或socket服务。其安全设计要求采用标准 TLS 1.3 混合密钥交换及 ML-DSA 身份认证，并明确废弃历史自研握手。应用帧和确定性管理对象编码仍是候选规范，须待 Phase 0 评审及独立测试向量验证后再冻结。当前实现没有旧式 4 字节 `StreamID`/`Length` 帧。
 
@@ -32,7 +32,7 @@ Boreas 是一个基于 Rust 的三层 Overlay 引擎设计，计划使用 WebSoc
 
 ### 验证范围
 
-CI 在 Windows 与 Ubuntu 上运行格式检查、check、Clippy 和测试。这不代表已验证 Linux `x86_64` 与 `aarch64` 静态 TLS 构建、真实 Linux 运行、CDN 兼容、密码互操作或安全验收。请查看[实现状态与门禁表](docs/engineering/implementation-status.md)，其中逐项记录所有未通过门禁及后续任务。
+GitHub Actions 已成功分配五种原生 runner 目标。最近一次报告中 Clippy 全部通过，DNS wire/packet 测试 17 项通过；workspace 测试随后有一个 TUN 测试失败，因此后续 tunnel 测试尚未运行。测试矩阵仍未全绿，完整 artifacts 尚未产出。这不代表已验证 Linux `x86_64` 与 `aarch64` 静态 TLS 构建、生产运行、CDN兼容、密码互操作或安全验收。请查看[实现状态与门禁表](docs/engineering/implementation-status.md)及[Actions运行记录](https://github.com/Lanlan13-14/Boreas/actions/runs/43604239086)，了解当前证据和未通过门禁。
 
 ---
 
