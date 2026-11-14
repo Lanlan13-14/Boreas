@@ -177,7 +177,8 @@ fn inspect_v6(p: &[u8]) -> Result<PacketInfo, Error> {
                 }
                 let more = bits & 1 != 0;
                 let plen = n - (pos + 8);
-                if (more && (plen == 0 || !plen.is_multiple_of(8))) || off as usize + plen > 65_535 {
+                if (more && (plen == 0 || !plen.is_multiple_of(8))) || off as usize + plen > 65_535
+                {
                     return Err(Error::FragmentMalformed);
                 }
                 frag = Some(FragmentInfo {
@@ -611,7 +612,11 @@ impl FragmentTracker {
         let end = offset
             .checked_add(u32::try_from(len).map_err(|_| Error::FragmentMalformed)?)
             .ok_or(Error::FragmentMalformed)?;
-        if len == 0 || end > 65_535 || (offset != 0 && !offset.is_multiple_of(8)) || (more && !len.is_multiple_of(8)) {
+        if len == 0
+            || end > 65_535
+            || (offset != 0 && !offset.is_multiple_of(8))
+            || (more && !len.is_multiple_of(8))
+        {
             return Err(Error::FragmentMalformed);
         }
         if !self.flows.contains_key(&key) && self.flows.len() >= self.limits.streams {

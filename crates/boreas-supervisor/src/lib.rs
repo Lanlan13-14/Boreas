@@ -146,14 +146,21 @@ impl UpgradeStore {
             return Err(UpgradeError::Invalid("artifact must be a real directory"));
         }
         if !same_device(&self.root, src)? {
-            return Err(UpgradeError::Invalid("artifact must be on the store filesystem"));
+            return Err(UpgradeError::Invalid(
+                "artifact must be on the store filesystem",
+            ));
         }
         let stage = self.staging.join(format!("{}.tmp", candidate.version));
         let dest = self.versions.join(&candidate.version);
         if path_entry_exists(&stage)? || path_entry_exists(&dest)? {
-            return Err(UpgradeError::Invalid("candidate stage/version already exists"));
+            return Err(UpgradeError::Invalid(
+                "candidate stage/version already exists",
+            ));
         }
-        let mut budget = CopyBudget { bytes: 0, entries: 0 };
+        let mut budget = CopyBudget {
+            bytes: 0,
+            entries: 0,
+        };
         if let Err(error) = copy_tree_no_symlinks(src, &stage, 0, &mut budget) {
             let _ = fs::remove_dir_all(&stage);
             let _ = sync_dir(&self.staging);
@@ -626,8 +633,13 @@ mod tests {
     #[test]
     fn first_install_prepare_activate_crash_rolls_back_to_empty() {
         let (_t, s, a) = setup();
-        s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate"))
-            .unwrap();
+        s.prepare(
+            &Candidate {
+                version: "1.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
         s.activate().unwrap();
         assert_eq!(s.active_version().unwrap().as_deref(), Some("1.0.0"));
         assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: None });
@@ -639,13 +651,23 @@ mod tests {
         let old = s.versions.join("1.0.0");
         fs::create_dir(&old).unwrap();
         s.write_active(Some("1.0.0")).unwrap();
-        s.prepare(&Candidate { version: "2.0.0".into() }, a.path().join("candidate"))
-            .unwrap();
+        s.prepare(
+            &Candidate {
+                version: "2.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
         s.activate().unwrap();
         s.confirm().unwrap();
         assert!(old.is_dir());
         assert_eq!(s.active_version().unwrap().as_deref(), Some("2.0.0"));
-        assert_eq!(s.recover().unwrap(), Recovery::Confirmed { active: Some("2.0.0".into()) });
+        assert_eq!(
+            s.recover().unwrap(),
+            Recovery::Confirmed {
+                active: Some("2.0.0".into())
+            }
+        );
     }
     #[test]
     fn crash_after_pointer_rename_before_journal_activated_still_rolls_back() {
@@ -653,42 +675,85 @@ mod tests {
         let old = s.versions.join("1.0.0");
         fs::create_dir(&old).unwrap();
         s.write_active(Some("1.0.0")).unwrap();
-        s.prepare(&Candidate { version: "2.0.0".into() }, a.path().join("candidate"))
-            .unwrap();
+        s.prepare(
+            &Candidate {
+                version: "2.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
         s.write_active(Some("2.0.0")).unwrap();
-        assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: Some("1.0.0".into()) });
+        assert_eq!(
+            s.recover().unwrap(),
+            Recovery::RolledBack {
+                active: Some("1.0.0".into())
+            }
+        );
     }
     #[test]
     fn unsafe_version_and_symlink_artifact_rejected() {
         let (_t, s, a) = setup();
-        assert!(s.prepare(&Candidate { version: "../oops".into() }, a.path().join("candidate")).is_err());
+        assert!(
+            s.prepare(
+                &Candidate {
+                    version: "../oops".into()
+                },
+                a.path().join("candidate")
+            )
+            .is_err()
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             let link = a.path().join("link");
             symlink(a.path().join("candidate"), &link).unwrap();
-            assert!(s.prepare(&Candidate { version: "1.0.0".into() }, &link).is_err());
+            assert!(
+                s.prepare(
+                    &Candidate {
+                        version: "1.0.0".into()
+                    },
+                    &link
+                )
+                .is_err()
+            );
         }
     }
     #[test]
     fn journal_parser_rejects_traversal() {
         let (_t, s, _a) = setup();
-        fs::write(s.root.join(JOURNAL_FILE), format!("{FORMAT}\n-\n../evil\nPrepared\n")).unwrap();
+        fs::write(
+            s.root.join(JOURNAL_FILE),
+            format!("{FORMAT}\n-\n../evil\nPrepared\n"),
+        )
+        .unwrap();
         assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
     }
     #[test]
     fn journal_rejects_same_old_and_new_and_oversized_files() {
         let (_t, s, _a) = setup();
-        fs::write(s.root.join(JOURNAL_FILE), format!("{FORMAT}\n1.0.0\n1.0.0\nPrepared\n")).unwrap();
+        fs::write(
+            s.root.join(JOURNAL_FILE),
+            format!("{FORMAT}\n1.0.0\n1.0.0\nPrepared\n"),
+        )
+        .unwrap();
         assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
-        fs::write(s.root.join(JOURNAL_FILE), vec![b'x'; MAX_JOURNAL_BYTES as usize + 1]).unwrap();
+        fs::write(
+            s.root.join(JOURNAL_FILE),
+            vec![b'x'; MAX_JOURNAL_BYTES as usize + 1],
+        )
+        .unwrap();
         assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
     }
     #[test]
     fn inconsistent_confirmed_journal_rolls_back_instead_of_claiming_success() {
         let (_t, s, _a) = setup();
         fs::create_dir(s.versions.join("1.0.0")).unwrap();
-        s.write_journal(&Journal { old_version: None, new_version: "1.0.0".into(), phase: Phase::Confirmed }).unwrap();
+        s.write_journal(&Journal {
+            old_version: None,
+            new_version: "1.0.0".into(),
+            phase: Phase::Confirmed,
+        })
+        .unwrap();
         assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: None });
         assert_eq!(s.journal().unwrap().unwrap().phase, Phase::Prepared);
     }
@@ -698,20 +763,37 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(a.path().join("candidate/boreas"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(
+                a.path().join("candidate/boreas"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
         }
-        s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate")).unwrap();
+        s.prepare(
+            &Candidate {
+                version: "1.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(s.versions.join("1.0.0/boreas")).unwrap().permissions().mode();
+            let mode = fs::metadata(s.versions.join("1.0.0/boreas"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o700);
         }
     }
     #[test]
     fn active_pointer_rejects_oversized_content() {
         let (_t, s, _a) = setup();
-        fs::write(s.root.join(ACTIVE_FILE), vec![b'x'; MAX_ACTIVE_BYTES as usize + 1]).unwrap();
+        fs::write(
+            s.root.join(ACTIVE_FILE),
+            vec![b'x'; MAX_ACTIVE_BYTES as usize + 1],
+        )
+        .unwrap();
         assert!(s.active_version().is_err());
     }
     #[test]
@@ -720,7 +802,12 @@ mod tests {
         let big = a.path().join("candidate/too-large");
         let f = File::create(&big).unwrap();
         f.set_len(MAX_ARTIFACT_BYTES + 1).unwrap();
-        let result = s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate"));
+        let result = s.prepare(
+            &Candidate {
+                version: "1.0.0".into(),
+            },
+            a.path().join("candidate"),
+        );
         assert!(result.is_err());
         assert!(!s.staging.join("1.0.0.tmp").exists());
     }
@@ -729,7 +816,19 @@ mod tests {
     fn hardlinked_artifact_file_rejected() {
         use std::os::unix::fs::hard_link;
         let (_t, s, a) = setup();
-        hard_link(a.path().join("candidate/boreas"), a.path().join("candidate/alias")).unwrap();
-        assert!(s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate")).is_err());
+        hard_link(
+            a.path().join("candidate/boreas"),
+            a.path().join("candidate/alias"),
+        )
+        .unwrap();
+        assert!(
+            s.prepare(
+                &Candidate {
+                    version: "1.0.0".into()
+                },
+                a.path().join("candidate")
+            )
+            .is_err()
+        );
     }
 }

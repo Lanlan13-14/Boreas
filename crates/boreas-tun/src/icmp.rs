@@ -2,43 +2,494 @@
 //!
 //! These helpers perform packet-level anti-reflection checks. Callers remain responsible for
 //! authorization/rate policy at the routing layer; the bucket here provides an additional bound.
-use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr}, time::Instant};
-use crate::{inspect_packet, IpVersion};
+use crate::{IpVersion, inspect_packet};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcmpError { InvalidPacket, Unsupported, ForbiddenResponse, InvalidMtu, RateLimited, TooManyFragments }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ErrorKind { Ipv4TimeExceeded, Ipv4FragmentationNeeded { mtu:u16 }, Ipv6PacketTooBig { mtu:u32 }, Ipv6TimeExceeded }
-#[derive(Clone, Debug)]
-pub struct TokenBucket { capacity:u32, tokens:f64, refill_per_second:f64, updated:Instant }
-impl TokenBucket {
- pub fn new(capacity:u32,refill_per_second:f64,now:Instant)->Result<Self,IcmpError>{if capacity==0||!refill_per_second.is_finite()||refill_per_second<=0.0{return Err(IcmpError::InvalidMtu)}Ok(Self{capacity,tokens:capacity as f64,refill_per_second,updated:now})}
- pub fn allow(&mut self,now:Instant)->bool{let elapsed=now.saturating_duration_since(self.updated).as_secs_f64();self.tokens=(self.tokens+elapsed*self.refill_per_second).min(self.capacity as f64);self.updated=now;if self.tokens<1.0{return false}self.tokens-=1.0;true}
+pub enum IcmpError {
+    InvalidPacket,
+    Unsupported,
+    ForbiddenResponse,
+    InvalidMtu,
+    RateLimited,
+    TooManyFragments,
 }
-fn checksum(bytes:&[u8])->u16{let mut s=0u64;for c in bytes.chunks(2){s+=if c.len()==2{u16::from_be_bytes([c[0],c[1]])as u64}else{(c[0]as u64)<<8}}while s>>16!=0{s=(s&0xffff)+(s>>16)}!(s as u16)}
-fn verify_v4(p:&[u8])->Result<usize,IcmpError>{if p.len()<20||p[0]>>4!=4{return Err(IcmpError::InvalidPacket)}let h=(p[0]&15)as usize*4;let n=u16::from_be_bytes([p[2],p[3]])as usize;if h<20||h>p.len()||n!=p.len()||n<h||checksum(&p[..h])!=0{return Err(IcmpError::InvalidPacket)}Ok(h)}
-fn verify_v6(p:&[u8])->Result<(),IcmpError>{if p.len()<40||p[0]>>4!=6||40+u16::from_be_bytes([p[4],p[5]])as usize!=p.len(){return Err(IcmpError::InvalidPacket)}Ok(())}
-fn forbidden_v4(p:&[u8],h:usize)->bool{let src=&p[12..16];let dst=&p[16..20];let frag=u16::from_be_bytes([p[6],p[7]]);src[0]==0||src[0]>=224||dst[0]>=224||dst==[255,255,255,255]||frag&0x1fff!=0||(p[9]==1&&p.len()>h&&matches!(p[h],3|4|5|11|12))}
-fn forbidden_v6(p:&[u8])->bool{let src=&p[8..24];let dst=&p[24..40];if src[0]==0xff||dst[0]==0xff||src.iter().all(|b|*b==0){return true}let(mut next,mut pos,mut depth)=(p[6],40usize,0usize);while matches!(next,0|43|44|51|60){if depth>=4{return true}depth+=1;if next==44{if pos+8>p.len(){return true}let bits=u16::from_be_bytes([p[pos+2],p[pos+3]]);if bits&0xfff8!=0{return true}next=p[pos];pos+=8}else{if pos+2>p.len(){return true}let len=if next==51{(p[pos+1]as usize+2)*4}else{(p[pos+1]as usize+1)*8};if pos+len>p.len(){return true}next=p[pos];pos+=len}}next==58&&pos<p.len()&&matches!(p[pos],1..=4)}
-fn quote4(p:&[u8],h:usize)->&[u8]{&p[..p.len().min(h.saturating_add(8)).min(548)]}
-fn quote6(p:&[u8])->&[u8]{&p[..p.len().min(1232)]}
-fn output_v4(src:Ipv4Addr,dst:Ipv4Addr,ttl:u8,payload:&[u8])->Vec<u8>{let n=20+payload.len();let mut out=vec![0u8;n];out[0]=0x45;out[2..4].copy_from_slice(&(n as u16).to_be_bytes());out[8]=ttl;out[9]=1;out[12..16].copy_from_slice(&src.octets());out[16..20].copy_from_slice(&dst.octets());out[20..].copy_from_slice(payload);let c=checksum(&out[..20]).to_be_bytes();out[10..12].copy_from_slice(&c);out}
-fn pseudo6(src:&[u8],dst:&[u8],len:u32)->Vec<u8>{let mut b=Vec::with_capacity(40);b.extend_from_slice(src);b.extend_from_slice(dst);b.extend_from_slice(&len.to_be_bytes());b.extend_from_slice(&[0,0,0,58]);b}
-fn output_v6(src:Ipv6Addr,dst:Ipv6Addr,hop:u8,payload:&[u8])->Vec<u8>{let n=payload.len();let mut out=vec![0u8;40+n];out[0]=0x60;out[4..6].copy_from_slice(&(n as u16).to_be_bytes());out[6]=58;out[7]=hop;out[8..24].copy_from_slice(&src.octets());out[24..40].copy_from_slice(&dst.octets());out[40..].copy_from_slice(payload);let mut pseudo=pseudo6(&out[8..24],&out[24..40],n as u32);pseudo.extend_from_slice(payload);let c=checksum(&pseudo).to_be_bytes();out[42..44].copy_from_slice(&c);out}
-pub fn build_icmpv4_error(original:&[u8],source:Ipv4Addr,kind:ErrorKind,hop_limit:u8,bucket:&mut TokenBucket,now:Instant)->Result<Vec<u8>,IcmpError>{let h=verify_v4(original)?;if forbidden_v4(original,h){return Err(IcmpError::ForbiddenResponse)}let(ty,code,rest)=match kind{ErrorKind::Ipv4TimeExceeded=>(11,0,[0u8;4]),ErrorKind::Ipv4FragmentationNeeded{mtu}if mtu>=68=>{let mut r=[0;4];r[2..].copy_from_slice(&mtu.to_be_bytes());(3,4,r)},ErrorKind::Ipv4FragmentationNeeded{..}=>return Err(IcmpError::InvalidMtu),_=>return Err(IcmpError::Unsupported)};if !bucket.allow(now){return Err(IcmpError::RateLimited)}let q=quote4(original,h);let mut b=vec![ty,code,0,0];b.extend_from_slice(&rest);b.extend_from_slice(q);let c=checksum(&b).to_be_bytes();b[2..4].copy_from_slice(&c);let dst=Ipv4Addr::from(<[u8;4]>::try_from(&original[12..16]).unwrap());Ok(output_v4(source,dst,hop_limit,&b))}
-pub fn build_icmpv6_error(original:&[u8],source:Ipv6Addr,kind:ErrorKind,hop_limit:u8,bucket:&mut TokenBucket,now:Instant)->Result<Vec<u8>,IcmpError>{verify_v6(original)?;if forbidden_v6(original){return Err(IcmpError::ForbiddenResponse)}let(ty,code,value)=match kind{ErrorKind::Ipv6PacketTooBig{mtu}if mtu>=1280=>(2,0,mtu),ErrorKind::Ipv6PacketTooBig{..}=>return Err(IcmpError::InvalidMtu),ErrorKind::Ipv6TimeExceeded=>(3,0,0),_=>return Err(IcmpError::Unsupported)};if !bucket.allow(now){return Err(IcmpError::RateLimited)}let mut b=vec![ty,code,0,0];b.extend_from_slice(&value.to_be_bytes());b.extend_from_slice(quote6(original));let dst=Ipv6Addr::from(<[u8;16]>::try_from(&original[8..24]).unwrap());Ok(output_v6(source,dst,hop_limit,&b))}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorKind {
+    Ipv4TimeExceeded,
+    Ipv4FragmentationNeeded { mtu: u16 },
+    Ipv6PacketTooBig { mtu: u32 },
+    Ipv6TimeExceeded,
+}
+#[derive(Clone, Debug)]
+pub struct TokenBucket {
+    capacity: u32,
+    tokens: f64,
+    refill_per_second: f64,
+    updated: Instant,
+}
+impl TokenBucket {
+    pub fn new(capacity: u32, refill_per_second: f64, now: Instant) -> Result<Self, IcmpError> {
+        if capacity == 0 || !refill_per_second.is_finite() || refill_per_second <= 0.0 {
+            return Err(IcmpError::InvalidMtu);
+        }
+        Ok(Self {
+            capacity,
+            tokens: capacity as f64,
+            refill_per_second,
+            updated: now,
+        })
+    }
+    pub fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_second).min(self.capacity as f64);
+        self.updated = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+fn checksum(bytes: &[u8]) -> u16 {
+    let mut s = 0u64;
+    for c in bytes.chunks(2) {
+        s += if c.len() == 2 {
+            u16::from_be_bytes([c[0], c[1]]) as u64
+        } else {
+            (c[0] as u64) << 8
+        }
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16)
+    }
+    !(s as u16)
+}
+fn verify_v4(p: &[u8]) -> Result<usize, IcmpError> {
+    if p.len() < 20 || p[0] >> 4 != 4 {
+        return Err(IcmpError::InvalidPacket);
+    }
+    let h = (p[0] & 15) as usize * 4;
+    let n = u16::from_be_bytes([p[2], p[3]]) as usize;
+    if h < 20 || h > p.len() || n != p.len() || n < h || checksum(&p[..h]) != 0 {
+        return Err(IcmpError::InvalidPacket);
+    }
+    Ok(h)
+}
+fn verify_v6(p: &[u8]) -> Result<(), IcmpError> {
+    if p.len() < 40 || p[0] >> 4 != 6 || 40 + u16::from_be_bytes([p[4], p[5]]) as usize != p.len() {
+        return Err(IcmpError::InvalidPacket);
+    }
+    Ok(())
+}
+fn forbidden_v4(p: &[u8], h: usize) -> bool {
+    let src = &p[12..16];
+    let dst = &p[16..20];
+    let frag = u16::from_be_bytes([p[6], p[7]]);
+    src[0] == 0
+        || src[0] >= 224
+        || dst[0] >= 224
+        || dst == [255, 255, 255, 255]
+        || frag & 0x1fff != 0
+        || (p[9] == 1 && p.len() > h && matches!(p[h], 3 | 4 | 5 | 11 | 12))
+}
+fn forbidden_v6(p: &[u8]) -> bool {
+    let src = &p[8..24];
+    let dst = &p[24..40];
+    if src[0] == 0xff || dst[0] == 0xff || src.iter().all(|b| *b == 0) {
+        return true;
+    }
+    let (mut next, mut pos, mut depth) = (p[6], 40usize, 0usize);
+    while matches!(next, 0 | 43 | 44 | 51 | 60) {
+        if depth >= 4 {
+            return true;
+        }
+        depth += 1;
+        if next == 44 {
+            if pos + 8 > p.len() {
+                return true;
+            }
+            let bits = u16::from_be_bytes([p[pos + 2], p[pos + 3]]);
+            if bits & 0xfff8 != 0 {
+                return true;
+            }
+            next = p[pos];
+            pos += 8
+        } else {
+            if pos + 2 > p.len() {
+                return true;
+            }
+            let len = if next == 51 {
+                (p[pos + 1] as usize + 2) * 4
+            } else {
+                (p[pos + 1] as usize + 1) * 8
+            };
+            if pos + len > p.len() {
+                return true;
+            }
+            next = p[pos];
+            pos += len
+        }
+    }
+    next == 58 && pos < p.len() && matches!(p[pos], 1..=4)
+}
+fn quote4(p: &[u8], h: usize) -> &[u8] {
+    &p[..p.len().min(h.saturating_add(8)).min(548)]
+}
+fn quote6(p: &[u8]) -> &[u8] {
+    &p[..p.len().min(1232)]
+}
+fn output_v4(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8, payload: &[u8]) -> Vec<u8> {
+    let n = 20 + payload.len();
+    let mut out = vec![0u8; n];
+    out[0] = 0x45;
+    out[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+    out[8] = ttl;
+    out[9] = 1;
+    out[12..16].copy_from_slice(&src.octets());
+    out[16..20].copy_from_slice(&dst.octets());
+    out[20..].copy_from_slice(payload);
+    let c = checksum(&out[..20]).to_be_bytes();
+    out[10..12].copy_from_slice(&c);
+    out
+}
+fn pseudo6(src: &[u8], dst: &[u8], len: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(40);
+    b.extend_from_slice(src);
+    b.extend_from_slice(dst);
+    b.extend_from_slice(&len.to_be_bytes());
+    b.extend_from_slice(&[0, 0, 0, 58]);
+    b
+}
+fn output_v6(src: Ipv6Addr, dst: Ipv6Addr, hop: u8, payload: &[u8]) -> Vec<u8> {
+    let n = payload.len();
+    let mut out = vec![0u8; 40 + n];
+    out[0] = 0x60;
+    out[4..6].copy_from_slice(&(n as u16).to_be_bytes());
+    out[6] = 58;
+    out[7] = hop;
+    out[8..24].copy_from_slice(&src.octets());
+    out[24..40].copy_from_slice(&dst.octets());
+    out[40..].copy_from_slice(payload);
+    let mut pseudo = pseudo6(&out[8..24], &out[24..40], n as u32);
+    pseudo.extend_from_slice(payload);
+    let c = checksum(&pseudo).to_be_bytes();
+    out[42..44].copy_from_slice(&c);
+    out
+}
+pub fn build_icmpv4_error(
+    original: &[u8],
+    source: Ipv4Addr,
+    kind: ErrorKind,
+    hop_limit: u8,
+    bucket: &mut TokenBucket,
+    now: Instant,
+) -> Result<Vec<u8>, IcmpError> {
+    let h = verify_v4(original)?;
+    if forbidden_v4(original, h) {
+        return Err(IcmpError::ForbiddenResponse);
+    }
+    let (ty, code, rest) = match kind {
+        ErrorKind::Ipv4TimeExceeded => (11, 0, [0u8; 4]),
+        ErrorKind::Ipv4FragmentationNeeded { mtu } if mtu >= 68 => {
+            let mut r = [0; 4];
+            r[2..].copy_from_slice(&mtu.to_be_bytes());
+            (3, 4, r)
+        }
+        ErrorKind::Ipv4FragmentationNeeded { .. } => return Err(IcmpError::InvalidMtu),
+        _ => return Err(IcmpError::Unsupported),
+    };
+    if !bucket.allow(now) {
+        return Err(IcmpError::RateLimited);
+    }
+    let q = quote4(original, h);
+    let mut b = vec![ty, code, 0, 0];
+    b.extend_from_slice(&rest);
+    b.extend_from_slice(q);
+    let c = checksum(&b).to_be_bytes();
+    b[2..4].copy_from_slice(&c);
+    let dst = Ipv4Addr::from(<[u8; 4]>::try_from(&original[12..16]).unwrap());
+    Ok(output_v4(source, dst, hop_limit, &b))
+}
+pub fn build_icmpv6_error(
+    original: &[u8],
+    source: Ipv6Addr,
+    kind: ErrorKind,
+    hop_limit: u8,
+    bucket: &mut TokenBucket,
+    now: Instant,
+) -> Result<Vec<u8>, IcmpError> {
+    verify_v6(original)?;
+    if forbidden_v6(original) {
+        return Err(IcmpError::ForbiddenResponse);
+    }
+    let (ty, code, value) = match kind {
+        ErrorKind::Ipv6PacketTooBig { mtu } if mtu >= 1280 => (2, 0, mtu),
+        ErrorKind::Ipv6PacketTooBig { .. } => return Err(IcmpError::InvalidMtu),
+        ErrorKind::Ipv6TimeExceeded => (3, 0, 0),
+        _ => return Err(IcmpError::Unsupported),
+    };
+    if !bucket.allow(now) {
+        return Err(IcmpError::RateLimited);
+    }
+    let mut b = vec![ty, code, 0, 0];
+    b.extend_from_slice(&value.to_be_bytes());
+    b.extend_from_slice(quote6(original));
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&original[8..24]).unwrap());
+    Ok(output_v6(source, dst, hop_limit, &b))
+}
 
 /// Fragment one IPv4 packet to `mtu`, preserving ID, options, prior MF and byte offset.
 /// Non-first fragments carry only copied options (RFC 791); DF packets are refused.
-pub fn fragment_ipv4(packet:&[u8],mtu:usize,max_fragments:usize)->Result<Vec<Vec<u8>>,IcmpError>{let info=inspect_packet(packet).map_err(|_|IcmpError::InvalidPacket)?;if info.version!=IpVersion::V4{return Err(IcmpError::InvalidPacket)}let h=verify_v4(packet)?;if !(68..=65_535).contains(&mtu){return Err(IcmpError::InvalidMtu)}if packet.len()<=mtu{return Ok(vec![packet.to_vec()])}let flags=u16::from_be_bytes([packet[6],packet[7]]);if flags&0x4000!=0{return Err(IcmpError::InvalidMtu)}let mut copts=Vec::new();let mut i=20;while i<h{let typ=packet[i];if typ==0{break}if typ==1{i+=1;continue}if i+2>h{return Err(IcmpError::InvalidPacket)}let l=packet[i+1]as usize;if l<2||i+l>h{return Err(IcmpError::InvalidPacket)}if typ&0x80!=0{copts.extend_from_slice(&packet[i..i+l]);}i+=l;}while copts.len()%4!=0{copts.push(0)}let payload=&packet[h..];let mut offset=(flags&0x1fff)as usize*8;let prior_more=flags&0x2000!=0;let(mut pos,mut out)=(0,Vec::new());while pos<payload.len(){let opts=if offset==0{packet[20..h].to_vec()}else{copts.clone()};let ihl=20+opts.len();if mtu<=ihl{return Err(IcmpError::InvalidMtu)}let room=mtu-ihl;let remain=payload.len()-pos;let take=if remain>room{room&!7}else{remain};if take==0{return Err(IcmpError::InvalidMtu)}let more=pos+take<payload.len()||prior_more;if more&&take%8!=0{return Err(IcmpError::InvalidMtu)}if out.len()>=max_fragments{return Err(IcmpError::TooManyFragments)}let n=ihl+take;let mut f=vec![0u8;n];f[..20].copy_from_slice(&packet[..20]);f[0]=(f[0]&0xf0)|((ihl/4)as u8);f[2..4].copy_from_slice(&(n as u16).to_be_bytes());f[6..8].copy_from_slice(&((if more{0x2000}else{0})|((offset/8)as u16&0x1fff)).to_be_bytes());f[10]=0;f[11]=0;f[20..ihl].copy_from_slice(&opts);f[ihl..].copy_from_slice(&payload[pos..pos+take]);let c=checksum(&f[..ihl]).to_be_bytes();f[10..12].copy_from_slice(&c);out.push(f);pos+=take;offset+=take;if offset>65_535{return Err(IcmpError::InvalidPacket)}}if out.is_empty(){return Err(IcmpError::InvalidPacket)}Ok(out)}
-pub fn is_multicast_or_unspecified(ip:IpAddr)->bool{match ip{IpAddr::V4(v)=>v.is_multicast()||v.is_unspecified(),IpAddr::V6(v)=>v.is_multicast()||v.is_unspecified()}}
+pub fn fragment_ipv4(
+    packet: &[u8],
+    mtu: usize,
+    max_fragments: usize,
+) -> Result<Vec<Vec<u8>>, IcmpError> {
+    let info = inspect_packet(packet).map_err(|_| IcmpError::InvalidPacket)?;
+    if info.version != IpVersion::V4 {
+        return Err(IcmpError::InvalidPacket);
+    }
+    let h = verify_v4(packet)?;
+    if !(68..=65_535).contains(&mtu) {
+        return Err(IcmpError::InvalidMtu);
+    }
+    if packet.len() <= mtu {
+        return Ok(vec![packet.to_vec()]);
+    }
+    let flags = u16::from_be_bytes([packet[6], packet[7]]);
+    if flags & 0x4000 != 0 {
+        return Err(IcmpError::InvalidMtu);
+    }
+    let mut copts = Vec::new();
+    let mut i = 20;
+    while i < h {
+        let typ = packet[i];
+        if typ == 0 {
+            break;
+        }
+        if typ == 1 {
+            i += 1;
+            continue;
+        }
+        if i + 2 > h {
+            return Err(IcmpError::InvalidPacket);
+        }
+        let l = packet[i + 1] as usize;
+        if l < 2 || i + l > h {
+            return Err(IcmpError::InvalidPacket);
+        }
+        if typ & 0x80 != 0 {
+            copts.extend_from_slice(&packet[i..i + l]);
+        }
+        i += l;
+    }
+    while copts.len() % 4 != 0 {
+        copts.push(0)
+    }
+    let payload = &packet[h..];
+    let mut offset = (flags & 0x1fff) as usize * 8;
+    let prior_more = flags & 0x2000 != 0;
+    let (mut pos, mut out) = (0, Vec::new());
+    while pos < payload.len() {
+        let opts = if offset == 0 {
+            packet[20..h].to_vec()
+        } else {
+            copts.clone()
+        };
+        let ihl = 20 + opts.len();
+        if mtu <= ihl {
+            return Err(IcmpError::InvalidMtu);
+        }
+        let room = mtu - ihl;
+        let remain = payload.len() - pos;
+        let take = if remain > room { room & !7 } else { remain };
+        if take == 0 {
+            return Err(IcmpError::InvalidMtu);
+        }
+        let more = pos + take < payload.len() || prior_more;
+        if more && take % 8 != 0 {
+            return Err(IcmpError::InvalidMtu);
+        }
+        if out.len() >= max_fragments {
+            return Err(IcmpError::TooManyFragments);
+        }
+        let n = ihl + take;
+        let mut f = vec![0u8; n];
+        f[..20].copy_from_slice(&packet[..20]);
+        f[0] = (f[0] & 0xf0) | ((ihl / 4) as u8);
+        f[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+        f[6..8].copy_from_slice(
+            &((if more { 0x2000 } else { 0 }) | ((offset / 8) as u16 & 0x1fff)).to_be_bytes(),
+        );
+        f[10] = 0;
+        f[11] = 0;
+        f[20..ihl].copy_from_slice(&opts);
+        f[ihl..].copy_from_slice(&payload[pos..pos + take]);
+        let c = checksum(&f[..ihl]).to_be_bytes();
+        f[10..12].copy_from_slice(&c);
+        out.push(f);
+        pos += take;
+        offset += take;
+        if offset > 65_535 {
+            return Err(IcmpError::InvalidPacket);
+        }
+    }
+    if out.is_empty() {
+        return Err(IcmpError::InvalidPacket);
+    }
+    Ok(out)
+}
+pub fn is_multicast_or_unspecified(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_multicast() || v.is_unspecified(),
+        IpAddr::V6(v) => v.is_multicast() || v.is_unspecified(),
+    }
+}
 
-#[cfg(test)]mod tests{
- use super::*;
- fn v4()->Vec<u8>{let mut p=vec![0;128];p[0]=0x45;p[2..4].copy_from_slice(&128u16.to_be_bytes());p[8]=1;p[9]=17;p[12..16].copy_from_slice(&[10,1,0,1]);p[16..20].copy_from_slice(&[10,1,0,2]);let c=checksum(&p[..20]).to_be_bytes();p[10..12].copy_from_slice(&c);p}
- fn v6()->Vec<u8>{let mut p=vec![0;1400];p[0]=0x60;p[4..6].copy_from_slice(&1360u16.to_be_bytes());p[6]=17;p[7]=32;p[8]=0x20;p[24]=0x20;p}
- #[test]fn v4_icmp_types_checksums_and_limits(){let now=Instant::now();let mut b=TokenBucket::new(4,1.0,now).unwrap();let p=v4();let r=build_icmpv4_error(&p,Ipv4Addr::new(10,1,0,254),ErrorKind::Ipv4FragmentationNeeded{mtu:1280},64,&mut b,now).unwrap();assert_eq!(r[20],3);assert_eq!(r[21],4);assert_eq!(u16::from_be_bytes([r[26],r[27]]),1280);assert_eq!(checksum(&r[..20]),0);assert_eq!(checksum(&r[20..]),0);let r=build_icmpv4_error(&p,Ipv4Addr::new(10,1,0,254),ErrorKind::Ipv4TimeExceeded,64,&mut b,now).unwrap();assert_eq!(r[20],11);assert_eq!(r.len(),20+8+28);}
- #[test]fn v6_pseudo_checksum_and_quote_bound(){let now=Instant::now();let mut b=TokenBucket::new(2,1.0,now).unwrap();let r=build_icmpv6_error(&v6(),Ipv6Addr::new(0x2001,0xdb8,0,0,0,0,0,0xfe),ErrorKind::Ipv6PacketTooBig{mtu:1280},64,&mut b,now).unwrap();assert_eq!(r[40],2);assert_eq!(u32::from_be_bytes(r[44..48].try_into().unwrap()),1280);assert_eq!(r.len(),1280);let mut pseudo=pseudo6(&r[8..24],&r[24..40],(r.len()-40)as u32);pseudo.extend_from_slice(&r[40..]);assert_eq!(checksum(&pseudo),0);}
- #[test]fn errors_suppress_reflection_and_rate_limit(){let now=Instant::now();let mut b=TokenBucket::new(1,0.1,now).unwrap();let p=v4();build_icmpv4_error(&p,Ipv4Addr::new(10,1,0,254),ErrorKind::Ipv4TimeExceeded,64,&mut b,now).unwrap();assert_eq!(build_icmpv4_error(&p,Ipv4Addr::new(10,1,0,254),ErrorKind::Ipv4TimeExceeded,64,&mut b,now),Err(IcmpError::RateLimited));let mut bad=p.clone();bad[12]=224;bad[10]=0;bad[11]=0;let c=checksum(&bad[..20]).to_be_bytes();bad[10..12].copy_from_slice(&c);assert_eq!(build_icmpv4_error(&bad,Ipv4Addr::new(10,1,0,254),ErrorKind::Ipv4TimeExceeded,64,&mut b,now),Err(IcmpError::ForbiddenResponse));}
- #[test]fn ipv4_fragment_headers_offsets_and_df(){let p=v4();let frags=fragment_ipv4(&p,68,8).unwrap();assert!(frags.len()>1);let mut offset=0;for(i,f)in frags.iter().enumerate(){assert_eq!(checksum(&f[..20]),0);assert_eq!((u16::from_be_bytes([f[6],f[7]])&0x1fff) as usize,offset/8);offset+=f.len()-20;if i+1<frags.len(){assert_ne!(u16::from_be_bytes([f[6],f[7]])&0x2000,0)}}let mut df=p.clone();df[6]=0x40;let c=checksum(&df[..20]).to_be_bytes();df[10..12].copy_from_slice(&c);assert_eq!(fragment_ipv4(&df,68,8),Err(IcmpError::InvalidMtu));}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn v4() -> Vec<u8> {
+        let mut p = vec![0; 128];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&128u16.to_be_bytes());
+        p[8] = 1;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[10, 1, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 1, 0, 2]);
+        let c = checksum(&p[..20]).to_be_bytes();
+        p[10..12].copy_from_slice(&c);
+        p
+    }
+    fn v6() -> Vec<u8> {
+        let mut p = vec![0; 1400];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&1360u16.to_be_bytes());
+        p[6] = 17;
+        p[7] = 32;
+        p[8] = 0x20;
+        p[24] = 0x20;
+        p
+    }
+    #[test]
+    fn v4_icmp_types_checksums_and_limits() {
+        let now = Instant::now();
+        let mut b = TokenBucket::new(4, 1.0, now).unwrap();
+        let p = v4();
+        let r = build_icmpv4_error(
+            &p,
+            Ipv4Addr::new(10, 1, 0, 254),
+            ErrorKind::Ipv4FragmentationNeeded { mtu: 1280 },
+            64,
+            &mut b,
+            now,
+        )
+        .unwrap();
+        assert_eq!(r[20], 3);
+        assert_eq!(r[21], 4);
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 1280);
+        assert_eq!(checksum(&r[..20]), 0);
+        assert_eq!(checksum(&r[20..]), 0);
+        let r = build_icmpv4_error(
+            &p,
+            Ipv4Addr::new(10, 1, 0, 254),
+            ErrorKind::Ipv4TimeExceeded,
+            64,
+            &mut b,
+            now,
+        )
+        .unwrap();
+        assert_eq!(r[20], 11);
+        assert_eq!(r.len(), 20 + 8 + 28);
+    }
+    #[test]
+    fn v6_pseudo_checksum_and_quote_bound() {
+        let now = Instant::now();
+        let mut b = TokenBucket::new(2, 1.0, now).unwrap();
+        let r = build_icmpv6_error(
+            &v6(),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xfe),
+            ErrorKind::Ipv6PacketTooBig { mtu: 1280 },
+            64,
+            &mut b,
+            now,
+        )
+        .unwrap();
+        assert_eq!(r[40], 2);
+        assert_eq!(u32::from_be_bytes(r[44..48].try_into().unwrap()), 1280);
+        assert_eq!(r.len(), 1280);
+        let mut pseudo = pseudo6(&r[8..24], &r[24..40], (r.len() - 40) as u32);
+        pseudo.extend_from_slice(&r[40..]);
+        assert_eq!(checksum(&pseudo), 0);
+    }
+    #[test]
+    fn errors_suppress_reflection_and_rate_limit() {
+        let now = Instant::now();
+        let mut b = TokenBucket::new(1, 0.1, now).unwrap();
+        let p = v4();
+        build_icmpv4_error(
+            &p,
+            Ipv4Addr::new(10, 1, 0, 254),
+            ErrorKind::Ipv4TimeExceeded,
+            64,
+            &mut b,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            build_icmpv4_error(
+                &p,
+                Ipv4Addr::new(10, 1, 0, 254),
+                ErrorKind::Ipv4TimeExceeded,
+                64,
+                &mut b,
+                now
+            ),
+            Err(IcmpError::RateLimited)
+        );
+        let mut bad = p.clone();
+        bad[12] = 224;
+        bad[10] = 0;
+        bad[11] = 0;
+        let c = checksum(&bad[..20]).to_be_bytes();
+        bad[10..12].copy_from_slice(&c);
+        assert_eq!(
+            build_icmpv4_error(
+                &bad,
+                Ipv4Addr::new(10, 1, 0, 254),
+                ErrorKind::Ipv4TimeExceeded,
+                64,
+                &mut b,
+                now
+            ),
+            Err(IcmpError::ForbiddenResponse)
+        );
+    }
+    #[test]
+    fn ipv4_fragment_headers_offsets_and_df() {
+        let p = v4();
+        let frags = fragment_ipv4(&p, 68, 8).unwrap();
+        assert!(frags.len() > 1);
+        let mut offset = 0;
+        for (i, f) in frags.iter().enumerate() {
+            assert_eq!(checksum(&f[..20]), 0);
+            assert_eq!(
+                (u16::from_be_bytes([f[6], f[7]]) & 0x1fff) as usize,
+                offset / 8
+            );
+            offset += f.len() - 20;
+            if i + 1 < frags.len() {
+                assert_ne!(u16::from_be_bytes([f[6], f[7]]) & 0x2000, 0)
+            }
+        }
+        let mut df = p.clone();
+        df[6] = 0x40;
+        let c = checksum(&df[..20]).to_be_bytes();
+        df[10..12].copy_from_slice(&c);
+        assert_eq!(fragment_ipv4(&df, 68, 8), Err(IcmpError::InvalidMtu));
+    }
 }
