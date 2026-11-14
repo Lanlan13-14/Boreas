@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod packet;
+pub mod tcp;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -149,6 +150,12 @@ impl AuthoritativeDns {
                     .strip_suffix(name)
                     .is_some_and(|prefix| prefix.ends_with('.'))
             })
+    }
+
+    /// Handle one length-prefix-stripped TCP DNS query with the same explicit
+    /// source authorization and wire bounds used by UDP.
+    pub fn respond_tcp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
+        self.respond_udp(source, query)
     }
 
     pub fn respond_udp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
