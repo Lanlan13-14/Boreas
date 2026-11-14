@@ -298,18 +298,14 @@ pub fn validate_frame_policy(frame: &Frame, ctx: &mut SessionContext) -> Result<
                     if ctx.enrollment_service
                         && ctx.peer_role == PeerRole::EnrollmentService
                         && !ctx.accepted =>
-                {
-                    ()
-                }
+                {}
                 ControlType::DirectoryPage
                 | ControlType::Grant
                 | ControlType::Revoke
                 | ControlType::Probe
                 | ControlType::Drain
                     if ctx.accepted =>
-                {
-                    ()
-                }
+                {}
                 ControlType::Lease if ctx.accepted && ctx.identity_registered => (),
                 ControlType::Lsa if ctx.accepted && ctx.peer_role == PeerRole::Core => (),
                 ControlType::CircuitOpen
@@ -467,10 +463,10 @@ impl<'a> Parser<'a> {
                     let start = self.i;
                     self.item(depth + 1)?;
                     let key = self.d[start..self.i].to_vec();
-                    if let Some(p) = &prev {
-                        if canonical_cmp(p, &key) != std::cmp::Ordering::Less {
-                            return Err(Error::InvalidCbor("duplicate_or_key_order"));
-                        }
+                    if let Some(p) = &prev
+                        && canonical_cmp(p, &key) != std::cmp::Ordering::Less
+                    {
+                        return Err(Error::InvalidCbor("duplicate_or_key_order"));
                     }
                     prev = Some(key);
                     self.item(depth + 1)?

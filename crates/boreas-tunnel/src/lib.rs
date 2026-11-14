@@ -204,10 +204,10 @@ pub fn classify_prefix(prefix: Prefix, ctx: &ClassifyContext) -> Result<PrefixCl
     }
     // Step 3: reject any overlap with special-use ranges (including unspecified).
     for range in special_ranges() {
-        if let Some(reserved) = range.prefix() {
-            if prefix.overlaps(reserved) {
-                return Err(DenyReason::ReservedRange);
-            }
+        if let Some(reserved) = range.prefix()
+            && prefix.overlaps(reserved)
+        {
+            return Err(DenyReason::ReservedRange);
         }
     }
     // Step 4: only the genesis overlay ranges are protected.
