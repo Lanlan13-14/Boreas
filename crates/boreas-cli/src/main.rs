@@ -38,7 +38,9 @@ fn doctor_json() -> String {
 mod tests {
     use super::run;
 
-    fn args(values: &[&str]) -> Vec<String> { values.iter().map(|s| (*s).into()).collect() }
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).into()).collect()
+    }
 
     #[test]
     fn doctor_command_reports_explicit_limitations() {

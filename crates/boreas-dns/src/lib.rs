@@ -56,7 +56,10 @@ impl Zone {
         if origin.is_empty() {
             return Err(DnsError::InvalidConfiguration);
         }
-        Ok(Self { origin, records: BTreeMap::new() })
+        Ok(Self {
+            origin,
+            records: BTreeMap::new(),
+        })
     }
 
     /// Add an address to an owner name within this zone. Duplicate addresses
@@ -74,7 +77,9 @@ impl Zone {
     }
 
     /// Configured origin in canonical lowercase form without a trailing dot.
-    pub fn origin(&self) -> &str { &self.origin }
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
 }
 
 /// Explicit source-policy input. A packet source must exactly match one of
@@ -91,12 +96,16 @@ impl SourceAuthorization {
     pub fn new<I: IntoIterator<Item = IpAddr>>(sources: I) -> Self {
         let mut authorized = Vec::new();
         for source in sources {
-            if !authorized.contains(&source) { authorized.push(source); }
+            if !authorized.contains(&source) {
+                authorized.push(source);
+            }
         }
         Self { authorized }
     }
 
-    pub fn permits(&self, source: IpAddr) -> bool { self.authorized.contains(&source) }
+    pub fn permits(&self, source: IpAddr) -> bool {
+        self.authorized.contains(&source)
+    }
 }
 
 /// Immutable resolver configuration.
@@ -111,11 +120,19 @@ impl AuthoritativeDns {
     /// Construct a non-recursive authority with an explicit source allowlist.
     /// The response ceiling must fit a DNS header and question and is capped at
     /// the crate hard maximum.
-    pub fn new(zone: Zone, sources: SourceAuthorization, max_response_bytes: usize) -> Result<Self, DnsError> {
+    pub fn new(
+        zone: Zone,
+        sources: SourceAuthorization,
+        max_response_bytes: usize,
+    ) -> Result<Self, DnsError> {
         if !(12..=MAX_RESPONSE_BYTES).contains(&max_response_bytes) {
             return Err(DnsError::InvalidConfiguration);
         }
-        Ok(Self { zone, sources, max_response_bytes })
+        Ok(Self {
+            zone,
+            sources,
+            max_response_bytes,
+        })
     }
 
     /// Handle one DNS-over-UDP message payload from an IPv4/IPv6 source address.
@@ -123,14 +140,22 @@ impl AuthoritativeDns {
     /// synthetic responses. Exactly one question and at most one EDNS OPT are
     /// accepted. No recursion, forwarding, or TCP behavior is provided.
     fn name_exists(&self, name: &str) -> bool {
-        name == self.zone.origin || self.zone.records.contains_key(name) || self.zone.records.keys().any(|owner| {
-            owner.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))
-        })
+        name == self.zone.origin
+            || self.zone.records.contains_key(name)
+            || self.zone.records.keys().any(|owner| {
+                owner
+                    .strip_suffix(name)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            })
     }
 
     pub fn respond_udp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
-        if !self.sources.permits(source) { return Ok(None); }
-        if query.len() > MAX_QUERY_BYTES { return Err(DnsError::MessageTooLarge); }
+        if !self.sources.permits(source) {
+            return Ok(None);
+        }
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(DnsError::MessageTooLarge);
+        }
         let question = parse_query(query)?;
         let mut limit = self.max_response_bytes;
         if let Some(edns_limit) = question.edns_size {
@@ -156,7 +181,15 @@ impl AuthoritativeDns {
         } else {
             rcode = 3; // NXDOMAIN
         }
-        Ok(Some(build_response(query, &question, rcode, answer, limit, question.edns_size.is_some(), authoritative)?))
+        Ok(Some(build_response(
+            query,
+            &question,
+            rcode,
+            answer,
+            limit,
+            question.edns_size.is_some(),
+            authoritative,
+        )?))
     }
 }
 
@@ -171,7 +204,9 @@ struct Question {
 }
 
 fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
-    if msg.len() < 12 { return Err(DnsError::Truncated); }
+    if msg.len() < 12 {
+        return Err(DnsError::Truncated);
+    }
     let id = u16_at(msg, 0)?;
     let flags = u16_at(msg, 2)?;
     let qd = u16_at(msg, 4)?;
@@ -186,11 +221,17 @@ fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
     let (name, after_name) = decode_name(msg, 12)?;
     let qtype = u16_at(msg, after_name)?;
     let qclass = u16_at(msg, after_name + 2)?;
-    if qclass != CLASS_IN { return Err(DnsError::InvalidQuestion); }
+    if qclass != CLASS_IN {
+        return Err(DnsError::InvalidQuestion);
+    }
     let end = after_name + 4;
     let edns_size = if ar == 1 {
-        if end + 11 > msg.len() { return Err(DnsError::Truncated); }
-        if msg[end] != 0 || u16_at(msg, end + 1)? != TYPE_OPT { return Err(DnsError::InvalidEdns); }
+        if end + 11 > msg.len() {
+            return Err(DnsError::Truncated);
+        }
+        if msg[end] != 0 || u16_at(msg, end + 1)? != TYPE_OPT {
+            return Err(DnsError::InvalidEdns);
+        }
         let payload = usize::from(u16_at(msg, end + 3)?);
         let ttl = u32_at(msg, end + 5)?;
         let rdlen = usize::from(u16_at(msg, end + 9)?);
@@ -198,23 +239,40 @@ fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
         let rend = rstart.checked_add(rdlen).ok_or(DnsError::InvalidEdns)?;
         // Extended RCODE and EDNS version must be zero. Only the DO bit is
         // meaningful in the low flags word; reserved bits fail closed.
-        if rend != msg.len() || ttl >> 24 != 0 || ttl & 0x00ff_7fff != 0 || !valid_edns_options(&msg[rstart..rend]) {
+        if rend != msg.len()
+            || ttl >> 24 != 0
+            || ttl & 0x00ff_7fff != 0
+            || !valid_edns_options(&msg[rstart..rend])
+        {
             return Err(DnsError::InvalidEdns);
         }
         Some(payload)
     } else {
-        if end != msg.len() { return Err(DnsError::InvalidQuestion); }
+        if end != msg.len() {
+            return Err(DnsError::InvalidQuestion);
+        }
         None
     };
-    Ok(Question { id, flags, name, qtype, end, edns_size })
+    Ok(Question {
+        id,
+        flags,
+        name,
+        qtype,
+        end,
+        edns_size,
+    })
 }
 
 fn valid_edns_options(mut data: &[u8]) -> bool {
     let mut count = 0usize;
     while !data.is_empty() {
-        if data.len() < 4 || count >= 64 { return false; }
+        if data.len() < 4 || count >= 64 {
+            return false;
+        }
         let len = usize::from(u16::from_be_bytes([data[2], data[3]]));
-        if len > data.len() - 4 { return false; }
+        if len > data.len() - 4 {
+            return false;
+        }
         data = &data[4 + len..];
         count += 1;
     }
@@ -236,16 +294,37 @@ fn decode_name(msg: &[u8], start: usize) -> Result<(String, usize), DnsError> {
             // interpreting arbitrary header/question bytes as labels.
             return Err(DnsError::InvalidName);
         }
-        if first & 0xc0 != 0 { return Err(DnsError::InvalidName); }
+        if first & 0xc0 != 0 {
+            return Err(DnsError::InvalidName);
+        }
         pos += 1;
-        if first == 0 { break; }
+        if first == 0 {
+            break;
+        }
         let len = usize::from(first);
-        if len > 63 || pos.checked_add(len).filter(|end| *end <= msg.len()).is_none() { return Err(DnsError::Truncated); }
-        if labels.len() >= MAX_NAME_LABELS { return Err(DnsError::InvalidName); }
+        if len > 63
+            || pos
+                .checked_add(len)
+                .filter(|end| *end <= msg.len())
+                .is_none()
+        {
+            return Err(DnsError::Truncated);
+        }
+        if labels.len() >= MAX_NAME_LABELS {
+            return Err(DnsError::InvalidName);
+        }
         expanded = expanded.checked_add(len + 1).ok_or(DnsError::InvalidName)?;
-        if expanded > 255 { return Err(DnsError::InvalidName); }
+        if expanded > 255 {
+            return Err(DnsError::InvalidName);
+        }
         let raw = &msg[pos..pos + len];
-        if !raw.is_ascii() || raw.iter().any(|b| *b <= 0x20 || *b >= 0x7f || *b == b'.' || *b == b'\\') { return Err(DnsError::InvalidName); }
+        if !raw.is_ascii()
+            || raw
+                .iter()
+                .any(|b| *b <= 0x20 || *b >= 0x7f || *b == b'.' || *b == b'\\')
+        {
+            return Err(DnsError::InvalidName);
+        }
         let label = std::str::from_utf8(raw).map_err(|_| DnsError::InvalidName)?;
         labels.push(label.to_ascii_lowercase());
         pos += len;
@@ -253,11 +332,21 @@ fn decode_name(msg: &[u8], start: usize) -> Result<(String, usize), DnsError> {
     Ok((labels.join("."), consumed_end.unwrap_or(pos)))
 }
 
-fn build_response(query: &[u8], q: &Question, rcode: u16, answer: Option<(u16, Vec<u8>)>, limit: usize, include_opt: bool, authoritative: bool) -> Result<Vec<u8>, DnsError> {
+fn build_response(
+    query: &[u8],
+    q: &Question,
+    rcode: u16,
+    answer: Option<(u16, Vec<u8>)>,
+    limit: usize,
+    include_opt: bool,
+    authoritative: bool,
+) -> Result<Vec<u8>, DnsError> {
     let mut out = Vec::with_capacity(q.end + 16);
     out.extend_from_slice(&q.id.to_be_bytes());
     let mut flags = 0x8000 | (if authoritative { 0x0400 } else { 0 }) | (q.flags & 0x0100) | rcode; // QR, conditional AA, echo RD; RA stays clear.
-    if q.flags & 0x0010 != 0 { flags |= 0x0010; } // CD
+    if q.flags & 0x0010 != 0 {
+        flags |= 0x0010;
+    } // CD
     out.extend_from_slice(&flags.to_be_bytes());
     // If the question itself cannot fit, return a bounded TC header rather
     // than exceeding the caller's advertised response ceiling.
@@ -266,21 +355,35 @@ fn build_response(query: &[u8], q: &Question, rcode: u16, answer: Option<(u16, V
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    if question_fits { out.extend_from_slice(&query[12..q.end]); }
+    if question_fits {
+        out.extend_from_slice(&query[12..q.end]);
+    }
     if !question_fits {
         let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200;
         out[2..4].copy_from_slice(&flags.to_be_bytes());
         return Ok(out);
     }
     let opt_size = if include_opt { 11 } else { 0 };
-    if include_opt && out.len().checked_add(opt_size).filter(|size| *size <= limit).is_none() {
+    if include_opt
+        && out
+            .len()
+            .checked_add(opt_size)
+            .filter(|size| *size <= limit)
+            .is_none()
+    {
         let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200;
         out[2..4].copy_from_slice(&flags.to_be_bytes());
         return Ok(out);
     }
     if let Some((rrtype, bytes)) = answer {
         let required = 2 + 2 + 2 + 4 + 2 + bytes.len();
-        if out.len().checked_add(required).and_then(|size| size.checked_add(opt_size)).filter(|size| *size <= limit).is_some() {
+        if out
+            .len()
+            .checked_add(required)
+            .and_then(|size| size.checked_add(opt_size))
+            .filter(|size| *size <= limit)
+            .is_some()
+        {
             out.extend_from_slice(&[0xc0, 0x0c]);
             out.extend_from_slice(&rrtype.to_be_bytes());
             out.extend_from_slice(&CLASS_IN.to_be_bytes());
@@ -300,30 +403,58 @@ fn build_response(query: &[u8], q: &Question, rcode: u16, answer: Option<(u16, V
         out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         out[10..12].copy_from_slice(&1u16.to_be_bytes());
     }
-    if out.len() > limit { return Err(DnsError::InvalidConfiguration); }
+    if out.len() > limit {
+        return Err(DnsError::InvalidConfiguration);
+    }
     Ok(out)
 }
 
 fn normalize_name(name: &str) -> Option<String> {
     let trimmed = name.strip_suffix('.').unwrap_or(name);
-    if trimmed.is_empty() { return Some(String::new()); }
-    if trimmed.len() > 253 || !trimmed.is_ascii() { return None; }
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    if trimmed.len() > 253 || !trimmed.is_ascii() {
+        return None;
+    }
     let mut total = 1usize;
     for label in trimmed.split('.') {
-        if label.is_empty() || label.len() > 63 || label.bytes().any(|b| b <= 0x20 || b >= 0x7f || b == b'/' || b == b'\\') { return None; }
+        if label.is_empty()
+            || label.len() > 63
+            || label
+                .bytes()
+                .any(|b| b <= 0x20 || b >= 0x7f || b == b'/' || b == b'\\')
+        {
+            return None;
+        }
         total = total.checked_add(label.len() + 1)?;
     }
-    if total > 255 { return None; }
+    if total > 255 {
+        return None;
+    }
     Some(trimmed.to_ascii_lowercase())
 }
 
-fn is_in_zone(name: &str, origin: &str) -> bool { name == origin || name.strip_suffix(origin).is_some_and(|prefix| prefix.ends_with('.')) }
-fn u16_at(data: &[u8], at: usize) -> Result<u16, DnsError> { let bytes = data.get(at..at + 2).ok_or(DnsError::Truncated)?; Ok(u16::from_be_bytes([bytes[0], bytes[1]])) }
-fn u32_at(data: &[u8], at: usize) -> Result<u32, DnsError> { let bytes = data.get(at..at + 4).ok_or(DnsError::Truncated)?; Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) }
+fn is_in_zone(name: &str, origin: &str) -> bool {
+    name == origin
+        || name
+            .strip_suffix(origin)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+fn u16_at(data: &[u8], at: usize) -> Result<u16, DnsError> {
+    let bytes = data.get(at..at + 2).ok_or(DnsError::Truncated)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+fn u32_at(data: &[u8], at: usize) -> Result<u32, DnsError> {
+    let bytes = data.get(at..at + 4).ok_or(DnsError::Truncated)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
 
 /// TCP DNS is intentionally not implemented. Do not interpret TCP segments as DNS messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TcpDnsSupport { Unsupported }
+pub enum TcpDnsSupport {
+    Unsupported,
+}
 
 #[cfg(test)]
 mod tests {
@@ -333,81 +464,239 @@ mod tests {
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
     fn base_query(name: &[u8], qtype: u16) -> Vec<u8> {
         let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-        q.extend_from_slice(name); q.extend_from_slice(&qtype.to_be_bytes()); q.extend_from_slice(&1u16.to_be_bytes()); q
+        q.extend_from_slice(name);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q
     }
-    fn wire_name(labels: &[&[u8]]) -> Vec<u8> { let mut n = Vec::new(); for l in labels { n.push(l.len() as u8); n.extend_from_slice(l); } n.push(0); n }
+    fn wire_name(labels: &[&[u8]]) -> Vec<u8> {
+        let mut n = Vec::new();
+        for l in labels {
+            n.push(l.len() as u8);
+            n.extend_from_slice(l);
+        }
+        n.push(0);
+        n
+    }
     fn fixture() -> AuthoritativeDns {
         let mut z = Zone::new("corp.example.").unwrap();
-        z.add_address("Host.Corp.Example", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))).unwrap();
-        z.add_address("host.corp.example", IpAddr::V6("2001:db8::10".parse().unwrap())).unwrap();
+        z.add_address(
+            "Host.Corp.Example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        )
+        .unwrap();
+        z.add_address(
+            "host.corp.example",
+            IpAddr::V6("2001:db8::10".parse().unwrap()),
+        )
+        .unwrap();
         AuthoritativeDns::new(z, SourceAuthorization::new([CLIENT]), 1232).unwrap()
     }
-    fn response(query: &[u8]) -> Vec<u8> { fixture().respond_udp(CLIENT, query).unwrap().unwrap() }
-    fn rcode(r: &[u8]) -> u16 { u16::from_be_bytes([r[2], r[3]]) & 15 }
+    fn response(query: &[u8]) -> Vec<u8> {
+        fixture().respond_udp(CLIENT, query).unwrap().unwrap()
+    }
+    fn rcode(r: &[u8]) -> u16 {
+        u16::from_be_bytes([r[2], r[3]]) & 15
+    }
 
-    #[test] fn a_and_aaaa_records_are_authoritative() {
+    #[test]
+    fn a_and_aaaa_records_are_authoritative() {
         let a = response(&base_query(&wire_name(&[b"HOST", b"corp", b"example"]), 1));
-        assert_eq!(rcode(&a), 0); assert_eq!(u16_at(&a, 6).unwrap(), 1); assert_eq!(&a[a.len()-4..], &[192,0,2,10]); assert_ne!(a[2] & 4, 0);
+        assert_eq!(rcode(&a), 0);
+        assert_eq!(u16_at(&a, 6).unwrap(), 1);
+        assert_eq!(&a[a.len() - 4..], &[192, 0, 2, 10]);
+        assert_ne!(a[2] & 4, 0);
         let aaaa = response(&base_query(&wire_name(&[b"host", b"corp", b"example"]), 28));
-        assert_eq!(rcode(&aaaa), 0); assert_eq!(u16_at(&aaaa, 6).unwrap(), 1); assert_eq!(&aaaa[aaaa.len()-16..], &"2001:db8::10".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(rcode(&aaaa), 0);
+        assert_eq!(u16_at(&aaaa, 6).unwrap(), 1);
+        assert_eq!(
+            &aaaa[aaaa.len() - 16..],
+            &"2001:db8::10".parse::<Ipv6Addr>().unwrap().octets()
+        );
     }
-    #[test] fn absent_family_and_unknown_type_are_nodata() {
-        let mut z = Zone::new("corp.example").unwrap(); z.add_address("v4.corp.example", CLIENT).unwrap();
+    #[test]
+    fn absent_family_and_unknown_type_are_nodata() {
+        let mut z = Zone::new("corp.example").unwrap();
+        z.add_address("v4.corp.example", CLIENT).unwrap();
         let svc = AuthoritativeDns::new(z, SourceAuthorization::new([CLIENT]), 1232).unwrap();
-        for qtype in [28, 65280] { let r = svc.respond_udp(CLIENT, &base_query(&wire_name(&[b"v4",b"corp",b"example"]), qtype)).unwrap().unwrap(); assert_eq!(rcode(&r), 0); assert_eq!(u16_at(&r,6).unwrap(), 0); }
+        for qtype in [28, 65280] {
+            let r = svc
+                .respond_udp(
+                    CLIENT,
+                    &base_query(&wire_name(&[b"v4", b"corp", b"example"]), qtype),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(rcode(&r), 0);
+            assert_eq!(u16_at(&r, 6).unwrap(), 0);
+        }
     }
-    #[test] fn zone_apex_and_empty_nonterminal_are_nodata_not_nxdomain() {
+    #[test]
+    fn zone_apex_and_empty_nonterminal_are_nodata_not_nxdomain() {
         let svc = fixture();
-        let apex = svc.respond_udp(CLIENT, &base_query(&wire_name(&[b"corp",b"example"]), 28)).unwrap().unwrap();
-        assert_eq!(rcode(&apex), 0); assert_eq!(u16_at(&apex, 6).unwrap(), 0);
-        let mut zone = svc.zone.clone(); zone.add_address("leaf.branch.corp.example", CLIENT).unwrap();
+        let apex = svc
+            .respond_udp(CLIENT, &base_query(&wire_name(&[b"corp", b"example"]), 28))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rcode(&apex), 0);
+        assert_eq!(u16_at(&apex, 6).unwrap(), 0);
+        let mut zone = svc.zone.clone();
+        zone.add_address("leaf.branch.corp.example", CLIENT)
+            .unwrap();
         let svc = AuthoritativeDns::new(zone, SourceAuthorization::new([CLIENT]), 1232).unwrap();
-        let ent = svc.respond_udp(CLIENT, &base_query(&wire_name(&[b"branch",b"corp",b"example"]), 1)).unwrap().unwrap();
-        assert_eq!(rcode(&ent), 0); assert_eq!(u16_at(&ent, 6).unwrap(), 0);
+        let ent = svc
+            .respond_udp(
+                CLIENT,
+                &base_query(&wire_name(&[b"branch", b"corp", b"example"]), 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rcode(&ent), 0);
+        assert_eq!(u16_at(&ent, 6).unwrap(), 0);
     }
-    #[test] fn missing_name_is_nxdomain_and_external_is_refused() {
-        let missing = response(&base_query(&wire_name(&[b"missing",b"corp",b"example"]), 1)); assert_eq!(rcode(&missing), 3);
-        let external = response(&base_query(&wire_name(&[b"example",b"net"]), 1)); assert_eq!(rcode(&external), 5); assert_eq!(external[2] & 4, 0);
+    #[test]
+    fn missing_name_is_nxdomain_and_external_is_refused() {
+        let missing = response(&base_query(
+            &wire_name(&[b"missing", b"corp", b"example"]),
+            1,
+        ));
+        assert_eq!(rcode(&missing), 3);
+        let external = response(&base_query(&wire_name(&[b"example", b"net"]), 1));
+        assert_eq!(rcode(&external), 5);
+        assert_eq!(external[2] & 4, 0);
     }
-    #[test] fn unauthorized_source_gets_no_response_even_for_malformed_packet() {
-        assert_eq!(fixture().respond_udp("192.0.2.200".parse().unwrap(), &[0; 1]).unwrap(), None);
+    #[test]
+    fn unauthorized_source_gets_no_response_even_for_malformed_packet() {
+        assert_eq!(
+            fixture()
+                .respond_udp("192.0.2.200".parse().unwrap(), &[0; 1])
+                .unwrap(),
+            None
+        );
     }
-    #[test] fn rejects_short_headers_counts_and_response_packets() {
-        for q in [&[][..], &[0;11][..]] { assert_eq!(fixture().respond_udp(CLIENT,q), Err(DnsError::Truncated)); }
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); q[5]=0; assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidHeader));
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); q[2]=0x80; assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidHeader));
-        assert_eq!(fixture().respond_udp(CLIENT,&vec![0;MAX_QUERY_BYTES+1]),Err(DnsError::MessageTooLarge));
+    #[test]
+    fn rejects_short_headers_counts_and_response_packets() {
+        for q in [&[][..], &[0; 11][..]] {
+            assert_eq!(fixture().respond_udp(CLIENT, q), Err(DnsError::Truncated));
+        }
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        q[5] = 0;
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidHeader)
+        );
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        q[2] = 0x80;
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidHeader)
+        );
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &vec![0; MAX_QUERY_BYTES + 1]),
+            Err(DnsError::MessageTooLarge)
+        );
     }
-    #[test] fn validates_labels_pointers_and_bounds() {
-        let mut q=base_query(&[0x40,0],1); assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidName));
-        q=base_query(&[0xc0,0x0c],1); assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidName));
-        q=base_query(&[0xc0,0xff],1); assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidName));
-        q=base_query(&[1,b'\\',0],1); assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidName));
-        q=base_query(&[0x03,b'a',b'b'],1); assert!(fixture().respond_udp(CLIENT,&q).is_err());
-        let long=vec![63u8; 1]; let mut labels=Vec::new(); for _ in 0..4 {labels.push(&long[..]);} assert!(fixture().respond_udp(CLIENT,&base_query(&wire_name(&labels),1)).is_err());
+    #[test]
+    fn validates_labels_pointers_and_bounds() {
+        let mut q = base_query(&[0x40, 0], 1);
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidName)
+        );
+        q = base_query(&[0xc0, 0x0c], 1);
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidName)
+        );
+        q = base_query(&[0xc0, 0xff], 1);
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidName)
+        );
+        q = base_query(&[1, b'\\', 0], 1);
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidName)
+        );
+        q = base_query(&[0x03, b'a', b'b'], 1);
+        assert!(fixture().respond_udp(CLIENT, &q).is_err());
+        let long = vec![63u8; 1];
+        let mut labels = Vec::new();
+        for _ in 0..4 {
+            labels.push(&long[..]);
+        }
+        assert!(
+            fixture()
+                .respond_udp(CLIENT, &base_query(&wire_name(&labels), 1))
+                .is_err()
+        );
     }
-    #[test] fn rejects_multiple_questions_non_in_and_trailing_garbage() {
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); q[5]=2; assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidHeader));
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); let last=q.len()-1; q[last]=3; assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidQuestion));
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); q.push(0); assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidQuestion));
+    #[test]
+    fn rejects_multiple_questions_non_in_and_trailing_garbage() {
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        q[5] = 2;
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidHeader)
+        );
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        let last = q.len() - 1;
+        q[last] = 3;
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidQuestion)
+        );
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        q.push(0);
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidQuestion)
+        );
     }
-    #[test] fn edns_clamped_and_malformed_edns_rejected() {
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1); q[11]=1; q.extend_from_slice(&[0,0,41,0xff,0xff,0,0,0,0,0,0]);
-        let r=fixture().respond_udp(CLIENT,&q).unwrap().unwrap(); assert!(r.len()<=1232); assert_eq!(u16_at(&r,6).unwrap(),1);
-        q[q.len()-1]=2; assert_eq!(fixture().respond_udp(CLIENT,&q),Err(DnsError::InvalidEdns));
+    #[test]
+    fn edns_clamped_and_malformed_edns_rejected() {
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        q[11] = 1;
+        q.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+        let r = fixture().respond_udp(CLIENT, &q).unwrap().unwrap();
+        assert!(r.len() <= 1232);
+        assert_eq!(u16_at(&r, 6).unwrap(), 1);
+        q[q.len() - 1] = 2;
+        assert_eq!(
+            fixture().respond_udp(CLIENT, &q),
+            Err(DnsError::InvalidEdns)
+        );
     }
-    #[test] fn truncates_whole_answer_to_advertised_and_configured_caps() {
-        let mut q=base_query(&wire_name(&[b"host",b"corp",b"example"]),1);
-        let small=AuthoritativeDns::new(fixture().zone.clone(),SourceAuthorization::new([CLIENT]),32).unwrap();
-        let r=small.respond_udp(CLIENT,&q).unwrap().unwrap(); assert!(r.len()<=32); assert_eq!(u16_at(&r,6).unwrap(),0); assert_ne!(r[2]&2,0);
-        q[11]=1; q.extend_from_slice(&[0,0,41,0,0,0,0,0,0,0,0]);
-        let r=fixture().respond_udp(CLIENT,&q).unwrap().unwrap(); assert!(r.len()<=512);
+    #[test]
+    fn truncates_whole_answer_to_advertised_and_configured_caps() {
+        let mut q = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        let small = AuthoritativeDns::new(
+            fixture().zone.clone(),
+            SourceAuthorization::new([CLIENT]),
+            32,
+        )
+        .unwrap();
+        let r = small.respond_udp(CLIENT, &q).unwrap().unwrap();
+        assert!(r.len() <= 32);
+        assert_eq!(u16_at(&r, 6).unwrap(), 0);
+        assert_ne!(r[2] & 2, 0);
+        q[11] = 1;
+        q.extend_from_slice(&[0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let r = fixture().respond_udp(CLIENT, &q).unwrap().unwrap();
+        assert!(r.len() <= 512);
     }
-    #[test] fn configuration_and_zone_boundaries() {
-        assert!(Zone::new("bad..example").is_err()); assert!(Zone::new(&"a".repeat(64)).is_err());
-        let mut z=Zone::new("example.com").unwrap(); assert!(z.add_address("notexample.com",CLIENT).is_err());
-        assert!(AuthoritativeDns::new(z.clone(),SourceAuthorization::default(),11).is_err());
-        assert!(AuthoritativeDns::new(z,SourceAuthorization::default(),MAX_RESPONSE_BYTES+1).is_err());
-        assert!(is_in_zone("a.example.com","example.com")); assert!(!is_in_zone("notexample.com","example.com"));
+    #[test]
+    fn configuration_and_zone_boundaries() {
+        assert!(Zone::new("bad..example").is_err());
+        assert!(Zone::new(&"a".repeat(64)).is_err());
+        let mut z = Zone::new("example.com").unwrap();
+        assert!(z.add_address("notexample.com", CLIENT).is_err());
+        assert!(AuthoritativeDns::new(z.clone(), SourceAuthorization::default(), 11).is_err());
+        assert!(
+            AuthoritativeDns::new(z, SourceAuthorization::default(), MAX_RESPONSE_BYTES + 1)
+                .is_err()
+        );
+        assert!(is_in_zone("a.example.com", "example.com"));
+        assert!(!is_in_zone("notexample.com", "example.com"));
     }
 }
