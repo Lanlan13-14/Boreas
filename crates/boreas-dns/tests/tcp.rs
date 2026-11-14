@@ -7,9 +7,9 @@ use std::{
 use boreas_dns::tcp::{DNS_TCP_PORT, TcpDnsConfig, TcpDnsServer, TcpSourceAuthorizer};
 use boreas_dns::{AuthoritativeDns, SourceAuthorization, Zone};
 use smoltcp::{
-    socket::tcp::SocketBuffer,
     iface::{Config, Interface, SocketSet, SocketStorage},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::tcp::SocketBuffer,
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint},
 };
@@ -207,12 +207,10 @@ fn connect(
     local_port: u16,
 ) -> smoltcp::iface::SocketHandle {
     use smoltcp::socket::tcp;
-    let h = client
-        .sockets
-        .add(tcp::Socket::new(
-            SocketBuffer::new(vec![0u8; 8192]),
-            SocketBuffer::new(vec![0u8; 8192]),
-        ));
+    let h = client.sockets.add(tcp::Socket::new(
+        SocketBuffer::new(vec![0u8; 8192]),
+        SocketBuffer::new(vec![0u8; 8192]),
+    ));
     client
         .sockets
         .get_mut::<tcp::Socket>(h)

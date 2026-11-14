@@ -579,7 +579,8 @@ impl EnrollmentStore {
     fn apply_prepared(&mut self, tx: Tx) {
         let node_id = tx.result.node_id;
         self.used_slots.insert(node_id);
-        self.generations.insert(node_id, tx.result.identity_generation);
+        self.generations
+            .insert(node_id, tx.result.identity_generation);
         self.invite_bindings
             .insert(tx.invite_id, (tx.enrollment_id, tx.csr_hash));
         self.transactions

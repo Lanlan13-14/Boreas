@@ -164,7 +164,12 @@ impl AuthoritativeDns {
         self.respond(source, query, true)
     }
 
-    fn respond(&self, source: IpAddr, query: &[u8], datagram: bool) -> Result<Option<Vec<u8>>, DnsError> {
+    fn respond(
+        &self,
+        source: IpAddr,
+        query: &[u8],
+        datagram: bool,
+    ) -> Result<Option<Vec<u8>>, DnsError> {
         if !self.sources.permits(source) {
             return Ok(None);
         }
@@ -174,7 +179,8 @@ impl AuthoritativeDns {
         let question = parse_query(query)?;
         let limit = if datagram {
             if let Some(edns_limit) = question.edns_size {
-                self.max_response_bytes.min(edns_limit.clamp(512, MAX_RESPONSE_BYTES))
+                self.max_response_bytes
+                    .min(edns_limit.clamp(512, MAX_RESPONSE_BYTES))
             } else {
                 self.max_response_bytes.min(512)
             }
@@ -705,7 +711,11 @@ mod tests {
     #[test]
     fn tcp_response_uses_configured_cap_without_udp_datagram_clamp() {
         let mut zone = Zone::new("corp.example").unwrap();
-        zone.add_address("host.corp.example", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))).unwrap();
+        zone.add_address(
+            "host.corp.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        )
+        .unwrap();
         let dns = AuthoritativeDns::new(zone, SourceAuthorization::new([CLIENT]), 1500).unwrap();
         let query = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
         let udp = dns.respond_udp(CLIENT, &query).unwrap().unwrap();
