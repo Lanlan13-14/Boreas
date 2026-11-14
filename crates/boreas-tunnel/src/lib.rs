@@ -582,30 +582,32 @@ mod tests {
             "198.51.100.0/24",
             "203.0.113.0/24",
             "127.0.0.0/8",
-            "224.0.0.0/4",
             "::/128",
             "::1/128",
         ] {
-            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange));
+            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange), "{s}");
         }
-        for s in ["fe80::/10", "ff00::/8", "2001:db8::/32"] {
-            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::TooBroad));
+        for s in ["224.0.0.0/4", "fe80::/10", "ff00::/8", "2001:db8::/32"] {
+            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::TooBroad), "{s}");
         }
-        for s in ["fe80::/48", "ff00::/48"] {
-            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange));
+        for s in ["224.0.0.0/8", "fe80::/48", "ff00::/48"] {
+            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange), "{s}");
         }
         assert_eq!(
             classify_prefix(p("2001:db8:1::/48"), &c),
-            Err(DenyReason::ReservedRange)
+            Err(DenyReason::ReservedRange),
+            "2001:db8:1::/48"
         );
         c.management_routes.protected.push(p("192.168.1.0/24"));
         assert_eq!(
             classify_prefix(p("192.168.0.0/16"), &c),
-            Err(DenyReason::ManagementRouteOverlap)
+            Err(DenyReason::ManagementRouteOverlap),
+            "192.168.0.0/16 management overlap"
         );
         assert_eq!(
             classify_prefix(p("192.168.2.0/24"), &c),
-            Ok(PrefixClass::PrivateV4)
+            Ok(PrefixClass::PrivateV4),
+            "192.168.2.0/24 outside management subnet"
         );
     }
     fn candidate(id: u8, sub: u16, net: &str, metric: u32) -> RouteCandidate {
