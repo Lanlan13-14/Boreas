@@ -136,10 +136,7 @@ impl NodeIdentity {
         }
         match (self.vip6, ula48_base) {
             (Some(v6), Some(base))
-                if v6 == expected_vip6(base, self.home_core_id, octet, self.role)? =>
-            {
-                ()
-            }
+                if v6 == expected_vip6(base, self.home_core_id, octet, self.role)? => {}
             (None, _) => (),
             _ => return Err(PolicyError::Vip6Mismatch),
         }

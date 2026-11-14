@@ -118,7 +118,7 @@ fn inspect_v4(p: &[u8]) -> Result<PacketInfo, Error> {
     let off = ((frag & 0x1fff) as u32) * 8;
     let more = frag & 0x2000 != 0;
     let plen = n - ihl;
-    if (more && (plen == 0 || plen % 8 != 0)) || off as usize + plen > 65_535 - ihl {
+    if (more && (plen == 0 || !plen.is_multiple_of(8))) || off as usize + plen > 65_535 - ihl {
         return Err(Error::FragmentMalformed);
     }
     let fragmented = more || off != 0;
@@ -177,7 +177,7 @@ fn inspect_v6(p: &[u8]) -> Result<PacketInfo, Error> {
                 }
                 let more = bits & 1 != 0;
                 let plen = n - (pos + 8);
-                if (more && (plen == 0 || plen % 8 != 0)) || off as usize + plen > 65_535 {
+                if (more && (plen == 0 || !plen.is_multiple_of(8))) || off as usize + plen > 65_535 {
                     return Err(Error::FragmentMalformed);
                 }
                 frag = Some(FragmentInfo {
@@ -563,15 +563,15 @@ impl FragmentTracker {
     }
     fn tombstone(&mut self, key: FragmentKey, until: Instant) {
         let cap = self.limits.streams.saturating_mul(2).max(1);
-        if self.tombstones.len() >= cap && !self.tombstones.contains_key(&key) {
-            if let Some(old) = self
+        if self.tombstones.len() >= cap
+            && !self.tombstones.contains_key(&key)
+            && let Some(old) = self
                 .tombstones
                 .iter()
                 .min_by_key(|(_, t)| *t)
                 .map(|(k, _)| *k)
-            {
-                self.tombstones.remove(&old);
-            }
+        {
+            self.tombstones.remove(&old);
         }
         self.tombstones.insert(key, until);
     }
@@ -611,7 +611,7 @@ impl FragmentTracker {
         let end = offset
             .checked_add(u32::try_from(len).map_err(|_| Error::FragmentMalformed)?)
             .ok_or(Error::FragmentMalformed)?;
-        if len == 0 || end > 65_535 || (offset != 0 && offset % 8 != 0) || (more && len % 8 != 0) {
+        if len == 0 || end > 65_535 || (offset != 0 && !offset.is_multiple_of(8)) || (more && !len.is_multiple_of(8)) {
             return Err(Error::FragmentMalformed);
         }
         if !self.flows.contains_key(&key) && self.flows.len() >= self.limits.streams {
@@ -626,15 +626,14 @@ impl FragmentTracker {
             self.discard(key, now);
             return Err(Error::FragmentLimit);
         }
-        if let Some(f) = self.flows.get(&key) {
-            if f.ranges.iter().any(|(a, b)| offset < *b && *a < end)
+        if let Some(f) = self.flows.get(&key)
+            && (f.ranges.iter().any(|(a, b)| offset < *b && *a < end)
                 || f.final_end
                     .is_some_and(|x| end > x || (!more && end != x) || (more && end >= x))
-                || (!more && f.ranges.iter().any(|(_, b)| *b > end))
-            {
-                self.discard(key, now);
-                return Err(Error::FragmentOverlap);
-            }
+                || (!more && f.ranges.iter().any(|(_, b)| *b > end)))
+        {
+            self.discard(key, now);
+            return Err(Error::FragmentOverlap);
         }
         let f = self.flows.entry(key).or_insert_with(|| Flow {
             ranges: Vec::new(),

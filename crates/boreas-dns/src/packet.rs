@@ -127,7 +127,8 @@ fn respond_v4(dns: &AuthoritativeDns, cfg: PacketConfig, peer: AuthenticatedPeer
     let frag = be16(p, 6)?;
     if frag & 0xbfff != 0 { return Err(PacketError::Fragmented); }
     if p[9] != 17 { return Err(PacketError::UnsupportedProtocol); }
-    let src = IpAddr::V4(Ipv4Addr::new(p[12], p[13], p[14], p[15]));
+    let src4 = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+    let src = IpAddr::V4(src4);
     let dst4 = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
     if peer.0 != src { return Err(PacketError::UnauthorizedSource); }
     if dst4 != cfg.genesis.dns_v4 { return Err(PacketError::InvalidAddress); }
@@ -138,7 +139,7 @@ fn respond_v4(dns: &AuthoritativeDns, cfg: PacketConfig, peer: AuthenticatedPeer
         Some(v) => v,
         None => return Ok(None),
     };
-    let out = build_v4(dst4, src, dst_port, src_port, &response)?;
+    let out = build_v4(dst4, src4, dst_port, src_port, &response)?;
     if out.len() > cfg.max_packet_bytes { return Err(PacketError::ResponseTooLarge); }
     Ok(Some(out))
 }

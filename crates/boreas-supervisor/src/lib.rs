@@ -260,6 +260,7 @@ impl UpgradeStore {
                     self.ensure_version_exists(s)?;
                     Ok(Some(s.to_owned()))
                 }
+            }
         }
     }
     pub fn journal(&self) -> Result<Option<Journal>> {
