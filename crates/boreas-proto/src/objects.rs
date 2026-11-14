@@ -974,32 +974,6 @@ mod tests {
     fn fixture_hex(id: &str) -> Vec<u8> {
         decode_hex(&fixture_field(id, "raw_tbs_hex"))
     }
-    fn legacy_fixture_hex_removed(id: &str) -> Vec<u8> {
-        let marker = format!("\"id\": \"{id}\"");
-        let item = FIXTURES.find(&marker).expect("fixture id present");
-        let object_start = FIXTURES[..item].rfind('{').expect("fixture object start");
-        let object_end = FIXTURES[item..].find('}').expect("fixture object end") + item + 1;
-        let tail = &FIXTURES[object_start..object_end];
-        let field = "\"raw_tbs_hex\": \"";
-        let start = tail.find(field).expect("fixture has raw TBS") + field.len();
-        let hex = &tail[start..];
-        let end = hex.find('\"').expect("quoted hex");
-        let hex = &hex[..end];
-        assert!(!hex.contains('_'));
-        hex.as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                let digit = |b: u8| match b {
-                    b'0'..=b'9' => b - b'0',
-                    b'a'..=b'f' => b - b'a' + 10,
-                    _ => panic!("bad fixture hex"),
-                };
-                digit(pair[0]) * 16 + digit(pair[1])
-            })
-            .collect()
-    }
     #[test]
     fn positive_fixed_tbs_vectors_round_trip_exact_bytes() {
         for (id, ty) in [
@@ -1066,16 +1040,7 @@ mod tests {
         let object_type = ObjectType::NodeIdentity;
         let raw = fixture_hex("signature-domain-raw-three-bytes");
         let got = signature_input(&raw, object_type, 1).unwrap();
-        let tail = &fixture_entry("signature-domain-raw-three-bytes");
-        let value = tail.find("expected_hex").unwrap() + "expected_hex".len();
-        let value = tail[value..]
-            .trim_start()
-            .strip_prefix(':')
-            .unwrap()
-            .trim_start()
-            .strip_prefix('"')
-            .unwrap();
-        let expected = &value[..value.find('"').unwrap()];
+        let expected = fixture_field("signature-domain-raw-three-bytes", "expected_hex");
         let expected: Vec<u8> = expected
             .as_bytes()
             .as_chunks::<2>()
