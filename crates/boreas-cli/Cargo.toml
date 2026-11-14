@@ -1,0 +1,13 @@
+[package]
+name = "boreas-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-only"
+description = "Boreas CLI foundation (policy/parser only; no daemon or TLS backend)"
+
+[[bin]]
+name = "boreas"
+path = "src/main.rs"
+
+[dependencies]

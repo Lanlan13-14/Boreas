@@ -1,0 +1,33 @@
+{
+  "status": "candidate-not-frozen",
+  "format": "boreas-proto-fixed-vectors-v1",
+  "hex": "lowercase or uppercase hexadecimal, no separators; raw wire bytes",
+  "app_header": [
+    {"id":"control-empty-invalid","input_hex":"0301000000000000","valid":false,"expected":{"error":"empty_control"}},
+    {"id":"relay-zero-body","input_hex":"0303000000000000","valid":true,"expected":{"proto_major":3,"kind":"RelayCircuit","flags":0,"body_len":0}},
+    {"id":"hop-max-body","input_hex":"0302000000010000","valid":true,"expected":{"proto_major":3,"kind":"HopIpBatch","flags":0,"body_len":65536}},
+    {"id":"relay-over-cap","input_hex":"0303000000010001","valid":false,"expected":{"error":"body_too_large"}},
+    {"id":"unknown-kind","input_hex":"0304000000000000","valid":false,"expected":{"error":"unknown_kind"}},
+    {"id":"undefined-flag","input_hex":"0303000100000000","valid":false,"expected":{"error":"bad_flags"}},
+    {"id":"wrong-major","input_hex":"0203000000000000","valid":false,"expected":{"error":"bad_version"}},
+    {"id":"header-wrong-length","input_hex":"03030000000000","valid":false,"expected":{"error":"invalid_length"}}
+  ],
+  "cbor": [
+    {"id":"uint-zero","input_hex":"00","valid":true,"expected":"canonical_item"},
+    {"id":"uint-24-shortest","input_hex":"1818","valid":true,"expected":"canonical_item"},
+    {"id":"text-a","input_hex":"6161","valid":true,"expected":"canonical_item"},
+    {"id":"ordered-map","input_hex":"a201000200","valid":true,"expected":"canonical_item"},
+    {"id":"nonshortest-uint","input_hex":"1801","valid":false,"expected":{"error":"non_shortest"}},
+    {"id":"duplicate-key","input_hex":"a201000101","valid":false,"expected":{"error":"duplicate_or_key_order"}},
+    {"id":"reversed-map-keys","input_hex":"a202000100","valid":false,"expected":{"error":"duplicate_or_key_order"}},
+    {"id":"indefinite-array","input_hex":"9fff","valid":false,"expected":{"error":"unsupported_indefinite"}},
+    {"id":"float16","input_hex":"f90000","valid":false,"expected":{"error":"unsupported_float_simple_tag"}},
+    {"id":"tag","input_hex":"c000","valid":false,"expected":{"error":"unsupported_float_simple_tag"}},
+    {"id":"invalid-utf8","input_hex":"61ff","valid":false,"expected":{"error":"invalid_utf8"}},
+    {"id":"trailing","input_hex":"0000","valid":false,"expected":{"error":"trailing_bytes"}},
+    {"id":"truncated-uint","input_hex":"18","valid":false,"expected":{"error":"truncated"}},
+    {"id":"reserved-additional-info","input_hex":"1c","valid":false,"expected":{"error":"unsupported_reserved"}},
+    {"id":"undefined-simple","input_hex":"f8ff","valid":false,"expected":{"error":"unsupported_float_simple_tag"}}
+  ],
+  "limits": {"max_depth":0,"depth_test_value_hex":"8100","depth_expected_error":"depth_limit","max_len":1,"length_test_value_hex":"4100","length_expected_error":"length_limit"}
+}

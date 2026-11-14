@@ -1,0 +1,12 @@
+[package]
+name = "boreas-proto"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.97"
+description = "Candidate bounded Boreas application framing and deterministic CBOR validation"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

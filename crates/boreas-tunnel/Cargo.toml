@@ -1,0 +1,10 @@
+[package]
+name = "boreas-tunnel"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.97"
+description = "Pure routing policy and deterministic route arbitration primitives"
+
+[lib]
+path = "src/lib.rs"

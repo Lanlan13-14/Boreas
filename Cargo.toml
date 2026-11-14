@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/boreas-cli",
+    "crates/boreas-proto",
+    "crates/boreas-pki",
+    "crates/boreas-crypto",
+    "crates/boreas-tunnel",
+    "crates/boreas-tun",
+    "crates/boreas-dns",
+    "crates/boreas-supervisor",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-only"
+repository = "https://github.com/Lanlan13-14/Boreas"
+
+# Intentionally no shared dependency declarations: each crate manifest is self-contained.

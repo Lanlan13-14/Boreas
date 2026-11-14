@@ -1,0 +1,10 @@
+[package]
+name = "boreas-tun"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.100"
+description = "Bounded L3 packet IO primitives for Boreas"
+
+[lib]
+path = "src/lib.rs"

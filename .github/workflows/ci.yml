@@ -1,0 +1,79 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Apply stable rustfmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format workspace
+        run: cargo fmt --all
+      - name: Save format patch
+        if: always()
+        run: git diff --binary > format.patch
+      - name: Upload format patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-patch
+          path: format.patch
+          if-no-files-found: warn
+      - name: Commit formatting on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- 'crates/**/*.rs'
+            git commit -m "Apply rustfmt"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+  rust:
+    name: Rust checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format workspace before checks
+        if: always()
+        run: cargo fmt --all
+      - name: Check workspace
+        if: always()
+        run: cargo check --workspace --locked
+      - name: Clippy
+        if: always()
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        if: always()
+        run: cargo test --workspace --locked
+      - name: Set up Python (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Verify independent vectors (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          python tools/verify_vectors.py
+          python -m unittest discover -s tools/tests -v

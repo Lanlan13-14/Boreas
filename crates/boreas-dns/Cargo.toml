@@ -1,0 +1,10 @@
+[package]
+name = "boreas-dns"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-only"
+description = "Bounded authoritative DNS wire parsing and response construction"
+
+[lib]
+path = "src/lib.rs"
