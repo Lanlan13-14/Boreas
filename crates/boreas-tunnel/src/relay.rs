@@ -352,7 +352,14 @@ impl RelayTable {
         _session: &VerifiedE2eSession,
         segment: Segment<'_>,
     ) -> Result<u64, RelayError> {
-        let Segment { direction, offset, source: claimed_source, destination: claimed_destination, bytes, now } = segment;
+        let Segment {
+            direction,
+            offset,
+            source: claimed_source,
+            destination: claimed_destination,
+            bytes,
+            now,
+        } = segment;
         let c = self
             .circuits
             .get_mut(&id)
@@ -575,7 +582,14 @@ mod tests {
             t.accept_segment(
                 id(1),
                 &session,
-                Segment { direction: Direction::SourceToDestination, offset: 0, source: node(1, 1), destination: node(2, 3), bytes: b"x", now },
+                Segment {
+                    direction: Direction::SourceToDestination,
+                    offset: 0,
+                    source: node(1, 1),
+                    destination: node(2, 3),
+                    bytes: b"x",
+                    now
+                },
             ),
             Err(RelayError::WrongSourceGeneration)
         );
@@ -583,7 +597,14 @@ mod tests {
             t.accept_segment(
                 id(1),
                 &session,
-                Segment { direction: Direction::SourceToDestination, offset: 0, source: node(1, 2), destination: node(2, 3), bytes: b"x", now },
+                Segment {
+                    direction: Direction::SourceToDestination,
+                    offset: 0,
+                    source: node(1, 2),
+                    destination: node(2, 3),
+                    bytes: b"x",
+                    now
+                },
             ),
             Err(RelayError::NotEstablished)
         );
