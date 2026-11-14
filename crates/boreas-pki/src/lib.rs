@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod enrollment;
+
 use core::fmt;
 
 pub const MAX_HOME_CORE_ID: u8 = 16;
