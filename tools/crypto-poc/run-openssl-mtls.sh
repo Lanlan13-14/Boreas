@@ -45,9 +45,10 @@ sanitize_logs() {
     awk '
       /^(CONNECTION ESTABLISHED|Protocol version:|Ciphersuite:|Requested Signature Algorithms:|Peer certificate:|Hash used:|Signature type:|Peer signature type:|Verification:|Verified peername:|Negotiated TLS1\.3 group:|New, TLSv1\.3, Cipher is|BOREAS_TLS_PLAINTEXT_OK|HTTP\/1\.0 200)/ {print; next}
       /^SSL_accept:/ {print; next}
-      /^depth=[0-9]+:/ {print; next}
+      /^depth=[0-9]+[[:space:]]/ {print; next}
       /^verify return:[01]$/ {print; next}
       /^SSL3 alert (read|write):/ {print; next}
+      /^(s_server:|.*unknown option:|.*unrecognized option|.*Error setting|.*error setting|.*Address already in use|.*BIO_bind|.*unable to listen|.*Could not open|.*Unable to load)/ {print; next}
       /certificate required|certificate verify failed|certificate has expired|no suitable key share|no shared group|no ciphers available|no shared cipher|handshake failure/ {print; next}
       END { }
     ' "$raw" > "$safe"
@@ -186,7 +187,7 @@ success_case() {
   grep -Fq 'Protocol version: TLSv1.3' "$RAW_LOGS/client-$tag.log" || fail "TLS 1.3 not observed ($tag)"
   grep -Fq "Ciphersuite: $cipher" "$RAW_LOGS/client-$tag.log" || fail "cipher not observed ($tag)"
   grep -Fq 'Negotiated TLS1.3 group: X25519MLKEM768' "$RAW_LOGS/client-$tag.log" || fail "hybrid group not observed ($tag)"
-  grep -Eiq 'Peer signature type: (mldsa65|ML-DSA-65)' "$RAW_LOGS/client-$tag.log" || fail "ML-DSA peer signature not observed ($tag)"
+  grep -Eiq '^Signature type: mldsa65$' "$RAW_LOGS/client-$tag.log" || fail "server CertificateVerify mldsa65 signature not observed ($tag)"
   grep -Fq 'Verification: OK' "$RAW_LOGS/client-$tag.log" || fail "server chain not verified ($tag)"
   grep -Fq 'SSL_accept:SSLv3/TLS read client certificate' "$RAW_LOGS/server-$tag.log" || fail "server did not receive a client certificate ($tag)"
   grep -Fq 'SSL_accept:TLSv1.3 read certificate verify' "$RAW_LOGS/server-$tag.log" || fail "server did not process client CertificateVerify ($tag)"

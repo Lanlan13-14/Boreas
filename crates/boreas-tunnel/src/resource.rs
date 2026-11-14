@@ -162,10 +162,10 @@ impl HandshakeCredit {
 }
 impl Drop for HandshakeCredit {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if let Ok(mut c) = inner.counts.lock() {
-                c.handshakes = c.handshakes.saturating_sub(1);
-            }
+        if let Some(inner) = self.inner.take()
+            && let Ok(mut c) = inner.counts.lock()
+        {
+            c.handshakes = c.handshakes.saturating_sub(1);
         }
     }
 }
@@ -176,18 +176,18 @@ pub struct ConnectionCredit {
 }
 impl Drop for ConnectionCredit {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if let Ok(mut c) = inner.counts.lock() {
-                c.authenticated = c.authenticated.saturating_sub(1);
-                let remove_peer = if let Some(n) = c.peers.get_mut(&self.peer) {
-                    *n = n.saturating_sub(1);
-                    *n == 0
-                } else {
-                    false
-                };
-                if remove_peer {
-                    c.peers.remove(&self.peer);
-                }
+        if let Some(inner) = self.inner.take()
+            && let Ok(mut c) = inner.counts.lock()
+        {
+            c.authenticated = c.authenticated.saturating_sub(1);
+            let remove_peer = if let Some(n) = c.peers.get_mut(&self.peer) {
+                *n = n.saturating_sub(1);
+                *n == 0
+            } else {
+                false
+            };
+            if remove_peer {
+                c.peers.remove(&self.peer);
             }
         }
     }
@@ -204,10 +204,10 @@ impl ByteCredit {
 }
 impl Drop for ByteCredit {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if let Ok(mut c) = inner.counts.lock() {
-                c.bytes = c.bytes.saturating_sub(self.bytes);
-            }
+        if let Some(inner) = self.inner.take()
+            && let Ok(mut c) = inner.counts.lock()
+        {
+            c.bytes = c.bytes.saturating_sub(self.bytes);
         }
     }
 }

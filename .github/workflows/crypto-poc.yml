@@ -74,6 +74,15 @@ jobs:
           set -euo pipefail
           chmod +x tools/crypto-poc/run-openssl-mtls.sh
           tools/crypto-poc/run-openssl-mtls.sh
+      - name: Fail if private TLS material escaped sanitizer
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R -E -i 'Resumption PSK:|Early Exporter Master Secret|CLIENT_TRAFFIC_SECRET|SERVER_TRAFFIC_SECRET|-----BEGIN .*PRIVATE KEY-----' crypto-poc-artifacts/; then
+            echo 'Refusing artifact upload: private TLS material detected' >&2
+            exit 1
+          fi
       - name: Upload test evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4

@@ -110,14 +110,11 @@ impl<T> DrrScheduler<T> {
         if flow_id >= self.config.max_flows {
             return Err(EnqueueError::TooManyFlows);
         }
-        if !self.flows.contains_key(&flow_id) {
-            self.flows.insert(
-                flow_id,
-                Flow {
-                    queue: VecDeque::new(),
-                    deficit: 0,
-                },
-            );
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.flows.entry(flow_id) {
+            entry.insert(Flow {
+                queue: VecDeque::new(),
+                deficit: 0,
+            });
             self.active.push_back(flow_id);
         }
         let flow = self.flows.get_mut(&flow_id).expect("flow inserted");
@@ -154,12 +151,7 @@ impl<T> DrrScheduler<T> {
                 return Err(DequeueError::QueueAgeExceeded { flow_id });
             }
             flow.deficit = flow.deficit.saturating_add(self.config.quantum_bytes);
-            if flow
-                .queue
-                .front()
-                .is_some_and(|item| item.bytes <= flow.deficit)
-            {
-                let item = flow.queue.pop_front().expect("front checked");
+            if let Some(item) = flow.queue.pop_front_if(|item| item.bytes <= flow.deficit) {
                 flow.deficit -= item.bytes;
                 self.packet_count -= 1;
                 self.byte_count -= item.bytes;

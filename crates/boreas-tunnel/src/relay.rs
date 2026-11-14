@@ -68,6 +68,18 @@ pub enum Direction {
     SourceToDestination,
     DestinationToSource,
 }
+
+/// One already-authenticated segment descriptor. Payload is borrowed and is not
+/// parsed or decrypted by the relay lifecycle state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Segment<'a> {
+    pub direction: Direction,
+    pub offset: u64,
+    pub source: NodeRef,
+    pub destination: NodeRef,
+    pub bytes: &'a [u8],
+    pub now: Instant,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CircuitState {
     Opening,
@@ -338,13 +350,9 @@ impl RelayTable {
         &mut self,
         id: CircuitId,
         _session: &VerifiedE2eSession,
-        direction: Direction,
-        offset: u64,
-        claimed_source: NodeRef,
-        claimed_destination: NodeRef,
-        bytes: &[u8],
-        now: Instant,
+        segment: Segment<'_>,
     ) -> Result<u64, RelayError> {
+        let Segment { direction, offset, source: claimed_source, destination: claimed_destination, bytes, now } = segment;
         let c = self
             .circuits
             .get_mut(&id)
@@ -567,12 +575,7 @@ mod tests {
             t.accept_segment(
                 id(1),
                 &session,
-                Direction::SourceToDestination,
-                0,
-                node(1, 1),
-                node(2, 3),
-                b"x",
-                now
+                Segment { direction: Direction::SourceToDestination, offset: 0, source: node(1, 1), destination: node(2, 3), bytes: b"x", now },
             ),
             Err(RelayError::WrongSourceGeneration)
         );
@@ -580,12 +583,7 @@ mod tests {
             t.accept_segment(
                 id(1),
                 &session,
-                Direction::SourceToDestination,
-                0,
-                node(1, 2),
-                node(2, 3),
-                b"x",
-                now
+                Segment { direction: Direction::SourceToDestination, offset: 0, source: node(1, 2), destination: node(2, 3), bytes: b"x", now },
             ),
             Err(RelayError::NotEstablished)
         );
