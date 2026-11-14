@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod icmp;
+#[cfg(target_os = "linux")]
 pub mod linux;
 
 use std::{

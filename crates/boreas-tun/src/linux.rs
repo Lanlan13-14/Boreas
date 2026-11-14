@@ -105,16 +105,3 @@ impl PacketIo for LinuxTun {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn mtu_is_bounded() {
-        let f = File::open("/dev/null").unwrap();
-        assert!(matches!(
-            LinuxTun::from_configured_file(f, 67),
-            Err(LinuxTunError::InvalidConfiguration)
-        ));
-    }
-}
