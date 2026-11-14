@@ -6,3 +6,13 @@ license = "GPL-3.0-only"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+openssl-backend = ["dep:openssl", "dep:openssl-sys"]
+
+[dependencies]
+# Pinned to the maintained upstream rust-openssl release reviewed in docs/research.
+# This opts into actual OpenSSL via feature only; the default workspace build stays backend-free.
+openssl = { version = "=0.10.82", optional = true }
+openssl-sys = { version = "=0.9.118", optional = true }
