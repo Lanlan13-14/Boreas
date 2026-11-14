@@ -68,12 +68,12 @@ jobs:
         if: always()
         run: cargo test --workspace --locked
       - name: Set up Python (Linux only)
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
       - name: Verify independent vectors (Linux only)
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         run: |
           python tools/verify_vectors.py
           python -m unittest discover -s tools/tests -v

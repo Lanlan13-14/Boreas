@@ -254,8 +254,9 @@ mod tests {
  #[test] fn special_boundaries_and_mgmt_overlap() {
   let mut c=ctx(vec![p("192.168.0.0/16")]);
   for s in ["192.0.2.0/24","198.51.100.0/24","203.0.113.0/24","127.0.0.0/8","224.0.0.0/4","::/128","::1/128","fe80::/10"] {assert_eq!(classify_prefix(p(s),&c),Err(DenyReason::ReservedRange));}
-  c.management_routes.assert_eq!(classify_prefix(p("2001:db8::/32"),&c),Err(DenyReason::TooBroad));
-   protected.push(p("192.168.1.0/24"));
+  assert_eq!(classify_prefix(p("2001:db8::/32"),&c),Err(DenyReason::TooBroad));
+   assert_eq!(classify_prefix(p("2001:db8:1::/48"),&c),Err(DenyReason::ReservedRange));
+   c.management_routes.protected.push(p("192.168.1.0/24"));
   assert_eq!(classify_prefix(p("192.168.0.0/16"),&c),Err(DenyReason::ManagementRouteOverlap));
   assert_eq!(classify_prefix(p("192.168.2.0/24"),&c),Ok(PrefixClass::PrivateV4));
  }

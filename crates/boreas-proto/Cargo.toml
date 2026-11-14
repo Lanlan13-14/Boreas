@@ -8,5 +8,3 @@ description = "Candidate bounded Boreas application framing and deterministic CB
 
 [lib]
 path = "src/lib.rs"
-
-[workspace]
