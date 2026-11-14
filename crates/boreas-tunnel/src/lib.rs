@@ -585,14 +585,15 @@ mod tests {
             "224.0.0.0/4",
             "::/128",
             "::1/128",
-            "fe80::/10",
         ] {
             assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange));
         }
-        assert_eq!(
-            classify_prefix(p("2001:db8::/32"), &c),
-            Err(DenyReason::TooBroad)
-        );
+        for s in ["fe80::/10", "ff00::/8", "2001:db8::/32"] {
+            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::TooBroad));
+        }
+        for s in ["fe80::/48", "ff00::/48"] {
+            assert_eq!(classify_prefix(p(s), &c), Err(DenyReason::ReservedRange));
+        }
         assert_eq!(
             classify_prefix(p("2001:db8:1::/48"), &c),
             Err(DenyReason::ReservedRange)
