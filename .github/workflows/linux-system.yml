@@ -1,0 +1,33 @@
+name: Linux system TUN checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tun-device:
+    name: Real Linux TUN integration (Ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install iproute2
+        run: sudo apt-get update && sudo apt-get install -y iproute2
+      - name: Check /dev/net/tun availability
+        run: |
+          test -c /dev/net/tun
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+      - name: Format workspace
+        run: cargo fmt --all
+      - name: Check crate
+        run: cargo check -p boreas-tun --locked
+      - name: Clippy crate
+        run: cargo clippy -p boreas-tun --all-targets --locked -- -D warnings
+      - name: Unit and real-device tests as root
+        run: sudo -E env "PATH=$PATH" cargo test -p boreas-tun --locked -- --test-threads=1

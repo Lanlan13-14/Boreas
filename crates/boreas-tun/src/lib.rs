@@ -1,6 +1,7 @@
 //! Bounded, platform-neutral packet I/O and L3 validation primitives.
 //! This crate deliberately does not claim to implement or validate a real Linux TUN device.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod icmp;
 #[cfg(target_os = "linux")]
