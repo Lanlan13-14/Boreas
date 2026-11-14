@@ -174,11 +174,11 @@ fn pump(
 
 fn setup_v4() -> (Side, Side, TcpDnsServer) {
     let (cdev, sdev) = Link::pair();
-    let client = side(IpAddress::Ipv4(CLIENT4.into()), cdev, 11);
-    let mut server = side(IpAddress::Ipv4(SERVER4.into()), sdev, 12);
+    let client = side(IpAddress::Ipv4(CLIENT4), cdev, 11);
+    let mut server = side(IpAddress::Ipv4(SERVER4), sdev, 12);
     let mut listener = SocketSet::new(Vec::<SocketStorage<'static>>::new());
     let endpoint = IpListenEndpoint {
-        addr: Some(IpAddress::Ipv4(SERVER4.into())),
+        addr: Some(IpAddress::Ipv4(SERVER4)),
         port: DNS_TCP_PORT,
     };
     let tcp = TcpDnsServer::new(TcpDnsConfig::default(), endpoint, &mut listener).unwrap();
@@ -187,11 +187,11 @@ fn setup_v4() -> (Side, Side, TcpDnsServer) {
 }
 fn setup_v6() -> (Side, Side, TcpDnsServer) {
     let (cdev, sdev) = Link::pair();
-    let client = side(IpAddress::Ipv6(CLIENT6.into()), cdev, 21);
-    let mut server = side(IpAddress::Ipv6(SERVER6.into()), sdev, 22);
+    let client = side(IpAddress::Ipv6(CLIENT6), cdev, 21);
+    let mut server = side(IpAddress::Ipv6(SERVER6), sdev, 22);
     let mut listener = SocketSet::new(Vec::<SocketStorage<'static>>::new());
     let endpoint = IpListenEndpoint {
-        addr: Some(IpAddress::Ipv6(SERVER6.into())),
+        addr: Some(IpAddress::Ipv6(SERVER6)),
         port: DNS_TCP_PORT,
     };
     let tcp = TcpDnsServer::new(TcpDnsConfig::default(), endpoint, &mut listener).unwrap();
@@ -340,14 +340,16 @@ fn v6_tcp_and_invalid_frame_close() {
 
 #[test]
 fn config_rejects_unbounded_resources() {
-    let mut cfg = TcpDnsConfig::default();
-    cfg.max_connections = 0;
+    let cfg = TcpDnsConfig {
+        max_connections: 0,
+        ..TcpDnsConfig::default()
+    };
     let mut set = SocketSet::new(Vec::<SocketStorage<'static>>::new());
     assert!(
         TcpDnsServer::new(
             cfg,
             IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(SERVER4.into())),
+                addr: Some(IpAddress::Ipv4(SERVER4)),
                 port: DNS_TCP_PORT
             },
             &mut set
@@ -362,7 +364,7 @@ fn config_rejects_unbounded_resources() {
         TcpDnsServer::new(
             cfg,
             IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(SERVER4.into())),
+                addr: Some(IpAddress::Ipv4(SERVER4)),
                 port: DNS_TCP_PORT
             },
             &mut set
