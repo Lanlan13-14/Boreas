@@ -52,7 +52,7 @@ class StrictCBORTests(unittest.TestCase):
             "20",          # negative integer
             "4100",        # byte string
             "6161",        # UTF-8 text
-            "8000",        # empty array
+            "80",          # empty array
             "a0",          # empty map
             "a201000200",  # canonical integer-keyed map
         )

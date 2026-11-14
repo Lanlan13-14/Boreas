@@ -52,20 +52,31 @@ and fault-injection/power-cut validation.
 
 Version identifiers are restricted to ASCII alphanumeric plus `. _ + -`, cannot
 start with `.`, and cannot contain path separators or traversal. Store root and
-artifact paths reject symlink components; the artifact tree rejects symlinks
-and special files. The root and its parents still must be trusted and not
-attacker-writable. Concurrent writers are not serialized; callers must ensure
-exclusive access. This is not a defense against a malicious privileged writer
-racing the store.
+artifact paths reject symlink components; the artifact tree rejects symlinks,
+hard-linked regular files, and special files. Copy is bounded to 2 GiB, 100,000
+entries, and 64 nested directory levels. Unix staged directories/files and
+journal temporary files are created mode `0700`/`0600`; executable files retain
+an executable bit (staged mode `0700`), while non-executables are `0600`. The
+root and its parents still must be trusted and not attacker-writable; the
+artifact source must remain immutable/trusted during copying because portable
+path-based traversal cannot close every source-side TOCTOU race. Concurrent
+writers are not serialized; callers must ensure exclusive access.
+This is not a defense against a malicious privileged writer racing the store.
 
 The transaction uses same-filesystem staging, `File::sync_all`, same-directory
-temporary files, atomic rename, and parent-directory fsync. **Only Linux is
-currently supported by the documented durability implementation. Windows is
-explicitly unsupported for successful store operations** because directory
-fsync semantics are not implemented; other non-Linux platforms fail closed.
-There is no claim of equivalent guarantees on Windows, network filesystems,
-FUSE, or unusual storage devices. Linux guarantees must still be tested on
-supported filesystem/mount configurations, including actual power-loss testing.
+temporary files, atomic rename, and parent-directory fsync. **This initial
+implementation currently supports successful durable transactions only on
+Linux.** Windows and macOS are not intended to be permanently excluded; their
+platform backends remain unimplemented and fail closed today. Before enabling
+Windows, implement and review `ReplaceFileW`/`MoveFileExW` replacement semantics,
+`FlushFileBuffers`, and a precise parent-directory durability strategy; before
+enabling macOS, implement and review directory `fsync` and the required
+`F_FULLFSYNC` policy. Add platform-specific GitHub Actions and fault/reboot
+validation before claiming either platform's guarantees. There is no claim of
+equivalent guarantees on Windows/macOS, network filesystems, FUSE, or unusual
+storage devices in this initial version. Linux guarantees must still be tested
+on supported filesystem/mount configurations, including actual power-loss
+testing.
 
 ## Required CI gates before release
 

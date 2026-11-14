@@ -2,6 +2,9 @@
 //! This crate deliberately does not claim to implement or validate a real Linux TUN device.
 #![forbid(unsafe_code)]
 
+pub mod icmp;
+pub mod linux;
+
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -168,7 +171,7 @@ fn inspect_v6(p: &[u8]) -> Result<PacketInfo, Error> {
                 if bits & 0x0006 != 0 || frag.is_some() {
                     return Err(Error::FragmentMalformed);
                 }
-                let off = bits & 0xfff8;
+                let off = (bits & 0xfff8) as u32;
                 if off != 0 && matches!(following, 0 | 43 | 44 | 51 | 60 | 135 | 139 | 140) {
                     return Err(Error::UnsupportedExtension);
                 }

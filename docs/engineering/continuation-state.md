@@ -6,6 +6,7 @@
 - Delegate implementation primarily to `lightcode/gpt-6-luna`; lead owns decomposition, static review, integration, and evidence.
 - Commit and push normal changes to `https://github.com/Lanlan13-14/Boreas`, branch `main`; never force-push.
 - **All compilation and tests run in GitHub Actions, not locally.** Do not run local cargo/rustc/Python verification or formatter checks. Static reading and Git operations are allowed. CI can format and return/commit formatting changes.
+- Final releases must include mainstream Linux (x86_64/aarch64 static), Windows, and macOS (Intel/Apple Silicon). Platform builds alone are not proof of real TUN/routing/security/upgrade functionality. No production release until applicable gates pass.
 - No approval prompts. No invented TLS/security/performance/third-party review evidence.
 
 ## Baseline observations (2026-11-14)

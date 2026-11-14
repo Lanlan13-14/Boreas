@@ -21,6 +21,11 @@ use std::path::{Component, Path, PathBuf};
 const JOURNAL_FILE: &str = "upgrade.journal";
 const ACTIVE_FILE: &str = "active.version";
 const FORMAT: &str = "BOREAS-UPGRADE-1";
+const MAX_JOURNAL_BYTES: u64 = 512;
+const MAX_ACTIVE_BYTES: u64 = 129;
+const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_TREE_DEPTH: usize = 64;
+const MAX_TREE_ENTRIES: usize = 100_000;
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -105,6 +110,8 @@ impl UpgradeStore {
         let staging = root.join("staging");
         ensure_child_dir(&root, &versions)?;
         ensure_child_dir(&root, &staging)?;
+        restrict_private_dir(&versions)?;
+        restrict_private_dir(&staging)?;
         sync_dir(&root)?;
         Ok(Self {
             root,
@@ -138,22 +145,26 @@ impl UpgradeStore {
         if !src_meta.is_dir() || src_meta.file_type().is_symlink() {
             return Err(UpgradeError::Invalid("artifact must be a real directory"));
         }
-        if same_device(&self.root, src)? == false {
-            return Err(UpgradeError::Invalid(
-                "artifact must be on the store filesystem",
-            ));
+        if !same_device(&self.root, src)? {
+            return Err(UpgradeError::Invalid("artifact must be on the store filesystem"));
         }
         let stage = self.staging.join(format!("{}.tmp", candidate.version));
         let dest = self.versions.join(&candidate.version);
-        if stage.exists() || dest.exists() {
-            return Err(UpgradeError::Invalid(
-                "candidate stage/version already exists",
-            ));
+        if path_entry_exists(&stage)? || path_entry_exists(&dest)? {
+            return Err(UpgradeError::Invalid("candidate stage/version already exists"));
         }
-        copy_tree_no_symlinks(src, &stage)?;
+        let mut budget = CopyBudget { bytes: 0, entries: 0 };
+        if let Err(error) = copy_tree_no_symlinks(src, &stage, 0, &mut budget) {
+            let _ = fs::remove_dir_all(&stage);
+            let _ = sync_dir(&self.staging);
+            return Err(error);
+        }
         sync_tree(&stage)?;
         sync_dir(&self.staging)?;
         fs::rename(&stage, &dest)?;
+        // Rename crosses two directories on the same filesystem; persist both
+        // directory entries before recording Prepared.
+        sync_dir(&self.staging)?;
         sync_dir(&self.versions)?;
         let journal = Journal {
             old_version: old,
@@ -196,9 +207,18 @@ impl UpgradeStore {
             return Ok(Recovery::NoTransaction);
         };
         if j.phase == Phase::Confirmed {
-            return Ok(Recovery::Confirmed {
-                active: self.active_version()?,
-            });
+            let active = self.active_version().ok().flatten();
+            if active.as_deref() == Some(j.new_version.as_str()) {
+                return Ok(Recovery::Confirmed { active });
+            }
+            // A confirmed record with a missing/malformed/mismatched pointer is
+            // inconsistent. Fail safe by restoring the retained previous version
+            // rather than reporting success or launching an uncertain target.
+            self.write_active(j.old_version.as_deref())?;
+            let old = j.old_version.clone();
+            j.phase = Phase::Prepared;
+            self.write_journal(&j)?;
+            return Ok(Recovery::RolledBack { active: old });
         }
         // Do not parse/follow the current pointer here: it may reference a
         // missing or malformed candidate after a crash. Replace it directly
@@ -218,10 +238,21 @@ impl UpgradeStore {
             Ok(m) if m.file_type().is_symlink() || !m.is_file() => Err(UpgradeError::Invalid(
                 "active pointer is not a regular file",
             )),
-            Ok(_) => {
+            Ok(m) => {
+                if m.len() > MAX_ACTIVE_BYTES {
+                    return Err(UpgradeError::Invalid("active pointer exceeds size limit"));
+                }
                 let mut s = String::new();
-                File::open(path)?.take(256).read_to_string(&mut s)?;
-                let s = s.trim_end_matches('\n');
+                File::open(path)?
+                    .take(MAX_ACTIVE_BYTES + 1)
+                    .read_to_string(&mut s)?;
+                if s.len() as u64 > MAX_ACTIVE_BYTES {
+                    return Err(UpgradeError::Invalid("active pointer exceeds size limit"));
+                }
+                let s = s.strip_suffix('\n').unwrap_or(&s);
+                if s.contains('\n') || s.contains('\r') {
+                    return Err(UpgradeError::Invalid("active pointer has trailing data"));
+                }
                 if s.is_empty() {
                     Ok(None)
                 } else {
@@ -229,7 +260,6 @@ impl UpgradeStore {
                     self.ensure_version_exists(s)?;
                     Ok(Some(s.to_owned()))
                 }
-            }
         }
     }
     pub fn journal(&self) -> Result<Option<Journal>> {
@@ -254,12 +284,15 @@ impl UpgradeStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_JOURNAL_BYTES {
             return Err(UpgradeError::CorruptJournal);
         }
         let mut f = File::open(&p)?;
         let mut s = String::new();
-        f.take(1024).read_to_string(&mut s)?;
+        f.take(MAX_JOURNAL_BYTES + 1).read_to_string(&mut s)?;
+        if s.len() as u64 > MAX_JOURNAL_BYTES {
+            return Err(UpgradeError::CorruptJournal);
+        }
         let lines: Vec<_> = s.lines().collect();
         if lines.len() != 4 || lines[0] != FORMAT {
             return Err(UpgradeError::CorruptJournal);
@@ -271,6 +304,9 @@ impl UpgradeStore {
             Some(lines[1].to_owned())
         };
         validate_version(lines[2]).map_err(|_| UpgradeError::CorruptJournal)?;
+        if old.as_deref() == Some(lines[2]) {
+            return Err(UpgradeError::CorruptJournal);
+        }
         let phase = match lines[3] {
             "Prepared" => Phase::Prepared,
             "Activated" => Phase::Activated,
@@ -319,6 +355,13 @@ fn validate_version(v: &str) -> Result<()> {
     }
     Ok(())
 }
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 fn ensure_child_dir(root: &Path, path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
@@ -326,7 +369,7 @@ fn ensure_child_dir(root: &Path, path: &Path) -> Result<()> {
             "store child must be a real directory",
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
+            create_private_dir(path)?;
             sync_dir(root)
         }
         Err(e) => Err(e.into()),
@@ -358,27 +401,99 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn copy_tree_no_symlinks(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir(dst)?;
+struct CopyBudget {
+    bytes: u64,
+    entries: usize,
+}
+fn copy_tree_no_symlinks(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    budget: &mut CopyBudget,
+) -> Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(UpgradeError::Invalid(
+            "artifact directory nesting exceeds limit",
+        ));
+    }
+    create_private_dir(dst)?;
     for entry in fs::read_dir(src)? {
+        budget.entries += 1;
+        if budget.entries > MAX_TREE_ENTRIES {
+            return Err(UpgradeError::Invalid("artifact has too many entries"));
+        }
         let e = entry?;
         let ty = e.file_type()?;
+        let from = e.path();
         let to = dst.join(e.file_name());
         if ty.is_symlink() {
             return Err(UpgradeError::Invalid("artifact contains symlink"));
         }
         if ty.is_dir() {
-            copy_tree_no_symlinks(&e.path(), &to)?;
+            copy_tree_no_symlinks(&from, &to, depth + 1, budget)?;
         } else if ty.is_file() {
-            let mut i = File::open(e.path())?;
-            let mut o = OpenOptions::new().write(true).create_new(true).open(to)?;
-            io::copy(&mut i, &mut o)?;
+            let meta = fs::symlink_metadata(&from)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(UpgradeError::Invalid("artifact contains hard-linked file"));
+                }
+            }
+            if meta.len() > MAX_ARTIFACT_BYTES.saturating_sub(budget.bytes) {
+                return Err(UpgradeError::Invalid("artifact exceeds total size limit"));
+            }
+            let i = File::open(&from)?;
+            let mut builder = OpenOptions::new();
+            builder.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                let exec = meta.mode() & 0o111 != 0;
+                builder.mode(if exec { 0o700 } else { 0o600 });
+            }
+            let mut o = builder.open(&to)?;
+            let remaining = MAX_ARTIFACT_BYTES.saturating_sub(budget.bytes);
+            let copied = io::copy(&mut i.take(remaining.saturating_add(1)), &mut o)?;
+            if copied > remaining {
+                return Err(UpgradeError::Invalid("artifact exceeds total size limit"));
+            }
+            budget.bytes = budget
+                .bytes
+                .checked_add(copied)
+                .ok_or(UpgradeError::Invalid("artifact size overflow"))?;
             o.sync_all()?;
         } else {
             return Err(UpgradeError::Invalid("artifact contains special file"));
         }
     }
     sync_dir(dst)
+}
+fn create_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = fs::DirBuilder::new();
+        b.mode(0o700);
+        b.create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)?;
+    }
+    Ok(())
+}
+fn restrict_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 fn sync_tree(path: &Path) -> Result<()> {
     for e in fs::read_dir(path)? {
@@ -409,7 +524,14 @@ fn atomic_write(root: &Path, name: &str, data: &[u8]) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let mut builder = OpenOptions::new();
+    builder.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        builder.mode(0o600);
+    }
+    let mut f = builder.open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     drop(f);
@@ -499,105 +621,114 @@ mod tests {
         artifact(&a, "candidate");
         (t, store, a)
     }
-    #[cfg(target_os = "linux")]
+
     #[test]
     fn first_install_prepare_activate_crash_rolls_back_to_empty() {
         let (_t, s, a) = setup();
-        s.prepare(
-            &Candidate {
-                version: "1.0.0".into(),
-            },
-            a.path().join("candidate"),
-        )
-        .unwrap();
+        s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate"))
+            .unwrap();
         s.activate().unwrap();
         assert_eq!(s.active_version().unwrap().as_deref(), Some("1.0.0"));
         assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: None });
         assert_eq!(s.active_version().unwrap(), None);
     }
-    #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_upgrade_preserves_old_version_and_active_new() {
         let (_t, s, a) = setup();
         let old = s.versions.join("1.0.0");
         fs::create_dir(&old).unwrap();
         s.write_active(Some("1.0.0")).unwrap();
-        s.prepare(
-            &Candidate {
-                version: "2.0.0".into(),
-            },
-            a.path().join("candidate"),
-        )
-        .unwrap();
+        s.prepare(&Candidate { version: "2.0.0".into() }, a.path().join("candidate"))
+            .unwrap();
         s.activate().unwrap();
         s.confirm().unwrap();
         assert!(old.is_dir());
         assert_eq!(s.active_version().unwrap().as_deref(), Some("2.0.0"));
-        assert_eq!(
-            s.recover().unwrap(),
-            Recovery::Confirmed {
-                active: Some("2.0.0".into())
-            }
-        );
+        assert_eq!(s.recover().unwrap(), Recovery::Confirmed { active: Some("2.0.0".into()) });
     }
-    #[cfg(target_os = "linux")]
     #[test]
     fn crash_after_pointer_rename_before_journal_activated_still_rolls_back() {
         let (_t, s, a) = setup();
         let old = s.versions.join("1.0.0");
         fs::create_dir(&old).unwrap();
         s.write_active(Some("1.0.0")).unwrap();
-        s.prepare(
-            &Candidate {
-                version: "2.0.0".into(),
-            },
-            a.path().join("candidate"),
-        )
-        .unwrap();
+        s.prepare(&Candidate { version: "2.0.0".into() }, a.path().join("candidate"))
+            .unwrap();
         s.write_active(Some("2.0.0")).unwrap();
-        assert_eq!(
-            s.recover().unwrap(),
-            Recovery::RolledBack {
-                active: Some("1.0.0".into())
-            }
-        );
+        assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: Some("1.0.0".into()) });
     }
     #[test]
     fn unsafe_version_and_symlink_artifact_rejected() {
         let (_t, s, a) = setup();
-        assert!(
-            s.prepare(
-                &Candidate {
-                    version: "../oops".into()
-                },
-                a.path().join("candidate")
-            )
-            .is_err()
-        );
+        assert!(s.prepare(&Candidate { version: "../oops".into() }, a.path().join("candidate")).is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             let link = a.path().join("link");
             symlink(a.path().join("candidate"), &link).unwrap();
-            assert!(
-                s.prepare(
-                    &Candidate {
-                        version: "1.0.0".into()
-                    },
-                    &link
-                )
-                .is_err()
-            );
+            assert!(s.prepare(&Candidate { version: "1.0.0".into() }, &link).is_err());
         }
     }
     #[test]
     fn journal_parser_rejects_traversal() {
         let (_t, s, _a) = setup();
-        fs::write(
-            s.root.join(JOURNAL_FILE),
-            format!("{FORMAT}\n-\n../evil\nPrepared\n"),
-        )
-        .unwrap();
+        fs::write(s.root.join(JOURNAL_FILE), format!("{FORMAT}\n-\n../evil\nPrepared\n")).unwrap();
         assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
+    }
+    #[test]
+    fn journal_rejects_same_old_and_new_and_oversized_files() {
+        let (_t, s, _a) = setup();
+        fs::write(s.root.join(JOURNAL_FILE), format!("{FORMAT}\n1.0.0\n1.0.0\nPrepared\n")).unwrap();
+        assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
+        fs::write(s.root.join(JOURNAL_FILE), vec![b'x'; MAX_JOURNAL_BYTES as usize + 1]).unwrap();
+        assert!(matches!(s.journal(), Err(UpgradeError::CorruptJournal)));
+    }
+    #[test]
+    fn inconsistent_confirmed_journal_rolls_back_instead_of_claiming_success() {
+        let (_t, s, _a) = setup();
+        fs::create_dir(s.versions.join("1.0.0")).unwrap();
+        s.write_journal(&Journal { old_version: None, new_version: "1.0.0".into(), phase: Phase::Confirmed }).unwrap();
+        assert_eq!(s.recover().unwrap(), Recovery::RolledBack { active: None });
+        assert_eq!(s.journal().unwrap().unwrap().phase, Phase::Prepared);
+    }
+    #[test]
+    fn copied_binary_retains_executable_bit_and_private_mode() {
+        let (_t, s, a) = setup();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(a.path().join("candidate/boreas"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(s.versions.join("1.0.0/boreas")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+    #[test]
+    fn active_pointer_rejects_oversized_content() {
+        let (_t, s, _a) = setup();
+        fs::write(s.root.join(ACTIVE_FILE), vec![b'x'; MAX_ACTIVE_BYTES as usize + 1]).unwrap();
+        assert!(s.active_version().is_err());
+    }
+    #[test]
+    fn artifact_size_limit_enforced_and_partial_stage_cleaned() {
+        let (_t, s, a) = setup();
+        let big = a.path().join("candidate/too-large");
+        let f = File::create(&big).unwrap();
+        f.set_len(MAX_ARTIFACT_BYTES + 1).unwrap();
+        let result = s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate"));
+        assert!(result.is_err());
+        assert!(!s.staging.join("1.0.0.tmp").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_artifact_file_rejected() {
+        use std::os::unix::fs::hard_link;
+        let (_t, s, a) = setup();
+        hard_link(a.path().join("candidate/boreas"), a.path().join("candidate/alias")).unwrap();
+        assert!(s.prepare(&Candidate { version: "1.0.0".into() }, a.path().join("candidate")).is_err());
     }
 }

@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod packet;
+
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
@@ -282,8 +284,6 @@ fn valid_edns_options(mut data: &[u8]) -> bool {
 fn decode_name(msg: &[u8], start: usize) -> Result<(String, usize), DnsError> {
     let mut labels: Vec<String> = Vec::new();
     let mut pos = start;
-    let mut consumed_end = None;
-    let mut jumps = 0;
     let mut expanded = 1usize;
     loop {
         let first = *msg.get(pos).ok_or(DnsError::Truncated)?;
@@ -329,7 +329,7 @@ fn decode_name(msg: &[u8], start: usize) -> Result<(String, usize), DnsError> {
         labels.push(label.to_ascii_lowercase());
         pos += len;
     }
-    Ok((labels.join("."), consumed_end.unwrap_or(pos)))
+    Ok((labels.join("."), pos))
 }
 
 fn build_response(
@@ -661,7 +661,8 @@ mod tests {
         let r = fixture().respond_udp(CLIENT, &q).unwrap().unwrap();
         assert!(r.len() <= 1232);
         assert_eq!(u16_at(&r, 6).unwrap(), 1);
-        q[q.len() - 1] = 2;
+        let last = q.len() - 1;
+        q[last] = 2;
         assert_eq!(
             fixture().respond_udp(CLIENT, &q),
             Err(DnsError::InvalidEdns)

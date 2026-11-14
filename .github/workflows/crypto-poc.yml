@@ -1,0 +1,87 @@
+name: OpenSSL ML-DSA hybrid TLS PoC
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/crypto-poc/**'
+      - '.github/workflows/crypto-poc.yml'
+      - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
+  pull_request:
+    paths:
+      - 'tools/crypto-poc/**'
+      - '.github/workflows/crypto-poc.yml'
+      - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-poc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openssl-ml-dsa-tls:
+    name: OpenSSL 3.6.1 source build + TLS tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      OPENSSL_VERSION: 3.6.1
+      OPENSSL_SHA256: b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e
+      OPENSSL_PREFIX: ${{ github.workspace }}/.poc-openssl
+      ARTIFACT_DIR: ${{ github.workspace }}/crypto-poc-artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential perl wget ca-certificates iproute2 binutils
+      - name: Download and verify pinned OpenSSL release
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o openssl.tar.gz
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum --check --strict
+          mkdir openssl-src
+          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-src
+          source openssl-src/VERSION.dat
+          test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}" || {
+            cat openssl-src/VERSION.dat
+            exit 1
+          }
+      - name: Build OpenSSL static library and CLI
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          cd openssl-src
+          ./Configure linux-x86_64 no-shared no-tests --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          make -j2
+          make install_sw
+          test -x "${OPENSSL_PREFIX}/bin/openssl"
+          readelf -d "${OPENSSL_PREFIX}/bin/openssl" | tee "${GITHUB_WORKSPACE}/crypto-poc-linkage.txt"
+          if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' "${GITHUB_WORKSPACE}/crypto-poc-linkage.txt"; then
+            echo 'OpenSSL CLI unexpectedly linked against shared libssl/libcrypto' >&2
+            exit 1
+          fi
+          echo 'NOTE: static OpenSSL libraries verified; this is a backend PoC, not a fully static libc executable.' | tee -a "${GITHUB_WORKSPACE}/crypto-poc-linkage.txt"
+      - name: Run hybrid ML-DSA mTLS and fail-closed cases
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x tools/crypto-poc/run-openssl-mtls.sh
+          tools/crypto-poc/run-openssl-mtls.sh
+      - name: Upload test evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-${{ env.OPENSSL_VERSION }}-crypto-poc-${{ github.run_id }}
+          path: |
+            crypto-poc-artifacts/
+            crypto-poc-linkage.txt
+            openssl.tar.gz
+          if-no-files-found: warn
+          retention-days: 30
