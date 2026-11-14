@@ -488,6 +488,8 @@ mod tests {
         }
         let mut df = p.clone();
         df[6] = 0x40;
+        df[10] = 0;
+        df[11] = 0;
         let c = checksum(&df[..20]).to_be_bytes();
         df[10..12].copy_from_slice(&c);
         assert_eq!(fragment_ipv4(&df, 68, 8), Err(IcmpError::InvalidMtu));
