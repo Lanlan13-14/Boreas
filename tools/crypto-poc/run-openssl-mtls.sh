@@ -190,7 +190,7 @@ success_case() {
   grep -Eiq '^Signature type: mldsa65$' "$RAW_LOGS/client-$tag.log" || fail "server CertificateVerify mldsa65 signature not observed ($tag)"
   grep -Fq 'Verification: OK' "$RAW_LOGS/client-$tag.log" || fail "server chain not verified ($tag)"
   grep -Fq 'SSL_accept:SSLv3/TLS read client certificate' "$RAW_LOGS/server-$tag.log" || fail "server did not receive a client certificate ($tag)"
-  grep -Fq 'SSL_accept:TLSv1.3 read certificate verify' "$RAW_LOGS/server-$tag.log" || fail "server did not process client CertificateVerify ($tag)"
+  grep -Fq 'SSL_accept:SSLv3/TLS read certificate verify' "$RAW_LOGS/server-$tag.log" || fail "server did not process client CertificateVerify ($tag)"
   grep -Fq 'SSL_accept:SSLv3/TLS read finished' "$RAW_LOGS/server-$tag.log" || fail "server did not complete authenticated handshake ($tag)"
   grep -Fq 'BOREAS_TLS_PLAINTEXT_OK' "$RAW_LOGS/client-$tag.log" || fail "TLS plaintext response marker missing ($tag)"
   # OpenSSL 3.6.1 apps/lib/s_cb.c verify_callback prints `depth=%d ` then subject text;
