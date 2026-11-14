@@ -93,6 +93,48 @@ class StrictCBORTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, category)
 
 
+class ManagementObjectTests(unittest.TestCase):
+    def test_candidate_management_fixture_matches_typed_decoder(self):
+        fixture_path = Path(__file__).resolve().parents[2] / "docs/protocol/vectors/management-objects-candidate-v1.json"
+        import json
+        document = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.assertEqual(verify_vectors.verify_management_document(document), [])
+
+    def test_default_cbor_parser_has_hard_depth_cap(self):
+        deeply_nested = bytes.fromhex("81" * 40 + "00")
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_cbor(deeply_nested)
+        self.assertEqual(caught.exception.category, "depth_limit")
+
+
+    def test_signature_input_uses_exact_raw_bytes(self):
+        vector = {
+            "id": "sig", "kind": "signature_input", "object_type": 1,
+            "schema_version": 1, "raw_tbs_hex": "616263", "valid": True,
+            "expected_hex": "424f524541532d4d474d542d4f424a454354000001010000000000000003616263",
+        }
+        self.assertIsNone(verify_vectors._management_vector(vector, 0))
+        vector["expected_hex"] = "00"
+        self.assertIn("signature input", verify_vectors._management_vector(vector, 0))
+
+    def test_rejects_cross_type_and_unknown_critical_extension(self):
+        valid = bytes.fromhex(
+            "ab000103025000000000000000000000000000000000034101040105820201"
+            "06010701080109a60000010102010301040105020a80"
+        )
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_management_tbs(valid)
+        self.assertEqual(caught.exception.category, "invalid_field")
+
+        critical = bytes.fromhex(
+            "ab000106025000000000000000000000000000000000034101040105810306"
+            "010701080209a400010102020103400a8183010140"
+        )
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_management_tbs(critical)
+        self.assertEqual(caught.exception.category, "unknown_critical_extension")
+
+
 class FixtureValidationTests(unittest.TestCase):
     def test_rejects_expected_result_mismatch(self):
         fixture = {

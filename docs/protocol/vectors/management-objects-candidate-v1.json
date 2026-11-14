@@ -1,0 +1,91 @@
+{
+  "status": "candidate-not-frozen",
+  "format": "boreas-management-object-tbs-v1",
+  "encoding": "raw deterministic CBOR TBS hex; object_id is outside TBS and candidate SHA-256(raw_tbs)",
+  "schema_version": 1,
+  "vectors": [
+    {
+      "id": "node-identity-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab0001010102500000000000000000000000000000000003410104010582010206010701080209ac0050000000000000000000000000000000000102020103440a140102045000000000000000000000000000000000050106010741aa080109010a020b400a80",
+      "valid": true,
+      "expected": {"object_type":"NodeIdentity","net_id_hex":"00000000000000000000000000000000","issuer_key_id_hex":"01","issuer_generation":1,"subject":["Node",2],"seq":1,"issued_at":1,"expires":2}
+    },
+    {
+      "id": "attachment-lease-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab00010202500000000000000000000000000000000003410104010582010206010701080209a60002010102010301040105020a80",
+      "valid": true,
+      "expected": {"object_type":"AttachmentLease","subject":["Node",2],"seq":1,"issued_at":1,"expires":2}
+    },
+    {
+      "id": "core-lsa-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab00010302500000000000000000000000000000000003410104010582020106010701080209a400010101020103800a80",
+      "valid": true,
+      "expected": {"object_type":"CoreLsa","subject":["Core",1],"seq":1,"issued_at":1,"expires":2}
+    },
+    {
+      "id": "route-grant-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab00010402500000000000000000000000000000000003410104010582010206010701080209a70002014400000000020003000440050106020a80",
+      "valid": true,
+      "expected": {"object_type":"RouteGrant","subject":["Node",2],"seq":1,"issued_at":1,"expires":2}
+    },
+    {
+      "id": "direct-grant-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab00010502500000000000000000000000000000000003410104010582010206010701080209a600020102024161031901bb044005020a80",
+      "valid": true,
+      "expected": {"object_type":"DirectGrant","subject":["Node",2],"seq":1,"issued_at":1,"expires":2}
+    },
+    {
+      "id": "status-snapshot-minimal-valid",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab000106025000000000000000000000000000000000034101040105810306010701080209a400010102020103400a80",
+      "valid": true,
+      "expected": {"object_type":"StatusSnapshot","net_id_hex":"00000000000000000000000000000000","issuer_key_id_hex":"01","issuer_generation":1,"subject":"Network","seq":1,"issued_at":1,"expires":2,"status_body":{"issued_at":1,"next_update":2,"sequence":1,"revocations_hex":""},"extensions":[]}
+    },
+    {
+      "id": "node-identity-cross-net-mismatch",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab0001010102500000000000000000000000000000000003410104010582010206010701080209ac0050000000000000000000000000000000010102020103440a140102045000000000000000000000000000000000050106010741aa080109010a020b400a80",
+      "valid": false,
+      "expected_error": "invalid_field"
+    },
+    {
+      "id": "node-identity-common-sequence-mismatch",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab0001010102500000000000000000000000000000000003410104010582010206020701080209ac0050000000000000000000000000000000000102020103440a140102045000000000000000000000000000000000050106010741aa080109010a020b400a80",
+      "valid": false,
+      "expected_error": "invalid_field"
+    },
+    {
+      "id": "cross-type-body",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab0001010202500000000000000000000000000000000003410104010582010006010701080209a400010101020103800a80",
+      "valid": false,
+      "expected_error": "invalid_field"
+    },
+    {
+      "id": "empty-issuer-key-id",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab0001010102500000000000000000000000000000000003410004010582010206010701080209ac0050000000000000000000000000000000000102020103440a140102045000000000000000000000000000000000050106010741aa080109010a020b400a80",
+      "valid": false,
+      "expected_error": "invalid_field"
+    },
+    {
+      "id": "unknown-critical-extension",
+      "kind": "tbs",
+      "raw_tbs_hex": "ab000106025000000000000000000000000000000000034101040105810306010701080209a400010102020103400a8183010140",
+      "valid": false,
+      "expected_error": "unknown_critical_extension"
+    },
+    {"id":"signature-domain-raw-three-bytes","kind":"signature_input","object_type":1,"schema_version":1,"raw_tbs_hex":"616263","valid":true,"expected_hex":"424f524541532d4d474d542d4f424a454354000001010000000000000003616263"},
+    {"id":"cbor-root-not-map","kind":"tbs","raw_tbs_hex":"00","valid":false,"expected_error":"invalid_field"},
+    {"id":"tbs-trailing-byte","kind":"tbs","raw_tbs_hex":"a1000000","valid":false,"expected_error":"trailing_bytes"},
+    {"id":"tbs-nonshortest-map-length","kind":"tbs","raw_tbs_hex":"b800","valid":false,"expected_error":"noncanonical"},
+    {"id":"tbs-indefinite-map","kind":"tbs","raw_tbs_hex":"bfff","valid":false,"expected_error":"unsupported_cbor"}
+  ],
+  "object_id_rule":{"candidate":"SHA-256(raw_tbs)","in_tbs":false,"computed_by_this_module":false}
+}

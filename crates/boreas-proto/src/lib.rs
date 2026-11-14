@@ -1,6 +1,8 @@
 //! Candidate Boreas wire primitives; not a frozen protocol or cryptographic implementation.
 #![forbid(unsafe_code)]
 
+pub mod objects;
+
 use std::fmt;
 
 pub const PROTO_MAJOR: u8 = 3;

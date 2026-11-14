@@ -44,6 +44,7 @@ sanitize_logs() {
     # Never copy SSL-Session / PSK / master-secret or cert dump blocks into artifacts.
     awk '
       /^(CONNECTION ESTABLISHED|Protocol version:|Ciphersuite:|Requested Signature Algorithms:|Peer certificate:|Hash used:|Signature type:|Peer signature type:|Verification:|Verified peername:|Negotiated TLS1\.3 group:|New, TLSv1\.3, Cipher is|BOREAS_TLS_PLAINTEXT_OK|HTTP\/1\.0 200)/ {print; next}
+      /^SSL_accept:/ {print; next}
       /^depth=[0-9]+:/ {print; next}
       /^verify return:[01]$/ {print; next}
       /^SSL3 alert (read|write):/ {print; next}
@@ -116,12 +117,12 @@ start_server() {
   mkfifo "$fifo"
   # Open read-write before starting server: no EOF and no test command reaches stdin.
   exec {SERVER_STDIN_FD}<>"$fifo"
-  local -a verify_args=(-CAfile root.pem -Verify 1 -verify_return_error)
+  local -a verify_args=(-CAfile root.pem -Verify 1 -verify_return_error -state)
   [[ -z "$attime" ]] || verify_args+=(-attime "$attime")
   timeout --signal=TERM --kill-after=3s 40s "$OPENSSL_BIN" s_server -accept "127.0.0.1:$SERVER_PORT" -naccept 1 -WWW \
     -cert server.pem -key server.key "${verify_args[@]}" \
     -tls1_3 -groups X25519MLKEM768 -sigalgs mldsa65 -ciphersuites "$cipher" \
-    -state -verify_verbose -no_ticket -num_tickets 0 <&"$SERVER_STDIN_FD" >"$RAW_LOGS/server-$tag.log" 2>&1 &
+    -no_ticket -num_tickets 0 <&"$SERVER_STDIN_FD" >"$RAW_LOGS/server-$tag.log" 2>&1 &
   SERVER_PID=$!
   local ready=0
   for _ in $(seq 1 150); do
@@ -187,9 +188,14 @@ success_case() {
   grep -Fq 'Negotiated TLS1.3 group: X25519MLKEM768' "$RAW_LOGS/client-$tag.log" || fail "hybrid group not observed ($tag)"
   grep -Eiq 'Peer signature type: (mldsa65|ML-DSA-65)' "$RAW_LOGS/client-$tag.log" || fail "ML-DSA peer signature not observed ($tag)"
   grep -Fq 'Verification: OK' "$RAW_LOGS/client-$tag.log" || fail "server chain not verified ($tag)"
+  grep -Fq 'SSL_accept:SSLv3/TLS read client certificate' "$RAW_LOGS/server-$tag.log" || fail "server did not receive a client certificate ($tag)"
+  grep -Fq 'SSL_accept:TLSv1.3 read certificate verify' "$RAW_LOGS/server-$tag.log" || fail "server did not process client CertificateVerify ($tag)"
+  grep -Fq 'SSL_accept:SSLv3/TLS read finished' "$RAW_LOGS/server-$tag.log" || fail "server did not complete authenticated handshake ($tag)"
   grep -Fq 'BOREAS_TLS_PLAINTEXT_OK' "$RAW_LOGS/client-$tag.log" || fail "TLS plaintext response marker missing ($tag)"
-  grep -Eqi '^depth=1:' "$RAW_LOGS/server-$tag.log" || fail "server did not report issuer verification depth ($tag)"
-  grep -Eqi '^depth=0:' "$RAW_LOGS/server-$tag.log" || fail "server did not report client leaf verification depth ($tag)"
+  # OpenSSL 3.6.1 apps/lib/s_cb.c verify_callback prints `depth=%d ` then subject text;
+  # successful return is exactly `verify return:1`. No colon follows depth.
+  grep -Eqi '^depth=1 ' "$RAW_LOGS/server-$tag.log" || fail "server did not report issuer verification depth ($tag)"
+  grep -Eqi '^depth=0 ' "$RAW_LOGS/server-$tag.log" || fail "server did not report client leaf verification depth ($tag)"
   grep -Eqi '^verify return:1$' "$RAW_LOGS/server-$tag.log" || fail "server did not log successful client chain verification ($tag)"
   log "PASS TLS1.3 mTLS group=X25519MLKEM768 sigalg=mldsa65 cipher=$cipher HTTP-response ($tag)"
 }

@@ -1,0 +1,11 @@
+{
+  "status": "candidate-not-frozen",
+  "schema_version": 1,
+  "envelope_fields": {"0":"schema_version:uint=1","1":"object_type:uint 1..6","2":"net_id:bstr16","3":"issuer_key_id:bstr1..64","4":"issuer_generation:uint>=1","5":"subject_identity:tagged-array","6":"seq:uint","7":"issued_at:uint unix_us","8":"expires:uint unix_us","9":"body:object-map","10":"extensions:array<=32"},
+  "object_types": {"1":"NodeIdentity","2":"AttachmentLease","3":"CoreLsa","4":"RouteGrant","5":"DirectGrant","6":"StatusSnapshot"},
+  "limits": {"tbs_bytes":16384,"depth":32,"issuer_key_id_bytes":[1,64],"extension_value_bytes":2048,"extensions":32,"scope_bytes":1024,"neighbors":15},
+  "cbor_subset": ["unsigned integer","byte string","array","map"],
+  "forbidden": ["negative integer","text string","simple values incl bool","float","tag","indefinite length","trailing bytes","non-shortest argument"],
+  "object_id": {"candidate":"SHA-256(raw_tbs)","inside_tbs":false,"this_module_computes":false},
+  "signature_input": {"domain_hex":"424f524541532d4d474d542d4f424a45435400","schema_version":"u16be","object_type":"u8","raw_tbs_length":"u64be","raw_tbs":"exact original bytes"}
+}
