@@ -950,15 +950,26 @@ mod tests {
         let entry = fixture_entry(id);
         let marker = format!("\"{field}\"");
         let at = entry.find(&marker).expect("fixture field present") + marker.len();
-        let value = entry[at..].trim_start().strip_prefix(':').expect("field colon").trim_start();
+        let value = entry[at..]
+            .trim_start()
+            .strip_prefix(':')
+            .expect("field colon")
+            .trim_start();
         let value = value.strip_prefix('\"').expect("string fixture field");
         value[..value.find('\"').expect("fixture string terminator")].to_owned()
     }
     fn decode_hex(hex: &str) -> Vec<u8> {
-        let digit = |b: u8| match b { b'0'..=b'9' => b-b'0', b'a'..=b'f' => b-b'a'+10, _ => panic!("bad fixture hex") };
+        let digit = |b: u8| match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => panic!("bad fixture hex"),
+        };
         let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
         assert!(remainder.is_empty(), "odd fixture hex length");
-        pairs.iter().map(|pair| digit(pair[0])*16 + digit(pair[1])).collect()
+        pairs
+            .iter()
+            .map(|pair| digit(pair[0]) * 16 + digit(pair[1]))
+            .collect()
     }
     fn fixture_hex(id: &str) -> Vec<u8> {
         decode_hex(&fixture_field(id, "raw_tbs_hex"))
@@ -977,7 +988,8 @@ mod tests {
         assert!(!hex.contains('_'));
         hex.as_bytes()
             .as_chunks::<2>()
-            .0.iter()
+            .0
+            .iter()
             .map(|pair| {
                 let digit = |b: u8| match b {
                     b'0'..=b'9' => b - b'0',
@@ -1067,7 +1079,8 @@ mod tests {
         let expected: Vec<u8> = expected
             .as_bytes()
             .as_chunks::<2>()
-            .0.iter()
+            .0
+            .iter()
             .map(|p| {
                 let d = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
                 d(p[0]) * 16 + d(p[1])
