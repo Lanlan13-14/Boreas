@@ -1,4 +1,4 @@
-﻿//! Durable enrollment transaction engine.
+//! Durable enrollment transaction engine.
 //!
 //! This module does no CSR parsing or signature verification. The claim API accepts an
 //! opaque verified-request token with private fields and no production constructor; it cannot
@@ -451,17 +451,9 @@ impl EnrollmentStore {
         };
         self.append_event(Event::Prepared {
             fence: self.fence,
-            tx,
+            tx: tx.clone(),
         })?;
-        self.apply_prepared(
-            result.node_id,
-            generation,
-            req.invite_id,
-            req.enrollment_id,
-            req.raw_csr_sha256,
-            req.raw_csr_der.clone(),
-            result.clone(),
-        );
+        self.apply_prepared(tx);
         Ok(result)
     }
 
@@ -584,29 +576,14 @@ impl EnrollmentStore {
             Ok(())
         }
     }
-    fn apply_prepared(
-        &mut self,
-        node_id: u16,
-        generation: u64,
-        invite: [u8; 16],
-        enrollment: [u8; 16],
-        hash: [u8; 32],
-        csr_der: Vec<u8>,
-        tx: EnrollmentResult,
-    ) {
+    fn apply_prepared(&mut self, tx: Tx) {
+        let node_id = tx.result.node_id;
         self.used_slots.insert(node_id);
-        self.generations.insert(node_id, generation);
-        self.invite_bindings.insert(invite, (enrollment, hash));
-        self.transactions.insert(
-            (invite, enrollment),
-            Tx {
-                result: tx,
-                invite_id: invite,
-                enrollment_id: enrollment,
-                csr_hash: hash,
-                csr_der,
-            },
-        );
+        self.generations.insert(node_id, tx.result.identity_generation);
+        self.invite_bindings
+            .insert(tx.invite_id, (tx.enrollment_id, tx.csr_hash));
+        self.transactions
+            .insert((tx.invite_id, tx.enrollment_id), tx);
     }
     fn append_event(&mut self, event: Event) -> Result<(), EnrollmentError> {
         self.ensure_healthy()?;
@@ -636,10 +613,7 @@ impl EnrollmentStore {
             if self.fail_next_write {
                 self.fail_next_write = false;
                 self.journal.write_all(&frame[..frame.len() / 2])?;
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected partial write failure",
-                ));
+                return Err(io::Error::other("injected partial write failure"));
             }
             self.journal.write_all(&frame)?;
             self.journal.sync_all()
@@ -736,7 +710,7 @@ impl EnrollmentStore {
                     .ok_or(EnrollmentError::CorruptJournal)?;
                 if invite.role != tx.result.slot.role
                     || invite.home_core_id != tx.result.slot.home_core_id
-                    || !self.slots.iter().any(|s| *s == tx.result.slot)
+                    || !self.slots.contains(&tx.result.slot)
                     || tx.csr_der.is_empty()
                     || tx.csr_der.len() > MAX_CSR_BYTES
                     || tx.result.phase != EnrollmentPhase::Prepared
@@ -748,15 +722,7 @@ impl EnrollmentStore {
                 if tx.result.identity_generation != old_generation + 1 {
                     return Err(EnrollmentError::CorruptJournal);
                 }
-                self.apply_prepared(
-                    id,
-                    tx.result.identity_generation,
-                    tx.invite_id,
-                    tx.enrollment_id,
-                    tx.csr_hash,
-                    tx.csr_der.clone(),
-                    tx.result,
-                );
+                self.apply_prepared(tx);
             }
             Event::Issued { fence, tx } => {
                 self.check_fence(fence)?;
@@ -1137,6 +1103,7 @@ fn secret_bytes_equal(a: &[u8], b: &[u8]) -> bool {
     }
     diff == 0
 }
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1345,7 +1312,7 @@ mod tests {
         ));
         drop(s);
         let mut recovered = setup(&path);
-        assert!(matches!(recovered.claim(request(2, 3), 1), Ok(_)));
+        assert!(recovered.claim(request(2, 3), 1).is_ok());
         drop(recovered);
         cleanup(&path);
     }
