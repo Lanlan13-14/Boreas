@@ -118,21 +118,29 @@ class ManagementObjectTests(unittest.TestCase):
         self.assertIn("signature input", verify_vectors._management_vector(vector, 0))
 
     def test_rejects_cross_type_and_unknown_critical_extension(self):
-        valid = bytes.fromhex(
-            "ab000103025000000000000000000000000000000000034101040105820201"
-            "06010701080109a60000010102010301040105020a80"
+        fixture_path = Path(__file__).resolve().parents[2] / "docs/protocol/vectors/management-objects-candidate-v1.json"
+        import json
+        document = json.loads(fixture_path.read_text(encoding="utf-8"))
+        node_fixture = next(
+            vector for vector in document["vectors"]
+            if vector.get("id") == "node-identity-minimal-valid"
         )
+        # Start from a generator-produced, canonical NodeIdentity TBS and alter
+        # only the encoded envelope object_type (key 1), retaining its body.
+        cross_type = bytearray.fromhex(node_fixture["raw_tbs_hex"])
+        self.assertEqual(cross_type[:5], bytes.fromhex("ab00010101"))
+        cross_type[4] = 2  # AttachmentLease type with a NodeIdentity body.
         with self.assertRaises(verify_vectors.Reject) as caught:
-            verify_vectors.parse_management_tbs(valid)
+            verify_vectors.parse_management_tbs(bytes(cross_type))
         self.assertEqual(caught.exception.category, "invalid_field")
 
-        critical = bytes.fromhex(
-            "ab000106025000000000000000000000000000000000034101040105810306"
-            "010701080209a400010102020103400a8183010140"
+        critical_fixture = next(
+            vector for vector in document["vectors"]
+            if vector.get("id") == "unknown-critical-extension"
         )
         with self.assertRaises(verify_vectors.Reject) as caught:
-            verify_vectors.parse_management_tbs(critical)
-        self.assertEqual(caught.exception.category, "unknown_critical_extension")
+            verify_vectors.parse_management_tbs(bytes.fromhex(critical_fixture["raw_tbs_hex"]))
+        self.assertEqual(caught.exception.category, critical_fixture["expected_error"])
 
 
 class FixtureValidationTests(unittest.TestCase):

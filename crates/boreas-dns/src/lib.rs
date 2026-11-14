@@ -152,13 +152,19 @@ impl AuthoritativeDns {
             })
     }
 
-    /// Handle one length-prefix-stripped TCP DNS query with the same explicit
-    /// source authorization and wire bounds used by UDP.
+    /// Handle one length-prefix-stripped TCP DNS query. TCP has no UDP datagram
+    /// payload ceiling, so its response may use the configured DNS message cap
+    /// (at most 4096 bytes) rather than inheriting UDP's 512-byte default or
+    /// EDNS datagram size. Authorization and wire parsing remain shared.
     pub fn respond_tcp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
-        self.respond_udp(source, query)
+        self.respond(source, query, false)
     }
 
     pub fn respond_udp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
+        self.respond(source, query, true)
+    }
+
+    fn respond(&self, source: IpAddr, query: &[u8], datagram: bool) -> Result<Option<Vec<u8>>, DnsError> {
         if !self.sources.permits(source) {
             return Ok(None);
         }
@@ -166,12 +172,15 @@ impl AuthoritativeDns {
             return Err(DnsError::MessageTooLarge);
         }
         let question = parse_query(query)?;
-        let mut limit = self.max_response_bytes;
-        if let Some(edns_limit) = question.edns_size {
-            limit = limit.min(edns_limit.clamp(512, MAX_RESPONSE_BYTES));
+        let limit = if datagram {
+            if let Some(edns_limit) = question.edns_size {
+                self.max_response_bytes.min(edns_limit.clamp(512, MAX_RESPONSE_BYTES))
+            } else {
+                self.max_response_bytes.min(512)
+            }
         } else {
-            limit = limit.min(512);
-        }
+            self.max_response_bytes.min(MAX_RESPONSE_BYTES)
+        };
         let mut answer = None;
         let authoritative = is_in_zone(&question.name, &self.zone.origin);
         let exists = authoritative && self.name_exists(&question.name);
@@ -693,6 +702,20 @@ mod tests {
         let r = fixture().respond_udp(CLIENT, &q).unwrap().unwrap();
         assert!(r.len() <= 512);
     }
+    #[test]
+    fn tcp_response_uses_configured_cap_without_udp_datagram_clamp() {
+        let mut zone = Zone::new("corp.example").unwrap();
+        zone.add_address("host.corp.example", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))).unwrap();
+        let dns = AuthoritativeDns::new(zone, SourceAuthorization::new([CLIENT]), 1500).unwrap();
+        let query = base_query(&wire_name(&[b"host", b"corp", b"example"]), 1);
+        let udp = dns.respond_udp(CLIENT, &query).unwrap().unwrap();
+        let tcp = dns.respond_tcp(CLIENT, &query).unwrap().unwrap();
+        assert_eq!(udp.len(), tcp.len());
+        assert_eq!(u16_at(&tcp, 6).unwrap(), 1);
+        assert_eq!(u16_at(&udp, 6).unwrap(), 1);
+        assert!(tcp.len() <= 1500);
+    }
+
     #[test]
     fn configuration_and_zone_boundaries() {
         assert!(Zone::new("bad..example").is_err());
