@@ -9,7 +9,7 @@ const CLIENT4: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 2);
 const DNS4: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 53);
 const DNS6_PREFIX: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x1234, 0x5678, 0, 0, 0, 0, 0);
 const CLIENT6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x1234, 0x5678, 0, 0, 0, 0, 2);
-const DNS6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x1234, 0x5678, 0, 0, 0, 0, 53);
+const DNS6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x1234, 0x5678, 0, 0, 0, 0, 0x53);
 
 fn setup() -> (AuthoritativeDns, PacketConfig) {
     let genesis =

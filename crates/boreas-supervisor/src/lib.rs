@@ -398,10 +398,10 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
             }
             Component::Normal(n) => {
                 current.push(n);
-                if let Ok(m) = fs::symlink_metadata(&current) {
-                    if m.file_type().is_symlink() {
-                        return Err(UpgradeError::Invalid("symlink path component"));
-                    }
+                if let Ok(m) = fs::symlink_metadata(&current)
+                    && m.file_type().is_symlink()
+                {
+                    return Err(UpgradeError::Invalid("symlink path component"));
                 }
             }
             _ => current.push(c.as_os_str()),
