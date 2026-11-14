@@ -68,8 +68,18 @@ impl TcpDnsConfig {
             || self.max_frames_per_poll == 0
             || self.max_frames_per_poll > 1024
             || self.idle_timeout.is_zero()
-            || self.max_frame_bytes.checked_add(2).is_none_or(|n| n > self.rx_bytes_per_connection)
-            || self.rx_bytes_per_connection.checked_add(self.tx_bytes_per_connection).and_then(|n| n.checked_add(self.max_frame_bytes + 2)).and_then(|n| n.checked_add(self.tx_bytes_per_connection)).and_then(|n| n.checked_add(MAX_RESPONSE_BYTES + 2)).and_then(|n| n.checked_mul(self.max_connections)).is_none_or(|n| n > MAX_TCP_BUFFER_BYTES)
+            || self
+                .max_frame_bytes
+                .checked_add(2)
+                .is_none_or(|n| n > self.rx_bytes_per_connection)
+            || self
+                .rx_bytes_per_connection
+                .checked_add(self.tx_bytes_per_connection)
+                .and_then(|n| n.checked_add(self.max_frame_bytes + 2))
+                .and_then(|n| n.checked_add(self.tx_bytes_per_connection))
+                .and_then(|n| n.checked_add(MAX_RESPONSE_BYTES + 2))
+                .and_then(|n| n.checked_mul(self.max_connections))
+                .is_none_or(|n| n > MAX_TCP_BUFFER_BYTES)
         {
             return Err(TcpDnsError::InvalidConfiguration);
         }
@@ -110,12 +120,21 @@ impl TcpDnsServer {
     /// Allocate the bounded socket pool into an existing smoltcp socket set and
     /// place each socket in LISTEN on port 53. The socket set must be polled by
     /// the caller with the same `Interface` and `Device` that own the DNS VIP.
-    pub fn new(config: TcpDnsConfig, listen: IpListenEndpoint, sockets: &mut SocketSet<'static>) -> Result<Self, TcpDnsError> {
+    pub fn new(
+        config: TcpDnsConfig,
+        listen: IpListenEndpoint,
+        sockets: &mut SocketSet<'static>,
+    ) -> Result<Self, TcpDnsError> {
         config.validate()?;
         if listen.port != DNS_TCP_PORT || listen.addr.is_none() {
             return Err(TcpDnsError::InvalidConfiguration);
         }
-        if sockets.iter().count().checked_add(config.max_connections).is_none() {
+        if sockets
+            .iter()
+            .count()
+            .checked_add(config.max_connections)
+            .is_none()
+        {
             return Err(TcpDnsError::SocketPoolFull);
         }
         let mut connections = Vec::with_capacity(config.max_connections);
@@ -129,7 +148,9 @@ impl TcpDnsServer {
             added_handles.push(handle);
             let listen_result = sockets.get_mut::<tcp::Socket>(handle).listen(listen);
             if listen_result.is_err() {
-                for added in added_handles.into_iter().rev() { let _ = sockets.remove(added); }
+                for added in added_handles.into_iter().rev() {
+                    let _ = sockets.remove(added);
+                }
                 return Err(TcpDnsError::SocketPoolFull);
             }
             let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -144,10 +165,16 @@ impl TcpDnsServer {
                 peer_closed: false,
             });
         }
-        Ok(Self { config, listen, connections })
+        Ok(Self {
+            config,
+            listen,
+            connections,
+        })
     }
 
-    pub fn connection_capacity(&self) -> usize { self.connections.len() }
+    pub fn connection_capacity(&self) -> usize {
+        self.connections.len()
+    }
 
     /// Consume available TCP stream bytes and enqueue DNS frames. Call after
     /// each interface poll; each invocation handles at most `max_frames_per_poll`
@@ -180,7 +207,9 @@ impl TcpDnsServer {
                 conn.active = true;
                 conn.last_activity = now;
             }
-            if socket.is_active() && now - conn.last_activity >= duration_to_smoltcp(self.config.idle_timeout) {
+            if socket.is_active()
+                && now - conn.last_activity >= duration_to_smoltcp(self.config.idle_timeout)
+            {
                 socket.abort();
                 reset_connection(conn, now);
                 continue;
@@ -193,7 +222,10 @@ impl TcpDnsServer {
             };
             let source = remote_ip(Some(endpoint));
             if !socket.is_active() || !authorizer.is_authorized_authenticated_peer(source) {
-                if socket.is_active() { socket.abort(); reset_connection(conn, now); }
+                if socket.is_active() {
+                    socket.abort();
+                    reset_connection(conn, now);
+                }
                 continue;
             }
 
@@ -202,7 +234,11 @@ impl TcpDnsServer {
                 let left = &conn.transmit[conn.transmit_offset..];
                 match socket.send_slice(left) {
                     Ok(n) => conn.transmit_offset += n,
-                    Err(_) => { socket.abort(); reset_connection(conn, now); continue; }
+                    Err(_) => {
+                        socket.abort();
+                        reset_connection(conn, now);
+                        continue;
+                    }
                 }
                 if conn.transmit_offset == conn.transmit.len() {
                     conn.transmit.clear();
@@ -220,7 +256,10 @@ impl TcpDnsServer {
             }
             // TCP.recv_slice returns bytes in-order after smoltcp reassembly and
             // sequence processing; it does not read or synthesize raw segments.
-            while socket.can_recv() && conn.receive.len() < self.config.max_frame_bytes + 2 && completed < self.config.max_frames_per_poll {
+            while socket.can_recv()
+                && conn.receive.len() < self.config.max_frame_bytes + 2
+                && completed < self.config.max_frames_per_poll
+            {
                 let remaining = self.config.max_frame_bytes + 2 - conn.receive.len();
                 let mut chunk = [0u8; 1024];
                 let take = remaining.min(chunk.len());
@@ -232,17 +271,33 @@ impl TcpDnsServer {
                     }
                     Err(_) => break,
                 }
-                if !extract_frames(conn, source, dns, &self.config, &mut completed) { socket.abort(); reset_connection(conn, now); break; }
-                if completed >= self.config.max_frames_per_poll { break; }
+                if !extract_frames(conn, source, dns, &self.config, &mut completed) {
+                    socket.abort();
+                    reset_connection(conn, now);
+                    break;
+                }
+                if completed >= self.config.max_frames_per_poll {
+                    break;
+                }
             }
-            if completed >= self.config.max_frames_per_poll { break; }
+            if completed >= self.config.max_frames_per_poll {
+                break;
+            }
             // FIN with an incomplete DNS frame is invalid. FIN after complete
             // requests permits queued response transmission before local close.
             if !socket.may_recv() {
-                if !conn.receive.is_empty() { socket.abort(); reset_connection(conn, now); }
-                else { conn.peer_closed = true; }
+                if !conn.receive.is_empty() {
+                    socket.abort();
+                    reset_connection(conn, now);
+                } else {
+                    conn.peer_closed = true;
+                }
             }
-            if conn.peer_closed && conn.transmit.is_empty() && socket.send_queue() == 0 && socket.may_send() {
+            if conn.peer_closed
+                && conn.transmit.is_empty()
+                && socket.send_queue() == 0
+                && socket.may_send()
+            {
                 socket.close();
             }
         }
@@ -250,20 +305,39 @@ impl TcpDnsServer {
     }
 }
 
-fn extract_frames(conn: &mut Connection, source: IpAddr, dns: &AuthoritativeDns, config: &TcpDnsConfig, completed: &mut usize) -> bool {
+fn extract_frames(
+    conn: &mut Connection,
+    source: IpAddr,
+    dns: &AuthoritativeDns,
+    config: &TcpDnsConfig,
+    completed: &mut usize,
+) -> bool {
     loop {
-        if conn.receive.len() < 2 { return true; }
+        if conn.receive.len() < 2 {
+            return true;
+        }
         let frame_len = usize::from(u16::from_be_bytes([conn.receive[0], conn.receive[1]]));
-        if frame_len == 0 || frame_len > config.max_frame_bytes { return false; }
-        if conn.receive.len() < frame_len + 2 { return true; }
-        if conn.transmit.len() != conn.transmit_offset { return true; }
+        if frame_len == 0 || frame_len > config.max_frame_bytes {
+            return false;
+        }
+        if conn.receive.len() < frame_len + 2 {
+            return true;
+        }
+        if conn.transmit.len() != conn.transmit_offset {
+            return true;
+        }
         let query = conn.receive[2..2 + frame_len].to_vec();
         conn.receive.drain(..2 + frame_len);
         match dns.respond_tcp(source, &query) {
             Ok(Some(response)) => {
-                if response.len() > u16::MAX as usize || response.len() + 2 > config.tx_bytes_per_connection { return false; }
+                if response.len() > u16::MAX as usize
+                    || response.len() + 2 > config.tx_bytes_per_connection
+                {
+                    return false;
+                }
                 conn.transmit.clear();
-                conn.transmit.extend_from_slice(&(response.len() as u16).to_be_bytes());
+                conn.transmit
+                    .extend_from_slice(&(response.len() as u16).to_be_bytes());
                 conn.transmit.extend_from_slice(&response);
                 conn.transmit_offset = 0;
             }
@@ -271,7 +345,9 @@ fn extract_frames(conn: &mut Connection, source: IpAddr, dns: &AuthoritativeDns,
             Err(_) => return false,
         }
         *completed += 1;
-        if *completed >= config.max_frames_per_poll || conn.receive.len() < 2 { return true; }
+        if *completed >= config.max_frames_per_poll || conn.receive.len() < 2 {
+            return true;
+        }
     }
 }
 
