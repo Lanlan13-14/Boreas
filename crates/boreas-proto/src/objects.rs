@@ -353,7 +353,7 @@ impl Reader<'_> {
         }
     }
 }
-fn get<'a>(m: &'a [(u64, V)], k: u64) -> Result<&'a V, Error> {
+fn get(m: &[(u64, V)], k: u64) -> Result<&V, Error> {
     m.iter()
         .find(|(x, _)| *x == k)
         .map(|x| &x.1)
@@ -939,10 +939,36 @@ mod tests {
     use super::*;
     const FIXTURES: &str =
         include_str!("../../../docs/protocol/vectors/management-objects-candidate-v1.json");
+    fn fixture_entry(id: &str) -> String {
+        let marker = format!("\"id\": \"{id}\"");
+        let at = FIXTURES.find(&marker).expect("fixture id present");
+        let start = FIXTURES[..at].rfind('{').expect("fixture object start");
+        let end = FIXTURES[at..].find('}').expect("fixture object end") + at + 1;
+        FIXTURES[start..end].to_owned()
+    }
+    fn fixture_field(id: &str, field: &str) -> String {
+        let entry = fixture_entry(id);
+        let marker = format!("\"{field}\"");
+        let at = entry.find(&marker).expect("fixture field present") + marker.len();
+        let value = entry[at..].trim_start().strip_prefix(':').expect("field colon").trim_start();
+        let value = value.strip_prefix('\"').expect("string fixture field");
+        value[..value.find('\"').expect("fixture string terminator")].to_owned()
+    }
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        let digit = |b: u8| match b { b'0'..=b'9' => b-b'0', b'a'..=b'f' => b-b'a'+10, _ => panic!("bad fixture hex") };
+        let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "odd fixture hex length");
+        pairs.iter().map(|pair| digit(pair[0])*16 + digit(pair[1])).collect()
+    }
     fn fixture_hex(id: &str) -> Vec<u8> {
+        decode_hex(&fixture_field(id, "raw_tbs_hex"))
+    }
+    fn legacy_fixture_hex_removed(id: &str) -> Vec<u8> {
         let marker = format!("\"id\": \"{id}\"");
         let item = FIXTURES.find(&marker).expect("fixture id present");
-        let tail = &FIXTURES[item..];
+        let object_start = FIXTURES[..item].rfind('{').expect("fixture object start");
+        let object_end = FIXTURES[item..].find('}').expect("fixture object end") + item + 1;
+        let tail = &FIXTURES[object_start..object_end];
         let field = "\"raw_tbs_hex\": \"";
         let start = tail.find(field).expect("fixture has raw TBS") + field.len();
         let hex = &tail[start..];
@@ -950,7 +976,8 @@ mod tests {
         let hex = &hex[..end];
         assert!(!hex.contains('_'));
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0.iter()
             .map(|pair| {
                 let digit = |b: u8| match b {
                     b'0'..=b'9' => b - b'0',
@@ -983,7 +1010,9 @@ mod tests {
     fn fixture_error(id: &str) -> String {
         let marker = format!("\"id\": \"{id}\"");
         let item = FIXTURES.find(&marker).expect("fixture id present");
-        let tail = &FIXTURES[item..];
+        let object_start = FIXTURES[..item].rfind('{').expect("fixture object start");
+        let object_end = FIXTURES[item..].find('}').expect("fixture object end") + item + 1;
+        let tail = &FIXTURES[object_start..object_end];
         let field = "\"expected_error\": \"";
         let start = tail.find(field).expect("negative fixture error category") + field.len();
         let value = &tail[start..];
@@ -1025,10 +1054,7 @@ mod tests {
         let object_type = ObjectType::NodeIdentity;
         let raw = fixture_hex("signature-domain-raw-three-bytes");
         let got = signature_input(&raw, object_type, 1).unwrap();
-        let bytes = FIXTURES
-            .find("\"id\": \"signature-domain-raw-three-bytes\"")
-            .unwrap();
-        let tail = &FIXTURES[bytes..];
+        let tail = &fixture_entry("signature-domain-raw-three-bytes");
         let value = tail.find("expected_hex").unwrap() + "expected_hex".len();
         let value = tail[value..]
             .trim_start()
@@ -1040,7 +1066,8 @@ mod tests {
         let expected = &value[..value.find('"').unwrap()];
         let expected: Vec<u8> = expected
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0.iter()
             .map(|p| {
                 let d = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
                 d(p[0]) * 16 + d(p[1])

@@ -1,0 +1,89 @@
+name: Refresh candidate management vectors
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-vectors-main
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Generate, verify, and commit candidate fixture
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout dispatch source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Record source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          printf 'SOURCE_SHA=%s\n' "$SOURCE_SHA" | tee source-revision.txt
+      - name: Generate candidate vectors
+        run: python tools/generate_management_vectors.py --write
+      - name: Verify candidate vectors and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/verify_vectors.py
+          python -m unittest discover -s tools/tests -v
+      - name: Upload generated fixture and source revision
+        uses: actions/upload-artifact@v4
+        with:
+          name: management-vectors-${{ github.run_id }}
+          path: |
+            docs/protocol/vectors/management-objects-candidate-v1.json
+            source-revision.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Commit fixture to main (safe retry, no force)
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fixture='docs/protocol/vectors/management-objects-candidate-v1.json'
+          generated="$RUNNER_TEMP/management-objects-candidate-v1.json"
+          cp "$fixture" "$generated"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git diff --quiet "$SOURCE_SHA" origin/main -- \
+              Cargo.toml ':(glob)**/Cargo.toml' \
+              tools/generate_management_vectors.py \
+              docs/protocol/management-objects-v1.md; then
+              echo 'Relevant manifests, generator, or schema changed after dispatch source; rerun this workflow on current main.' >&2
+              exit 1
+            fi
+
+            git checkout --detach origin/main
+            cp "$generated" "$fixture"
+            git add -- "$fixture"
+            if git diff --cached --quiet; then
+              echo 'Generated fixture already matches main; no commit needed.'
+              exit 0
+            fi
+            git commit -m 'Refresh candidate management vector fixture'
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Non-fast-forward push race on attempt $attempt; retrying after refetch." >&2
+          done
+          echo 'Could not push fixture after three non-force attempts; rerun workflow.' >&2
+          exit 1

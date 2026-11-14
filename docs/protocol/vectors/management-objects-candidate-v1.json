@@ -9,7 +9,7 @@
       "kind": "tbs",
       "raw_tbs_hex": "ab0001010102500000000000000000000000000000000003410104010582010206010701080209ac0050000000000000000000000000000000000102020103440a140102045000000000000000000000000000000000050106010741aa080109010a020b400a80",
       "valid": true,
-      "expected": {"object_type":"NodeIdentity","net_id_hex":"00000000000000000000000000000000","issuer_key_id_hex":"01","issuer_generation":1,"subject":["Node",2],"seq":1,"issued_at":1,"expires":2}
+      "expected": {"object_type":"NodeIdentity","net_id_hex":"00000000000000000000000000000000","issuer_key_id_hex":"01","issuer_generation":1,"subject":["Node",2],"seq":1,"issued_at":1,"expires":2,"codec_sample_only":true,"mldsa_key_crypto_valid":false}
     },
     {
       "id": "attachment-lease-minimal-valid",
