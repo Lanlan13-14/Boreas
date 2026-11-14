@@ -6,5 +6,8 @@ rust-version = "1.100"
 license = "GPL-3.0-only"
 description = "Bounded authoritative DNS wire parsing and response construction"
 
+[dependencies]
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+
 [lib]
 path = "src/lib.rs"
