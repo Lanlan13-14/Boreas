@@ -411,21 +411,21 @@ fn be16(p: &[u8], at: usize) -> Result<u16, PacketError> {
 
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
+        sum += u32::from(u16::from_be_bytes(*c));
     }
-    if let Some(&b) = chunks.remainder().first() {
+    if let Some(&b) = remainder.first() {
         sum += u32::from(b) << 8;
     }
     fold(sum)
 }
 fn checksum_add(mut sum: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
+        sum += u32::from(u16::from_be_bytes(*c));
     }
-    if let Some(&b) = chunks.remainder().first() {
+    if let Some(&b) = remainder.first() {
         sum += u32::from(b) << 8;
     }
     sum

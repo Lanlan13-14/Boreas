@@ -8,6 +8,24 @@ OPENSSL_BIN="${OPENSSL_PREFIX}/bin/openssl"
 OUT="${ARTIFACT_DIR:-$PWD/artifacts}"
 mkdir -p "$OUT"
 WORK="$(mktemp -d)"
+# install_sw doesn't install openssl.cnf. Use an explicit minimal config that activates only
+# OpenSSL's built-in default provider; no modules/providers from the host or PATH are trusted.
+cat > "$WORK/openssl.cnf" <<'EOF'
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+
+[default_sect]
+activate = 1
+EOF
+export OPENSSL_CONF="$WORK/openssl.cnf"
+[[ -s "$OPENSSL_CONF" ]] || { echo 'explicit OPENSSL_CONF was not created' >&2; exit 2; }
+cp "$OPENSSL_CONF" "$OUT/openssl-test-config.cnf"
+printf '[crypto-poc] OPENSSL_CONF=%s (explicit minimal default-provider config)\n' "$OPENSSL_CONF" | tee -a "$OUT/run.log"
 SERVER_PID=""
 SERVER_PORT=""
 SERVER_STDIN_FD=""

@@ -73,7 +73,7 @@
 - `tools/crypto-poc/run-openssl-mtls.sh` 与 `.github/workflows/crypto-poc.yml` 是**后端冒烟测试**，基于固定 OpenSSL `3.6.1` tag 和 release tarball SHA-256 `b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e`，仅应在 GitHub Actions 中构建/运行。workflow 对 `openssl` CLI 做 OpenSSL shared lib 依赖检查；**不声称完全静态 libc**。PoC 仅 Linux x86_64 runner，不等同 Linux aarch64。
 - 脚本生成 ML-DSA-65 root/server/client 证书，在仅 `X25519MLKEM768`、`mldsa65`、指定 TLS 1.3 AEAD 条件下，用相同 OpenSSL `s_server`/`s_client` 测试两套 AEAD 正向 mTLS 并请求 HTTP 状态响应；负测要求 classical-only group、无 client cert、AEAD 不交叠、未来时间下短期 client cert 过期均出现明确拒绝。负测非零 exit 本身不算通过：要求日志包含预期 TLS/证书拒绝原因，排除 timeout 和明显 CLI/文件设置错误。
 - FIFO 保持 server stdin 不发生 EOF；`ss` readiness 不建立 probe 连接；客户端 `-ign_eof` 保持接收 server 的 HTTP 记录，server 有 `naccept=1` 并受 timeout 约束。artifact 只允许证书公有信息文本、协议/错误日志、版本/依赖信息及上游源码压缩包，**不得上传任何测试私钥/私密 CSR/包含私钥的工作目录**。
-- 该 smoke test 是同一 OpenSSL 实现的 `s_server` 与 `s_client` 互通，**不是第二个独立 TLS 实现互操作，更没有 WebSocket、Rust FFI 或 Boreas 内层 transport**。Actions 尚未跑出 evidence，所以这里只称“已准备触发”，状态为“待 CI”；结果由 lead 推送触发后复核 artifact/log 再记。
+- 该 smoke test 是同一 OpenSSL 实现的 `s_server` 与 `s_client` 互通，**不是第二个独立 TLS 实现互操作，更没有 WebSocket、Rust FFI 或 Boreas 内层 transport**。首次 GitHub Actions（lead提供的日志 `.local/crypto1.log`，run 2249）已成功完成下载 hash 校验及 OpenSSL 静态库/CLI构建，但脚本因 `install_sw` 没安装 `${OPENSSL_PREFIX}/ssl/openssl.cnf`，在生成证书阶段失败。当前脚本已在私有临时目录显式生成最小 OpenSSL 配置（仅激活内建 default provider），设置 `OPENSSL_CONF`，并复制不含密钥的该配置到证据目录。该修正尚未由下一次 Actions 验证；状态为“待重跑 CI”，不是 PoC 通过。
 
 ### 6. 证据包与判定
 

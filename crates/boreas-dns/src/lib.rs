@@ -620,7 +620,7 @@ mod tests {
         );
         q = base_query(&[0x03, b'a', b'b'], 1);
         assert!(fixture().respond_udp(CLIENT, &q).is_err());
-        let long = vec![63u8; 1];
+        let long = [63u8; 1];
         let mut labels = Vec::new();
         for _ in 0..4 {
             labels.push(&long[..]);

@@ -295,7 +295,7 @@ impl UpgradeStore {
         if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_JOURNAL_BYTES {
             return Err(UpgradeError::CorruptJournal);
         }
-        let mut f = File::open(&p)?;
+        let f = File::open(&p)?;
         let mut s = String::new();
         f.take(MAX_JOURNAL_BYTES + 1).read_to_string(&mut s)?;
         if s.len() as u64 > MAX_JOURNAL_BYTES {
@@ -814,9 +814,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardlinked_artifact_file_rejected() {
-        use std::os::unix::fs::hard_link;
         let (_t, s, a) = setup();
-        hard_link(
+        fs::hard_link(
             a.path().join("candidate/boreas"),
             a.path().join("candidate/alias"),
         )
