@@ -297,15 +297,13 @@ pub fn validate_frame_policy(frame: &Frame, ctx: &mut SessionContext) -> Result<
                 ControlType::Enrollment
                     if ctx.enrollment_service
                         && ctx.peer_role == PeerRole::EnrollmentService
-                        && !ctx.accepted =>
-                {}
+                        && !ctx.accepted => {}
                 ControlType::DirectoryPage
                 | ControlType::Grant
                 | ControlType::Revoke
                 | ControlType::Probe
                 | ControlType::Drain
-                    if ctx.accepted =>
-                {}
+                    if ctx.accepted => {}
                 ControlType::Lease if ctx.accepted && ctx.identity_registered => (),
                 ControlType::Lsa if ctx.accepted && ctx.peer_role == PeerRole::Core => (),
                 ControlType::CircuitOpen
