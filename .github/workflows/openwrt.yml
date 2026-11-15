@@ -91,12 +91,18 @@ jobs:
           mkdir -p "$MUSL_UAPI"
           ln -s /usr/include/linux "$MUSL_UAPI/linux"
           ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
+          extra_cflags=()
           case '${{ matrix.arch }}' in
             x86_64) ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
-            aarch64) ln -s /usr/include/aarch64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
+            aarch64)
+              ln -s /usr/include/aarch64-linux-gnu/asm "$MUSL_UAPI/asm"
+              # The distro GCC outline-atomics helper depends on glibc's
+              # __getauxval. Emit native baseline atomics for musl instead.
+              extra_cflags+=(-mno-outline-atomics)
+              ;;
           esac
           CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-shared no-tests no-async no-legacy \
-            -isystem "$MUSL_UAPI" \
+            "${extra_cflags[@]}" -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
           make -j2
           make install_sw
@@ -146,7 +152,7 @@ jobs:
           install -m 0755 "dist/boreas-linux-${{ matrix.arch }}-musl-pq768" \
             openwrt-rootfs/usr/local/bin/boreas
           ln -s boreas openwrt-rootfs/usr/local/bin/boreas-easy
-          chroot openwrt-rootfs /usr/local/bin/boreas doctor | tee dist/openwrt-doctor.json
+          sudo chroot openwrt-rootfs /usr/local/bin/boreas doctor | tee dist/openwrt-doctor.json
           grep -F '"daemon":true' dist/openwrt-doctor.json
           grep -F '"tls_backend":true' dist/openwrt-doctor.json
           test "$(readlink openwrt-rootfs/usr/local/bin/boreas-easy)" = boreas

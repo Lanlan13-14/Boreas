@@ -55,6 +55,9 @@ jobs:
           test -n '${{ github.event.workflow_run.head_sha }}'
           echo 'source_sha=${{ github.event.workflow_run.head_sha }}' >> "$GITHUB_ENV"
           echo 'source_run=${{ github.event.workflow_run.id }}' >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/download-artifact@v8
         with:
           name: boreas-hop-node-linux-x86_64-${{ github.event.workflow_run.id }}
@@ -66,10 +69,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
-          test -x artifact/boreas-linux-x86_64-musl-pq768
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          test -s artifact/boreas-linux-x86_64-musl-pq768
+          (cd artifact && sha256sum --check --strict SHA256SUMS)
+          chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'

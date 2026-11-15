@@ -1736,12 +1736,19 @@ uplinks = ["wss://hub-us-c.example.net"]
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
 
-        let dir = std::env::temp_dir().join(format!(
-            "boreas-console-live-{}-{}",
+        // macOS TMPDIR can already exceed sockaddr_un.sun_path once a test
+        // name is appended. Keep this Unix-socket fixture short on every Unix.
+        let dir = std::path::Path::new("/tmp").join(format!(
+            "bc-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir(&dir).expect("unique temp dir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("private socket directory");
+        }
         let socket_path = dir.join("control.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");

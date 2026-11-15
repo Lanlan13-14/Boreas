@@ -1362,10 +1362,6 @@ mod linux_daemon {
     #[cfg(test)]
     mod watchdog_tests {
         use super::*;
-        // Trait methods used below (`read`, `as_raw_fd`); imported anonymously so
-        // no name can collide with the module's own imports.
-        use std::io::Read as _;
-        use std::os::unix::io::AsRawFd as _;
 
         fn counters() -> Arc<LiveCounters> {
             Arc::new(LiveCounters {
