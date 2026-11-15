@@ -212,7 +212,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         &format!("wss.boreas.test:{port}"),
     );
 
-    let mut srv = Command::new(bin())
+    let srv = Command::new(bin())
         .args([
             "daemon",
             "serve",
@@ -239,7 +239,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     }
     assert!(core_sock.exists(), "core control.sock did not start");
 
-    let mut cli = Command::new(bin())
+    let cli = Command::new(bin())
         .args([
             "daemon",
             "connect",

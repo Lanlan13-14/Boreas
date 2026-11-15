@@ -984,8 +984,8 @@ mod linux_daemon {
     ) -> Result<(), String> {
         let mut path = PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
             .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
-        let local_vip = path.local_endpoint().vip;
-        let peer_vip = path.peer_endpoint().vip;
+        let local_vip = path.local_endpoint().vip();
+        let peer_vip = path.peer_endpoint().vip();
 
         let started = Instant::now();
         let mut last_status_check = Instant::now();
