@@ -415,12 +415,7 @@ impl ManagementTrust {
         if is_lease {
             self.verify_lease(&object, &issuer, &signed, &message)?;
         } else {
-            verify_signer_signatures(
-                &issuer,
-                &message,
-                &signed.signers[0],
-                SignerRole::Primary,
-            )?;
+            verify_signer_signatures(&issuer, &message, &signed.signers[0], SignerRole::Primary)?;
         }
         let object_id = sha256(&raw_tbs)?;
         let duplicate = match self.record_replay(
@@ -880,9 +875,7 @@ fn verify_node_signatures(
         MldsaParameterSet::Mldsa65 => MLDSA65_SIGNATURE_LEN,
         MldsaParameterSet::Mldsa87 => MLDSA87_SIGNATURE_LEN,
     };
-    if signer.mldsa.len() != expected_mldsa_len
-        || node.identity_pub_ed25519 == [0; 32]
-    {
+    if signer.mldsa.len() != expected_mldsa_len || node.identity_pub_ed25519 == [0; 32] {
         return Err(Error::InvalidMlDsaSignature);
     }
     let ed_key = PKey::public_key_from_raw_bytes(&node.identity_pub_ed25519, Id::ED25519)
@@ -1144,13 +1137,11 @@ mod tests {
             MANAGEMENT_SCHEMA_VERSION,
         )
         .unwrap();
-        let node_ed: [u8; ED25519_SIGNATURE_LEN] = sign_bytes(node_ed25519, &message)
-            .try_into()
-            .unwrap();
+        let node_ed: [u8; ED25519_SIGNATURE_LEN] =
+            sign_bytes(node_ed25519, &message).try_into().unwrap();
         let node_ml = sign_bytes(node_mldsa, &message);
-        let core_ed: [u8; ED25519_SIGNATURE_LEN] = sign_bytes(&core.ed25519, &message)
-            .try_into()
-            .unwrap();
+        let core_ed: [u8; ED25519_SIGNATURE_LEN] =
+            sign_bytes(&core.ed25519, &message).try_into().unwrap();
         let core_ml = sign_bytes(&core.mldsa, &message);
         SignedObject {
             object_type: object.body.object_type(),
@@ -1602,9 +1593,11 @@ mod tests {
         );
         let raw_identity = objects::encode_tbs(&identity).unwrap();
         let identity_signatures = identity_authority.sign(&identity);
-        assert!(trust
-            .verify_test(&raw_identity, &identity_signatures, 200)
-            .is_ok());
+        assert!(
+            trust
+                .verify_test(&raw_identity, &identity_signatures, 200)
+                .is_ok()
+        );
 
         let lease = ManagementObject {
             net_id: NET,

@@ -2629,18 +2629,10 @@ mod tests {
             .expect("control vectors array")
     }
 
-    fn vector_by_id<'a>(
-        document: &'a serde_json::Value,
-        id: &str,
-    ) -> &'a serde_json::Value {
+    fn vector_by_id<'a>(document: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
         let matches: Vec<&serde_json::Value> = vector_array(document)
             .iter()
-            .filter(|candidate| {
-                candidate
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    == Some(id)
-            })
+            .filter(|candidate| candidate.get("id").and_then(|value| value.as_str()) == Some(id))
             .collect();
         assert_eq!(matches.len(), 1, "control vector id {id} must be unique");
         matches[0]
@@ -2720,16 +2712,14 @@ mod tests {
         match kind {
             "control" => {
                 if message != "ControlBody" {
-                    let subtype = data.first().copied().unwrap_or_else(|| {
-                        panic!("control vector {message} has an empty body")
-                    });
+                    let subtype = data
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| panic!("control vector {message} has an empty body"));
                     let expected = message_for_subtype(subtype).unwrap_or_else(|| {
                         panic!("control vector {message} uses unregistered subtype {subtype}")
                     });
-                    assert_eq!(
-                        message, expected,
-                        "control vector message/subtype mismatch"
-                    );
+                    assert_eq!(message, expected, "control vector message/subtype mismatch");
                 }
             }
             "relay" => assert_eq!(message, "RelayFragment", "relay vector message"),
@@ -2790,11 +2780,9 @@ mod tests {
     fn encode_vector(message: &str, data: &[u8]) -> Result<Vec<u8>, MessageError> {
         match message {
             "SessionHello" => Ok(SessionHello::decode(data)?.encode()?.to_vec()),
-            "SessionAccept" => {
-                Ok(SessionAccept::decode_bound(data, sample_accept().params)?
-                    .encode()?
-                    .to_vec())
-            }
+            "SessionAccept" => Ok(SessionAccept::decode_bound(data, sample_accept().params)?
+                .encode()?
+                .to_vec()),
             "Enrollment" => Ok(Enrollment::decode(data)?.encode()?),
             "DirectoryPage" => Ok(DirectoryPage::decode(data)?.encode()?),
             "SignedObject" => Ok(SignedObject::decode(data)?.encode()?),
@@ -2838,8 +2826,9 @@ mod tests {
             if valid {
                 decode_vector(message, &data)
                     .unwrap_or_else(|error| panic!("{id}: valid vector rejected as {error:?}"));
-                let encoded = encode_vector(message, &data)
-                    .unwrap_or_else(|error| panic!("{id}: valid vector re-encode failed as {error:?}"));
+                let encoded = encode_vector(message, &data).unwrap_or_else(|error| {
+                    panic!("{id}: valid vector re-encode failed as {error:?}")
+                });
                 assert_eq!(encoded, data, "{id}: decode/encode is not byte-exact");
             } else {
                 let error = match decode_vector(message, &data) {
@@ -2895,9 +2884,8 @@ mod tests {
     #[test]
     fn minimal_vectors_pin_exact_sample_bytes() {
         let document = vector_document();
-        let expected = |id: &str| {
-            decode_hex(string_field(vector_by_id(&document, id), "expected_hex"))
-        };
+        let expected =
+            |id: &str| decode_hex(string_field(vector_by_id(&document, id), "expected_hex"));
         assert_eq!(
             sample_hello().encode().unwrap().to_vec(),
             expected("session-hello-minimal")

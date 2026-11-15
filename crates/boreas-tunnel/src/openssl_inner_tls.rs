@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use boreas_crypto::{NodeRole, Policy, PolicyError, Suite};
 use boreas_crypto::backend::{BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector};
+use boreas_crypto::{NodeRole, Policy, PolicyError, Suite};
 use boreas_pki::management::VerifiedObject;
 use boreas_proto::objects::{MldsaParameterSet, NodeRole as ObjectRole, ObjectBody};
 use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};

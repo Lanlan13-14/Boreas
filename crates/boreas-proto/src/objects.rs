@@ -956,31 +956,23 @@ mod tests {
             .map(|values| values.as_slice())
             .expect("management vectors array")
     }
-    fn fixture_by_id<'a>(
-        document: &'a serde_json::Value,
-        id: &str,
-    ) -> &'a serde_json::Value {
+    fn fixture_by_id<'a>(document: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
         let matches: Vec<&serde_json::Value> = fixture_array(document)
             .iter()
-            .filter(|candidate| {
-                candidate
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    == Some(id)
-            })
+            .filter(|candidate| candidate.get("id").and_then(|value| value.as_str()) == Some(id))
             .collect();
-        assert_eq!(matches.len(), 1, "management fixture id {id} must be unique");
+        assert_eq!(
+            matches.len(),
+            1,
+            "management fixture id {id} must be unique"
+        );
         matches[0]
     }
     fn fixture_field(id: &str, field: &str) -> String {
         let document = fixture_document();
         fixture_field_in(&document, id, field)
     }
-    fn fixture_field_in(
-        document: &serde_json::Value,
-        id: &str,
-        field: &str,
-    ) -> String {
+    fn fixture_field_in(document: &serde_json::Value, id: &str, field: &str) -> String {
         fixture_by_id(document, id)
             .get(field)
             .and_then(|value| value.as_str())
@@ -1263,17 +1255,26 @@ mod tests {
                 .get("id")
                 .and_then(|value| value.as_str())
                 .unwrap_or_else(|| panic!("management fixture[{index}] has no string id"));
-            assert!(!id.is_empty(), "management fixture[{index}] has an empty id");
+            assert!(
+                !id.is_empty(),
+                "management fixture[{index}] has an empty id"
+            );
             assert!(
                 ids.insert(id.to_owned()),
                 "duplicate management fixture id {id}"
             );
             assert!(
-                vector.get("kind").and_then(|value| value.as_str()).is_some(),
+                vector
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .is_some(),
                 "management fixture {id} has no string kind"
             );
             assert!(
-                vector.get("valid").and_then(|value| value.as_bool()).is_some(),
+                vector
+                    .get("valid")
+                    .and_then(|value| value.as_bool())
+                    .is_some(),
                 "management fixture {id} has no boolean valid"
             );
         }

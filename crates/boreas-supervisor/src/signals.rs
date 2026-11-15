@@ -49,7 +49,8 @@ pub fn take() -> Option<i32> {
 
 /// Forward `signal` to `pid`. Returns a diagnostic on failure; never panics.
 #[cfg(unix)]
-pub fn forward(pid: u32, signal: i32) -> Option<String> {    // SAFETY: kill(2) on a pid we spawned; no memory is touched.
+pub fn forward(pid: u32, signal: i32) -> Option<String> {
+    // SAFETY: kill(2) on a pid we spawned; no memory is touched.
     let rc = unsafe { libc::kill(pid as libc::pid_t, signal as libc::c_int) };
     if rc == 0 {
         None
