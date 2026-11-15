@@ -138,6 +138,21 @@ impl LinkServer {
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
         let (tcp, _peer_address) = listener.accept()?;
+        self.accept_tls_stream(tcp, outer, policy, io_timeout, admission)
+    }
+
+    /// Complete the authenticated WSS server path for a TCP stream already
+    /// accepted by the caller. This seam lets listeners apply an absolute
+    /// accept deadline without changing listener-wide blocking mode. Admission
+    /// is still reserved immediately after TCP accept and before outer TLS work.
+    pub fn accept_tls_stream(
+        &self,
+        tcp: TcpStream,
+        outer: &dyn crate::tls::OuterTlsAcceptor,
+        policy: SessionPolicy,
+        io_timeout: Duration,
+        admission: &Admission,
+    ) -> Result<AcceptedSession, TunnelError> {
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, io_timeout)?;
@@ -241,7 +256,7 @@ mod tests {
             identity_registered: true,
             allow_pq1024: false,
             allow_hop_only: false,
-            allowed_peer_roles: vec![NodeRole::Core],
+            allowed_peer_roles: vec![peer.role],
         }
     }
 
