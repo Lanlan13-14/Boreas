@@ -1811,8 +1811,15 @@ mod unix_tests {
             match builder.create(&root) {
                 Ok(()) => {
                     let metadata = fs::symlink_metadata(&root).expect("fixture metadata");
-                    assert!(metadata.file_type().is_dir(), "fixture root must be a directory");
-                    assert_eq!(metadata.uid(), uid, "fixture root must be owned by this user");
+                    assert!(
+                        metadata.file_type().is_dir(),
+                        "fixture root must be a directory"
+                    );
+                    assert_eq!(
+                        metadata.uid(),
+                        uid,
+                        "fixture root must be owned by this user"
+                    );
                     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                         .expect("restrict fixture root permissions");
                     return root.canonicalize().expect("canonical fixture root");

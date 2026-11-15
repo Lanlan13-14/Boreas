@@ -830,15 +830,24 @@ mod tests {
             root_ed.public_key_to_der().unwrap(),
             boreas_proto::objects::MldsaParameterSet::Mldsa65,
             root_pq.public_key_to_der().unwrap(),
-        ).unwrap();
-        assert_ne!(pin.fingerprint().unwrap(), other_network.fingerprint().unwrap());
+        )
+        .unwrap();
+        assert_ne!(
+            pin.fingerprint().unwrap(),
+            other_network.fingerprint().unwrap()
+        );
         let (other_root_ed, other_root_pq) = pair(12);
         let other_keys = NetworkRootPin::provisioned(
-            [3; 16], other_root_ed.public_key_to_der().unwrap(),
+            [3; 16],
+            other_root_ed.public_key_to_der().unwrap(),
             boreas_proto::objects::MldsaParameterSet::Mldsa65,
             other_root_pq.public_key_to_der().unwrap(),
-        ).unwrap();
-        assert_ne!(pin.fingerprint().unwrap(), other_keys.fingerprint().unwrap());
+        )
+        .unwrap();
+        assert_ne!(
+            pin.fingerprint().unwrap(),
+            other_keys.fingerprint().unwrap()
+        );
         assert_eq!(
             RootAuthorizationCandidate::decode_candidate(&raw).unwrap(),
             c
