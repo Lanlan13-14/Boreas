@@ -9,6 +9,10 @@ pub mod enrollment;
 /// It requires OpenSSL 3.5+ for the ML-DSA provider and is therefore feature-gated.
 #[cfg(feature = "openssl-backend")]
 pub mod management;
+/// Offline authority separation, `roots.cbor` verification, ML-DSA-65 X.509 issuance,
+/// and signed `StatusSnapshot` lifecycle (§2.2 / §3.1 / §3.4).
+#[cfg(feature = "openssl-backend")]
+pub mod provisioning;
 pub mod revoke_cleanup;
 /// Bounded NetworkRoot authorization candidate validation; requires the real crypto backend.
 #[cfg(feature = "openssl-backend")]

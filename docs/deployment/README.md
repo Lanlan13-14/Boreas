@@ -231,3 +231,77 @@ schema 迁移不代表网络状态迁移或在线 reload。安全模式、suite�
 - **若运维/回滚演练已通过**：小范围 canary，检查业务完整性、E2E 无降级抓包、权限/吊销/时间失效拒绝、真实 DNS/路由和资源预算；放量后持续观测，失败按签名、兼容与安全策略回退，绝不退回已撤销或低于最低安全版本的二进制/状态。
 
 目前上述生产条件未满足，必须停在开发使用边界；本教程不提供 `systemctl enable`、服务单元或虚构 `boreas daemon` 安装命令。
+
+## 8. `v0.1.0-pre.1` 预发布可运行路径（`openssl-inner-tls` Linux 双节点点对点 E2E + TUN）
+
+> **边界声明**：以下路径仅适用于启用了 `--features openssl-inner-tls`（静态链接 OpenSSL 3.6.1 `X25519MLKEM768` + `ML-DSA-65`）的 Linux `boreas` 预发布二进制（如 `v0.1.0-pre.1` 附带的 `boreas-linux-x86_64-musl-pq768`）。五平台未签名离线开发包（`platforms.yml`）仍不含 TLS 后端，对 `pki` / `daemon` 会 fail-closed 返回退出码 `2`。此预发布实现点对点双节点（1 Core ↔ 1 Edge）真实运行，**不代表**多跳网格收敛、DNS、30 分钟资源门禁、双 TLS 栈互操作（`G-CRYPTO`）或外部安全审计（`G-EXTERNAL-REVIEW`）通过；`docs/engineering/gates.json` 全部生产门禁仍保持 `open`。
+
+### 8.1 离线生成四权分立 CA 与双节点预配包（无需在线 CA，禁止 TOFU）
+
+在一台离线管理机上生成 `NetworkRoot`、分离的 `IdentityAuthority` 与 `StatusSigner`：
+
+```sh
+BOREAS='/path/to/boreas-linux-x86_64-musl-pq768'
+umask 077
+
+# 1. 初始化离线 CA（生成 roots.cbor 与各分离角色的密钥，绝不拷给业务节点）
+"$BOREAS" pki init-ca --ca-dir ./offline-ca --validity-days 365
+
+# 2. 签发 Core 节点材料包（永久 VIP 10.20.1.1，node_id = 1）
+"$BOREAS" pki issue-node \
+  --ca-dir ./offline-ca \
+  --out-dir ./bundle-core-1 \
+  --role core --home-core 1 --vip-octet 1 \
+  --outer-san wss.example.net
+
+# 3. 签发 Edge 节点材料包（永久 VIP 10.20.1.2，node_id = 2）
+"$BOREAS" pki issue-node \
+  --ca-dir ./offline-ca \
+  --out-dir ./bundle-edge-2 \
+  --role edge --home-core 1 --vip-octet 2
+
+# 4. 互相挂载公开的对端 NodeIdentity（peer.signed），并在离线机上验签整包
+cp ./bundle-core-1/local.signed ./bundle-edge-2/peer.signed
+cp ./bundle-edge-2/local.signed ./bundle-core-1/peer.signed
+"$BOREAS" pki verify-bundle --material-dir ./bundle-core-1 --require-peer
+"$BOREAS" pki verify-bundle --material-dir ./bundle-edge-2 --require-peer
+```
+
+将 `./bundle-core-1` 安全拷贝到 Core 机器（如 `/etc/boreas/material`），`./bundle-edge-2` 拷贝到 Edge 机器，**严禁拷贝 `./offline-ca`**。
+
+### 8.2 启动 Core 与 Edge 守护进程并配置 Linux TUN VIP
+
+Core 机器（需 `CAP_NET_ADMIN` / `/dev/net/tun`）：
+
+```sh
+"$BOREAS" daemon serve \
+  --config /etc/boreas/core.toml \
+  --material-dir /etc/boreas/material \
+  --listen 0.0.0.0:8443 \
+  --tun-name btun0 --mtu 1360 &
+
+ip addr add 10.20.1.1/32 dev btun0
+ip link set btun0 up
+ip route add 10.20.1.2/32 dev btun0
+```
+
+Edge 机器（需 `CAP_NET_ADMIN` / `/dev/net/tun`）：
+
+```sh
+"$BOREAS" daemon connect \
+  --config /etc/boreas/edge.toml \
+  --material-dir /etc/boreas/material \
+  --connect <CORE_PUBLIC_OR_CDN_IP>:8443 \
+  --tls-name wss.example.net \
+  --tun-name btun0 --mtu 1360 &
+
+ip addr add 10.20.1.2/32 dev btun0
+ip link set btun0 up
+ip route add 10.20.1.1/32 dev btun0
+```
+
+### 8.3 观测实时状态与刷新 `StatusSnapshot`（§3.4 过期停业务保护）
+
+- 查看实时连接与包计数：`"$BOREAS" ctl status --config /etc/boreas/edge.toml` 或 `"$BOREAS" status --socket /var/lib/boreas/control.sock`。
+- 周期性刷新状态快照（`ttl-seconds` 最大 `86400`，超时未更新时守护进程将按 §3.4 自动断开业务电路 fail-closed）：
+  `"$BOREAS" pki sign-status --ca-dir ./offline-ca --out ./status.signed --sequence <递增序号> --ttl-seconds 43200`

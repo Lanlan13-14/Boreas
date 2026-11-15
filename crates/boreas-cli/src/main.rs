@@ -23,8 +23,10 @@
 //! only: no raw mode, no DSR probe and no control socket (G-UI is not met).
 
 mod config;
+mod daemon;
 mod i18n;
 mod node;
+mod pki_cmd;
 mod render;
 mod tui;
 
@@ -159,6 +161,18 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
         Some("node") => node::run(&args[1..]),
+        Some("pki") => match pki_cmd::run_pki_command(&args[1..]) {
+            Ok(()) => (0, String::new(), String::new()),
+            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+        },
+        Some("daemon") => match daemon::run_daemon_command(&args[1..]) {
+            Ok(()) => (0, String::new(), String::new()),
+            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+        },
+        Some("ctl") => match daemon::run_ctl_command(&args[1..]) {
+            Ok(()) => (0, String::new(), String::new()),
+            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+        },
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => {
             (0, help_text(), String::new())
         }
@@ -180,9 +194,25 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
 /// says so. Non-TTY output (or an explicit `--json`) is JSON (§10.4).
 fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
     let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
+    let mut socket_path: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--socket" => {
+                let Some(val) = args.get(i + 1) else {
+                    return (
+                        2,
+                        String::new(),
+                        "error: --socket requires a path; run `boreas help`".into(),
+                    );
+                };
+                socket_path = Some(std::path::PathBuf::from(val));
+                i += 2;
+            }
             other => {
                 return (
                     2,
@@ -192,7 +222,15 @@ fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Str
             }
         }
     }
-    let snapshot = StatusSnapshot::offline(env!("CARGO_PKG_VERSION"));
+    let snapshot = match socket_path {
+        Some(sock) => match daemon::query_control_socket(&sock) {
+            Ok((live, _)) => live,
+            Err(err) => {
+                return (2, String::new(), format!("error: {err}"));
+            }
+        },
+        None => StatusSnapshot::offline(env!("CARGO_PKG_VERSION")),
+    };
     if json || !stdout_tty {
         (0, snapshot.to_json(lang), String::new())
     } else {
@@ -353,7 +391,12 @@ fn help_text() -> String {
      \x20                          records the phrase only; never applies it\n\
      \x20 boreas node serve <config> <listen> <material-dir>\n\
      \x20 boreas node connect <config> <host:port> <tls-name> <material-dir>\n\
-     \x20                          hop process; TLS backend is feature-gated\n\n\
+     \x20                          hop process; TLS backend is feature-gated\n\
+     \x20 boreas pki init-ca|issue-node|sign-status|verify-bundle ...\n\
+     \x20                          offline ML-DSA-65 PKI management (openssl-inner-tls)\n\
+     \x20 boreas daemon serve|connect --config <path> --material-dir <dir> ...\n\
+     \x20                          real pq768 E2E + Linux TUN daemon (openssl-inner-tls)\n\
+     \x20 boreas ctl status [--socket <path>] [--config <path>]\n\n\
      config-check parses one TOML file (`version = 1` legacy or `version = 2`),\n\
      validates static policy and prints redacted JSON. config-migrate prints the\n\
      canonical version = 2 document for a legacy file and never rewrites it.\n\
@@ -377,9 +420,18 @@ fn help_text() -> String {
 }
 
 fn doctor_json() -> String {
-    format!(
-        "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"control_socket\":false,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"console_menu\":true,\"runtime_capabilities\":\"not_integrated\",\"phase0_complete\":false}}"
-    )
+    #[cfg(feature = "openssl-inner-tls")]
+    {
+        format!(
+            "{{\"status\":\"pre_release_pq768_e2e\",\"phase\":\"Phase 0-5 partial (pre.1)\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":true,\"tls_backend\":true,\"networking\":true,\"control_socket\":true,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"console_menu\":true,\"runtime_capabilities\":\"openssl_pq768_e2e_point_to_point\",\"phase0_complete\":false}}"
+        )
+    }
+    #[cfg(not(feature = "openssl-inner-tls"))]
+    {
+        format!(
+            "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"control_socket\":false,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"console_menu\":true,\"runtime_capabilities\":\"not_integrated\",\"phase0_complete\":false}}"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -476,11 +528,20 @@ uplinks = ["wss://hub-us-c.example.net"]
         let (code, stdout, stderr) = run(&args(&["doctor"]), Lang::En, false);
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
-        assert!(stdout.contains("\"daemon\":false"));
-        assert!(stdout.contains("\"tls_backend\":false"));
-        assert!(stdout.contains("\"control_socket\":false"));
-        assert!(stdout.contains("\"runtime_capabilities\":\"not_integrated\""));
         assert!(stdout.contains("\"phase0_complete\":false"));
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        {
+            assert!(stdout.contains("\"daemon\":false"));
+            assert!(stdout.contains("\"tls_backend\":false"));
+            assert!(stdout.contains("\"control_socket\":false"));
+            assert!(stdout.contains("\"runtime_capabilities\":\"not_integrated\""));
+        }
+        #[cfg(feature = "openssl-inner-tls")]
+        {
+            assert!(stdout.contains("\"daemon\":true"));
+            assert!(stdout.contains("\"tls_backend\":true"));
+            assert!(stdout.contains("\"control_socket\":true"));
+        }
     }
 
     #[test]
@@ -491,10 +552,22 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn daemon_and_unknown_commands_fail_without_starting() {
-        for command in ["daemon", "made-up"] {
-            let (code, stdout, stderr) = run(&args(&[command]), Lang::En, false);
+        let (code, stdout, stderr) = run(&args(&["made-up"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("no daemon was started"));
+
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        {
+            let (code, stdout, stderr) = run(&args(&["daemon"]), Lang::En, false);
             assert_eq!(code, 2);
             assert!(stdout.is_empty());
+            assert!(stderr.contains("no daemon was started"));
+        }
+        #[cfg(feature = "openssl-inner-tls")]
+        {
+            let (code, _, stderr) = run(&args(&["daemon", "bogus"]), Lang::En, false);
+            assert_eq!(code, 2);
             assert!(stderr.contains("no daemon was started"));
         }
     }
@@ -906,7 +979,7 @@ uplinks = ["wss://hub-us-c.example.net"]
     fn easy_still_accepts_explicit_commands() {
         let (code, stdout, _) = dispatch("boreas-easy", &args(&["doctor"]), probe_en, false);
         assert_eq!(code, 0);
-        assert!(stdout.contains("\"daemon\":false"));
+        assert!(stdout.contains("\"phase0_complete\":false"));
         let (code, _, _) = dispatch("boreas-easy", &args(&["bogus"]), probe_en, false);
         assert_eq!(code, 2);
     }

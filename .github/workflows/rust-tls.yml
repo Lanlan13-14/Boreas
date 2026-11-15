@@ -10,8 +10,10 @@ on:
       - 'crates/boreas-pki/**'
       - 'crates/boreas-proto/**'
       - 'crates/boreas-supervisor/**'
+      - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'tools/release/netns_daemon_smoke.sh'
       - '.github/workflows/rust-tls.yml'
   pull_request:
     paths:
@@ -21,8 +23,10 @@ on:
       - 'crates/boreas-pki/**'
       - 'crates/boreas-proto/**'
       - 'crates/boreas-supervisor/**'
+      - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'tools/release/netns_daemon_smoke.sh'
       - '.github/workflows/rust-tls.yml'
 
 permissions:
@@ -49,12 +53,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Install native build tools
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential perl curl ca-certificates pkg-config binutils
+            build-essential perl curl ca-certificates pkg-config binutils \
+            musl-tools iproute2 iputils-ping
       - name: Build pinned static OpenSSL
         timeout-minutes: 35
         shell: bash
@@ -218,7 +223,7 @@ jobs:
           set -o pipefail
           cargo test --locked -p boreas-supervisor --features openssl-backend \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
-      - name: CLI hop-node process tests with backend feature
+      - name: CLI hop-node & daemon process tests with backend feature
         if: always()
         timeout-minutes: 15
         shell: bash
@@ -227,29 +232,57 @@ jobs:
           OPENSSL_STATIC: '1'
         run: |
           set -o pipefail
+          cargo clippy --locked -p boreas-pki -p boreas-tunnel -p boreas-cli \
+            --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
-      - name: Build Linux hop-node development binary
+      - name: Build Linux pq768 E2E daemon binary (glibc + static musl) & run real netns ping
         if: success()
-        timeout-minutes: 15
+        timeout-minutes: 25
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
           OPENSSL_STATIC: '1'
         run: |
           set -euo pipefail
           cargo build --locked --release -p boreas-cli --features openssl-inner-tls
+          sudo modprobe tun || true
+          sudo -E bash tools/release/netns_daemon_smoke.sh target/release/boreas \
+            2>&1 | tee rust-tls-netns-e2e.log
+
           mkdir -p hop-node-linux
           cp target/release/boreas hop-node-linux/boreas
+
+          # Also build a zero-glibc-dependency static x86_64-unknown-linux-musl binary
+          # linked against musl-compiled OpenSSL 3.6.1 for portable Linux pre-releases.
+          rustup target add x86_64-unknown-linux-musl
+          OPENSSL_MUSL_PREFIX="${GITHUB_WORKSPACE}/.rust-tls-openssl-musl"
+          mkdir -p openssl-musl-src
+          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-musl-src
+          pushd openssl-musl-src
+          CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests no-async \
+            --prefix="${OPENSSL_MUSL_PREFIX}" --openssldir="${OPENSSL_MUSL_PREFIX}/ssl"
+          make -j2
+          make install_sw
+          popd
+          OPENSSL_DIR="${OPENSSL_MUSL_PREFIX}" OPENSSL_STATIC=1 \
+            cargo build --locked --release --target x86_64-unknown-linux-musl \
+              -p boreas-cli --features openssl-inner-tls
+          cp target/x86_64-unknown-linux-musl/release/boreas hop-node-linux/boreas-linux-x86_64-musl-pq768
+          readelf -l hop-node-linux/boreas-linux-x86_64-musl-pq768 | grep -v 'Requesting program interpreter'
+          sudo -E bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            2>&1 | tee -a rust-tls-netns-e2e.log
+
           printf '%s\n' \
-            'BOREAS HOP-NODE DEVELOPMENT BINARY - NOT A PRODUCTION RELEASE' \
+            'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
             'Source commit: '"$GITHUB_SHA" \
-            'Feature: openssl-inner-tls' \
-            'This binary links the reviewed OpenSSL 3.6.1 pq768 backend.' \
-            'It is glibc/Debian development evidence, not a musl static archive.' \
-            'doctor still reports no production daemon. node serve/connect run one hop.' \
-            'Not G-CRYPTO, G-DATA, G-TUN, or production_approved.' \
+            'Feature: openssl-inner-tls (OpenSSL 3.6.1 X25519MLKEM768 + ML-DSA-65)' \
+            'Included binaries:' \
+            '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
+            '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
+            'Verified end-to-end in CI: offline PKI -> mounted roots.cbor -> WSS + pq768 hop + pq768 E2E + real Linux netns /dev/net/tun ICMP ping (0% loss).' \
+            'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
             > hop-node-linux/README-DEVELOPMENT.txt
-          sha256sum hop-node-linux/boreas > hop-node-linux/SHA256SUMS
+          (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
       - name: Upload hop-node development binary
         if: success()
         uses: actions/upload-artifact@v4
@@ -272,5 +305,6 @@ jobs:
             rust-tls-tunnel-tests.log
             rust-tls-supervisor-tests.log
             rust-tls-cli-tests.log
+            rust-tls-netns-e2e.log
           if-no-files-found: warn
           retention-days: 14
