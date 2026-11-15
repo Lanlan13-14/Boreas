@@ -2393,8 +2393,12 @@ mod unix_tests {
                 &art,
             )
             .unwrap();
+        // This tests the durable attempt budget, not startup latency. Allow
+        // a loaded native runner to schedule the child and write its marker;
+        // timeout/kill behavior has separate tests.
+        let startup_budget_ms = 5_000;
         for attempt in 1..=3 {
-            let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
+            let (code, _) = supervise_with(&f, &["{version}/prog.sh"], startup_budget_ms, 3);
             assert_eq!(code, EXIT_ERROR, "attempt {attempt}");
             assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
             assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
@@ -2405,7 +2409,7 @@ mod unix_tests {
 
         // Fourth attempt: refused during planning, nothing is activated or
         // launched, and the operator is pointed at `reset-trial`.
-        let (code, stderr) = supervise_plan(&f, &["{version}/prog.sh"], 100, 3);
+        let (code, stderr) = supervise_plan(&f, &["{version}/prog.sh"], startup_budget_ms, 3);
         assert_eq!(code, EXIT_ERROR);
         assert!(stderr.contains("trial budget"), "{stderr}");
         assert!(stderr.contains("reset-trial"), "{stderr}");
@@ -2435,7 +2439,7 @@ mod unix_tests {
             audit.contains("reset-trial version=2.0.0 attempts=3"),
             "{audit}"
         );
-        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], startup_budget_ms, 3);
         assert_eq!(code, EXIT_ERROR);
         assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
     }

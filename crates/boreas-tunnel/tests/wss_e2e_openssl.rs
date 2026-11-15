@@ -1161,6 +1161,7 @@ fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
             .inject(&expected_inbound)
             .map_err(|e| format!("server tun inject: {e}"))?;
         let sent = path.step_outbound().map_err(|e| e.to_string())?;
+        path.close_gracefully();
         Ok::<_, String>((received, delivered, sent))
     });
 
@@ -1206,6 +1207,10 @@ fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
         .expect("exactly one packet delivered");
     assert_eq!(delivered, inbound);
     assert_eq!(sha256(&delivered), sha256(&inbound));
+    assert_eq!(
+        path.step_inbound().expect("TLS close_notify must be clean EOF"),
+        None
+    );
 
     let server_result = server
         .join()

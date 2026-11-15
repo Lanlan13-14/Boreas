@@ -32,7 +32,7 @@ use boreas_proto::objects::{MldsaParameterSet, NodeRole as ObjectRole, ObjectBod
 use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
 
-use crate::e2e::{CircuitStream, E2eEstablished, E2eTlsBackend};
+use crate::e2e::{CircuitStream, E2eEstablished, E2eStream, E2eTlsBackend};
 use crate::error::TunnelError;
 use crate::stream::Duplex;
 use crate::tls::{
@@ -149,14 +149,11 @@ impl OpenSslE2eBackend {
     }
 }
 
-impl Duplex for EstablishedStream<CircuitStream<'_>> {
+impl E2eStream for EstablishedStream<CircuitStream<'_>> {
     fn close_stream(&mut self) -> io::Result<()> {
-        // `shutdown` writes close_notify through the circuit stream, which
-        // fragments it into relay frames. The result is not checked: a peer
-        // that already closed still leaves the circuit usable for its own
-        // close frame, which the caller sends next.
-        let _ = self.get_mut().ssl_mut().shutdown();
-        Ok(())
+        // Send through the owned TLS record layer; the circuit beneath it
+        // carries the notification as ordinary ordered ciphertext fragments.
+        self.close_notify()
     }
 }
 

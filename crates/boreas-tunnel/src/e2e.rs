@@ -472,18 +472,26 @@ pub fn accept_circuit<'a>(
 
 // --- E2E TLS seam ------------------------------------------------------------
 
+/// E2E byte stream with a protocol-specific planned-stop notification.
+///
+/// Kept separate from `Duplex` so its blanket implementation does not hide
+/// TLS shutdown behind a no-op implementation.
+pub trait E2eStream: Duplex {
+    fn close_stream(&mut self) -> io::Result<()>;
+}
+
 /// E2E TLS session established over a circuit byte stream.
 ///
 /// Fields are private: only the in-tree E2E backend adapter pairs a stream with
 /// its verified facts.
 pub struct E2eEstablished<'a> {
-    stream: Box<dyn Duplex + 'a>,
+    stream: Box<dyn E2eStream + 'a>,
     session: InnerTlsSession,
 }
 
 impl<'a> E2eEstablished<'a> {
     #[cfg(any(feature = "openssl-inner-tls", test))]
-    pub(crate) fn new(stream: Box<dyn Duplex + 'a>, session: InnerTlsSession) -> Self {
+    pub(crate) fn new(stream: Box<dyn E2eStream + 'a>, session: InnerTlsSession) -> Self {
         Self { stream, session }
     }
 
@@ -491,13 +499,12 @@ impl<'a> E2eEstablished<'a> {
         &self.session
     }
 
-    pub fn into_parts(self) -> (Box<dyn Duplex + 'a>, InnerTlsSession) {
+    pub fn into_parts(self) -> (Box<dyn E2eStream + 'a>, InnerTlsSession) {
         (self.stream, self.session)
     }
 
     /// End the E2E TLS record layer with `close_notify` before the circuit is
-    /// torn down. A raw (non-TLS) stream's default implementation does nothing,
-    /// so the in-memory confirmation tests are unaffected.
+    /// torn down. Raw test streams implement this as a no-op.
     pub fn close_tls(&mut self) -> io::Result<()> {
         self.stream.close_stream()
     }
@@ -527,7 +534,7 @@ pub trait E2eTlsBackend: Send + Sync {
 /// `mtu_cap` is the hop session's negotiated MTU ceiling, captured at the same
 /// time. A packet adapter must not use a link MTU above it.
 pub struct E2eCircuit<'a> {
-    stream: Box<dyn Duplex + 'a>,
+    stream: Box<dyn E2eStream + 'a>,
     token: VerifiedE2eSession,
     info: E2eInfo,
     local: PeerIdentity,
@@ -1098,6 +1105,14 @@ mod tests {
     /// exercising confirmation ordering; it is not production crypto evidence.
     struct TestE2eBackend {
         peer: PeerIdentity,
+    }
+
+    // Confirmation tests use a plaintext circuit seam, with no TLS record
+    // layer to notify. Production adapters must provide their own close.
+    impl E2eStream for CircuitStream<'_> {
+        fn close_stream(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl E2eTlsBackend for TestE2eBackend {

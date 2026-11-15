@@ -356,16 +356,13 @@ impl<S: Read + Write> EstablishedStream<S> {
         self.stream.ssl_write(buf).map_err(map_tls_io_error)
     }
 
-    /// Send TLS `close_notify` and return the TLS stream with its transport.
+    /// Attempt to send TLS `close_notify` while retaining stream ownership.
     ///
-    /// OpenSSL keeps ownership of the transport inside `SslStream`, so this
-    /// cannot extract the inner transport. The shutdown result is deliberately
-    /// ignored: a peer that already went away still leaves the stream available
-    /// for the caller to finish draining any queued ciphertext.
-    pub fn shutdown_quiet(self) -> SslStream<S> {
-        let (mut stream, _, _) = self.into_parts();
-        let _ = stream.shutdown();
-        stream
+    /// One shutdown call sends our notification; it need not wait for the peer's
+    /// reply. Non-blocking callers must retry on `WouldBlock` after driving the
+    /// transport. Error paths may still drop the stream without a notification.
+    pub fn close_notify(&mut self) -> io::Result<()> {
+        self.stream.shutdown().map(|_| ()).map_err(map_tls_io_error)
     }
 }
 
