@@ -217,7 +217,7 @@ mod linux_daemon {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
     use std::thread;
@@ -297,9 +297,9 @@ mod linux_daemon {
         }
     }
 
-    /// Linux TUN adapter whose reads never introduce a polling delay. The
-    /// daemon waits on the TUN and outer TCP descriptors together when idle,
-    /// then drains ready work without a per-packet sleep.
+    /// Linux TUN adapter whose reads never introduce a polling delay. The daemon
+    /// waits on the TUN and outer TCP descriptors together when idle, then drains
+    /// ready work without a per-packet sleep.
     struct NonBlockingLinuxTun {
         queue: LinuxTunQueue,
     }
@@ -786,9 +786,20 @@ mod linux_daemon {
         }
     }
 
-    /// Wait for the outer socket and (for a real device) the TUN fd as one
-    /// event set. A zero duration is a nonblocking readiness query; an idle
-    /// iteration uses a short bounded wait only to retain stop/status control.
+    /// Bounded readiness wait on the outer socket and, when the endpoint is a real
+    /// device, the TUN descriptor as one event set.
+    ///
+    /// Socket readiness is only one input: OpenSSL, WebSocket, `FrameIo` and
+    /// `CircuitStream` can all retain bytes after an earlier read, so the packet
+    /// loop also consults `PacketPath::has_buffered_input()`. A zero duration is
+    /// a nonblocking probe; an idle iteration uses a short bounded wait so the
+    /// loop always returns to the status/budget checks.
+    ///
+    /// A terminal TUN event (`POLLERR` / `POLLHUP`) is fail-closed: a dead host
+    /// packet interface is not a recoverable condition and must stop business
+    /// forwarding instead of idling on a descriptor that never fills. The outer
+    /// socket's `POLLHUP`/`POLLERR` stays readable on purpose, because it is how
+    /// a clean peer close (and the watchdog's `shutdown`) surfaces.
     fn poll_io(
         sock_fd: i32,
         tun_fd: Option<i32>,
@@ -811,6 +822,8 @@ mod linux_daemon {
         ];
         let count = if tun_fd.is_some() { 2 } else { 1 };
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `fds` is a valid array of `count` initialized `pollfd` values;
+        // `poll` only writes `revents`.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout_ms) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
@@ -822,9 +835,175 @@ mod linux_daemon {
         if fds.iter().any(|pfd| pfd.revents & libc::POLLNVAL != 0) {
             return Err("daemon: poll reported an invalid fd".to_string());
         }
+        if count == 2 && fds[1].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            return Err(
+                "daemon: TUN device reported a terminal poll event (HUP/ERR); business forwarding halted"
+                    .to_string(),
+            );
+        }
         let ready =
             |pfd: &libc::pollfd| pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
-        Ok((ready(&fds[0]), count == 2 && ready(&fds[1])))
+        Ok((
+            ready(&fds[0]),
+            count == 2 && fds[1].revents & libc::POLLIN != 0,
+        ))
+    }
+
+    /// Whether one loop iteration did work.
+    ///
+    /// A packet the host emitted for another address is consumed and dropped by
+    /// the adapter. That is still work: treating it as idle would sleep in front
+    /// of a TUN queue that is ready, so it keeps the loop hot without pretending
+    /// that anything crossed the circuit.
+    fn iteration_progress(delivered: bool, dropped_before: u64, dropped_after: u64) -> bool {
+        delivered || dropped_after > dropped_before
+    }
+
+    /// §3.4 `StatusSnapshot` freshness watchdog.
+    ///
+    /// The 500 ms re-check reads `roots.cbor` + `status.signed` and verifies
+    /// signatures, so it cannot live on the packet loop: a blocking socket read
+    /// would stall it past the deadline. This thread runs the same
+    /// [`verify_status_freshness_from_roots`] check, publishes the first failure
+    /// as an owned string, and interrupts any in-flight blocking I/O with
+    /// `shutdown(SHUT_RDWR)` on the outer socket.
+    ///
+    /// It never tears the circuit down and never falls back to hop-only: the
+    /// packet loop owns the fail-closed teardown and reports the published
+    /// reason. `Drop` stops and joins the thread, so every exit path — including
+    /// a panic-free early return — leaves no live checker behind.
+    struct StatusWatchdog {
+        /// Guards the wakeup predicate. The predicate itself is the atomic
+        /// below so a stopped checker never needs the lock to observe `stop`,
+        /// and no lock is ever held across `shutdown()` or a status check.
+        stop: Arc<(Mutex<()>, Condvar)>,
+        stopped: Arc<AtomicBool>,
+        fault: Arc<Mutex<Option<String>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl StatusWatchdog {
+        fn start(
+            roots_path: PathBuf,
+            status_path: PathBuf,
+            expected_net_id: [u8; 16],
+            sock_fd: i32,
+            counters: Arc<LiveCounters>,
+            interval: Duration,
+        ) -> Self {
+            let stop = Arc::new((Mutex::new(()), Condvar::new()));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let fault: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let stop_bg = Arc::clone(&stop);
+            let stopped_bg = Arc::clone(&stopped);
+            let fault_bg = Arc::clone(&fault);
+            let handle = thread::spawn(move || {
+                loop {
+                    // Monotonic deadline per check: verification work must not
+                    // stretch the cadence, and stop/join must stay prompt.
+                    let deadline = Instant::now() + interval;
+                    let mut guard = match stop_bg.0.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    while !stopped_bg.load(Ordering::Acquire) {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        guard = match stop_bg.1.wait_timeout(guard, deadline - now) {
+                            Ok((guard, _timeout)) => guard,
+                            Err(poisoned) => poisoned.into_inner().0,
+                        };
+                    }
+                    let stopping = stopped_bg.load(Ordering::Acquire);
+                    drop(guard);
+                    if stopping {
+                        return;
+                    }
+
+                    let failure = match now_utc_us() {
+                        Err(_) => Some(
+                            "daemon: StatusSnapshot clock unavailable (system clock before UNIX_EPOCH)"
+                                .to_string(),
+                        ),
+                        Ok(now_us) => match verify_status_freshness_from_roots(
+                            &roots_path,
+                            &status_path,
+                            expected_net_id,
+                            now_us,
+                        ) {
+                            Ok((seq, _issued, _next)) => {
+                                let prev = counters.status_sequence.load(Ordering::Relaxed);
+                                if seq < prev {
+                                    Some(format!(
+                                        "daemon: StatusSnapshot sequence rollback detected (fail-closed): {seq} < {prev}"
+                                    ))
+                                } else {
+                                    counters.status_sequence.store(seq, Ordering::Relaxed);
+                                    None
+                                }
+                            }
+                            Err(error) => Some(format!(
+                                "daemon: StatusSnapshot stale or invalid, business forwarding halted (§3.4): {error}"
+                            )),
+                        },
+                    };
+                    let Some(message) = failure else { continue };
+                    // Ordering: flag first (observable through `ctl status`), then the
+                    // owned reason, then the syscall that unblocks the packet loop.
+                    counters.status_fresh.store(false, Ordering::SeqCst);
+                    {
+                        let mut slot = match fault_bg.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if slot.is_none() {
+                            *slot = Some(message);
+                        }
+                    }
+                    if sock_fd >= 0 {
+                        // SAFETY: `sock_fd` is the connected outer TCP socket, kept
+                        // open for the whole lifetime of `drive_packet_path`; this
+                        // watchdog is stopped and joined before that stream drops.
+                        unsafe { libc::shutdown(sock_fd, libc::SHUT_RDWR) };
+                    }
+                    return;
+                }
+            });
+            Self {
+                stop,
+                stopped,
+                fault,
+                handle: Some(handle),
+            }
+        }
+
+        /// Owned first-failure reason, if the watchdog halted forwarding.
+        fn fault(&self) -> Option<String> {
+            match self.fault.lock() {
+                Ok(slot) => (*slot).clone(),
+                Err(poisoned) => (*poisoned.into_inner()).clone(),
+            }
+        }
+    }
+
+    impl Drop for StatusWatchdog {
+        fn drop(&mut self) {
+            {
+                // Store the stop flag under the lock so a notify cannot be lost
+                // between the checker's predicate test and its wait.
+                let _guard = match self.stop.0.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                self.stopped.store(true, Ordering::Release);
+            }
+            self.stop.1.notify_all();
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1020,11 +1199,30 @@ mod linux_daemon {
         let local_vip = path.local_endpoint().vip();
         let peer_vip = path.peer_endpoint().vip();
 
+        // Declared after `path` on purpose: the watchdog is stopped and joined
+        // before the E2E stream (and its socket) is dropped, so `shutdown()`
+        // can never target a recycled descriptor.
+        let watchdog = StatusWatchdog::start(
+            roots_path.to_path_buf(),
+            status_path.to_path_buf(),
+            expected_net_id,
+            sock_fd,
+            Arc::clone(counters),
+            STATUS_RECHECK_INTERVAL,
+        );
+
         let started = Instant::now();
-        let mut last_status_check = Instant::now();
+        let mut last_dropped = 0u64;
         let stop_reason: &'static str;
 
         loop {
+            // Status first: once the watchdog published a failure, business I/O
+            // is forbidden and that reason must win over every later symptom.
+            if let Some(reason) = watchdog.fault() {
+                path.close();
+                return Err(reason);
+            }
+
             if let Some(sec) = max_seconds
                 && started.elapsed() >= Duration::from_secs(sec)
             {
@@ -1041,42 +1239,10 @@ mod linux_daemon {
                 }
             }
 
-            // §3.4 StatusSnapshot fail-closed freshness check: if expired or invalid,
-            // immediately close the E2E circuit and stop forwarding business packets.
-            if last_status_check.elapsed() >= STATUS_RECHECK_INTERVAL {
-                last_status_check = Instant::now();
-                let now_us = now_utc_us()?;
-                match verify_status_freshness_from_roots(
-                    roots_path,
-                    status_path,
-                    expected_net_id,
-                    now_us,
-                ) {
-                    Ok((seq, _issued, _next)) => {
-                        let prev = counters.status_sequence.load(Ordering::Relaxed);
-                        if seq < prev {
-                            counters.status_fresh.store(false, Ordering::SeqCst);
-                            path.close();
-                            return Err(
-                                "daemon: StatusSnapshot sequence rollback detected (fail-closed)"
-                                    .to_string(),
-                            );
-                        }
-                        counters.status_sequence.store(seq, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        counters.status_fresh.store(false, Ordering::SeqCst);
-                        path.close();
-                        return Err(format!(
-                            "daemon: StatusSnapshot stale or invalid, business forwarding halted (§3.4): {e}"
-                        ));
-                    }
-                }
-            }
-
-            // Both packet sources are nonblocking here. Real TUN reads use a
-            // zero-time readiness query; idle waiting happens once below on
-            // the combined TUN + TCP event set, never once per packet.
+            // Both packet sources are nonblocking here: TUN reads are zero-time
+            // readiness queries and idle waiting happens once per iteration.
+            // Status freshness is no longer checked inline — the watchdog owns
+            // it, so a blocking read can never stall the §3.4 deadline.
             let mut made_progress = false;
             match path.step_outbound() {
                 Ok(Some(_len)) => {
@@ -1089,16 +1255,34 @@ mod linux_daemon {
                         .tx_bytes
                         .store(st.outbound_bytes, Ordering::Relaxed);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // `Ok(None)` covers both "no host packet" and "a valid host
+                    // packet the adapter discarded locally". The latter consumed
+                    // a packet, so it counts as work: sleeping in front of a
+                    // still-ready TUN queue would leak latency for no reason.
+                    let dropped = path.stats().dropped_outbound;
+                    made_progress = iteration_progress(made_progress, last_dropped, dropped);
+                    last_dropped = dropped;
+                }
                 Err(PacketPathError::Denied(_)) => {
                     // `step_outbound` discards ordinary local traffic itself.
                     // Reaching here means the packet was malformed or the host
                     // packet interface failed; that remains fatal.
+                    if let Some(reason) = watchdog.fault() {
+                        path.close();
+                        return Err(reason);
+                    }
                     return Err(
                         "daemon: outbound packet path rejected a malformed host packet".to_string(),
                     );
                 }
                 Err(e) => {
+                    // A watchdog `shutdown()` surfaces here as an I/O error; the
+                    // status reason must win over the symptom it caused.
+                    if let Some(reason) = watchdog.fault() {
+                        path.close();
+                        return Err(reason);
+                    }
                     return Err(format!("daemon: outbound packet path error: {e:?}"));
                 }
             }
@@ -1107,7 +1291,12 @@ mod linux_daemon {
             // FrameIo and CircuitStream can all hold bytes after an earlier
             // read. Drain whenever any layer reports buffered input as well.
             let buffered = path.has_buffered_input();
-            let (socket_ready, _) = poll_io(sock_fd, None, Duration::ZERO)?;
+            let socket_ready = if buffered {
+                // Buffered work is already known to be readable; skip the probe.
+                false
+            } else {
+                poll_io(sock_fd, None, Duration::ZERO)?.0
+            };
             if buffered || socket_ready {
                 match path.step_inbound() {
                     Ok(Some(_len)) => {
@@ -1119,10 +1308,20 @@ mod linux_daemon {
                         counters.rx_bytes.store(st.inbound_bytes, Ordering::Relaxed);
                     }
                     Ok(None) => {
+                        // The watchdog's `shutdown()` also surfaces as a clean
+                        // end of stream; the status reason must win.
+                        if let Some(reason) = watchdog.fault() {
+                            path.close();
+                            return Err(reason);
+                        }
                         stop_reason = "peer_closed_cleanly";
                         break;
                     }
                     Err(e) => {
+                        if let Some(reason) = watchdog.fault() {
+                            path.close();
+                            return Err(reason);
+                        }
                         return Err(format!("daemon: inbound packet path error: {e:?}"));
                     }
                 }
@@ -1130,14 +1329,22 @@ mod linux_daemon {
 
             if !made_progress && !buffered {
                 if tun.raw_fd().is_none() && !socket_ready {
+                    // In-memory endpoint: nothing to wait on, so yield briefly
+                    // rather than spin at 100% CPU.
                     thread::sleep(VIRTUAL_IDLE_WAIT);
                 } else {
-                    // Sleep only when both sources are idle. Readiness is
-                    // consumed at the top of the next iteration; busy queues
-                    // continue immediately and sustain full-duplex forwarding.
-                    let _ = poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
+                    // One wait on both sources: an outbound packet arriving on
+                    // the TUN wakes the loop immediately, and a TUN HUP/ERR is
+                    // fail-closed inside `poll_io` instead of idling forever.
+                    poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
                 }
             }
+        }
+
+        // A failure that raced in during a graceful budget stop must still be
+        // reported: never print `"status":"ok"` for a halted §3.4 condition.
+        if let Some(reason) = watchdog.fault() {
+            return Err(reason);
         }
 
         let st = path.stats();
@@ -1150,5 +1357,138 @@ mod linux_daemon {
             st.inbound_bytes
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod watchdog_tests {
+        use super::*;
+        // Trait methods used below (`read`, `as_raw_fd`); imported anonymously so
+        // no name can collide with the module's own imports.
+        use std::io::Read as _;
+        use std::os::unix::io::AsRawFd as _;
+
+        fn counters() -> Arc<LiveCounters> {
+            Arc::new(LiveCounters {
+                node_label: "test".to_string(),
+                security_mode: "e2e-required",
+                inbound_on: false,
+                connected: AtomicBool::new(true),
+                inbound_connections: AtomicU64::new(0),
+                outbound_upstreams: AtomicU64::new(0),
+                tx_packets: AtomicU64::new(0),
+                tx_bytes: AtomicU64::new(0),
+                rx_packets: AtomicU64::new(0),
+                rx_bytes: AtomicU64::new(0),
+                status_sequence: AtomicU64::new(7),
+                status_fresh: AtomicBool::new(true),
+            })
+        }
+
+        /// An unusable status file must halt forwarding: the first failure is
+        /// published as an owned string and `status_fresh` flips immediately,
+        /// without requiring a live socket.
+        #[test]
+        fn watchdog_publishes_status_failure_and_marks_stale() {
+            let counters = counters();
+            let watchdog = StatusWatchdog::start(
+                PathBuf::from("/nonexistent-boreas-roots.cbor"),
+                PathBuf::from("/nonexistent-boreas-status.signed"),
+                [0x2a; 16],
+                -1,
+                Arc::clone(&counters),
+                Duration::from_millis(10),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reason = None;
+            while Instant::now() < deadline {
+                if let Some(published) = watchdog.fault() {
+                    reason = Some(published);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let reason = reason.expect("watchdog must publish a status failure");
+            assert!(
+                reason.contains("StatusSnapshot"),
+                "unexpected reason: {reason}"
+            );
+            assert!(!counters.status_fresh.load(Ordering::SeqCst));
+        }
+
+        /// `Drop` stops and joins promptly even while the checker is parked.
+        #[test]
+        fn watchdog_drop_joins_promptly_without_fault() {
+            let counters = counters();
+            let watchdog = StatusWatchdog::start(
+                PathBuf::from("/nonexistent-boreas-roots.cbor"),
+                PathBuf::from("/nonexistent-boreas-status.signed"),
+                [0x2a; 16],
+                -1,
+                Arc::clone(&counters),
+                Duration::from_secs(3600),
+            );
+            let started = Instant::now();
+            drop(watchdog);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "watchdog drop must not block: {:?}",
+                started.elapsed()
+            );
+            assert!(counters.status_fresh.load(Ordering::SeqCst));
+        }
+
+        /// `shutdown(SHUT_RDWR)` is the mechanism that unblocks a stalled read;
+        /// without it the 500 ms re-check could never interrupt the packet loop.
+        #[test]
+        fn shutdown_interrupts_a_blocking_read() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr");
+            let client = std::net::TcpStream::connect(address).expect("connect");
+            let (_server, _) = listener.accept().expect("accept");
+            let fd = client.as_raw_fd();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = thread::spawn(move || {
+                let mut client = client;
+                let mut byte = [0u8; 1];
+                let _ = tx.send(client.read(&mut byte));
+            });
+            thread::sleep(Duration::from_millis(50));
+            // SAFETY: `fd` belongs to `client`, owned by the reader thread for
+            // the whole call; `shutdown` does not close the descriptor.
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+            let outcome = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("blocking read must be interrupted by shutdown");
+            assert_eq!(outcome.expect("read returns after shutdown"), 0);
+            reader.join().expect("reader thread");
+        }
+
+        /// A terminal TUN poll event is fail-closed, while the outer socket's
+        /// HUP stays readable because that is how a normal peer close surfaces.
+        #[test]
+        fn terminal_tun_poll_event_is_fail_closed() {
+            let mut sock = [0i32; 2];
+            let mut tun = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(sock.as_mut_ptr()) }, 0);
+            assert_eq!(unsafe { libc::pipe(tun.as_mut_ptr()) }, 0);
+            // Closing the write end makes the TUN read end report POLLHUP.
+            unsafe { libc::close(tun[1]) };
+            let result = poll_io(sock[0], Some(tun[0]), Duration::ZERO);
+            unsafe {
+                libc::close(sock[0]);
+                libc::close(sock[1]);
+                libc::close(tun[0]);
+            }
+            let error = result.expect_err("a dead TUN must fail closed");
+            assert!(error.contains("TUN"), "unexpected error: {error}");
+        }
+
+        /// Local discards keep the loop hot but never count as delivery.
+        #[test]
+        fn local_discards_count_as_progress_without_faking_delivery() {
+            assert!(!iteration_progress(false, 3, 3));
+            assert!(iteration_progress(false, 3, 4));
+            assert!(iteration_progress(true, 0, 0));
+        }
     }
 }
