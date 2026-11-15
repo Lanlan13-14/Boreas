@@ -493,7 +493,7 @@ pub fn client_handshake(
     if frame.body.first().copied() != Some(ControlType::SessionAccept as u8) {
         return Err(SessionReject::FirstFrameNotHello.into());
     }
-    let accept = decode_session_accept(&frame.body, hello, local_identity(policy.local))?;
+    let accept = decode_session_accept(&frame.body, hello, local_identity(policy.expected_peer))?;
     let authorized = policy.authorize_hello(tls, &accept)?;
     let ctx = accepted_context(&policy, &authorized);
     Ok(EstablishedSession {
