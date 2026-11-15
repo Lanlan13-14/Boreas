@@ -15,16 +15,13 @@
 
 use std::fmt;
 
-use crate::objects::{
-    self, MldsaParameterSet, ObjectBody, ObjectType, valid_node_id,
-};
+use crate::objects::{self, MldsaParameterSet, ObjectBody, ObjectType, valid_node_id};
 use crate::{ControlType, MAX_BODY_LEN, PROTO_MAJOR, PeerRole, SecurityMode, SessionContext};
 
 /// Fixed wire length of a `SessionHello`/`SessionAccept` control body,
 /// including the leading subtype byte.
 pub const SESSION_MESSAGE_LEN: usize = 1 + SESSION_PARAM_FIELDS_LEN;
-const SESSION_PARAM_FIELDS_LEN: usize =
-    1 + 16 + 2 + 2 + 8 + 8 + 16 + 1 + 1 + 1 + 2 + 1 + 8;
+const SESSION_PARAM_FIELDS_LEN: usize = 1 + 16 + 2 + 2 + 8 + 8 + 16 + 1 + 1 + 1 + 2 + 1 + 8;
 const _: () = assert!(SESSION_MESSAGE_LEN == 68);
 
 /// Length of the `net_id` field.
@@ -472,10 +469,7 @@ impl SessionParams {
     /// All shared fields are echoed; the source identity triple becomes local;
     /// source/destination node ids and generations are swapped. The peer must
     /// have addressed `hello` to the local node and generation.
-    pub fn accept_for(
-        hello: &SessionParams,
-        local: LocalIdentity,
-    ) -> Result<Self, MessageError> {
+    pub fn accept_for(hello: &SessionParams, local: LocalIdentity) -> Result<Self, MessageError> {
         hello.validate()?;
         if hello.destination_node_id != local.node_id
             || hello.destination_identity_generation != local.identity_generation
@@ -501,10 +495,7 @@ impl SessionParams {
         Ok(expected)
     }
 
-    fn encode(
-        self,
-        subtype: ControlType,
-    ) -> Result<[u8; SESSION_MESSAGE_LEN], MessageError> {
+    fn encode(self, subtype: ControlType) -> Result<[u8; SESSION_MESSAGE_LEN], MessageError> {
         if !matches!(
             subtype,
             ControlType::SessionHello | ControlType::SessionAccept
@@ -606,10 +597,7 @@ impl SessionAccept {
 
     /// Decode and require exact equality with the expected Accept tuple built
     /// by [`SessionParams::accept_for`].
-    pub fn decode_bound(
-        data: &[u8],
-        expected: SessionParams,
-    ) -> Result<Self, MessageError> {
+    pub fn decode_bound(data: &[u8], expected: SessionParams) -> Result<Self, MessageError> {
         let accept = Self::decode(data)?;
         if accept.params != expected {
             return Err(MessageError::SessionMismatch);
@@ -861,11 +849,9 @@ impl EnrollmentResponse {
             return Err(MessageError::InvalidField("signed_identity length"));
         }
         match self.status {
-            EnrollmentStatus::Issued if self.signed_identity.is_empty() => {
-                Err(MessageError::InvalidField(
-                    "issued response needs signed identity",
-                ))
-            }
+            EnrollmentStatus::Issued if self.signed_identity.is_empty() => Err(
+                MessageError::InvalidField("issued response needs signed identity"),
+            ),
             EnrollmentStatus::Pending | EnrollmentStatus::Rejected
                 if !self.signed_identity.is_empty() =>
             {
@@ -923,8 +909,8 @@ impl SignedObject {
         if self.raw_tbs.is_empty() || self.raw_tbs.len() > objects::MAX_OBJECT_LEN {
             return Err(MessageError::BadSignedObject);
         }
-        let object = objects::decode_tbs(&self.raw_tbs)
-            .map_err(|_| MessageError::BadManagementObject)?;
+        let object =
+            objects::decode_tbs(&self.raw_tbs).map_err(|_| MessageError::BadManagementObject)?;
         if object.body.object_type() != self.object_type {
             return Err(MessageError::BadObjectType);
         }
@@ -954,10 +940,7 @@ impl SignedObject {
         writer.byte(SIGNED_OBJECT_VERSION);
         writer.byte(self.object_type as u8);
         writer.be_u16(SIGNED_OBJECT_SCHEMA_VERSION);
-        writer.byte(
-            u8::try_from(self.signers.len())
-                .map_err(|_| MessageError::BadSignedObject)?,
-        );
+        writer.byte(u8::try_from(self.signers.len()).map_err(|_| MessageError::BadSignedObject)?);
         for signer in &self.signers {
             writer.byte(signer.role as u8);
             writer.put(&signer.ed25519);
@@ -968,9 +951,8 @@ impl SignedObject {
             );
             writer.put(&signer.mldsa);
         }
-        writer.be_u32(
-            u32::try_from(self.raw_tbs.len()).map_err(|_| MessageError::BadSignedObject)?,
-        );
+        writer
+            .be_u32(u32::try_from(self.raw_tbs.len()).map_err(|_| MessageError::BadSignedObject)?);
         writer.put(&self.raw_tbs);
         let out = writer.finish();
         if out.len() > MAX_SIGNED_OBJECT_LEN {
@@ -1261,9 +1243,7 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
         ControlType::SessionHello => Ok(ControlBody::SessionHello(SessionHello::decode(body)?)),
         ControlType::SessionAccept => Ok(ControlBody::SessionAccept(SessionAccept::decode(body)?)),
         ControlType::Enrollment => Ok(ControlBody::Enrollment(Enrollment::decode(body)?)),
-        ControlType::DirectoryPage => {
-            Ok(ControlBody::DirectoryPage(DirectoryPage::decode(body)?))
-        }
+        ControlType::DirectoryPage => Ok(ControlBody::DirectoryPage(DirectoryPage::decode(body)?)),
         ControlType::Lease => Ok(ControlBody::Lease(Lease {
             object: decode_signed_control(
                 body,
@@ -1291,9 +1271,7 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
         ControlType::Probe => Ok(ControlBody::Probe(Probe::decode(body)?)),
         ControlType::Drain => Ok(ControlBody::Drain(Drain::decode(body)?)),
         ControlType::CircuitOpen => Ok(ControlBody::CircuitOpen(CircuitOpen::decode(body)?)),
-        ControlType::CircuitAccept => {
-            Ok(ControlBody::CircuitAccept(CircuitAccept::decode(body)?))
-        }
+        ControlType::CircuitAccept => Ok(ControlBody::CircuitAccept(CircuitAccept::decode(body)?)),
         ControlType::CircuitReset => Ok(ControlBody::CircuitReset(CircuitReset::decode(body)?)),
         ControlType::CircuitClose => Ok(ControlBody::CircuitClose(CircuitClose::decode(body)?)),
     }
@@ -1301,7 +1279,11 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
 
 impl Lease {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        encode_signed_control(ControlType::Lease, &self.object, &[ObjectType::AttachmentLease])
+        encode_signed_control(
+            ControlType::Lease,
+            &self.object,
+            &[ObjectType::AttachmentLease],
+        )
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
@@ -2217,7 +2199,10 @@ mod tests {
         let accept = sample_accept();
         let bytes = accept.encode().unwrap();
         let expected = SessionParams::accept_for(&hello, sample_local_identity()).unwrap();
-        assert_eq!(SessionAccept::decode_bound(&bytes, expected).unwrap(), accept);
+        assert_eq!(
+            SessionAccept::decode_bound(&bytes, expected).unwrap(),
+            accept
+        );
         assert_eq!(
             SessionAccept::decode_for_hello(&bytes, &hello, sample_local_identity()).unwrap(),
             accept
@@ -2360,10 +2345,9 @@ mod tests {
         assert_eq!(missing.validate(), Err(MessageError::MissingCoSignature));
 
         let mut unexpected = single_signed(&object);
-        unexpected.signers.push(signer(
-            SignerRole::CoSign,
-            MldsaParameterSet::Mldsa65,
-        ));
+        unexpected
+            .signers
+            .push(signer(SignerRole::CoSign, MldsaParameterSet::Mldsa65));
         assert_eq!(
             unexpected.validate(),
             Err(MessageError::UnexpectedCoSignature)
@@ -2648,9 +2632,7 @@ mod tests {
     }
 
     fn vector_ids() -> Vec<&'static str> {
-        let section = &VECTORS[..VECTORS
-            .find("\"session_pairs\"")
-            .unwrap_or(VECTORS.len())];
+        let section = &VECTORS[..VECTORS.find("\"session_pairs\"").unwrap_or(VECTORS.len())];
         let mut ids = Vec::new();
         let mut offset = 0;
         while let Some(found) = section[offset..].find("\"id\": \"") {
@@ -2840,10 +2822,7 @@ mod tests {
             }
             .encode()
             .unwrap(),
-            decode_hex(quoted_field(
-                vector_object("drain-minimal"),
-                "expected_hex"
-            ))
+            decode_hex(quoted_field(vector_object("drain-minimal"), "expected_hex"))
         );
         assert_eq!(
             CircuitOpen {

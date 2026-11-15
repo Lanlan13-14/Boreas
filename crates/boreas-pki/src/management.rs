@@ -346,8 +346,8 @@ impl ManagementTrust {
         if raw_signed_object.is_empty() || raw_signed_object.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::ObjectTooLarge);
         }
-        let signed = SignedObject::decode(raw_signed_object)
-            .map_err(|_| Error::MalformedSignedObject)?;
+        let signed =
+            SignedObject::decode(raw_signed_object).map_err(|_| Error::MalformedSignedObject)?;
         let raw_tbs = signed.raw_tbs.clone();
         let object = objects::decode_tbs(&raw_tbs).map_err(|_| Error::MalformedObject)?;
         let canonical = objects::encode_tbs(&object).map_err(|_| Error::MalformedObject)?;
@@ -421,8 +421,7 @@ impl ManagementTrust {
         raw_signed: &[u8],
         now_us: u64,
     ) -> Result<VerifiedObject, Error> {
-        let signed = SignedObject::decode(raw_signed)
-            .map_err(|_| Error::MalformedSignedObject)?;
+        let signed = SignedObject::decode(raw_signed).map_err(|_| Error::MalformedSignedObject)?;
         if signed.raw_tbs.as_slice() != raw_tbs {
             return Err(Error::NonCanonicalObject);
         }
@@ -530,13 +529,13 @@ impl IdentityAuthority {
         {
             return Err(Error::InvalidIssuerRecord);
         }
-        let ed25519 = PKey::private_key_from_der(ed25519_pkcs8_der)
-            .map_err(|_| Error::InvalidIssuerKey)?;
+        let ed25519 =
+            PKey::private_key_from_der(ed25519_pkcs8_der).map_err(|_| Error::InvalidIssuerKey)?;
         if !ed25519.is_a(KeyType::ED25519) {
             return Err(Error::InvalidIssuerKey);
         }
-        let mldsa = PKey::private_key_from_der(mldsa_pkcs8_der)
-            .map_err(|_| Error::InvalidIssuerKey)?;
+        let mldsa =
+            PKey::private_key_from_der(mldsa_pkcs8_der).map_err(|_| Error::InvalidIssuerKey)?;
         if !mldsa.is_a(KeyType::ML_DSA_65) {
             return Err(Error::InvalidIssuerKey);
         }
@@ -590,19 +589,16 @@ impl IdentityAuthority {
         {
             return Err(Error::InvalidTemplate);
         }
-        let expected_node_id = crate::node_id(
-            template.home_core_id,
-            template.vip_octet,
-            template.role,
-        )
-        .map_err(|_| Error::InvalidTemplate)?;
+        let expected_node_id =
+            crate::node_id(template.home_core_id, template.vip_octet, template.role)
+                .map_err(|_| Error::InvalidTemplate)?;
         if expected_node_id != template.node_id {
             return Err(Error::InvalidTemplate);
         }
         let vip = crate::expected_vip(template.home_core_id, template.vip_octet, template.role)
             .map_err(|_| Error::InvalidTemplate)?;
-        let request = openssl::x509::X509Req::from_der(csr_der)
-            .map_err(|_| Error::InvalidIdentityKey)?;
+        let request =
+            openssl::x509::X509Req::from_der(csr_der).map_err(|_| Error::InvalidIdentityKey)?;
         let public_key = request
             .public_key()
             .map_err(|_| Error::InvalidIdentityKey)?;
@@ -679,13 +675,14 @@ impl IdentityAuthority {
                 mldsa,
             }],
         };
-        signed
-            .encode()
-            .map_err(|_| Error::MalformedSignedObject)?;
+        signed.encode().map_err(|_| Error::MalformedSignedObject)?;
         Ok(signed)
     }
 
-    fn sign_message(&self, message: &[u8]) -> Result<([u8; ED25519_SIGNATURE_LEN], Vec<u8>), Error> {
+    fn sign_message(
+        &self,
+        message: &[u8],
+    ) -> Result<([u8; ED25519_SIGNATURE_LEN], Vec<u8>), Error> {
         let mut ed_signer =
             Signer::new_without_digest(&self.ed25519).map_err(|_| Error::SignatureBackend)?;
         let ed_signature = ed_signer
@@ -927,13 +924,8 @@ mod tests {
     impl TestSigner {
         fn new(key_id: u8, authority: Authority, scope: IssuerScope) -> Self {
             let ed25519 = PKey::generate_ed25519().unwrap();
-            let mldsa = PKey::private_key_from_seed(
-                None,
-                KeyType::ML_DSA_65,
-                None,
-                &[key_id; 32],
-            )
-            .unwrap();
+            let mldsa =
+                PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[key_id; 32]).unwrap();
             Self {
                 key_id: vec![key_id],
                 ed25519,
@@ -1129,14 +1121,7 @@ mod tests {
         );
         let identity_key = ml_identity_key(21);
         let identity_public = identity_key.raw_public_key().unwrap();
-        let object = node_identity_object(
-            &signer,
-            ObjectNodeRole::Edge,
-            1,
-            2,
-            1,
-            &identity_public,
-        );
+        let object = node_identity_object(&signer, ObjectNodeRole::Edge, 1, 2, 1, &identity_public);
         let raw_tbs = objects::encode_tbs(&object).unwrap();
         let signatures = signer.sign(&object);
         let mut trust = trust_with(&[&signer]);
@@ -1145,9 +1130,7 @@ mod tests {
         assert_eq!(verified.raw_tbs(), raw_tbs.as_slice());
         assert_eq!(verified.raw_signed_object(), signatures.as_slice());
         assert!(!verified.is_duplicate());
-        let duplicate = trust
-            .verify_test(&raw_tbs, &signatures, 200)
-            .unwrap();
+        let duplicate = trust.verify_test(&raw_tbs, &signatures, 200).unwrap();
         assert!(duplicate.duplicate);
         let mut mismatched_tbs = raw_tbs.clone();
         mismatched_tbs[0] ^= 1;
@@ -1283,20 +1266,11 @@ mod tests {
         );
         let identity_key = ml_identity_key(26);
         let identity_public = identity_key.raw_public_key().unwrap();
-        let first = node_identity_object(
-            &signer,
-            ObjectNodeRole::Edge,
-            1,
-            2,
-            2,
-            &identity_public,
-        );
+        let first = node_identity_object(&signer, ObjectNodeRole::Edge, 1, 2, 2, &identity_public);
         let raw_first = objects::encode_tbs(&first).unwrap();
         let signatures = signer.sign(&first);
         let mut trust = trust_with(&[&signer]);
-        assert!(trust
-            .verify_test(&raw_first, &signatures, 200)
-            .is_ok());
+        assert!(trust.verify_test(&raw_first, &signatures, 200).is_ok());
 
         let mut higher = first.clone();
         if let ObjectBody::NodeIdentity(body) = &mut higher.body {
@@ -1308,9 +1282,7 @@ mod tests {
         higher.issued_at = 110;
         let raw_higher = objects::encode_tbs(&higher).unwrap();
         let signatures = signer.sign(&higher);
-        assert!(trust
-            .verify_test(&raw_higher, &signatures, 200)
-            .is_ok());
+        assert!(trust.verify_test(&raw_higher, &signatures, 200).is_ok());
 
         let stale = first.clone();
         let raw_stale = objects::encode_tbs(&stale).unwrap();
@@ -1359,14 +1331,8 @@ mod tests {
         );
         let identity_key = ml_identity_key(27);
         let identity_public = identity_key.raw_public_key().unwrap();
-        let mut object = node_identity_object(
-            &signer,
-            ObjectNodeRole::Edge,
-            1,
-            2,
-            1,
-            &identity_public,
-        );
+        let mut object =
+            node_identity_object(&signer, ObjectNodeRole::Edge, 1, 2, 1, &identity_public);
         object.net_id = [0x41; 16];
         let raw = objects::encode_tbs(&object).unwrap();
         let signatures = signer.sign(&object);
@@ -1375,14 +1341,7 @@ mod tests {
             trust.verify_test(&raw, &signatures, 200),
             Err(Error::WrongNetwork)
         );
-        let valid = node_identity_object(
-            &signer,
-            ObjectNodeRole::Edge,
-            1,
-            2,
-            1,
-            &identity_public,
-        );
+        let valid = node_identity_object(&signer, ObjectNodeRole::Edge, 1, 2, 1, &identity_public);
         let raw = objects::encode_tbs(&valid).unwrap();
         let signatures = signer.sign(&valid);
         assert_eq!(

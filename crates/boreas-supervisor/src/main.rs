@@ -629,7 +629,11 @@ fn parse_reset_trial_args(args: &[OsString]) -> std::result::Result<ResetTrialAr
             .ok_or_else(|| "reset-trial: argument is not valid UTF-8".to_string())?;
         match arg {
             "--store" | "--confirm" => {
-                let slot = if arg == "--store" { &mut store } else { &mut confirm };
+                let slot = if arg == "--store" {
+                    &mut store
+                } else {
+                    &mut confirm
+                };
                 if slot.is_some() {
                     return Err(format!("reset-trial: duplicate {arg}"));
                 }
@@ -680,10 +684,7 @@ fn cmd_reset_trial(args: &[OsString]) -> CliOutcome {
 /// audit record first. Deliberately an explicit operator action: the supervisor
 /// never clears a spent budget by itself, so a crash loop cannot silently
 /// re-enable unlimited candidate trials.
-fn reset_trial_report(
-    store: &UpgradeStore,
-    confirm: &str,
-) -> std::result::Result<String, String> {
+fn reset_trial_report(store: &UpgradeStore, confirm: &str) -> std::result::Result<String, String> {
     let state = store.trial_state().map_err(|e| e.to_string())?;
     let Some(state) = state else {
         return Ok("reset-trial: no trial record to clear\n".to_string());
@@ -861,10 +862,7 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
 /// old "killed between `activate()` and reservation" window: any kill after
 /// this returns still consumes the attempt on the next boot. An exhausted
 /// budget fails here, so the candidate is never briefly activated.
-fn reserve_pending_trial(
-    store: &UpgradeStore,
-    max_attempts: u32,
-) -> Result<Option<TrialState>> {
+fn reserve_pending_trial(store: &UpgradeStore, max_attempts: u32) -> Result<Option<TrialState>> {
     let Some(journal) = store.journal()? else {
         return Ok(None);
     };

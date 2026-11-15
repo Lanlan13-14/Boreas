@@ -158,9 +158,8 @@ impl WintunApi {
         // SAFETY: `wide` is a NUL-terminated absolute path to the staged image.
         // Only System32 is searched for dependent DLLs, never the staging or
         // caller-selected directory.
-        let module = unsafe {
-            LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
-        };
+        let module =
+            unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
             return Err(last_error("LoadLibraryExW"));
         }
@@ -351,7 +350,10 @@ fn validate_adapter_name(name: &str) -> Result<(), WintunError> {
         || name.encode_utf16().count() > MAX_ADAPTER_NAME_UTF16
         || name.chars().any(|character| {
             character.is_control()
-                || matches!(character, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                || matches!(
+                    character,
+                    '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
         })
     {
         return Err(WintunError::InvalidName);
@@ -393,7 +395,9 @@ impl fmt::Display for WintunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
-            Self::InvalidConfiguration(reason) => write!(formatter, "invalid configuration: {reason}"),
+            Self::InvalidConfiguration(reason) => {
+                write!(formatter, "invalid configuration: {reason}")
+            }
             Self::InvalidName => formatter.write_str("invalid Wintun adapter name"),
             Self::DriverHashMismatch { expected, actual } => write!(
                 formatter,
@@ -565,11 +569,7 @@ impl WintunDevice {
         // SAFETY: both strings are NUL-terminated for the duration of the call;
         // a null GUID asks Wintun to generate an adapter identity.
         let adapter = unsafe {
-            (api.create_adapter)(
-                name.as_ptr(),
-                tunnel_type.as_ptr(),
-                ptr::null::<Guid>(),
-            )
+            (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), ptr::null::<Guid>())
         };
         if adapter.is_null() {
             return Err(last_error("WintunCreateAdapter"));
@@ -646,7 +646,11 @@ impl WintunDevice {
     /// Block until one packet is available. Returns `Ok(None)` when Wintun
     /// reports that the session/adaptor is terminating.
     pub fn read_packet(&self) -> Result<Option<Vec<u8>>, WintunError> {
-        let _read = self.inner.read_lock.lock().map_err(|_| WintunError::Poisoned)?;
+        let _read = self
+            .inner
+            .read_lock
+            .lock()
+            .map_err(|_| WintunError::Poisoned)?;
         loop {
             match self.receive_once()? {
                 Receive::Packet(packet) => return Ok(Some(packet)),
@@ -690,9 +694,7 @@ impl WintunDevice {
                 return Ok(None);
             }
             let remaining = timeout.saturating_sub(start.elapsed());
-            let milliseconds = remaining
-                .as_millis()
-                .min((u32::MAX - 1) as u128) as u32;
+            let milliseconds = remaining.as_millis().min((u32::MAX - 1) as u128) as u32;
             // SAFETY: wait_event is owned by the live Wintun session.
             let wait = unsafe { WaitForSingleObject(self.inner.wait_event, milliseconds) };
             if wait == WAIT_TIMEOUT {
@@ -712,9 +714,13 @@ impl WintunDevice {
             }));
         }
         inspect_packet(packet)?;
-        let length = u32::try_from(packet.len())
-            .map_err(|_| WintunError::Packet(Error::InvalidLength))?;
-        let _send = self.inner.send_lock.lock().map_err(|_| WintunError::Poisoned)?;
+        let length =
+            u32::try_from(packet.len()).map_err(|_| WintunError::Packet(Error::InvalidLength))?;
+        let _send = self
+            .inner
+            .send_lock
+            .lock()
+            .map_err(|_| WintunError::Poisoned)?;
         // SAFETY: session is live; AllocateSendPacket returns a writable buffer
         // of exactly `length` bytes or null.
         let slot = unsafe { (self.inner.api.allocate_send_packet)(self.inner.session, length) };
@@ -850,9 +856,8 @@ fn verify_alias(luid: &NET_LUID_LH, expected: &str) -> Result<(), WintunError> {
         .ok_or(WintunError::InvalidConfiguration(
             "interface alias is not NUL-terminated",
         ))?;
-    let actual = String::from_utf16(&alias[..end]).map_err(|_| {
-        WintunError::InvalidConfiguration("interface alias is not valid UTF-16")
-    })?;
+    let actual = String::from_utf16(&alias[..end])
+        .map_err(|_| WintunError::InvalidConfiguration("interface alias is not valid UTF-16"))?;
     if actual != expected {
         return Err(WintunError::AdapterNameMismatch {
             expected: expected.to_owned(),
@@ -1055,11 +1060,7 @@ mod tests {
 
     #[test]
     fn config_requires_absolute_hash_pinned_dll_and_bounded_mtu() {
-        let valid = WintunConfig::new(
-            "BoreasTest",
-            r"C:\Windows\System32\wintun.dll",
-            [7u8; 32],
-        );
+        let valid = WintunConfig::new("BoreasTest", r"C:\Windows\System32\wintun.dll", [7u8; 32]);
         assert!(valid.validate().is_ok());
         let relative = WintunConfig::new("BoreasTest", "wintun.dll", [7u8; 32]);
         assert!(relative.validate().is_err());

@@ -1826,9 +1826,7 @@ mod tests {
     #[cfg(feature = "openssl-backend")]
     #[test]
     fn real_csr_admission_and_identity_signing_vertical_path() {
-        use crate::management::{
-            IdentityAuthority, ManagementTrust, verify_signed_identity,
-        };
+        use crate::management::{IdentityAuthority, ManagementTrust, verify_signed_identity};
         let path = temp_path();
         let csr_key = ml_dsa_key(11);
         let csr = csr_from_key(&csr_key);
@@ -1929,9 +1927,11 @@ mod tests {
         let mut tampered = csr.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(tamper_store
-            .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
-            .is_err());
+        assert!(
+            tamper_store
+                .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
+                .is_err()
+        );
         cleanup(&tamper_path);
         // A valid CSR for the wrong algorithm is rejected, not silently downgraded.
         let ed_path = temp_path();

@@ -222,7 +222,9 @@ fn real_wintun_device_packet_round_trip() {
     assert_eq!(device.name(), name);
     assert_eq!(device.mtu(), 1400);
     assert_ne!(device.luid(), 0, "Wintun adapter must have a real LUID");
-    device.verify().expect("verify adapter alias and IPv4/IPv6 MTU");
+    device
+        .verify()
+        .expect("verify adapter alias and IPv4/IPv6 MTU");
     assert!(
         device.write_packet(&[0u8; 20]).is_err(),
         "invalid L3 packet must be rejected before reaching Wintun"
@@ -295,10 +297,7 @@ fn real_wintun_device_packet_round_trip() {
         .recv_from(&mut buffer)
         .expect("Windows IP stack should deliver the injected packet through Wintun");
     assert_eq!(&buffer[..length], &b"boreas-wintun"[..]);
-    assert_eq!(
-        source,
-        socket_addr(Ipv4Addr::new(198, 18, 0, 2), 12_345)
-    );
+    assert_eq!(source, socket_addr(Ipv4Addr::new(198, 18, 0, 2), 12_345));
 
     socket
         .send_to(

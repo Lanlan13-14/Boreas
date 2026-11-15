@@ -211,10 +211,7 @@ fn real_utun_packet_round_trip() {
         .recv_from(&mut buffer)
         .expect("macOS IP stack should deliver the injected packet through utun");
     assert_eq!(&buffer[..length], &b"boreas-utun"[..]);
-    assert_eq!(
-        source,
-        socket_addr(Ipv4Addr::new(198, 18, 0, 2), 12_345)
-    );
+    assert_eq!(source, socket_addr(Ipv4Addr::new(198, 18, 0, 2), 12_345));
 
     socket
         .send_to(

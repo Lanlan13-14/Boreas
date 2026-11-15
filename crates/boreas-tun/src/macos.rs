@@ -81,9 +81,8 @@ impl fmt::Display for UtunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
-            Self::PermissionDenied => formatter.write_str(
-                "utun creation requires root or the utun control-socket privilege",
-            ),
+            Self::PermissionDenied => formatter
+                .write_str("utun creation requires root or the utun control-socket privilege"),
             Self::InvalidName => formatter.write_str("invalid utun name; expected utun or utunN"),
             Self::InvalidConfiguration(reason) => {
                 write!(formatter, "invalid configuration: {reason}")
@@ -495,13 +494,8 @@ fn read_fd(fd: RawFd, buffer: &mut [u8]) -> Result<usize, UtunError> {
     loop {
         // SAFETY: buffer is writable for its length and fd is an owned utun
         // control socket.
-        let result = unsafe {
-            libc::read(
-                fd,
-                buffer.as_mut_ptr().cast::<libc::c_void>(),
-                buffer.len(),
-            )
-        };
+        let result =
+            unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
         if result >= 0 {
             return Ok(result as usize);
         }
@@ -518,9 +512,7 @@ fn write_frame(fd: RawFd, data: &[u8]) -> Result<(), UtunError> {
         // SAFETY: data is readable for its length and fd is an owned utun
         // socket. A utun write transfers exactly one datagram; a short result
         // must not be retried as a second packet.
-        let result = unsafe {
-            libc::write(fd, data.as_ptr().cast::<libc::c_void>(), data.len())
-        };
+        let result = unsafe { libc::write(fd, data.as_ptr().cast::<libc::c_void>(), data.len()) };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -546,9 +538,7 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> Result<bool, UtunError> {
     let start = Instant::now();
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
-        let milliseconds = remaining
-            .as_millis()
-            .min((libc::c_int::MAX - 1) as u128) as libc::c_int;
+        let milliseconds = remaining.as_millis().min((libc::c_int::MAX - 1) as u128) as libc::c_int;
         let mut descriptor = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -600,14 +590,37 @@ mod tests {
 
     #[test]
     fn config_rejects_unbounded_mtu_and_foreign_names() {
-        assert!(UtunConfig { name: None, mtu: 1279 }.validate().is_err());
-        assert!(UtunConfig { name: None, mtu: MAX_IP_PACKET + 1 }.validate().is_err());
-        assert!(UtunConfig { name: None, mtu: 1400 }.validate().is_ok());
-        assert!(UtunConfig {
-            name: Some("boreas0".to_owned()),
-            mtu: 1400
-        }
-        .validate()
-        .is_err());
+        assert!(
+            UtunConfig {
+                name: None,
+                mtu: 1279
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            UtunConfig {
+                name: None,
+                mtu: MAX_IP_PACKET + 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            UtunConfig {
+                name: None,
+                mtu: 1400
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            UtunConfig {
+                name: Some("boreas0".to_owned()),
+                mtu: 1400
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
