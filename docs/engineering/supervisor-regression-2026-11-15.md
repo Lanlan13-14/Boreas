@@ -80,3 +80,53 @@ whether this persists at HEAD is unverified. This is recorded for triage only �
 - No statement about the final conclusion of runs 43683078414, 43683078388, 43683078354.
 - No statement about macOS/Windows/aarch64 targets or the TLS matrix.
 - Local `cargo`, Python, tests and formatting were intentionally not run.
+
+## Addendum — 116968e TLS run finished, df80a5b re-check
+
+Collected after the first pass; the sections above are kept unchanged.
+
+### 116968e run 43683078354 (Rust OpenSSL hybrid TLS backend) — failure
+
+Single job 132717696228 `OpenSSL 3.6.1 + rust-openssl 0.10.82 pq768 mTLS`.
+Steps 1–13 passed (pinned OpenSSL build, feature-flag assertions, policy-only tests,
+backend + all-target compile, real pq768 mTLS, PKI/CSR/signing, supervisor dual-signature
+tests). Step 14 `Transport inner-TLS seam tests with backend feature` **failed**
+(`exit code 101`), steps 15–16 and 32–33 passed afterwards.
+
+Cause is the `boreas-tunnel` test target noted above, now confirmed at 116968e with two sites:
+
+```
+error[E0308]: mismatched types
+   --> crates/boreas-tunnel/tests/wss_e2e_openssl.rs:300:48
+300 |     let scope = IssuerScope::for_identity(vec![NodeRole::Edge, NodeRole::Core], vec![1])
+    |                                                ^^^^^^^^^^^^^^ expected `boreas_pki::NodeRole`, found `boreas_crypto::NodeRole`
+
+error[E0308]: mismatched types
+   --> crates/boreas-tunnel/tests/wss_e2e_openssl.rs:309:41
+309 |                     ObjectRole::Edge => NodeRole::Edge,
+    |                                         ^^^^^^^^^^^^^^^ expected `boreas_pki::NodeRole`, found `boreas_crypto::NodeRole`
+
+error: could not compile `boreas-tunnel` (test "wss_e2e_openssl") due to 2 previous errors
+```
+
+So the earlier "unverified at HEAD" caveat is resolved: the `NodeRole` type mismatch
+persists unchanged from d5a215c to 116968e. It is independent of the supervisor work.
+
+### df80a5b (docs-only) — supervisor lint still failing, actually observed
+
+Runs for `df80a5ba1a57f277d67fb0dd59036487711c0c98`: Rust CI 43683191993 **failure**,
+Platform 43683191934 success, TUN 43683191930 success. No TLS run existed for this SHA.
+
+Rust CI jobs: 132718045108 ubuntu-latest failure, 132718045258 windows-latest failure,
+132718045246 rustfmt success, 132718045257 preflight success. Both failing jobs report the
+same lint, so it is not platform-specific:
+
+```
+error: unused variable: `older`
+  --> crates/boreas-supervisor/src/manifest.rs:1806:13
+error: could not compile `boreas-supervisor` (lib test) due to 1 previous error
+```
+
+Confirmed: after the docs-only commit the surviving supervisor blocker is still the dead
+`older` binding in `sequence_ledger_accepts_only_verified_manifests`, not the fixtures.
+Platform and TUN green at df80a5b is consistent with the supervisor tests passing at runtime.

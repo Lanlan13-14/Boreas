@@ -5,20 +5,24 @@
 //! current validity using caller-supplied trusted UTC on every use.
 #![cfg(feature = "openssl-backend")]
 
-use crate::root_authorization::{
-    self, MAX_CANDIDATE_BYTES, NetworkRootPin, VerifiedIssuerAuthorization,
-};
+use crate::root_authorization::{NetworkRootPin, VerifiedIssuerAuthorization};
+#[cfg(target_os = "linux")]
+use crate::root_authorization::{self, MAX_CANDIDATE_BYTES};
+#[cfg(target_os = "linux")]
 use openssl::hash::{MessageDigest, hash};
+use std::{fmt, io, path::Path};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::PathBuf,
+};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::{
-    collections::BTreeMap,
-    fmt,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-};
 
+#[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRTS\0\0\0\x01";
 pub const MAX_STORE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AUTHORIZATIONS: usize = 256;
@@ -55,12 +59,14 @@ pub enum ImportResult {
     Added,
     DuplicateNotRenewed,
 }
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct Entry {
     raw: Vec<u8>,
     ed: Vec<u8>,
     pq: Vec<u8>,
 }
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct Conflict {
     generation: u64,
@@ -70,25 +76,41 @@ struct Conflict {
 
 /// Exclusive, network-bound durable store. Directory/files must be owned by `trusted_owner_uid`.
 pub struct DurableTrustStore {
+    #[cfg(target_os = "linux")]
     path: PathBuf,
+    #[cfg(target_os = "linux")]
     _lock: File,
+    #[cfg(target_os = "linux")]
     net_id: [u8; 16],
+    #[cfg(target_os = "linux")]
     net_fingerprint: [u8; 32],
+    #[cfg(target_os = "linux")]
     root_fingerprint: [u8; 32],
+    #[cfg(target_os = "linux")]
     trusted_owner_uid: u32,
+    #[cfg(target_os = "linux")]
     entries: BTreeMap<Vec<u8>, Entry>,
+    #[cfg(target_os = "linux")]
     conflicts: BTreeMap<Vec<u8>, Conflict>,
+    #[cfg(target_os = "linux")]
     poisoned: bool,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fail_next_commit: bool,
 }
 impl fmt::Debug for DurableTrustStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DurableTrustStore")
-            .field("net_id", &self.net_id)
-            .field("entry_count", &self.entries.len())
-            .field("conflict_count", &self.conflicts.len())
-            .finish()
+        #[cfg(target_os = "linux")]
+        {
+            f.debug_struct("DurableTrustStore")
+                .field("net_id", &self.net_id)
+                .field("entry_count", &self.entries.len())
+                .field("conflict_count", &self.conflicts.len())
+                .finish()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            f.debug_struct("DurableTrustStore").finish()
+        }
     }
 }
 impl DurableTrustStore {
@@ -141,22 +163,28 @@ impl DurableTrustStore {
             Ok(store)
         }
     }
+    #[cfg(target_os = "linux")]
     pub fn net_id(&self) -> [u8; 16] {
         self.net_id
     }
+    #[cfg(target_os = "linux")]
     pub fn network_fingerprint(&self) -> [u8; 32] {
         self.net_fingerprint
     }
     /// Current external NetworkRoot pin fingerprint; it is a report identifier, not provenance proof.
+    #[cfg(target_os = "linux")]
     pub fn root_pin_fingerprint(&self) -> [u8; 32] {
         self.root_fingerprint
     }
+    #[cfg(target_os = "linux")]
     pub fn issuer_count(&self) -> usize {
         self.entries.len()
     }
+    #[cfg(target_os = "linux")]
     pub fn is_quarantined(&self, issuer_key_id: &[u8]) -> bool {
         self.conflicts.contains_key(issuer_key_id)
     }
+    #[cfg(target_os = "linux")]
     pub fn equivocation_evidence(&self, issuer_key_id: &[u8]) -> Option<(&[u8], &[u8])> {
         self.conflicts
             .get(issuer_key_id)
@@ -164,6 +192,7 @@ impl DurableTrustStore {
     }
 
     /// Verify exact candidate bytes and both signatures now, then persist before returning.
+    #[cfg(target_os = "linux")]
     pub fn import(
         &mut self,
         raw: &[u8],
@@ -231,7 +260,22 @@ impl DurableTrustStore {
         }
         Ok(ImportResult::Added)
     }
+    /// Fail closed because this platform has no durable backend.
+    #[cfg(not(target_os = "linux"))]
+    pub fn import(
+        &mut self,
+        raw: &[u8],
+        ed: &[u8],
+        pq: &[u8],
+        pin: &NetworkRootPin,
+        trusted_now_us: u64,
+    ) -> Result<ImportResult, Error> {
+        let _ = (self, raw, ed, pq, pin, trusted_now_us);
+        Err(Error::Unsupported)
+    }
+
     /// Return only a currently valid authorization; signed validity is checked every call.
+    #[cfg(target_os = "linux")]
     pub fn issuer(
         &self,
         issuer_key_id: &[u8],
@@ -252,6 +296,19 @@ impl DurableTrustStore {
             .map(|e| verify_entry(e, pin, self.net_id, trusted_now_us))
             .transpose()
     }
+    /// Fail closed because this platform has no durable backend.
+    #[cfg(not(target_os = "linux"))]
+    pub fn issuer(
+        &self,
+        issuer_key_id: &[u8],
+        pin: &NetworkRootPin,
+        trusted_now_us: u64,
+    ) -> Result<Option<VerifiedIssuerAuthorization>, Error> {
+        let _ = (self, issuer_key_id, pin, trusted_now_us);
+        Err(Error::Unsupported)
+    }
+
+    #[cfg(target_os = "linux")]
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
             Err(Error::Poisoned)
@@ -343,10 +400,6 @@ impl DurableTrustStore {
             return Err(Error::Io(e));
         }
         Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    fn commit(&self) -> Result<(), Error> {
-        Err(Error::Unsupported)
     }
 }
 #[cfg(target_os = "linux")]
@@ -886,5 +939,28 @@ mod tests {
         let mut extra = b;
         extra.push(0);
         assert!(matches!(decode(&extra), Err(Error::Corrupt)));
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_tests {
+    use super::*;
+    use openssl::pkey::{KeyType, PKey};
+
+    #[test]
+    fn open_returns_unsupported_without_backend_state() {
+        let ed = PKey::generate_ed25519().unwrap();
+        let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[1; 32]).unwrap();
+        let pin = NetworkRootPin::provisioned(
+            [7; 16],
+            ed.public_key_to_der().unwrap(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            DurableTrustStore::open("unused", [7; 16], &pin, 0),
+            Err(Error::Unsupported)
+        ));
     }
 }
