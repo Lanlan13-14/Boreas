@@ -13,9 +13,7 @@
 
 use std::net::Ipv4Addr;
 
-use boreas_tun::{
-    Error as TunError, IpVersion, PacketIo, VirtualTun, inspect_packet,
-};
+use boreas_tun::{Error as TunError, IpVersion, PacketIo, VirtualTun, inspect_packet};
 use boreas_tunnel::packet_path::{
     DEFAULT_MTU, FRAME_PREFIX_LEN, MAX_FRAME_BYTES, MAX_MTU, MIN_MTU, PacketDeny, PacketPathError,
     PointToPoint, decode_packet_frame, encode_packet_frame,
@@ -158,7 +156,9 @@ fn real_virtual_tun_transports_one_authorized_packet_with_valid_checksum() {
         .expect("one packet was injected");
     assert_eq!(host_packet, outbound);
     assert_eq!(
-        policy.authorize_outbound(&host_packet).map(|info| info.packet_len),
+        policy
+            .authorize_outbound(&host_packet)
+            .map(|info| info.packet_len),
         Ok(outbound.len())
     );
     let frame = encode_packet_frame(&host_packet, mtu).expect("one frame");
@@ -169,13 +169,18 @@ fn real_virtual_tun_transports_one_authorized_packet_with_valid_checksum() {
 
     // Wire -> host stack.
     assert_eq!(
-        policy.authorize_inbound(&inbound).map(|info| info.packet_len),
+        policy
+            .authorize_inbound(&inbound)
+            .map(|info| info.packet_len),
         Ok(inbound.len())
     );
     let frame = encode_packet_frame(&inbound, mtu).expect("one frame");
     let received = decode_packet_frame(&frame, mtu).expect("one packet per frame");
     device.write_packet(received).expect("host queue has room");
-    let delivered = host.read_packet().expect("host readable").expect("one packet");
+    let delivered = host
+        .read_packet()
+        .expect("host readable")
+        .expect("one packet");
     assert_eq!(delivered, inbound);
     assert_eq!(fnv1a_64(&delivered), fnv1a_64(&inbound));
     assert_eq!(
@@ -308,7 +313,9 @@ fn ipv6_is_refused_rather_than_forwarded() {
     );
     let info = inspect_packet(&v6).expect("structurally valid IPv6");
     assert_eq!(info.version, IpVersion::V6);
-    device.inject(&v6).expect("VirtualTun accepts it structurally");
+    device
+        .inject(&v6)
+        .expect("VirtualTun accepts it structurally");
     let from_host = device.read_packet().expect("readable").expect("one packet");
     assert_eq!(
         policy.authorize_outbound(&from_host),

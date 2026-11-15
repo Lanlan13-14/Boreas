@@ -304,8 +304,8 @@ impl EndpointFacts {
         {
             return Err(PacketPathError::InvalidIdentity);
         }
-        let vip =
-            permanent_vip(identity.node_id, identity.role).ok_or(PacketPathError::InvalidPermanentSlot)?;
+        let vip = permanent_vip(identity.node_id, identity.role)
+            .ok_or(PacketPathError::InvalidPermanentSlot)?;
         Ok(Self {
             net_id: identity.net_id,
             node_id: identity.node_id,
@@ -346,10 +346,7 @@ fn permanent_vip(node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
 /// a role: `10.20.<1..=16>.<1..=251>`.
 fn is_permanent_vip(address: Ipv4Addr) -> bool {
     let [first, second, home_core, vip_octet] = address.octets();
-    first == 10
-        && second == 20
-        && (1..=16).contains(&home_core)
-        && (1..=251).contains(&vip_octet)
+    first == 10 && second == 20 && (1..=16).contains(&home_core) && (1..=251).contains(&vip_octet)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1314,7 +1311,11 @@ mod tests {
             "clean close between frames"
         );
         assert!(!receiver.is_open(), "a clean peer close ends the path");
-        assert_eq!(receiver.first_error(), None, "a clean close is not a failure");
+        assert_eq!(
+            receiver.first_error(),
+            None,
+            "a clean close is not a failure"
+        );
         assert_eq!(
             receiver.stats(),
             PacketStats {
@@ -1350,7 +1351,10 @@ mod tests {
             path.step_outbound(),
             Err(PacketPathError::Denied(PacketDeny::SourceNotLocal))
         );
-        assert_eq!(path.first_error(), Some(PacketPathError::Denied(PacketDeny::SourceNotLocal)));
+        assert_eq!(
+            path.first_error(),
+            Some(PacketPathError::Denied(PacketDeny::SourceNotLocal))
+        );
         assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
         assert_eq!(path.stats().failures, 1);
         assert!(!path.is_open());
@@ -1370,7 +1374,11 @@ mod tests {
             path.step_inbound(),
             Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal))
         );
-        assert_eq!(host.read_packet(), Ok(None), "nothing reaches the host stack");
+        assert_eq!(
+            host.read_packet(),
+            Ok(None),
+            "nothing reaches the host stack"
+        );
 
         // A frame that ends inside its declared packet.
         let packet = ipv4([10, 20, 3, 9], [10, 20, 3, 1], b"cut");
@@ -1402,13 +1410,9 @@ mod tests {
         v6[24..40].copy_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1]);
         device.inject(&v6).expect("structurally valid IPv6");
 
-        let mut path = PacketPath::try_new(
-            &device,
-            OutboundSink::new().0,
-            endpoints(local, peer),
-            mtu,
-        )
-        .expect("bound path");
+        let mut path =
+            PacketPath::try_new(&device, OutboundSink::new().0, endpoints(local, peer), mtu)
+                .expect("bound path");
         assert_eq!(
             path.step_outbound(),
             Err(PacketPathError::Denied(PacketDeny::Ipv6NotNegotiated))

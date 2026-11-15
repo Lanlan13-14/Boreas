@@ -1147,10 +1147,10 @@ fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
     let server = thread::spawn(move || {
         let (mut accepted, backend, peer) =
             accept_session(&listener, server_side).map_err(|e| format!("hop: {e}"))?;
-        let e2e = accept_e2e(&mut accepted.session, &backend, peer)
-            .map_err(|e| format!("E2E: {e}"))?;
-        let (device, host) = boreas_tun::VirtualTun::try_pair(4, 4, mtu)
-            .map_err(|e| format!("server tun: {e}"))?;
+        let e2e =
+            accept_e2e(&mut accepted.session, &backend, peer).map_err(|e| format!("E2E: {e}"))?;
+        let (device, host) =
+            boreas_tun::VirtualTun::try_pair(4, 4, mtu).map_err(|e| format!("server tun: {e}"))?;
         let mut path = boreas_tunnel::packet_path::PacketPath::try_new_over_e2e(&device, e2e, mtu)
             .map_err(|e| format!("server path: {e}"))?;
         let received = path.step_inbound().map_err(|e| e.to_string())?;
@@ -1184,14 +1184,16 @@ fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
             panic!("E2E TLS/confirmation failed: {e}; server={joined:?}");
         }
     };
-    let (device, host) =
-        boreas_tun::VirtualTun::try_pair(4, 4, mtu).expect("bounded client pair");
+    let (device, host) = boreas_tun::VirtualTun::try_pair(4, 4, mtu).expect("bounded client pair");
     let mut path = boreas_tunnel::packet_path::PacketPath::try_new_over_e2e(&device, e2e, mtu)
         .expect("client packet path");
 
-    device.inject(&outbound).expect("host emitted outbound packet");
+    device
+        .inject(&outbound)
+        .expect("host emitted outbound packet");
     assert_eq!(
-        path.step_outbound().expect("outbound authorization and framing"),
+        path.step_outbound()
+            .expect("outbound authorization and framing"),
         Some(outbound.len())
     );
     assert_eq!(
