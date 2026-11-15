@@ -18,9 +18,12 @@ const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
 const IFF_TUN_EXCL: libc::c_short = 0x8000u16 as libc::c_short;
-const TUNSETIFF: libc::c_ulong = 0x400454ca;
-const TUNGETIFF: libc::c_ulong = 0x800454d2;
-const TUNSETOFFLOAD: libc::c_ulong = 0x400454d0;
+// ioctl request codes are stored as u32 and cast to libc::Ioctl at the call
+// site: glibc defines Ioctl as c_ulong, musl as c_int, so a fixed-width
+// c_ulong constant does not compile on musl targets.
+const TUNSETIFF: u32 = 0x400454ca;
+const TUNGETIFF: u32 = 0x800454d2;
+const TUNSETOFFLOAD: u32 = 0x400454d0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -46,7 +49,9 @@ impl IfReq {
         };
         req.data.flags = flags;
         for (dst, src) in req.name.iter_mut().zip(bytes) {
-            *dst = *src as libc::c_char;
+            // cast_signed keeps this portable where c_char is u8 (aarch64)
+            // without tripping unnecessary_cast where c_char is i8 (x86_64).
+            *dst = (*src).cast_signed() as libc::c_char;
         }
         Ok(req)
     }
@@ -56,7 +61,7 @@ impl IfReq {
             .iter()
             .position(|c| *c == 0)
             .ok_or(LinuxTunError::InvalidInterface)?;
-        String::from_utf8(self.name[..end].iter().map(|c| *c as u8).collect())
+        String::from_utf8(self.name[..end].iter().map(|c| (*c) as i8 as u8).collect())
             .map_err(|_| LinuxTunError::InvalidInterface)
     }
 }
@@ -297,21 +302,17 @@ fn open_tun() -> Result<OwnedFd, LinuxTunError> {
     // SAFETY: fd is the unique descriptor just returned by open.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
-fn ioctl_ifreq(fd: RawFd, request: libc::c_ulong, req: &mut IfReq) -> Result<(), LinuxTunError> {
+fn ioctl_ifreq(fd: RawFd, request: u32, req: &mut IfReq) -> Result<(), LinuxTunError> {
     // SAFETY: req is a fully initialized Linux repr(C) ifreq-compatible object, writable for this call.
-    let r = unsafe { libc::ioctl(fd, request, req as *mut IfReq) };
+    let r = unsafe { libc::ioctl(fd, request as libc::Ioctl, req as *mut IfReq) };
     if r < 0 {
         return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
-fn ioctl_scalar(
-    fd: RawFd,
-    request: libc::c_ulong,
-    value: libc::c_uint,
-) -> Result<(), LinuxTunError> {
+fn ioctl_scalar(fd: RawFd, request: u32, value: libc::c_uint) -> Result<(), LinuxTunError> {
     // SAFETY: TUNSETOFFLOAD takes an unsigned long scalar bitmask as confirmed by Linux tun.c.
-    let r = unsafe { libc::ioctl(fd, request, value as libc::c_ulong) };
+    let r = unsafe { libc::ioctl(fd, request as libc::Ioctl, value as libc::c_ulong) };
     if r < 0 {
         return Err(io::Error::last_os_error().into());
     }

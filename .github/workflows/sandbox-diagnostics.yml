@@ -1,0 +1,96 @@
+name: Sandbox audit and diagnostics evidence
+
+# Independent evidence workflow for tools/sandbox-audit + tools/diagnostics
+# (master plan v1.11.0 section 9.5 / Phase 3 G-SANDBOX groundwork).
+#
+# What a green run means: the reference seccomp fixture and the redacted
+# diagnostics collector behaved as specified on a GitHub-hosted Linux
+# runner. It does NOT mean any Boreas daemon/worker passed G-SANDBOX, and
+# it is not production-environment evidence (plan section 11). The audit
+# report.json uploaded below always states
+# "g_sandbox_production": "UNPROVEN".
+#
+# This workflow is deliberately a separate file and does not touch the
+# Rust workspace, so it cannot mask or be masked by workspace CI.
+
+on:
+  push:
+    paths:
+      - 'tools/sandbox-audit/**'
+      - 'tools/diagnostics/**'
+      - 'docs/engineering/sandbox-audit-and-diagnostics.md'
+      - '.github/workflows/sandbox-diagnostics.yml'
+  pull_request:
+    paths:
+      - 'tools/sandbox-audit/**'
+      - 'tools/diagnostics/**'
+      - 'docs/engineering/sandbox-audit-and-diagnostics.md'
+      - '.github/workflows/sandbox-diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-diagnostics:
+    name: Seccomp fixture audit + redacted diagnostics (${{ matrix.arch }})
+    # Native runners only: seccomp AUDIT_ARCH evidence must come from a
+    # kernel running the target ABI, not from emulation.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (cc, strace, shellcheck)
+        run: sudo apt-get update && sudo apt-get install -y gcc strace shellcheck
+
+      - name: Shellcheck + syntax check
+        run: |
+          shellcheck -s sh tools/sandbox-audit/run-sandbox-audit.sh tools/diagnostics/collect-diagnostics.sh
+          sh -n tools/sandbox-audit/run-sandbox-audit.sh
+          sh -n tools/diagnostics/collect-diagnostics.sh
+
+      - name: Record runner environment (outer-sandbox visibility)
+        run: |
+          uname -a
+          grep -E '^(NoNewPrivs|Seccomp|Seccomp_filters):' /proc/self/status || true
+
+      # On a plain Linux runner the harness must reach PASS_FIXTURE (exit 0)
+      # or fail the job. UNPROVEN (exit 2) also fails the job: an
+      # environment that cannot prove the fixture policy must be visible,
+      # never silently green.
+      - name: Run sandbox audit (fixture level, with self-test)
+        run: sh tools/sandbox-audit/run-sandbox-audit.sh --out "$RUNNER_TEMP/sandbox-audit" --self-test
+
+      - name: Assert report honesty fields
+        run: |
+          grep -q '"status": "PASS_FIXTURE"' "$RUNNER_TEMP/sandbox-audit/report.json"
+          grep -q '"g_sandbox_production": "UNPROVEN"' "$RUNNER_TEMP/sandbox-audit/report.json"
+          grep -q '"production_daemon_audited": false' "$RUNNER_TEMP/sandbox-audit/report.json"
+          cat "$RUNNER_TEMP/sandbox-audit/report.json"
+
+      - name: Run redacted diagnostics (with self-test, against /bin/sh as sample ELF)
+        run: sh tools/diagnostics/collect-diagnostics.sh --out "$RUNNER_TEMP/diagnostics" --boreas-bin /bin/sh --self-test
+
+      - name: Verify diagnostics contains no secret-shaped material
+        run: |
+          ! grep -Eq 'BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY|CLIENT_TRAFFIC_SECRET|SERVER_TRAFFIC_SECRET|CLIENT_RANDOM' "$RUNNER_TEMP/diagnostics/diagnostics.txt"
+          (cd "$RUNNER_TEMP/diagnostics" && sha256sum -c SHA256SUMS)
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-diagnostics-evidence-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/sandbox-audit/
+            ${{ runner.temp }}/diagnostics/
+          if-no-files-found: warn
+          retention-days: 30

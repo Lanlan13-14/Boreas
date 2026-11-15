@@ -1,9 +1,13 @@
-//! Boreas TLS security policy gate, not a TLS implementation.
+//! Boreas TLS policy gate and optional OpenSSL backend.
 //!
-//! No handshake, key exchange, signature, certificate parser, or AEAD is implemented here.
-//! In particular, no production session can be created until a reviewed backend is wired in.
+//! The default build is policy-only: it says what a real TLS backend must prove
+//! before a session may be used.  The `openssl-backend` feature adds the
+//! concrete OpenSSL implementation in [`backend`]; it is kept behind that
+//! feature because it links native OpenSSL and needs FFI for one introspection
+//! call.  This root module itself remains free of `unsafe` code.
 
-#![forbid(unsafe_code)]
+#[cfg(feature = "openssl-backend")]
+pub mod backend;
 
 use core::fmt;
 

@@ -1,16 +1,33 @@
-//! Minimal, self-contained primitives for an external Boreas supervisor.
+//! Minimal, self-contained primitives and an external-supervisor entrypoint
+//! for Boreas upgrades.
 //!
-//! This crate intentionally does not download, authenticate, execute, or install a
-//! release. A future release-verification layer must provide independently
-//! verified artifact and manifest bytes plus provenance before calling
-//! [`UpgradeStore::prepare`]. There is no `bool`/"verified" escape hatch here.
-//! Hash/signature verification, preflight, process supervision, and OS service
-//! integration are NOT IMPLEMENTED and this crate makes no production-readiness
-//! or release-authenticity claim.
+//! This crate does not download or authenticate a release and exposes no
+//! install entry point. A future release-verification layer must provide
+//! independently verified artifact and manifest bytes plus provenance before
+//! calling [`UpgradeStore::prepare`]. There is no `bool`/"verified" escape
+//! hatch here.
 //!
-//! Transactions use a durable journal and one atomically replaced active pointer.
-//! Unconfirmed activations are rolled back by [`UpgradeStore::recover`], which a
-//! separate supervisor process must invoke before starting the selected version.
+//! The bundled `boreas-supervisor` binary is the minimal real process
+//! boundary for those primitives: it recovers the store before launching
+//! anything, launches the selected program as a real child process, confirms
+//! a newly activated candidate only after a zero exit, and rolls back via
+//! [`UpgradeStore::recover`] on any other outcome. It never downloads,
+//! installs, or authenticates anything.
+//!
+//! Hash/signature/manifest verification (master plan §10.1–§10.2), preflight
+//! (ELF/architecture/state-schema/seccomp/disk checks), signal forwarding,
+//! health checks and launch timeouts, OS service integration (systemd et
+//! al.), and the fault-injection / power-cut matrix remain NOT IMPLEMENTED.
+//! This crate makes no production-readiness or release-authenticity claim,
+//! and nothing here satisfies the master plan's `G-UPGRADE` gate on its own.
+//!
+//! Transactions use a durable journal and one atomically replaced active
+//! pointer. Unconfirmed activations are rolled back by
+//! [`UpgradeStore::recover`], which an external supervisor process must
+//! invoke before starting the selected version; the supervisor binary calls
+//! [`UpgradeStore::begin_activation`], the single reviewed composition of
+//! that recovery with the one permitted first launch of a `Prepared`
+//! candidate.
 
 use std::error::Error;
 use std::fmt;
@@ -274,6 +291,151 @@ impl UpgradeStore {
         self.read_journal()
     }
 
+    /// Return the absolute directory of a stored version after validating the
+    /// identifier. This is a pure path computation: it does not require, or
+    /// prove, that the version exists or that its contents are authentic.
+    pub fn version_dir(&self, version: &str) -> Result<PathBuf> {
+        validate_version(version)?;
+        Ok(self.versions.join(version))
+    }
+
+    /// Return the active version for display/status **without** requiring the
+    /// target directory to still exist.
+    ///
+    /// [`active_version`](Self::active_version) refuses a dangling pointer,
+    /// which is the right fail-closed behaviour for *launching*; but a status
+    /// report must still be able to show the operator that the pointer names
+    /// a vanished version so they can diagnose it. Never use this to select a
+    /// program to run: prefer [`active_version`](Self::active_version) and
+    /// let its error stop the launch.
+    pub fn recorded_active_version(&self) -> Result<Option<String>> {
+        let path = self.root.join(ACTIVE_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+            Ok(m) if m.file_type().is_symlink() || !m.is_file() => Err(UpgradeError::Invalid(
+                "active pointer is not a regular file",
+            )),
+            Ok(m) => {
+                if m.len() > MAX_ACTIVE_BYTES {
+                    return Err(UpgradeError::Invalid("active pointer exceeds size limit"));
+                }
+                let mut s = String::new();
+                File::open(path)?
+                    .take(MAX_ACTIVE_BYTES + 1)
+                    .read_to_string(&mut s)?;
+                if s.len() as u64 > MAX_ACTIVE_BYTES {
+                    return Err(UpgradeError::Invalid("active pointer exceeds size limit"));
+                }
+                let s = s.strip_suffix('\n').unwrap_or(&s);
+                if s.contains('\n') || s.contains('\r') {
+                    return Err(UpgradeError::Invalid("active pointer has trailing data"));
+                }
+                if s.is_empty() {
+                    Ok(None)
+                } else {
+                    validate_version(s)?;
+                    Ok(Some(s.to_owned()))
+                }
+            }
+        }
+    }
+
+    /// How many distinct versions are currently stored under `versions/`.
+    /// Used by status reporting to show that old versions are retained.
+    pub fn stored_version_count(&self) -> Result<usize> {
+        let mut count = 0usize;
+        for entry in fs::read_dir(&self.versions)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() && !kind.is_symlink() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Compose "recover before launch" with the single permitted first launch
+    /// of a `Prepared` candidate, for the external supervisor process.
+    ///
+    /// State machine (master plan §10.3, `docs/upgrade/README.md`):
+    ///
+    /// * **No journal** — `recover()` reports [`Recovery::NoTransaction`]; the
+    ///   existing active pointer (if any) is reported through
+    ///   [`Activation::Steady`].
+    /// * **journal `Confirmed`, pointer consistent** — the current version is
+    ///   reported through [`Activation::Steady`].
+    /// * **journal `Activated`** — a previous activation was never confirmed,
+    ///   i.e. the candidate already had its one trial launch (or died trying
+    ///   to). `recover()` rolls the pointer back to the retained old version,
+    ///   and this composition reports [`Activation::RolledBack`] *without*
+    ///   re-activating the candidate: the supervisor runs the old program,
+    ///   and the candidate is not automatically retried.
+    /// * **journal `Prepared`** — the candidate has never been launched.
+    ///   `recover()` first restores/validates the retained-old pointer (it
+    ///   also repairs the crash-mid-`activate` window: pointer already moved
+    ///   while the journal still says `Prepared`), and only then does this
+    ///   composition call [`activate`](Self::activate) exactly once and
+    ///   report [`Activation::TrialLaunch`].
+    /// * **journal `Confirmed` but pointer inconsistent** — `recover()` rolls
+    ///   back and resets the journal to `Prepared`. This composition refuses
+    ///   the launch ([`Activation::Refused`]) rather than silently treating
+    ///   the reset as "never launched": corruption gets operator attention,
+    ///   not an automatic retry.
+    ///
+    /// Limitation, stated plainly: `recover()` resets a rolled-back journal
+    /// to `Prepared`, and `prepare()` also ends at `Prepared`, so from
+    /// journal+pointer alone a pre-launch caller cannot distinguish "a
+    /// candidate that was just prepared" from "a candidate whose trial
+    /// already failed and was rolled back by an earlier `recover()`" —
+    /// immediately after `prepare()` the pointer still names the old
+    /// version, exactly as it does after a rollback; and once `activate()`
+    /// has moved the pointer it also advances the journal to `Activated`,
+    /// which is the one state this composition *can* refuse to retry. The
+    /// supervisor CLI built on this method therefore never relies on this
+    /// composition alone to avoid re-trialling a failed candidate across
+    /// process lifetimes; see that binary's documented boot protocol.
+    pub fn begin_activation(&self) -> Result<Activation> {
+        let Some(before) = self.read_journal()? else {
+            return Ok(Activation::Steady {
+                active: self.active_version()?,
+            });
+        };
+        match before.phase {
+            Phase::Confirmed => match self.recover()? {
+                Recovery::Confirmed { active } => Ok(Activation::Steady { active }),
+                Recovery::RolledBack { active } => Ok(Activation::Refused {
+                    active,
+                    candidate: before.new_version,
+                }),
+                Recovery::NoTransaction => Err(UpgradeError::WrongState),
+            },
+            Phase::Activated => match self.recover()? {
+                Recovery::RolledBack { active } => Ok(Activation::RolledBack {
+                    active,
+                    candidate: before.new_version,
+                }),
+                _ => Err(UpgradeError::WrongState),
+            },
+            Phase::Prepared => {
+                // Recover first. This repairs the crash-mid-activate window
+                // (pointer already at the candidate, journal still Prepared)
+                // by restoring the retained pointer, and validates that the
+                // old version a failing trial would fall back to really
+                // exists. Only then is the one trial launch permitted.
+                match self.recover()? {
+                    Recovery::RolledBack { .. } => {}
+                    _ => return Err(UpgradeError::WrongState),
+                }
+                self.activate()?;
+                Ok(Activation::TrialLaunch {
+                    candidate: before.new_version,
+                    previous: before.old_version,
+                })
+            }
+        }
+    }
+
     fn ensure_version_exists(&self, v: &str) -> Result<()> {
         validate_version(v)?;
         let p = self.versions.join(v);
@@ -345,6 +507,39 @@ pub enum Recovery {
     NoTransaction,
     Confirmed { active: Option<String> },
     RolledBack { active: Option<String> },
+}
+
+/// Outcome of [`UpgradeStore::begin_activation`]: the one pre-launch decision
+/// an external supervisor acts on. Every variant preserves the existing
+/// crash-recovery contract — no variant launches anything by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Activation {
+    /// No upgrade transaction is in flight (no journal, or a confirmed one
+    /// with a consistent pointer). Run `active`, if any.
+    Steady { active: Option<String> },
+    /// A `Prepared` candidate has just been activated for its single trial
+    /// launch. Run `candidate`; afterwards call [`UpgradeStore::confirm`]
+    /// only on a healthy (zero-exit) outcome, [`UpgradeStore::recover`]
+    /// otherwise. `previous` is the retained version a rollback restores.
+    TrialLaunch {
+        candidate: String,
+        previous: Option<String>,
+    },
+    /// A previously `Activated` candidate was never confirmed and has been
+    /// rolled back by recovery. Do not auto-retry it; run `active` (the
+    /// retained version), if any.
+    RolledBack {
+        active: Option<String>,
+        candidate: String,
+    },
+    /// The journal was inconsistent (a `Confirmed` record whose active
+    /// pointer did not match). Recovery restored `active`; the launch is
+    /// refused so an operator can inspect the store instead of the
+    /// supervisor silently re-trialling `candidate`.
+    Refused {
+        active: Option<String>,
+        candidate: String,
+    },
 }
 
 fn validate_version(v: &str) -> Result<()> {
@@ -810,6 +1005,123 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!s.staging.join("1.0.0.tmp").exists());
+    }
+    fn with_old_active(s: &UpgradeStore) {
+        fs::create_dir(s.versions.join("1.0.0")).unwrap();
+        s.write_active(Some("1.0.0")).unwrap();
+    }
+    #[test]
+    fn begin_activation_empty_store_is_steady_without_active() {
+        let (_t, s, _a) = setup();
+        assert_eq!(
+            s.begin_activation().unwrap(),
+            Activation::Steady { active: None }
+        );
+        assert_eq!(s.journal().unwrap(), None);
+    }
+    #[test]
+    fn begin_activation_without_journal_keeps_current_active() {
+        let (_t, s, _a) = setup();
+        with_old_active(&s);
+        assert_eq!(
+            s.begin_activation().unwrap(),
+            Activation::Steady {
+                active: Some("1.0.0".into())
+            }
+        );
+        assert_eq!(s.active_version().unwrap().as_deref(), Some("1.0.0"));
+    }
+    #[test]
+    fn begin_activation_prepared_candidate_gets_one_trial() {
+        let (_t, s, a) = setup();
+        with_old_active(&s);
+        s.prepare(
+            &Candidate {
+                version: "2.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
+        assert_eq!(
+            s.begin_activation().unwrap(),
+            Activation::TrialLaunch {
+                candidate: "2.0.0".into(),
+                previous: Some("1.0.0".into()),
+            }
+        );
+        assert_eq!(s.active_version().unwrap().as_deref(), Some("2.0.0"));
+        assert_eq!(s.journal().unwrap().unwrap().phase, Phase::Activated);
+    }
+    #[test]
+    fn begin_activation_unconfirmed_candidate_rolls_back_instead_of_retrying() {
+        let (_t, s, a) = setup();
+        with_old_active(&s);
+        s.prepare(
+            &Candidate {
+                version: "2.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
+        // First boot consumes the trial; the process "crashes" (no
+        // confirm/recover). The next boot must roll back, not retrial.
+        assert!(matches!(
+            s.begin_activation().unwrap(),
+            Activation::TrialLaunch { .. }
+        ));
+        assert_eq!(
+            s.begin_activation().unwrap(),
+            Activation::RolledBack {
+                active: Some("1.0.0".into()),
+                candidate: "2.0.0".into(),
+            }
+        );
+        assert_eq!(s.active_version().unwrap().as_deref(), Some("1.0.0"));
+    }
+    #[test]
+    fn begin_activation_inconsistent_confirmed_journal_is_refused() {
+        let (_t, s, _a) = setup();
+        fs::create_dir(s.versions.join("1.0.0")).unwrap();
+        s.write_journal(&Journal {
+            old_version: None,
+            new_version: "1.0.0".into(),
+            phase: Phase::Confirmed,
+        })
+        .unwrap();
+        assert_eq!(
+            s.begin_activation().unwrap(),
+            Activation::Refused {
+                active: None,
+                candidate: "1.0.0".into(),
+            }
+        );
+        assert_eq!(s.journal().unwrap().unwrap().phase, Phase::Prepared);
+    }
+    #[test]
+    fn recorded_active_version_reports_dangling_pointer_but_launch_read_fails() {
+        let (_t, s, _a) = setup();
+        fs::write(s.root.join(ACTIVE_FILE), "9.9.9\n").unwrap();
+        assert_eq!(
+            s.recorded_active_version().unwrap().as_deref(),
+            Some("9.9.9")
+        );
+        assert!(s.active_version().is_err());
+    }
+    #[test]
+    fn version_dir_and_stored_count_reflect_retained_versions() {
+        let (_t, s, a) = setup();
+        assert!(s.version_dir("../nope").is_err());
+        assert_eq!(s.stored_version_count().unwrap(), 0);
+        with_old_active(&s);
+        s.prepare(
+            &Candidate {
+                version: "2.0.0".into(),
+            },
+            a.path().join("candidate"),
+        )
+        .unwrap();
+        assert_eq!(s.stored_version_count().unwrap(), 2);
+        assert_eq!(s.version_dir("2.0.0").unwrap(), s.versions.join("2.0.0"));
     }
     #[cfg(unix)]
     #[test]

@@ -974,6 +974,232 @@ mod tests {
     fn fixture_hex(id: &str) -> Vec<u8> {
         decode_hex(&fixture_field(id, "raw_tbs_hex"))
     }
+
+    // ------------------------------------------------------------------
+    // G-FRAME/SS5.3 supplemental adversarial coverage for the candidate
+    // typed-object codec. Focus: truncation/mutation sweeps and size
+    // bounds. No new wire rules are asserted beyond the candidate docs.
+    // ------------------------------------------------------------------
+
+    const POSITIVE_IDS: [&str; 6] = [
+        "node-identity-minimal-valid",
+        "attachment-lease-minimal-valid",
+        "core-lsa-minimal-valid",
+        "route-grant-minimal-valid",
+        "direct-grant-minimal-valid",
+        "status-snapshot-minimal-valid",
+    ];
+
+    #[test]
+    fn every_proper_prefix_of_valid_tbs_rejects() {
+        // Truncation sweep: no prefix of a valid object may decode (a
+        // shorter valid object sharing the prefix would be a type
+        // confusion hazard), and none may panic.
+        for id in POSITIVE_IDS {
+            let raw = fixture_hex(id);
+            decode_tbs(&raw).unwrap_or_else(|e| panic!("{id} fixture must decode: {e:?}"));
+            for n in 0..raw.len() {
+                assert!(
+                    decode_tbs(&raw[..n]).is_err(),
+                    "{id}: prefix {n}/{} must reject",
+                    raw.len()
+                );
+            }
+            // Trailing garbage: one extra byte of each flavour.
+            for extra in [0x00u8, 0xFF, 0x81, b'X'] {
+                let mut longer = raw.clone();
+                longer.push(extra);
+                assert_eq!(
+                    decode_tbs(&longer),
+                    Err(Error::TrailingBytes),
+                    "{id}: trailing {extra:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_size_bounds_fail_before_semantics() {
+        // 16 KiB TBS cap (SS5.3): exactly-at data passes the size gate and
+        // then fails as CBOR/schema; one byte over fails as TooLarge.
+        assert_eq!(
+            MAX_OBJECT_LEN,
+            16 * 1024,
+            "SS5.3 single-object cap candidate"
+        );
+        assert_eq!(
+            decode_tbs(&vec![0x00; MAX_OBJECT_LEN + 1]),
+            Err(Error::TooLarge)
+        );
+        assert_ne!(
+            decode_tbs(&vec![0x00; MAX_OBJECT_LEN]),
+            Err(Error::TooLarge),
+            "at-cap input reaches the parser"
+        );
+        assert!(decode_tbs(&vec![0x00; MAX_OBJECT_LEN]).is_err());
+        // signature_input enforces the same cap on caller-retained bytes.
+        assert_eq!(
+            signature_input(&vec![0; MAX_OBJECT_LEN + 1], ObjectType::NodeIdentity, 1),
+            Err(Error::TooLarge)
+        );
+        assert!(signature_input(&vec![0; MAX_OBJECT_LEN], ObjectType::NodeIdentity, 1).is_ok());
+        // Empty input is truncated CBOR, never an empty object.
+        assert_eq!(decode_tbs(&[]), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn hostile_root_shapes_and_majors_reject() {
+        // Root must be a map with unsigned-int keys only; every other
+        // major type / shape rejects with a deterministic category.
+        assert_eq!(
+            decode_tbs(&[0x80]),
+            Err(Error::InvalidField("envelope map"))
+        ); // []
+        assert_eq!(
+            decode_tbs(&[0x00]),
+            Err(Error::InvalidField("envelope map"))
+        ); // 0
+        assert_eq!(
+            decode_tbs(&[0x40]),
+            Err(Error::InvalidField("envelope map"))
+        ); // h''
+        assert_eq!(decode_tbs(&[0x20]), Err(Error::UnsupportedCbor)); // -1: major 1 unsupported
+        assert_eq!(decode_tbs(&[0x61, b'a']), Err(Error::UnsupportedCbor)); // text unsupported
+        assert_eq!(decode_tbs(&[0xC0, 0x00]), Err(Error::UnsupportedCbor)); // tag
+        assert_eq!(decode_tbs(&[0xF5]), Err(Error::UnsupportedCbor)); // true
+        assert_eq!(decode_tbs(&[0xBF, 0xFF]), Err(Error::UnsupportedCbor)); // indefinite map
+        assert_eq!(
+            decode_tbs(&[0xA1, 0x61, b'a', 0x00]),
+            Err(Error::UnsupportedCbor),
+            "text map key: major-3 item itself is unsupported before key typing"
+        );
+        // Duplicate and out-of-order envelope keys are non-canonical.
+        assert_eq!(
+            decode_tbs(&[0xA2, 0x00, 0x00, 0x00, 0x00]),
+            Err(Error::NonCanonical)
+        );
+        assert_eq!(
+            decode_tbs(&[0xA2, 0x01, 0x00, 0x00, 0x00]),
+            Err(Error::NonCanonical)
+        );
+        // Empty map: missing all required fields.
+        assert_eq!(decode_tbs(&[0xA0]), Err(Error::DuplicateOrUnknownField));
+    }
+
+    #[test]
+    fn hostile_depth_and_flat_size_bombs_reject() {
+        // Deep nesting: reader caps at depth > 32 (TooLarge category).
+        let mut deep_arrays = vec![0x81; 64];
+        deep_arrays.push(0);
+        assert_eq!(decode_tbs(&deep_arrays), Err(Error::TooLarge));
+        let mut deep_arrays = vec![0x81; 33];
+        deep_arrays.push(0);
+        assert_eq!(decode_tbs(&deep_arrays), Err(Error::TooLarge));
+        // 32-deep is within the reader cap, then fails as schema (not a map).
+        let mut within = vec![0x81; 32];
+        within.push(0);
+        assert_eq!(
+            decode_tbs(&within),
+            Err(Error::InvalidField("envelope map"))
+        );
+        // Map with absurd declared entry count rejects as TooLarge without
+        // iterating it.
+        assert_eq!(
+            decode_tbs(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0]),
+            Err(Error::TooLarge)
+        );
+        // Array count header alone is truncated, not pre-allocated.
+        assert!(decode_tbs(&[0x9B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+        // Huge declared byte-string length rejects (truncated/overflow).
+        assert!(
+            decode_tbs(&[
+                0xA1, 0x00, 0x5B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_byte_mutation_never_panics_and_stays_deterministic() {
+        // Every position x every replacement byte on the smallest fixture:
+        // decode twice, require identical outcomes (determinism), and when
+        // a mutation happens to still decode, its re-encoding must equal
+        // the mutated input (the parser never "repairs" signed bytes).
+        let raw = fixture_hex("core-lsa-minimal-valid");
+        for pos in 0..raw.len() {
+            for replacement in 0u16..=255 {
+                let mut mutated = raw.clone();
+                mutated[pos] = replacement as u8;
+                let first = decode_tbs(&mutated);
+                assert_eq!(
+                    first,
+                    decode_tbs(&mutated),
+                    "non-deterministic at pos {pos}"
+                );
+                if let Ok(obj) = first {
+                    assert_eq!(
+                        encode_tbs(&obj).unwrap(),
+                        mutated,
+                        "pos {pos}: accepted mutation must round-trip exactly"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_side_bounds_fail_closed() {
+        // Typed values that violate candidate caps must fail to encode,
+        // not silently emit an object its own decoder would reject.
+        let baseline = decode_tbs(&fixture_hex("core-lsa-minimal-valid")).unwrap();
+        assert_eq!(
+            encode_tbs(&baseline).unwrap(),
+            fixture_hex("core-lsa-minimal-valid")
+        );
+        // issuer_key_id empty / over 64.
+        let mut o = baseline.clone();
+        o.issuer_key_id = vec![];
+        assert!(encode_tbs(&o).is_err());
+        let mut o = baseline.clone();
+        o.issuer_key_id = vec![7; 65];
+        assert_eq!(
+            encode_tbs(&o),
+            Err(Error::InvalidField("common envelope bounds"))
+        );
+        // Too many extensions.
+        let mut o = baseline.clone();
+        o.extensions = (0..(MAX_EXTENSIONS as u64 + 1))
+            .map(|i| Extension {
+                id: i,
+                critical: false,
+                value: vec![],
+            })
+            .collect();
+        assert_eq!(encode_tbs(&o), Err(Error::TooLarge));
+        // Unknown critical extension on encode.
+        let mut o = baseline.clone();
+        o.extensions = vec![Extension {
+            id: 99,
+            critical: true,
+            value: vec![],
+        }];
+        assert_eq!(encode_tbs(&o), Err(Error::UnknownCriticalExtension(99)));
+        // Duplicate extension ids.
+        let mut o = baseline;
+        o.extensions = vec![
+            Extension {
+                id: 5,
+                critical: false,
+                value: vec![],
+            },
+            Extension {
+                id: 5,
+                critical: false,
+                value: vec![1],
+            },
+        ];
+        assert_eq!(encode_tbs(&o), Err(Error::DuplicateOrUnknownField));
+    }
     #[test]
     fn positive_fixed_tbs_vectors_round_trip_exact_bytes() {
         for (id, ty) in [

@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "GPL-3.0-only"
-description = "Crash-recoverable Boreas upgrade journal and active-version pointer primitives"
+description = "Crash-recoverable Boreas upgrade journal/active-pointer primitives and the external supervisor process entrypoint"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "boreas-supervisor"
+path = "src/main.rs"
 
 [dependencies]
