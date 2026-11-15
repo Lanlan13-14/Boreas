@@ -104,6 +104,43 @@ jobs:
             echo 'crates/boreas-crypto must not enable the vendored OpenSSL feature' >&2
             exit 1
           fi
+      - name: Assert expected OpenSSL feature flags exist
+        # `cargo test --all-features` silently succeeds when a feature does not
+        # exist.  This preflight makes a missing pki/tunnel/supervisor feature a
+        # hard failure instead of a false-green run of old tests.
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          expected = {
+              "boreas-crypto": "openssl-backend",
+              "boreas-pki": "openssl-backend",
+              "boreas-tunnel": "openssl-inner-tls",
+              "boreas-supervisor": "openssl-backend",
+          }
+          packages = {package["name"]: package for package in metadata["packages"]}
+          missing = []
+          for name, feature in expected.items():
+              package = packages.get(name)
+              if package is None:
+                  missing.append(f"{name} (package missing)")
+              elif feature not in package.get("features", {}):
+                  missing.append(f"{name}:{feature}")
+          if missing:
+              print("missing expected OpenSSL feature(s): " + ", ".join(missing), file=sys.stderr)
+              sys.exit(1)
+          print("expected OpenSSL features present: " + ", ".join(f"{k}:{v}" for k, v in expected.items()))
+          PY
+
       - name: Format crypto-related crates in CI and record patch
         # Formatting is intentionally applied before tests, not used as a
         # blocking `--check` gate: this repository formats only in Actions, and
@@ -149,7 +186,7 @@ jobs:
           OPENSSL_STATIC: '1'
         run: |
           set -o pipefail
-          cargo test --locked -p boreas-pki --all-features \
+          cargo test --locked -p boreas-pki --features openssl-backend \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-pki-tests.log
       - name: Transport inner-TLS seam tests with backend feature
         if: always()
@@ -165,7 +202,7 @@ jobs:
           # skipping the seam test if that module has not landed yet.
           test -f crates/boreas-tunnel/src/openssl_inner_tls.rs
           set -o pipefail
-          cargo test --locked -p boreas-tunnel --all-features \
+          cargo test --locked -p boreas-tunnel --features openssl-inner-tls \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-tunnel-tests.log
       - name: Supervisor release-manifest dual-signature tests with real OpenSSL
         if: always()

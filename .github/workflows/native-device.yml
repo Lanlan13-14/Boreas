@@ -1,0 +1,275 @@
+name: Native packet I/O device tests (real driver only)
+
+# This workflow is the CI wiring for the native-packetio contract:
+#
+#   Windows: crates/boreas-tun/tests/windows_device.rs
+#            BOREAS_REQUIRE_TUN=1, BOREAS_WINTUN_DLL, BOREAS_WINTUN_SHA256
+#   macOS:   crates/boreas-tun/tests/macos_device.rs
+#            BOREAS_REQUIRE_TUN=1, real utun interface as root
+#
+# A skipped or absent device test is never counted as success.  The guard
+# (tools/release/native_device_guard.py) requires at least one passed test,
+# zero failed, zero ignored, and the explicit evidence marker:
+#
+#   BOREAS_DEVICE_EVIDENCE platform=windows driver=wintun adapter=created packet_roundtrip=ok cleanup=ok
+#   BOREAS_DEVICE_EVIDENCE platform=macos driver=utun adapter=created packet_roundtrip=ok cleanup=ok
+#
+# The official Wintun ZIP is downloaded for testing only and is not vendored in
+# the repository.  Its published SHA-256 is checked before extraction and the
+# extracted DLL's Authenticode signature and hash are checked before use.
+#
+# TRUST BOUNDARY: that SHA-256 is the vendor's own published value fetched from
+# the same vendor site, so it is an integrity pin against accidental or
+# mirror-level substitution, NOT an independent supply-chain attestation and NOT
+# a Boreas ReleaseRoot.  The Authenticode check is the Windows OS publisher
+# check for the test dependency.  Neither authorizes a Boreas production
+# artifact.  A green run here proves the test ran against that DLL; it does not
+# pass G-CRYPTO, G-SUPPLY or any release gate.
+#
+# Linux real-TUN coverage lives in .github/workflows/linux-system.yml; it uses
+# the existing linux_device.rs tests plus BOREAS_REQUIRE_TUN=1.
+#
+# A green run here is crate-level native device evidence, not a full VPN,
+# routing, DNS, failover or production release acceptance record.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'crates/boreas-tun/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/release/native_device_guard.py'
+      - '.github/workflows/native-device.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONDONTWRITEBYTECODE: "1"
+  BOREAS_REQUIRE_TUN: "1"
+
+jobs:
+  windows-wintun:
+    name: Windows Wintun adapter and real packet I/O
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download, verify and extract official signed Wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Vendor-published values from https://www.wintun.net/ (Wintun 0.14.1,
+          # downloaded from https://www.wintun.net/builds/wintun-0.14.1.zip).
+          # This is a test-dependency integrity pin, not a Boreas release root.
+          $expectedZip = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $expectedDll = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
+          $expectedThumbprint = 'DF98E075A012ED8C86FBCF14854B8F9555CB3D45'
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1.zip'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip -UseBasicParsing
+          $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($zipHash -ne $expectedZip) {
+            throw "Wintun ZIP SHA-256 mismatch: $zipHash (expected $expectedZip)"
+          }
+          $expanded = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1'
+          Expand-Archive -Path $zip -DestinationPath $expanded -Force
+          $dll = Get-ChildItem -Path $expanded -Recurse -Filter wintun.dll |
+            Where-Object { $_.FullName -match '\\amd64\\wintun\.dll$' } |
+            Select-Object -First 1
+          if (-not $dll) { throw 'bin/amd64/wintun.dll not found in the official ZIP' }
+          Unblock-File -Path $dll.FullName
+          $dllHash = (Get-FileHash -Algorithm SHA256 $dll.FullName).Hash.ToLowerInvariant()
+          if ($dllHash -ne $expectedDll) {
+            throw "Wintun DLL SHA-256 mismatch: $dllHash (expected $expectedDll)"
+          }
+          $signature = Get-AuthenticodeSignature $dll.FullName
+          if ($signature.Status -ne 'Valid') {
+            throw "Wintun Authenticode signature is not valid: $($signature.Status)"
+          }
+          if ($signature.SignerCertificate.Thumbprint -ne $expectedThumbprint) {
+            throw "Wintun signer thumbprint mismatch: $($signature.SignerCertificate.Thumbprint)"
+          }
+          if ($signature.SignerCertificate.Subject -notmatch 'CN=WireGuard LLC') {
+            throw "Wintun signer subject mismatch: $($signature.SignerCertificate.Subject)"
+          }
+          if ($signature.SignerCertificate.Issuer -notmatch 'DigiCert EV Code Signing CA') {
+            throw "Wintun signer issuer mismatch: $($signature.SignerCertificate.Issuer)"
+          }
+          "BOREAS_WINTUN_DLL=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "BOREAS_WINTUN_SHA256=$dllHash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          @{
+            zip_sha256 = $zipHash
+            dll_path = $dll.FullName
+            dll_sha256 = $dllHash
+            authenticode_status = "$($signature.Status)"
+            signer_subject = "$($signature.SignerCertificate.Subject)"
+            signer_issuer = "$($signature.SignerCertificate.Issuer)"
+            signer_thumbprint = "$($signature.SignerCertificate.Thumbprint)"
+            trust_basis = 'vendor-published SHA-256 + pinned WireGuard LLC Authenticode signer; test dependency only, not a Boreas ReleaseRoot'
+          } | ConvertTo-Json | Tee-Object -FilePath wintun-provenance.json
+
+      - name: Compile and lint the Windows crate
+        shell: pwsh
+        run: |
+          cargo check -p boreas-tun --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy -p boreas-tun --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run real Wintun device test (must not skip)
+        shell: pwsh
+        run: |
+          cargo test -p boreas-tun --test windows_device --locked -- --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath windows-device.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard against skipped or simulated Wintun evidence
+        shell: pwsh
+        run: |
+          python tools/release/native_device_guard.py `
+            --platform windows `
+            --log windows-device.log `
+            --out native-device-evidence.json `
+            --require-test real_wintun_device_packet_round_trip `
+            --require-marker "BOREAS_DEVICE_EVIDENCE platform=windows driver=wintun adapter=created packet_roundtrip=ok cleanup=ok"
+
+      - name: Upload Wintun device evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-device-windows-${{ github.run_id }}
+          path: |
+            windows-device.log
+            native-device-evidence.json
+            wintun-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-utun:
+    name: macOS utun (${{ matrix.arch }}) real packet I/O
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile and lint the macOS crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p boreas-tun --all-targets --locked
+          cargo clippy -p boreas-tun --all-targets --locked -- -D warnings
+
+      - name: Build the utun test binary as the unprivileged user
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p boreas-tun --test macos_device --no-run --locked \
+            --message-format=json > macos-device-build.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          executables = []
+          for line in Path("macos-device-build.json").read_text(encoding="utf-8", errors="replace").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  message = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if message.get("reason") != "compiler-artifact":
+                  continue
+              target = message.get("target") or {}
+              if target.get("name") != "macos_device":
+                  continue
+              executable = message.get("executable")
+              if executable:
+                  executables.append(executable)
+
+          # Cargo may omit a fresh compiler-artifact message in unusual cases.
+          if not executables:
+              candidates = [
+                  path
+                  for path in sorted(Path("target/debug/deps").glob("macos_device-*"))
+                  if path.is_file()
+                  and os.access(path, os.X_OK)
+                  and path.suffix not in (".d", ".rlib", ".rmeta")
+              ]
+              executables = [str(path) for path in candidates]
+
+          if len(executables) != 1:
+              raise SystemExit(f"expected exactly one macos_device executable, got {executables}")
+          binary = Path(executables[0]).resolve()
+          if not binary.is_file() or not os.access(binary, os.X_OK):
+              raise SystemExit(f"not an executable file: {binary}")
+          Path("macos-device-executable.txt").write_text(str(binary) + "\n", encoding="utf-8")
+          print(binary)
+          PY
+          binary="$(cat macos-device-executable.txt)"
+          test -x "$binary"
+          printf 'MACOS_DEVICE_TEST_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
+
+      - name: Run real utun device test as root (must not skip)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -E env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "BOREAS_REQUIRE_TUN=1" \
+            "$MACOS_DEVICE_TEST_BINARY" --test-threads=1 --nocapture 2>&1 |
+            tee macos-device.log
+
+      - name: Guard against skipped or simulated utun evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/release/native_device_guard.py \
+            --platform macos \
+            --log macos-device.log \
+            --out native-device-evidence.json \
+            --require-test real_utun_packet_round_trip \
+            --require-marker "BOREAS_DEVICE_EVIDENCE platform=macos driver=utun adapter=created packet_roundtrip=ok cleanup=ok"
+
+      - name: Upload utun device evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-device-macos-${{ matrix.arch }}-${{ github.run_id }}
+          path: |
+            macos-device-build.json
+            macos-device.log
+            native-device-evidence.json
+          if-no-files-found: warn
+          retention-days: 14

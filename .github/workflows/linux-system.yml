@@ -1,33 +1,95 @@
 name: Linux system TUN checks
 
+# Real Linux TUN device gate.  This is deliberately separate from the CLI
+# foundation workflow: `doctor` output is not TUN evidence, and this workflow
+# runs the crate's linux_device.rs tests as root with BOREAS_REQUIRE_TUN=1 so
+# an unprivileged or unavailable harness panics instead of silently skipping.
+#
+# A green run is crate-level real-device evidence (adapter creation, MTU,
+# multi-queue attach, and a kernel-routed ICMP reply through the TUN).  It is
+# not a full VPN data-plane, routing, DNS, failover or release acceptance gate.
+
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONDONTWRITEBYTECODE: "1"
+  BOREAS_REQUIRE_TUN: "1"
 
 jobs:
   linux-tun-device:
     name: Real Linux TUN integration (Ubuntu)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install iproute2
-        run: sudo apt-get update && sudo apt-get install -y iproute2
+
+      - name: Install iproute2, util-linux and Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 util-linux
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Check /dev/net/tun availability
         run: |
           test -c /dev/net/tun
           sudo modprobe tun || true
           test -c /dev/net/tun
-      - name: Format workspace
+
+      - name: Format workspace (apply, never gate tests on formatting)
+        continue-on-error: true
         run: cargo fmt --all
+
       - name: Check crate
+        if: always()
         run: cargo check -p boreas-tun --locked
+
       - name: Clippy crate
+        if: always()
         run: cargo clippy -p boreas-tun --all-targets --locked -- -D warnings
-      - name: Unit and real-device tests as root
-        run: sudo -E env "PATH=$PATH" BOREAS_REQUIRE_TUN=1 cargo test -p boreas-tun --locked -- --test-threads=1
+
+      - name: Run real-device tests as root (must not skip)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          sudo -E env "PATH=$PATH" BOREAS_REQUIRE_TUN=1 \
+            cargo test -p boreas-tun --locked -- --test-threads=1 2>&1 |
+            tee native-device-test.log
+
+      - name: Guard against skipped or simulated TUN evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/release/native_device_guard.py \
+            --platform linux \
+            --log native-device-test.log \
+            --out native-device-evidence.json \
+            --require-test create_verify_mtu_multiqueue_and_auto_cleanup \
+            --require-test real_l3_write_and_kernel_routed_reply
+
+      - name: Upload native TUN evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-device-linux-${{ github.run_id }}
+          path: |
+            native-device-test.log
+            native-device-evidence.json
+          if-no-files-found: warn
+          retention-days: 14

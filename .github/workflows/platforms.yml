@@ -1,4 +1,25 @@
-name: Platform build and compatibility (development only)
+name: Platform functional verification and development packaging
+
+# What this workflow proves:
+#   - the workspace compiles and its tests pass on five native runners;
+#   - the release CLI executable actually runs on those runners and reports
+#     its foundation-only state honestly;
+#   - both Linux executables have no ELF interpreter and no DT_NEEDED;
+#   - the x86_64/aarch64 static executables run in minimal distribution
+#     containers that have no Rust toolchain;
+#   - the five development archives and their SHA-256 index are internally
+#     consistent.
+#
+# What this workflow does NOT prove:
+#   - VPN functionality, TLS/WSS transport, TUN/Wintun/utun packet I/O,
+#     routing, DNS, failover, upgrade or security acceptance;
+#   - any master-plan production gate;
+#   - production authenticity. CI has no ReleaseRoot private key and never
+#     creates a GitHub Release, tag, signature or production promotion.
+#
+# The separate native-device.yml and linux-system.yml workflows are the only
+# places real packet-I/O device tests may run. A green `doctor` command here is
+# explicitly not a VPN test.
 
 on:
   push:
@@ -12,9 +33,43 @@ concurrency:
   group: platforms-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
+  lock-preflight:
+    name: Locked dependency preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Cargo.lock satisfies every workspace manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo metadata --locked --format-version 1 --no-deps > workspace-metadata.json 2> lock-error.txt; then
+            cat lock-error.txt
+            echo "::error title=Stale Cargo.lock::Cargo.lock does not satisfy the workspace manifests. Dispatch the 'Refresh Cargo.lock' workflow on main, review its validated diff, then rerun this workflow."
+            exit 1
+          fi
+          sha256sum Cargo.lock | tee cargo-lock.sha256
+          echo "Cargo.lock SHA-256: $(cut -d' ' -f1 cargo-lock.sha256)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload locked workspace metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: lock-preflight-${{ github.run_id }}
+          path: |
+            workspace-metadata.json
+            cargo-lock.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   build-test:
     name: ${{ matrix.label }}
+    needs: lock-preflight
     strategy:
       fail-fast: false
       matrix:
@@ -22,37 +77,33 @@ jobs:
           - label: Linux x86_64 musl (static)
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            artifact: boreas-foundation-dev-linux-x86_64-musl
             platform: linux
             expected_arch: x86_64
           - label: Linux aarch64 musl (static, native)
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            artifact: boreas-foundation-dev-linux-aarch64-musl
             platform: linux
             expected_arch: aarch64
           - label: Windows x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            artifact: boreas-foundation-dev-windows-x86_64
             platform: windows
             expected_arch: AMD64
           - label: macOS Intel x86_64 (native)
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            artifact: boreas-foundation-dev-macos-x86_64
             platform: macos
             expected_arch: x86_64
           - label: macOS Apple Silicon aarch64 (native)
             runner: macos-15
             target: aarch64-apple-darwin
-            artifact: boreas-foundation-dev-macos-aarch64
             platform: macos
             expected_arch: arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
       - name: Verify native runner architecture (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -63,6 +114,7 @@ jobs:
             echo "Expected native ${{ matrix.expected_arch }} runner, got $actual" >&2
             exit 1
           }
+
       - name: Verify native runner architecture (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -70,74 +122,293 @@ jobs:
           if ($env:PROCESSOR_ARCHITECTURE -ne '${{ matrix.expected_arch }}') {
             throw "Expected native ${{ matrix.expected_arch }} runner, got $env:PROCESSOR_ARCHITECTURE"
           }
-      - name: Install musl toolchain (Linux)
+
+      - name: Install musl toolchain and ELF inspection tools (Linux)
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y musl-tools binutils musl-dev
-      - name: Configure native musl linker
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          case '${{ matrix.target }}' in
-            x86_64-unknown-linux-musl) echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
-            aarch64-unknown-linux-musl) echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
-          esac
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Run workspace tests on the target
-        run: cargo test --workspace --locked --target ${{ matrix.target }}
-      - name: Build CLI foundation artifact
-        run: cargo build --locked --release -p boreas-cli --target ${{ matrix.target }}
-      - name: Verify Linux executable is static
+          sudo apt-get install --no-install-recommends -y musl-tools binutils file
+
+      - name: Configure native musl linker (Linux)
         if: matrix.platform == 'linux'
         shell: bash
         run: |
           set -eu
-          binary="target/${{ matrix.target }}/release/boreas"
-          file "$binary"
-          if readelf -l "$binary" | grep -q 'INTERP'; then
-            echo 'Expected a static musl executable with no ELF interpreter' >&2
-            exit 1
+          case '${{ matrix.target }}' in
+            x86_64-unknown-linux-musl) echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
+            aarch64-unknown-linux-musl) echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
+            *) echo "unexpected Linux target ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Record Rust toolchain and lock hash
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv | tee toolchain.txt
+          cargo -V | tee -a toolchain.txt
+          rustup target list --installed | tee -a toolchain.txt
+          echo "rustc_summary=$(rustc -Vv | tr -d '\r' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run workspace tests on the target
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p boreas-cli --target ${{ matrix.target }}
+
+      - name: Verify full static linkage (Linux only)
+        if: matrix.platform == 'linux'
+        run: |
+          python tools/release/verify_static_linux.py \
+            --binary "target/${{ matrix.target }}/release/boreas" \
+            --target "${{ matrix.target }}" \
+            --out dist/static-linkage.json
+
+      - name: Execute packaged-binary functional smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/boreas${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          python tools/release/functional_smoke.py \
+            --binary "$binary" \
+            --target "${{ matrix.target }}" \
+            --out functional-smoke.json
+
+      - name: Package development artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/boreas${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          args=(
+            --binary "$binary"
+            --target "${{ matrix.target }}"
+            --source-sha "$GITHUB_SHA"
+            --repository "$GITHUB_REPOSITORY"
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            --runner "$RUNNER_NAME"
+            --runner-os "$RUNNER_OS"
+            --rustc "${{ steps.toolchain.outputs.rustc_summary }}"
+            --smoke-report functional-smoke.json
+            --cargo-lock Cargo.lock
+            --out-dir dist
+          )
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            args+=(--static-report dist/static-linkage.json)
           fi
-      - name: Upload development-only artifact
+          python tools/release/package.py "${args[@]}"
+
+      - name: Upload development artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ github.run_id }}
-          path: target/${{ matrix.target }}/release/boreas${{ matrix.platform == 'windows' && '.exe' || '' }}
+          name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            dist/*
+            functional-smoke.json
+            toolchain.txt
           if-no-files-found: error
           retention-days: 14
 
-  linux-container-compat:
-    name: Static Linux doctor in ${{ matrix.label }}
+  linux-runtime-compat:
+    name: Static CLI runtime in ${{ matrix.distro }} (${{ matrix.arch }})
     needs: build-test
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: Ubuntu 24.04
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Ubuntu 24.04
+            distro_slug: ubuntu-24.04
             image: ubuntu:24.04
-          - label: Debian Bookworm
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Debian Bookworm
+            distro_slug: debian-bookworm
             image: debian:bookworm-slim
-          - label: Fedora 42
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Fedora 42
+            distro_slug: fedora-42
             image: fedora:42
-          - label: Alpine 3.22
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Alpine 3.22
+            distro_slug: alpine-3.22
+            image: alpine:3.22
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Ubuntu 24.04
+            distro_slug: ubuntu-24.04
+            image: ubuntu:24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Debian Bookworm
+            distro_slug: debian-bookworm
+            image: debian:bookworm-slim
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Fedora 42
+            distro_slug: fedora-42
+            image: fedora:42
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Alpine 3.22
+            distro_slug: alpine-3.22
             image: alpine:3.22
     steps:
-      - name: Download Linux x86_64 development artifact
+      - name: Download Linux development artifact
         uses: actions/download-artifact@v4
         with:
-          name: boreas-foundation-dev-linux-x86_64-musl-${{ github.run_id }}
-          path: ./linux-binary
-      - name: Run doctor in target distribution container
+          name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
+          path: artifact
+
+      - name: Extract package
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ./linux-binary/boreas
-          docker run --rm --platform linux/amd64 \
-            -v "$PWD/linux-binary/boreas:/boreas:ro" \
-            "${{ matrix.image }}" /boreas doctor | tee doctor.json
+          mkdir -p pkg
+          tar -xzf artifact/boreas-*.tar.gz -C pkg
+          test -x pkg/boreas
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: Run doctor in the target distribution (not a VPN test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas doctor | tee doctor.json
           grep -F '"status":"foundation_only"' doctor.json
+          grep -F '"daemon":false' doctor.json
+          grep -F '"tls_backend":false' doctor.json
+          grep -F '"networking":false' doctor.json
           grep -F '"phase0_complete":false' doctor.json
+
+      - name: Run self-check in the target distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas self-check | tee self-check.json
+          grep -F '"daemon":false' self-check.json
+          grep -F '"phase0_complete":false' self-check.json
+
+      - name: Unknown command must fail in the target distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas definitely-not-a-command \
+            > unknown.out 2> unknown.err
+          code=$?
+          set -e
+          test "$code" -ne 0
+          test ! -s unknown.out
+          grep -F 'no daemon was started' unknown.err
+
+      - name: Record container runtime evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '{"schema":"boreas.development.container-runtime.v1","distro":"%s","arch":"%s","image":"%s","target":"%s","result":"passed","vpn_data_plane_tested":false,"production_release":false}\n' \
+            "${{ matrix.distro }}" "${{ matrix.arch }}" "${{ matrix.image }}" \
+            "${{ matrix.target }}" > container-runtime.json
+          cat container-runtime.json
+
+      - name: Upload container runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-runtime-${{ matrix.target }}-${{ matrix.distro_slug }}-${{ github.run_id }}
+          path: |
+            doctor.json
+            self-check.json
+            unknown.out
+            unknown.err
+            container-runtime.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  development-bundle:
+    name: Five-target development bundle (unsigned; production blocked)
+    needs:
+      - lock-preflight
+      - build-test
+      - linux-runtime-compat
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download all five per-target development artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: boreas-development-*-${{ github.run_id }}
+          path: downloaded
+
+      - name: Assemble and verify the five-target bundle
+        run: |
+          python tools/release/make_index.py \
+            --dist downloaded \
+            --out release-bundle \
+            --source-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Independently re-verify the assembled bundle
+        run: python tools/release/verify_bundle.py --bundle release-bundle
+
+      - name: Attach development-bundle warning and checklist to the run summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat release-bundle/README-DEVELOPMENT.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '- [ ] Production gate ledger passed for this exact commit' >> "$GITHUB_STEP_SUMMARY"
+          echo '- [ ] Independent external audit completed and findings closed' >> "$GITHUB_STEP_SUMMARY"
+          echo '- [ ] Offline Ed25519 + ML-DSA ReleaseRoot promotion bundle verified' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload development release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: boreas-development-release-${{ github.run_id }}
+          path: release-bundle/*
+          if-no-files-found: error
+          retention-days: 14

@@ -8,7 +8,27 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
+  lock:
+    name: Locked dependency preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Cargo.lock satisfies every workspace manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo metadata --locked --format-version 1 --no-deps > /dev/null 2> lock-error.txt; then
+            cat lock-error.txt
+            echo "::error title=Stale Cargo.lock::Cargo.lock does not satisfy the workspace manifests. Dispatch the 'Refresh Cargo.lock' workflow on main, review its validated diff, then rerun CI."
+            exit 1
+          fi
+
   format:
     name: Apply stable rustfmt
     runs-on: ubuntu-latest
@@ -78,3 +98,19 @@ jobs:
         run: |
           python tools/verify_vectors.py
           python -m unittest discover -s tools/tests -v
+      - name: Verify production gate tooling (Linux only)
+        if: always() && runner.os == 'Linux'
+        run: python -m unittest discover -s tools/gates -p 'test_*.py' -v
+      - name: Verify release tooling and fail-closed promotion cases (Linux only)
+        if: always() && runner.os == 'Linux'
+        run: |
+          python -m unittest discover -s tools/release -p 'test_*.py' -v
+          python tools/release/production_promotion.py --self-test
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          for path in sorted(Path('tools/release').glob('*.py')):
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          print('release tool syntax OK')
+          PY
