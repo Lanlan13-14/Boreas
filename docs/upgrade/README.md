@@ -10,15 +10,15 @@ it does **not** claim `G-UPGRADE` or `G-SUPPLY`.
 
 | Area | State |
 | --- | --- |
-| Journal / active pointer / recovery (Linux, macOS) | implemented, tested |
-| Windows transaction backend | **not integrated**, store fails closed |
-| Exclusive store lock | implemented (`File::try_lock` OS lock) |
-| Trial readiness (AF_UNIX + peer credentials + challenge) | implemented (transport; no daemon integration yet) |
-| Signal forwarding + controlled stop | implemented on Unix; Windows fail-closed |
-| Durable trial budget across restarts | implemented (`trial.state`) |
-| Strict manifest parsing + policy | implemented, dependency-free |
-| Ed25519 + ML-DSA-65 verification | implemented behind `openssl-backend` (OpenSSL 3.5+); default build fails closed |
-| Artifact size + SHA-256 check | implemented on `VerifiedManifest` behind the same feature |
+| Journal / active pointer / recovery | present in source; CI/test evidence for the exact commit must be checked before deployment claims |
+| Windows transaction backend | **not integrated**; store fails closed |
+| Exclusive store lock | source uses `File::try_lock`; exact-commit validation required |
+| Trial readiness (Unix AF_UNIX + peer credentials + challenge/schema policy) | source present; stub-only tests, no daemon integration |
+| Signal forwarding + controlled stop | Unix source present; Windows fail-closed |
+| Durable trial budget across restarts | source present (`trial.state`); exact-commit validation required |
+| Strict manifest parsing + policy | source present; exact-commit validation required |
+| Ed25519 + ML-DSA-65 verification | source present behind `openssl-backend` (OpenSSL 3.5+); default build fails closed; exact-commit crypto CI still must be verified |
+| Artifact size + SHA-256 check | bounded in-memory bytes on `VerifiedAsset` behind that feature; no streaming downloader |
 | Durable anti-rollback / TUF roles / SBOM | **not implemented** |
 
 Dependencies: `libc = "=0.2.191"` for **Unix** (the macOS `F_FULLFSYNC` flush plus
@@ -77,17 +77,19 @@ ledger is `UpgradeError::CorruptTrial`, never "no attempts yet". The ledger can
 only ever *restrict* launches, so tampering causes denial of upgrades, never
 authorization.
 
-The attempt counter uses `checked_add`, so a saturated counter can never grant
-extra trials: overflow is reported as an invalid ledger rather than treated as
-"below budget".
+The attempt counter uses checked arithmetic, so overflow does not grant extra
+trials; corrupted or failed ledger I/O must be treated as an operational refusal
+and investigated, not as a reason to bypass the budget.
 
 ## External supervisor executable
 
 The binary exposes four commands and has no `prepare`/`activate`, so no
 unverified artifact can be staged through it:
 
-* `supervise --store <DIR> [--ready-timeout-ms <MS>] [--ready-require-tun <yes|no>]
-  [--ready-min-workers <N>] [--stop-grace-ms <MS>] [--max-trial-attempts <N>] -- <argv...>`
+* `supervise --store <DIR> --ready-expected-schema <ID> [--ready-timeout-ms <MS>]
+  [--ready-require-tun <yes|no>] [--ready-min-workers <N>] [--stop-grace-ms <MS>]
+  [--max-trial-attempts <N>] -- <argv...>` (`--ready-expected-schema` is required;
+  other bracketed flags are optional)
   — take the store lock, run `begin_activation()` (which starts in `recover()`),
   then spawn `<argv...>` with inherited stdio. A leading `{version}` in `argv[0]`
   is replaced with the absolute active-version directory after
@@ -104,13 +106,20 @@ unverified artifact can be staged through it:
   and a failed audit write leaves the ledger untouched. Nothing else clears a
   spent budget.
 
+CLI outcomes: `0` means command success (or child exit 0); supervisor-side errors,
+including usage/store/spawn/readiness/rollback errors, return `1`. For steady,
+confirmed, and rolled-back child launches, the child's exit code is propagated;
+a child killed by signal `n` maps to `128+n`. Check stderr and `status` for
+context; the CLI does not define richer machine-readable error codes.
+
 ### Trial readiness (the gate; liveness alone confirms nothing)
 
 A trial launch is confirmed only after an **authorized readiness answer**. Before
 spawning the candidate the supervisor:
 
 1. binds `<store>/ready.sock` as an `AF_UNIX` stream socket with mode `0600` and
-   exports the path as `BOREAS_READY_SOCKET`;
+   exports the path as `BOREAS_READY_SOCKET` (Unix only; Windows trial readiness
+   is unavailable and fails closed);
 2. accepts one connection and checks peer credentials — same uid in all cases
    (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and, on Linux, the **exact
    spawned pid**;
@@ -120,9 +129,11 @@ spawning the candidate the supervisor:
 
 `--ready-timeout-ms` (default 30 000) bounds the whole exchange;
 `--ready-min-workers` (default 1) and `--ready-require-tun` (default `yes`)
-define acceptance. A silence, a foreign peer, a wrong echo, malformed framing, a
-worker count below policy or an absent TUN when one is required all fail the
-trial, consume the durable attempt and roll the pointer back.
+define acceptance. `--ready-expected-schema <ID>` is **required** (1–64 ASCII
+identifier bytes; alphanumeric plus `._+-`, not starting with `.`); the candidate
+must report this exact schema. A silence, foreign peer, wrong echo or schema,
+malformed framing, worker count below policy or absent required TUN all fail the
+trial and trigger rollback/attempt accounting (subject to successful store I/O).
 
 That is what closes two holes the old behaviour had: "exit 0 immediately" and
 "alive but deadlocked/unready" both used to look like success. A process that is
@@ -140,9 +151,12 @@ Deliberate limits, stated rather than implied:
 * there is no `sd_notify` readiness, no launch timeout beyond the readiness
   deadline, and no health probing after confirmation.
 
-The durable budget bounds the restart loop across process lifetimes:
-`--max-trial-attempts` (default 3) attempts, then `supervise` refuses to even
-activate the candidate and points the operator at `reset-trial`.
+The durable budget bounds trial launches across process lifetimes:
+`--max-trial-attempts` (default 3), then `supervise` refuses to activate the
+candidate and the operator may inspect the store before considering the audited
+`reset-trial` procedure. This is a CLI component, not a complete deployment
+recipe: without an installer, daemon integration, or shipped service unit, do not
+copy an illustrative invocation into production.
 
 ### Signals: forwarding and controlled stop
 
@@ -186,13 +200,14 @@ Strict structure and policy only, plus one fail-closed verification seam:
   configured `ReleaseRoot`s (unknown id is refused before any crypto) → verify
   Ed25519 **AND** ML-DSA-65 over the exact raw bytes → parse *those same bytes*
   afterwards. `VerifiedManifest` has a private field and no public constructor.
-* With `openssl-backend`, verification is real: `release_crypto` parses both
-  anchors as SPKI DER, asserts `KeyType::ED25519` and `KeyType::ML_DSA_65`, and
-  checks both signatures with `Verifier::new_without_digest(..).verify_oneshot`,
-  requiring both to succeed. `VerifiedManifest::verify_asset_bytes` then checks
-  the received artifact's exact size and SHA-256 against the authenticated
-  manifest. `ReleaseRoot` keeps DER keys (not raw `[u8; 32]` blobs) precisely so
-  the algorithm check is possible.
+* With `openssl-backend`, source implements dual verification: `release_crypto`
+  parses both anchors as SPKI DER, checks `KeyType::ED25519` and
+  `KeyType::ML_DSA_65`, and checks both signatures over the exact bytes. Its
+  artifact helper checks size and SHA-256 for an already-bounded in-memory byte
+  slice against the authenticated manifest. This is not a downloader or a
+  streaming file verifier. `ReleaseRoot` stores DER keys to permit algorithm
+  checks. Do not describe this feature as release-validated until the exact
+  commit has passed the required OpenSSL 3.5+ CI job.
 * `SequenceLedger` accepts only `VerifiedManifest` (equivocation = same sequence,
   different bytes; rollback = lower sequence). It is **in-memory only**.
 
@@ -207,11 +222,12 @@ path) rather than a hand-split of a general URL: no userinfo, query, fragment,
 percent-encoding, backslash or dot segments can be expressed. `https://host?x@evil`
 fails at the authority check instead of being mis-split.
 
-Still open (next round): the actual Ed25519 + ML-DSA-65 provider and its test
-vectors, TUF-style root/targets/snapshot/timestamp roles with threshold and
-rotation, revocation, SBOM/provenance, the downloader (redirect policy, hash and
-size check on the received bytes), and durable anti-rollback persistence. None
-of these may be claimed from this module.
+Still open: TUF-style root/targets/snapshot/timestamp roles with threshold and
+rotation, revocation, SBOM/provenance, downloader and redirect policy, bounded
+streaming artifact verification wired to staging, and durable anti-rollback
+persistence. The OpenSSL provider implementation exists in source behind the
+feature, but its exact-commit CI/test status is not established by this document;
+do not claim it passed until verified.
 
 ## Filesystem security and platform boundary
 
@@ -229,11 +245,11 @@ race.
 **Linux** flushes file data with `fsync` and orders namespace changes with
 directory `fsync`.
 
-**macOS** is now integrated (`src/macos.rs`, `libc` 0.2.191): file data goes
-through `fcntl(F_FULLFSYNC)` (a failure is returned, never silently downgraded
-to `fsync`), and namespace changes are followed by a directory sync. The same
-transaction test suite that runs on Linux now runs on both macOS CI targets,
-which is what turns the adapter from an untested draft into a tested backend.
+**macOS** source (`src/macos.rs`, `libc` 0.2.191) uses `fcntl(F_FULLFSYNC)`
+(failure is returned, never silently downgraded to `fsync`), and namespace
+changes are followed by a directory sync. The same transaction suite is configured for Linux and both macOS CI targets;
+check the exact commit's completed Actions results before calling this backend
+tested or using CI configuration as deployment evidence.
 Apple documents that some drives ignore cache-flush requests, so this is still
 not an unconditional power-loss guarantee; the filesystem/hardware matrix is
 open.
@@ -301,32 +317,27 @@ power cut is safe.
 
 ## Required CI gates before release
 
-`cargo test --workspace --locked`, `cargo clippy --workspace --all-targets
---locked -- -D warnings` and the platform matrix
-(`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-`x86_64-pc-windows-msvc`, both macOS targets) run in GitHub Actions; local runs
-are development feedback only and are not release evidence.
+The repository configures `cargo test --workspace --locked`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings` and a platform
+matrix (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`x86_64-pc-windows-msvc`, both macOS targets) in GitHub Actions. Configuration is
+not evidence that a run passed: verify the completed Actions results for the
+exact release commit. Compilation, formatting and tests are Actions-only under
+repository policy; do not run them locally.
 
-Current supervisor tests cover: journal/pointer primitives; trial non-zero exit
-and death-by-signal roll back; **a clean exit is not readiness**; a candidate
-that stays alive but never answers is rolled back by the readiness deadline;
-`tests/readiness.rs` drives the real binary against the real `__ready-stub`
-candidate and asserts (a) a valid answer confirms and retains the old directory,
-(b) a policy-valid answer with no TUN rolls back and still consumes an attempt,
-(c) `SIGTERM` to the supervisor is forwarded to the confirmed child and the
-supervisor exits `143`; the durable budget bounds repeated failures and
-`reset-trial` clears it; the store lock rejects a second supervisor and a
-concurrent `recover`; `status` reports the trial ledger; missing argv/program
-and a dangling pointer fail closed. Manifest tests cover strict JSON (duplicate
-keys, unknown fields, non-integers, trailing data, UTF-8, nesting), the URL
-subset, timestamps, policy, asset selection, and the in-memory ledger.
+Source tests are present for journal/pointer behavior, trial failure and
+readiness, the Unix `__ready-stub` subprocess protocol, trial accounting,
+operator reset, locking, status and fail-closed CLI cases. Manifest tests cover
+strict parsing, URL subset, timestamps, policy, asset selection and the
+in-memory ledger. This list describes checked-in test coverage, not a passing run:
+verify the exact commit's Actions results before claiming tests passed. There is
+no real daemon readiness integration.
 
-Two CI obligations for the crypto path, both outside this file's scope:
-`cargo test -p boreas-supervisor --features openssl-backend` must run on a runner
-with **OpenSSL 3.5+** (the `rust-tls` workflow already pins 3.6.1), and
-`Cargo.lock` must be regenerated once by the `Refresh Cargo.lock` workflow. Until
-then the default (`--locked`) jobs exercise the fail-closed path only; that is a
-build-coverage gap, not a claim that the backend has been validated here.
+Crypto validation remains an explicit release check: run
+`cargo test -p boreas-supervisor --features openssl-backend` on a runner with
+**OpenSSL 3.5+**, and confirm the exact commit's result. The default build has no
+crypto and exercises only the fail-closed path. A configured workflow or a
+successful default build does not validate the crypto feature.
 
 Still to expand before any gate claim: process-level crash injection at every
 durable write boundary (including `SIGKILL` of the supervisor mid-readiness),
@@ -336,5 +347,5 @@ daemon that answers the readiness challenge (the protocol currently has only the
 stub counterpart), binding the challenge to the candidate artifact SHA, and
 old-version executable recovery in the shipped layout. Then satisfy the master
 plan's `G-UPGRADE` and `G-SUPPLY` gates plus the common production exit
-conditions. This is an integrated core plus a tested supervision boundary, not
-proof those gates pass.
+conditions. The checked-in source is an upgrade/supervision core, not proof that
+those gates pass or that it is ready for production deployment.
