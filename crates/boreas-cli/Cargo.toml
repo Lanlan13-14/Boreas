@@ -17,6 +17,7 @@ default = []
 openssl-inner-tls = [
     "dep:boreas-crypto",
     "dep:boreas-pki",
+    "dep:boreas-proto",
     "dep:boreas-tunnel",
     "boreas-crypto/openssl-backend",
     "boreas-pki/openssl-backend",
@@ -28,6 +29,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.2.1+spec-1.1.0"
 boreas-crypto = { path = "../boreas-crypto", optional = true }
 boreas-pki = { path = "../boreas-pki", optional = true }
+boreas-proto = { path = "../boreas-proto", optional = true }
 boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 
 # Unix-only: O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC for the safe config open and
