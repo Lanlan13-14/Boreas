@@ -363,7 +363,9 @@ fn help_text() -> String {
         .to_string();
     #[cfg(not(feature = "openssl-inner-tls"))]
     {
-        text.push_str("The default binary has no TLS backend; `node` exits without opening a socket.");
+        text.push_str(
+            "The default binary has no TLS backend; `node` exits without opening a socket.",
+        );
     }
     #[cfg(feature = "openssl-inner-tls")]
     {

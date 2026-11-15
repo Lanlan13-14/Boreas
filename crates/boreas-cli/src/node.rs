@@ -124,11 +124,9 @@ fn parse_socket(text: &str) -> Result<std::net::SocketAddr, String> {
 fn prepare(config_path: &str, server: bool) -> Result<Prepared, String> {
     use crate::config::{CryptoSuite, NodeRole as ConfigRole, SecurityMode as ConfigMode};
 
-    let config = crate::config::Config::read_file(
-        std::path::Path::new(config_path),
-        node_capabilities(),
-    )
-    .map_err(|error| format!("error: configuration rejected: {error}"))?;
+    let config =
+        crate::config::Config::read_file(std::path::Path::new(config_path), node_capabilities())
+            .map_err(|error| format!("error: configuration rejected: {error}"))?;
     if config.security.suite != CryptoSuite::Pq768 {
         return Err("error: only suite pq768 is enabled; pq1024 has no accepted PoC".into());
     }
@@ -243,10 +241,10 @@ fn serve_backend(
     use std::sync::Arc;
     use std::time::Duration;
 
-    use boreas_crypto::backend::{OpenSslAcceptor, PemIdentity};
     use boreas_crypto::Policy;
-    use boreas_proto::messages::{PathRole, Suite as MessageSuite};
+    use boreas_crypto::backend::{OpenSslAcceptor, PemIdentity};
     use boreas_proto::SecurityMode;
+    use boreas_proto::messages::{PathRole, Suite as MessageSuite};
     use boreas_tunnel::resource::{Admission, Limits};
     use boreas_tunnel::runtime::LinkServer;
     use boreas_tunnel::{
@@ -317,10 +315,10 @@ fn connect_backend(
     use std::sync::Arc;
     use std::time::Duration;
 
-    use boreas_crypto::backend::{OpenSslConnector, PemIdentity};
     use boreas_crypto::Policy;
-    use boreas_proto::messages::{PathRole, Suite as MessageSuite};
+    use boreas_crypto::backend::{OpenSslConnector, PemIdentity};
     use boreas_proto::SecurityMode;
+    use boreas_proto::messages::{PathRole, Suite as MessageSuite};
     use boreas_tunnel::runtime::{ClientTarget, LinkClient};
     use boreas_tunnel::{
         OpenSslInnerConnector, OpenSslOuterTlsConnector, PkiIdentityExtractor, SessionPolicy,
