@@ -24,8 +24,13 @@ fn rerun_in_netns(test_name: &str) -> bool {
     let exe = std::env::current_exe().expect("test executable path");
     let status = Command::new("unshare")
         .args([
-            "--net", "--mount", "--fork", "sh", "-c",
-            "mount --make-rprivate / && mount -t sysfs sysfs /sys && exec \"$@\"", "sh",
+            "--net",
+            "--mount",
+            "--fork",
+            "sh",
+            "-c",
+            "mount --make-rprivate / && mount -t sysfs sysfs /sys && exec \"$@\"",
+            "sh",
         ])
         .arg(exe)
         .args(["--exact", test_name, "--nocapture"])
