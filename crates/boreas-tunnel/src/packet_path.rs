@@ -1,0 +1,1461 @@
+//! Bounded L3 packet encapsulation between a real [`boreas_tun::PacketIo`]
+//! endpoint and an established [`E2eCircuit`] byte stream.
+//!
+//! # What this module is
+//!
+//! A single-owner adapter. One direction reads exactly one IP packet from the
+//! host-side `PacketIo` endpoint (the host stack sent it), checks it against the
+//! signed permanent VIP pair, and writes it as exactly one length-prefixed frame
+//! into the already authenticated and encrypted E2E circuit stream. The other
+//! direction reads exactly one frame from the stream, repeats the address check
+//! for its own direction, and hands exactly one packet to the host-side
+//! [`PacketIo::write_packet`]. There is no coalescing, no fragmentation, no
+//! queued retry and no second FIFO: `boreas_tun::VirtualTun` or a native
+//! `PacketIo` queue is the only packet queue, and the circuit stream is the only
+//! wire.
+//!
+//! # Where the endpoints come from
+//!
+//! The two endpoints are taken from the circuit itself: [`E2eCircuit::info`]
+//! reports the peer that the E2E handshake compared for exact equality against
+//! the verified TLS peer, and [`E2eCircuit::local`] reports the authenticated
+//! local hop identity captured when the circuit was established. Their permanent
+//! IPv4 addresses are derived from the verified node id and role, then checked to
+//! be a canonical permanent slot. There is no caller-supplied "authenticated"
+//! boolean, no caller-declared local endpoint and no address table that a caller
+//! can substitute. A plaintext or hop-only session cannot reach the public
+//! constructor at all, because it needs an `E2eCircuit`, and `E2eCircuit` can only
+//! be produced by the E2E TLS handshake plus the encrypted application
+//! confirmation.
+//!
+//! # Deliberate limits of this slice (not production acceptance)
+//!
+//! * Point-to-point only: the two exact permanent VIP addresses. No subnet
+//!   route, no default route, no third party and no IPv6. IPv6 is not negotiated
+//!   here, so every IPv6 packet is refused rather than forwarded.
+//! * **Status freshness is not integrated into this adapter.** The durable,
+//!   verified `FreshStatus` capability that business traffic must consult is
+//!   being implemented in a separate status-store slice; this adapter neither
+//!   consults nor revalidates status, revocation, generation or clock state.
+//!   Its success must not be recorded as `G-REVOKE`, `G-E2E`, `G-DATA` or as
+//!   1 GiB production evidence, and the daemon owner must gate construction on a
+//!   real verified status capability before enabling business traffic.
+//! * No retry buffer, no scheduler, no cancellation token and no worker thread.
+//!   The blocking owner loop, its poll/wakeup policy and shutdown ordering stay
+//!   with the runtime owner. One `read`/`write` step is bounded: consecutive
+//!   `Interrupted` results fail closed instead of being retried without limit.
+//!   A malformed packet, an unauthorized address or a wire/circuit error poisons
+//!   the path: it fails closed, refuses every later step, and the caller must
+//!   tear the circuit down. No failure path converts to hop-only delivery.
+//! * Not a router or a forwarder. This adapter terminates one point-to-point
+//!   link: it does not decrement TTL/hop limit, does not generate ICMP errors,
+//!   does not reassemble fragments and does not route. `path_hops` may be greater
+//!   than one — a multi-hop encrypted circuit still ends here — but this adapter
+//!   only ever sees its own two endpoints, never the intermediate hops. Those
+//!   forwarding slices carry their own evidence.
+//! * The 2-byte big-endian length framing is a **candidate** encoding, not a
+//!   frozen protocol and not a registered L3 capability. See
+//!   `docs/protocol/e2e-packet-candidate-v1.md`.
+//! * Only link MTUs in `MIN_MTU..=MAX_MTU` (576..=1500) are accepted, and never
+//!   above the circuit's negotiated `mtu_cap`. Jumbo frames, GSO and virtio
+//!   offload belong to separate slices.
+
+use std::{
+    fmt,
+    io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr},
+};
+
+use boreas_crypto::NodeRole;
+use boreas_tun::{Error as TunError, IpVersion, PacketInfo, PacketIo, inspect_packet};
+
+use crate::e2e::E2eCircuit;
+use crate::relay::MAX_RELAY_HOPS;
+use crate::tls::PeerIdentity;
+
+/// Width of the length prefix inside the E2E stream, in bytes.
+pub const FRAME_PREFIX_LEN: usize = 2;
+/// Smallest MTU this adapter accepts. This is a validation floor taken from the
+/// IPv4 minimum reassembly buffer (RFC 791); it is **not** a negotiated default
+/// link MTU. The runtime owner chooses the actual link MTU (`DEFAULT_MTU` is the
+/// 1500-byte Ethernet value).
+pub const MIN_MTU: usize = 576;
+/// Largest accepted link MTU for this slice.
+pub const MAX_MTU: usize = 1500;
+/// Default link MTU.
+pub const DEFAULT_MTU: usize = 1500;
+/// Largest encoded frame: prefix plus one full-MTU packet.
+pub const MAX_FRAME_BYTES: usize = FRAME_PREFIX_LEN + MAX_MTU;
+
+/// Bounded retries for `ErrorKind::Interrupted` reads before the path gives up.
+/// A stream that never makes progress must not spin forever.
+const MAX_INTERRUPT_RETRIES: u8 = 8;
+
+/// Why one L3 packet was refused.
+///
+/// These are structural and policy decisions over the packet bytes, not
+/// authentication results. Stable, peer-safe codes only: nothing here echoes
+/// packet contents, addresses or backend text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketDeny {
+    /// The packet slice was empty.
+    EmptyPacket,
+    /// The header or the declared length was cut off.
+    Truncated,
+    /// The version nibble was neither 4 nor 6.
+    UnknownVersion,
+    /// IPv6 is not negotiated in this slice, so it is refused, never forwarded.
+    Ipv6NotNegotiated,
+    /// A structurally invalid IP header.
+    BadHeader,
+    /// The declared total length disagrees with the slice or the header length.
+    BadLength,
+    /// The IPv4 header checksum did not verify.
+    BadChecksum,
+    /// An IPv6 extension chain this slice does not carry.
+    UnsupportedExtension,
+    /// A malformed fragment description.
+    MalformedFragment,
+    /// Larger than the negotiated link MTU.
+    MtuExceeded,
+    /// Outbound packet source is not the local permanent VIP.
+    SourceNotLocal,
+    /// Outbound packet destination is not the peer permanent VIP.
+    DestinationNotPeer,
+    /// Inbound packet source is not the peer permanent VIP.
+    SourceNotPeer,
+    /// Inbound packet destination is not the local permanent VIP.
+    DestinationNotLocal,
+}
+
+impl fmt::Display for PacketDeny {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EmptyPacket => "packet-empty",
+            Self::Truncated => "packet-truncated",
+            Self::UnknownVersion => "ip-version-unknown",
+            Self::Ipv6NotNegotiated => "ipv6-not-negotiated",
+            Self::BadHeader => "ip-header-invalid",
+            Self::BadLength => "ip-length-invalid",
+            Self::BadChecksum => "ip-checksum-invalid",
+            Self::UnsupportedExtension => "ip-extension-unsupported",
+            Self::MalformedFragment => "ip-fragment-malformed",
+            Self::MtuExceeded => "mtu-exceeded",
+            Self::SourceNotLocal => "source-not-local-vip",
+            Self::DestinationNotPeer => "destination-not-peer-vip",
+            Self::SourceNotPeer => "source-not-peer-vip",
+            Self::DestinationNotLocal => "destination-not-local-vip",
+        })
+    }
+}
+
+impl std::error::Error for PacketDeny {}
+
+impl From<TunError> for PacketDeny {
+    fn from(error: TunError) -> Self {
+        match error {
+            TunError::EmptyPacket => Self::EmptyPacket,
+            TunError::Truncated => Self::Truncated,
+            TunError::InvalidVersion => Self::UnknownVersion,
+            TunError::InvalidHeader => Self::BadHeader,
+            TunError::InvalidLength => Self::BadLength,
+            TunError::InvalidChecksum => Self::BadChecksum,
+            TunError::UnsupportedExtension | TunError::TooManyExtensions => {
+                Self::UnsupportedExtension
+            }
+            TunError::FragmentMalformed
+            | TunError::FragmentOverlap
+            | TunError::FragmentLimit
+            | TunError::FragmentTimeout => Self::MalformedFragment,
+            TunError::PacketTooLarge { .. } => Self::MtuExceeded,
+            TunError::TtlExpired
+            | TunError::QueueFull
+            | TunError::QueueClosed
+            | TunError::InvalidConfiguration
+            | TunError::VirtioHeaderTruncated
+            | TunError::VirtioUnsupportedGso
+            | TunError::VirtioUnsupportedOffload
+            | TunError::VirtioInvalid => Self::BadHeader,
+        }
+    }
+}
+
+/// Failure of the packet path itself, as opposed to one refused packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketPathError {
+    /// One packet was refused by the L3 policy.
+    Denied(PacketDeny),
+    /// A frame carried no packet.
+    EmptyFrame,
+    /// A frame declared more bytes than the negotiated MTU allows.
+    FrameTooLarge,
+    /// The declared frame length and the bytes actually present disagree.
+    FrameLengthMismatch,
+    /// The stream ended inside a frame.
+    TruncatedFrame,
+    /// The circuit stream reported an I/O error.
+    CircuitIo(io::ErrorKind),
+    /// The host-side packet queue is full. This slice has no retry buffer, so it
+    /// fails closed instead of dropping the packet silently.
+    HostQueueFull,
+    /// The host-side packet endpoint was closed.
+    HostQueueClosed,
+    /// The host-side `PacketIo` rejected a packet this path already validated.
+    HostRejected(TunError),
+    /// The link MTU is outside `MIN_MTU..=MAX_MTU`.
+    MtuOutOfRange,
+    /// The requested link MTU is above the hop session's negotiated cap.
+    MtuAboveCircuitCap,
+    /// An identity is not a usable Boreas node identity.
+    InvalidIdentity,
+    /// The node id and role do not describe a permanent VIP slot.
+    InvalidPermanentSlot,
+    /// A permanent VIP is not in the network overlay or not canonical.
+    InvalidEndpointVip,
+    /// Both endpoints resolved to the same identity or address.
+    SelfPair,
+    /// The circuit id, hop count or peer facts do not match the established
+    /// circuit.
+    CircuitMismatch,
+    /// The local and peer identities are not two nodes of one network.
+    IdentityMismatch,
+    /// The path was closed or poisoned by an earlier failure.
+    Closed,
+    /// The path was poisoned by an earlier failure and refuses all work.
+    Poisoned,
+}
+
+impl fmt::Display for PacketPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Denied(deny) => write!(f, "packet-denied({deny})"),
+            Self::EmptyFrame => f.write_str("frame-empty"),
+            Self::FrameTooLarge => f.write_str("frame-too-large"),
+            Self::FrameLengthMismatch => f.write_str("frame-length-mismatch"),
+            Self::TruncatedFrame => f.write_str("frame-truncated"),
+            Self::CircuitIo(kind) => write!(f, "circuit-io({kind:?})"),
+            Self::HostQueueFull => f.write_str("host-queue-full"),
+            Self::HostQueueClosed => f.write_str("host-queue-closed"),
+            Self::HostRejected(error) => write!(f, "host-rejected({error})"),
+            Self::MtuOutOfRange => f.write_str("mtu-out-of-range"),
+            Self::MtuAboveCircuitCap => f.write_str("mtu-above-circuit-cap"),
+            Self::InvalidIdentity => f.write_str("identity-invalid"),
+            Self::InvalidPermanentSlot => f.write_str("permanent-slot-invalid"),
+            Self::InvalidEndpointVip => f.write_str("endpoint-vip-invalid"),
+            Self::SelfPair => f.write_str("endpoint-pair-self"),
+            Self::CircuitMismatch => f.write_str("circuit-mismatch"),
+            Self::IdentityMismatch => f.write_str("identity-mismatch"),
+            Self::Closed => f.write_str("path-closed"),
+            Self::Poisoned => f.write_str("path-poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for PacketPathError {}
+
+/// Read-only facts about one authenticated endpoint of the circuit.
+///
+/// The fields are private and there is no public constructor: this value is only
+/// produced from an [`E2eCircuit`]'s verified identities, so code outside this
+/// crate cannot present its own endpoint declaration as one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointFacts {
+    net_id: [u8; 16],
+    node_id: u16,
+    identity_generation: u64,
+    role: NodeRole,
+    vip: Ipv4Addr,
+}
+
+impl EndpointFacts {
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+
+    pub fn node_id(&self) -> u16 {
+        self.node_id
+    }
+
+    pub fn identity_generation(&self) -> u64 {
+        self.identity_generation
+    }
+
+    pub fn role(&self) -> NodeRole {
+        self.role
+    }
+
+    /// The permanent IPv4 address derived from this verified identity.
+    pub fn vip(&self) -> Ipv4Addr {
+        self.vip
+    }
+
+    /// Derive the endpoint from authenticated identity facts.
+    ///
+    /// The VIP is a deterministic function of `(node_id, role)`: the network
+    /// overlay `10.20.<home_core>.<vip_octet>` with
+    /// `node_id = ((home_core - 1) << 8) | vip_octet`, Core `vip_octet = 1` and
+    /// Edge `vip_octet` in `2..=251`. This reproduces `boreas-pki`'s permanent
+    /// slot rule so the L3 binding can be checked in a build without the PKI
+    /// dependency; it is not a substitute for verifying the signed
+    /// `NodeIdentity` that carries the same value. Enrollment-service nodes have
+    /// no VIP and are refused.
+    fn from_verified_identity(identity: PeerIdentity) -> Result<Self, PacketPathError> {
+        if identity.net_id == [0; 16] || identity.node_id == 0 || identity.identity_generation == 0
+        {
+            return Err(PacketPathError::InvalidIdentity);
+        }
+        let vip =
+            permanent_vip(identity.node_id, identity.role).ok_or(PacketPathError::InvalidPermanentSlot)?;
+        Ok(Self {
+            net_id: identity.net_id,
+            node_id: identity.node_id,
+            identity_generation: identity.identity_generation,
+            role: identity.role,
+            vip,
+        })
+    }
+
+    fn matches(&self, identity: PeerIdentity) -> bool {
+        self.net_id == identity.net_id
+            && self.node_id == identity.node_id
+            && self.identity_generation == identity.identity_generation
+            && self.role == identity.role
+    }
+}
+
+/// The permanent IPv4 slot for a verified `(node_id, role)`, or `None` when the
+/// pair is not a canonical permanent slot.
+fn permanent_vip(node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
+    let home_core = u8::try_from(node_id >> 8).ok()?.checked_add(1)?;
+    let vip_octet = u8::try_from(node_id & 0xff).ok()?;
+    if home_core > 16 {
+        return None;
+    }
+    let octet_valid = match role {
+        NodeRole::Core => vip_octet == 1,
+        NodeRole::Edge => (2..=251).contains(&vip_octet),
+        NodeRole::EnrollmentService => false,
+    };
+    if !octet_valid {
+        return None;
+    }
+    Some(Ipv4Addr::new(10, 20, home_core, vip_octet))
+}
+
+/// Whether the address is a canonical permanent overlay VIP, without reference to
+/// a role: `10.20.<1..=16>.<1..=251>`.
+fn is_permanent_vip(address: Ipv4Addr) -> bool {
+    let [first, second, home_core, vip_octet] = address.octets();
+    first == 10
+        && second == 20
+        && (1..=16).contains(&home_core)
+        && (1..=251).contains(&vip_octet)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    /// Host stack to remote peer.
+    HostToPeer,
+    /// Remote peer to host stack.
+    PeerToHost,
+}
+
+/// Pure L3 policy model for one signed permanent VIP pair.
+///
+/// This type performs no I/O, holds no capability and authorizes no traffic by
+/// itself. [`PacketPath`] builds it only from an established circuit's verified
+/// identities; it is public so the address rules can be reviewed and tested
+/// against real packets without a TLS session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PointToPoint {
+    local: Ipv4Addr,
+    peer: Ipv4Addr,
+    mtu: usize,
+}
+
+impl PointToPoint {
+    /// Build the policy for one exact permanent VIP pair and link MTU.
+    ///
+    /// Both addresses must be canonical permanent overlay VIPs and must differ:
+    /// there is no way to express a subnet, a default route or a third address.
+    pub fn try_new(local: Ipv4Addr, peer: Ipv4Addr, mtu: usize) -> Result<Self, PacketPathError> {
+        if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+            return Err(PacketPathError::MtuOutOfRange);
+        }
+        if !is_permanent_vip(local) || !is_permanent_vip(peer) {
+            return Err(PacketPathError::InvalidEndpointVip);
+        }
+        if local == peer {
+            return Err(PacketPathError::SelfPair);
+        }
+        Ok(Self { local, peer, mtu })
+    }
+
+    pub fn local_vip(&self) -> Ipv4Addr {
+        self.local
+    }
+
+    pub fn peer_vip(&self) -> Ipv4Addr {
+        self.peer
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    /// Largest frame this policy can encode or accept.
+    pub fn max_frame(&self) -> usize {
+        FRAME_PREFIX_LEN + self.mtu
+    }
+
+    /// Validate and authorize one packet the host stack handed to the tunnel.
+    ///
+    /// The source must be the local permanent VIP and the destination the peer
+    /// permanent VIP. Nothing else is authorized, in either address position.
+    pub fn authorize_outbound(&self, packet: &[u8]) -> Result<PacketInfo, PacketDeny> {
+        self.authorize(packet, Direction::HostToPeer)
+    }
+
+    /// Validate and authorize one packet the peer delivered for the host stack.
+    ///
+    /// The source must be the peer permanent VIP and the destination the local
+    /// permanent VIP.
+    pub fn authorize_inbound(&self, packet: &[u8]) -> Result<PacketInfo, PacketDeny> {
+        self.authorize(packet, Direction::PeerToHost)
+    }
+
+    fn authorize(&self, packet: &[u8], direction: Direction) -> Result<PacketInfo, PacketDeny> {
+        if packet.len() > self.mtu {
+            return Err(PacketDeny::MtuExceeded);
+        }
+        let Some(&first) = packet.first() else {
+            return Err(PacketDeny::EmptyPacket);
+        };
+        match first >> 4 {
+            4 => {}
+            6 => return Err(PacketDeny::Ipv6NotNegotiated),
+            _ => return Err(PacketDeny::UnknownVersion),
+        }
+        // Structural validation only: length, header, checksum, fragment fields.
+        // `inspect_packet` never decides authorization; the address rules below do.
+        let info = inspect_packet(packet)?;
+        if info.version != IpVersion::V4 {
+            return Err(PacketDeny::Ipv6NotNegotiated);
+        }
+        match direction {
+            Direction::HostToPeer => {
+                if info.source != IpAddr::V4(self.local) {
+                    return Err(PacketDeny::SourceNotLocal);
+                }
+                if info.destination != IpAddr::V4(self.peer) {
+                    return Err(PacketDeny::DestinationNotPeer);
+                }
+            }
+            Direction::PeerToHost => {
+                if info.source != IpAddr::V4(self.peer) {
+                    return Err(PacketDeny::SourceNotPeer);
+                }
+                if info.destination != IpAddr::V4(self.local) {
+                    return Err(PacketDeny::DestinationNotLocal);
+                }
+            }
+        }
+        Ok(info)
+    }
+}
+
+/// Endpoints bound to one established E2E circuit.
+///
+/// Private fields and no public constructor. The only entrance is
+/// [`AuthorizedEndpoints::from_e2e_circuit`], which reads the circuit's own
+/// authenticated identities; an `E2eCircuit` can only be produced by the E2E
+/// handshake plus the encrypted application confirmation.
+///
+/// The verified token a circuit carries has no facts of its own, so no separate
+/// "token facts" check is claimed here: the identities are the circuit's.
+#[derive(Debug)]
+pub(crate) struct AuthorizedEndpoints {
+    local: EndpointFacts,
+    peer: EndpointFacts,
+    circuit_id: [u8; 16],
+    path_hops: u8,
+    mtu_cap: u16,
+}
+
+impl AuthorizedEndpoints {
+    /// Bind the circuit's own authenticated identities to their permanent VIPs.
+    fn from_e2e_circuit(circuit: &E2eCircuit<'_>) -> Result<Self, PacketPathError> {
+        let info = circuit.info();
+        Self::bind(
+            info.circuit_id,
+            info.path_hops,
+            info.peer,
+            circuit.local(),
+            circuit.mtu_cap(),
+        )
+    }
+
+    fn bind(
+        circuit_id: [u8; 16],
+        path_hops: u8,
+        peer: PeerIdentity,
+        local: PeerIdentity,
+        mtu_cap: u16,
+    ) -> Result<Self, PacketPathError> {
+        if circuit_id == [0; 16] || path_hops == 0 || path_hops > MAX_RELAY_HOPS {
+            return Err(PacketPathError::CircuitMismatch);
+        }
+        if local.net_id != peer.net_id || local.node_id == peer.node_id {
+            return Err(PacketPathError::IdentityMismatch);
+        }
+        let local = EndpointFacts::from_verified_identity(local)?;
+        let peer = EndpointFacts::from_verified_identity(peer)?;
+        if local.vip == peer.vip {
+            return Err(PacketPathError::SelfPair);
+        }
+        Ok(Self {
+            local,
+            peer,
+            circuit_id,
+            path_hops,
+            mtu_cap,
+        })
+    }
+}
+
+/// Encode one packet as one length-prefixed frame.
+///
+/// Candidate encoding: a big-endian `u16` packet length followed by exactly that
+/// many bytes, nothing else. One frame carries exactly one packet.
+pub fn encode_packet_frame(packet: &[u8], mtu: usize) -> Result<Vec<u8>, PacketPathError> {
+    if packet.is_empty() {
+        return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
+    }
+    if packet.len() > mtu || packet.len() > MAX_FRAME_BYTES - FRAME_PREFIX_LEN {
+        return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
+    }
+    let length = u16::try_from(packet.len())
+        .map_err(|_| PacketPathError::Denied(PacketDeny::MtuExceeded))?;
+    let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + packet.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(packet);
+    Ok(frame)
+}
+
+/// Decode exactly one length-prefixed frame back to its single packet.
+///
+/// Rejects an empty frame, a frame that declares more than the MTU, and any
+/// trailing or missing bytes, so a frame can never be reinterpreted as a packet
+/// boundary shift.
+pub fn decode_packet_frame(frame: &[u8], mtu: usize) -> Result<&[u8], PacketPathError> {
+    if frame.len() < FRAME_PREFIX_LEN {
+        return Err(PacketPathError::TruncatedFrame);
+    }
+    let length = usize::from(u16::from_be_bytes([frame[0], frame[1]]));
+    if length == 0 {
+        return Err(PacketPathError::EmptyFrame);
+    }
+    if length > mtu {
+        return Err(PacketPathError::FrameTooLarge);
+    }
+    let body = &frame[FRAME_PREFIX_LEN..];
+    if body.len() != length {
+        return Err(PacketPathError::FrameLengthMismatch);
+    }
+    Ok(body)
+}
+
+/// Read one frame's 2-byte prefix.
+///
+/// `Ok(false)` means the stream ended cleanly before a frame started. A stream
+/// that ends after one prefix byte is a truncated frame, not a clean close.
+fn read_prefix<C: Read + ?Sized>(
+    circuit: &mut C,
+    prefix: &mut [u8; FRAME_PREFIX_LEN],
+) -> Result<bool, PacketPathError> {
+    let mut filled = 0;
+    let mut interrupts = 0u8;
+    while filled < FRAME_PREFIX_LEN {
+        let target = &mut prefix[filled..filled + 1];
+        match circuit.read(target) {
+            Ok(0) => {
+                return if filled == 0 {
+                    Ok(false)
+                } else {
+                    Err(PacketPathError::TruncatedFrame)
+                };
+            }
+            Ok(read) => {
+                filled += read;
+                interrupts = 0;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interrupts = interrupts.saturating_add(1);
+                if interrupts >= MAX_INTERRUPT_RETRIES {
+                    return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
+                }
+            }
+            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+        }
+    }
+    Ok(true)
+}
+
+/// Read one whole frame and return its single packet.
+fn read_packet_frame<C: Read + ?Sized>(
+    circuit: &mut C,
+    mtu: usize,
+) -> Result<Option<Vec<u8>>, PacketPathError> {
+    let mut prefix = [0u8; FRAME_PREFIX_LEN];
+    if !read_prefix(circuit, &mut prefix)? {
+        return Ok(None);
+    }
+    let length = usize::from(u16::from_be_bytes(prefix));
+    if length == 0 {
+        return Err(PacketPathError::EmptyFrame);
+    }
+    if length > mtu {
+        return Err(PacketPathError::FrameTooLarge);
+    }
+    // The allocation is bounded by the negotiated MTU and happens only after the
+    // declared length has been checked.
+    let mut packet = vec![0u8; length];
+    read_exact_bounded(circuit, &mut packet)?;
+    Ok(Some(packet))
+}
+
+/// A single-owner adapter between one host-side packet endpoint and one
+/// established E2E circuit.
+///
+/// The public constructor [`PacketPath::try_new_over_e2e`] owns the circuit, so
+/// dropping the path drops the circuit (and its stream). Every failure and every
+/// clean peer close additionally drops the circuit **immediately**, inside the
+/// step that observed it: the path holds it in an `Option` and clears it, so a
+/// caller that forgets to drop the path cannot leave an authenticated E2E stream
+/// usable. After the first failure or close, no step succeeds in either
+/// direction, and no failure is retried, reclassed or delivered on another path.
+///
+/// This type is real and usable, but it is **not** wired to status freshness and
+/// must not be enabled for production business traffic in this slice.
+pub struct PacketPath<'a, C, P: ?Sized> {
+    io: &'a P,
+    /// `None` once the path is closed or poisoned. The circuit stream is dropped
+    /// at that moment, so a closed or failed adapter cannot keep an authenticated
+    /// E2E connection (and its TLS/buffer resources) alive.
+    circuit: Option<C>,
+    endpoints: AuthorizedEndpoints,
+    policy: PointToPoint,
+    state: PathState,
+    stats: PacketStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathState {
+    Open,
+    /// The peer closed the circuit cleanly (or the owner closed the path): normal
+    /// termination, not a failure.
+    Closed,
+    Poisoned(PacketPathError),
+}
+
+/// Counters for one path. Whole numbers of packets and bytes only: no payload.
+///
+/// `failures` counts steps that failed closed (per-packet policy denials and I/O
+/// failures alike); a clean close is not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PacketStats {
+    pub outbound_packets: u64,
+    pub outbound_bytes: u64,
+    pub inbound_packets: u64,
+    pub inbound_bytes: u64,
+    pub failures: u64,
+}
+
+impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
+    /// Bind an established E2E circuit to the host-side packet endpoint.
+    ///
+    /// This is the only business constructor. It consumes the circuit by value
+    /// and derives both endpoints from the circuit's own authenticated identities
+    /// (`E2eCircuit::local` and `E2eCircuit::info`). A hop-only or plaintext
+    /// session cannot satisfy the parameter type.
+    ///
+    /// `mtu` is the link MTU chosen by the runtime owner; it must be in
+    /// `MIN_MTU..=MAX_MTU` and must not exceed the circuit's negotiated MTU cap.
+    /// Status freshness is not integrated into this adapter: it holds the
+    /// borrowed `PacketIo` and the owned `E2eCircuit`, exchanges packets one at a
+    /// time, and consults no durable status, revocation or clock state. The
+    /// daemon owner must gate this construction on a real verified status
+    /// capability before any business traffic is enabled.
+    pub fn try_new_over_e2e(
+        io: &'a P,
+        circuit: E2eCircuit<'a>,
+        mtu: usize,
+    ) -> Result<Self, PacketPathError> {
+        let endpoints = AuthorizedEndpoints::from_e2e_circuit(&circuit)?;
+        Self::try_new(io, circuit, endpoints, mtu)
+    }
+}
+
+impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
+    /// Inner constructor used after the capability binding succeeded.
+    pub(crate) fn try_new(
+        io: &'a P,
+        circuit: C,
+        endpoints: AuthorizedEndpoints,
+        mtu: usize,
+    ) -> Result<Self, PacketPathError> {
+        if mtu > usize::from(endpoints.mtu_cap) {
+            return Err(PacketPathError::MtuAboveCircuitCap);
+        }
+        let policy = PointToPoint::try_new(endpoints.local.vip, endpoints.peer.vip, mtu)?;
+        Ok(Self {
+            io,
+            circuit: Some(circuit),
+            endpoints,
+            policy,
+            state: PathState::Open,
+            stats: PacketStats::default(),
+        })
+    }
+
+    /// The authenticated local endpoint of this circuit.
+    pub fn local_endpoint(&self) -> EndpointFacts {
+        self.endpoints.local
+    }
+
+    /// The authenticated peer endpoint of this circuit.
+    pub fn peer_endpoint(&self) -> EndpointFacts {
+        self.endpoints.peer
+    }
+
+    /// The circuit id this path is bound to.
+    pub fn circuit_id(&self) -> [u8; 16] {
+        self.endpoints.circuit_id
+    }
+
+    /// The declared circuit length in hop links.
+    pub fn path_hops(&self) -> u8 {
+        self.endpoints.path_hops
+    }
+
+    /// The link MTU this path enforces.
+    pub fn mtu(&self) -> usize {
+        self.policy.mtu()
+    }
+
+    pub fn stats(&self) -> PacketStats {
+        self.stats
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, PathState::Open)
+    }
+
+    /// The first failure that poisoned this path, if any.
+    ///
+    /// A cleanly closed path returns `None`: normal termination is reported
+    /// through `Ok(None)` from the step that observed it and through
+    /// [`PacketPath::is_open`], not as an error.
+    pub fn first_error(&self) -> Option<PacketPathError> {
+        match self.state {
+            PathState::Open | PathState::Closed => None,
+            PathState::Poisoned(reason) => Some(reason),
+        }
+    }
+
+    /// The hop session's negotiated MTU ceiling this path was bound to.
+    pub fn mtu_cap(&self) -> u16 {
+        self.endpoints.mtu_cap
+    }
+
+    /// Close the path and release the circuit stream immediately.
+    ///
+    /// Idempotent, and not counted as a failure. The owned `E2eCircuit` is
+    /// dropped here rather than left to the caller, so a closed adapter cannot
+    /// keep an authenticated E2E stream alive. Dropping that stream is the
+    /// existing circuit teardown (its `CircuitStream` drop sends a best-effort
+    /// reset); this module does not claim to suppress it.
+    pub fn close(&mut self) {
+        if matches!(self.state, PathState::Open) {
+            self.state = PathState::Closed;
+        }
+        self.circuit = None;
+    }
+
+    /// Read one packet from the host stack and send it to the peer.
+    ///
+    /// `Ok(None)` means no packet was available and the path stays open. Exactly
+    /// one packet is read, authorized, framed and written per call; a partial
+    /// write poisons the path and drops the circuit.
+    pub fn step_outbound(&mut self) -> Result<Option<usize>, PacketPathError> {
+        self.check_open()?;
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        match outbound_once(self.io, circuit, &self.policy) {
+            Ok(Some(length)) => {
+                self.stats.outbound_packets = self.stats.outbound_packets.saturating_add(1);
+                self.stats.outbound_bytes = self
+                    .stats
+                    .outbound_bytes
+                    .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+                Ok(Some(length))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
+    /// Read one frame from the peer and deliver its packet to the host stack.
+    ///
+    /// `Ok(None)` means the peer closed the circuit cleanly between frames. That
+    /// is terminal for business traffic: the path closes and drops the circuit,
+    /// so no later step (in either direction) succeeds. A frame that ends early,
+    /// declares too many bytes or fails L3 authorization poisons the path, drops
+    /// the circuit and is never delivered.
+    pub fn step_inbound(&mut self) -> Result<Option<usize>, PacketPathError> {
+        self.check_open()?;
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        match inbound_once(self.io, circuit, &self.policy) {
+            Ok(Some(length)) => {
+                self.stats.inbound_packets = self.stats.inbound_packets.saturating_add(1);
+                self.stats.inbound_bytes = self
+                    .stats
+                    .inbound_bytes
+                    .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+                Ok(Some(length))
+            }
+            Ok(None) => {
+                self.close();
+                Ok(None)
+            }
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
+    fn check_open(&self) -> Result<(), PacketPathError> {
+        match self.state {
+            PathState::Open => Ok(()),
+            PathState::Closed => Err(PacketPathError::Closed),
+            PathState::Poisoned(_) => Err(PacketPathError::Poisoned),
+        }
+    }
+
+    /// Record the failure, drop the circuit stream and refuse all further work.
+    fn fail(&mut self, error: PacketPathError) -> PacketPathError {
+        self.stats.failures = self.stats.failures.saturating_add(1);
+        self.state = PathState::Poisoned(error);
+        self.circuit = None;
+        error
+    }
+}
+
+/// One outbound step over the borrowed pieces, so the caller can drop the whole
+/// circuit on failure without a self-borrow conflict.
+fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
+    io: &P,
+    circuit: &mut C,
+    policy: &PointToPoint,
+) -> Result<Option<usize>, PacketPathError> {
+    let packet = match io.read_packet() {
+        Ok(Some(packet)) => packet,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(PacketPathError::from_host_error(error)),
+    };
+    let length = policy
+        .authorize_outbound(&packet)
+        .map_err(PacketPathError::Denied)?
+        .packet_len;
+    let frame = encode_packet_frame(&packet, policy.mtu())?;
+    write_all_bounded(circuit, &frame)?;
+    circuit
+        .flush()
+        .map_err(|error| PacketPathError::CircuitIo(error.kind()))?;
+    Ok(Some(length))
+}
+
+/// Write a whole frame, bounded on "no progress".
+///
+/// `std::io::Write::write_all` retries `Interrupted` without any limit, so a
+/// stream that keeps returning `Interrupted` would spin forever. This loop
+/// bounds *consecutive* interrupts and fails closed instead; each successful
+/// write resets the budget.
+fn write_all_bounded<C: Write + ?Sized>(
+    circuit: &mut C,
+    frame: &[u8],
+) -> Result<(), PacketPathError> {
+    let mut written = 0;
+    let mut interrupts = 0u8;
+    while written < frame.len() {
+        match circuit.write(&frame[written..]) {
+            Ok(0) => return Err(PacketPathError::CircuitIo(io::ErrorKind::WriteZero)),
+            Ok(count) => {
+                written += count;
+                interrupts = 0;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interrupts = interrupts.saturating_add(1);
+                if interrupts >= MAX_INTERRUPT_RETRIES {
+                    return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
+                }
+            }
+            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+        }
+    }
+    Ok(())
+}
+
+/// Read a whole frame body, bounded on "no progress" for the same reason.
+fn read_exact_bounded<C: Read + ?Sized>(
+    circuit: &mut C,
+    body: &mut [u8],
+) -> Result<(), PacketPathError> {
+    let mut filled = 0;
+    let mut interrupts = 0u8;
+    while filled < body.len() {
+        match circuit.read(&mut body[filled..]) {
+            Ok(0) => return Err(PacketPathError::TruncatedFrame),
+            Ok(count) => {
+                filled += count;
+                interrupts = 0;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interrupts = interrupts.saturating_add(1);
+                if interrupts >= MAX_INTERRUPT_RETRIES {
+                    return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
+                }
+            }
+            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+        }
+    }
+    Ok(())
+}
+
+/// One inbound step over the borrowed pieces.
+fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
+    io: &P,
+    circuit: &mut C,
+    policy: &PointToPoint,
+) -> Result<Option<usize>, PacketPathError> {
+    let Some(packet) = read_packet_frame(circuit, policy.mtu())? else {
+        return Ok(None);
+    };
+    let length = policy
+        .authorize_inbound(&packet)
+        .map_err(PacketPathError::Denied)?
+        .packet_len;
+    match io.write_packet(&packet) {
+        Ok(()) => Ok(Some(length)),
+        Err(TunError::QueueFull) => Err(PacketPathError::HostQueueFull),
+        Err(TunError::QueueClosed) => Err(PacketPathError::HostQueueClosed),
+        Err(error) => Err(PacketPathError::HostRejected(error)),
+    }
+}
+
+impl PacketPathError {
+    fn from_host_error(error: TunError) -> Self {
+        match error {
+            TunError::QueueFull => Self::HostQueueFull,
+            TunError::QueueClosed => Self::HostQueueClosed,
+            other => Self::HostRejected(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-crate tests.
+    //!
+    //! This module is the only place that can build [`AuthorizedEndpoints`]
+    //! directly, which lets the real `boreas_tun` endpoint and the real framing run
+    //! without a TLS stack. The real end-to-end path (actual WSS + E2E circuit +
+    //! `VirtualTun`) is covered by `tests/wss_e2e_openssl.rs` under the
+    //! `openssl-inner-tls` feature. These results are development evidence only and
+    //! are not a production, G-DATA or 1 GiB acceptance claim.
+
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use boreas_tun::VirtualTun;
+
+    const NET: [u8; 16] = [0x2a; 16];
+    const GENERATION: u64 = 7;
+
+    fn identity(node_id: u16, role: NodeRole) -> PeerIdentity {
+        PeerIdentity {
+            net_id: NET,
+            node_id,
+            identity_generation: GENERATION,
+            role,
+        }
+    }
+
+    fn endpoints(local: PeerIdentity, peer: PeerIdentity) -> AuthorizedEndpoints {
+        AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
+            .expect("canonical permanent pair")
+    }
+
+    fn checksum_value(data: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for chunk in data.chunks(2) {
+            sum += if chunk.len() == 2 {
+                u32::from(u16::from_be_bytes([chunk[0], chunk[1]]))
+            } else {
+                u32::from(chunk[0]) << 8
+            };
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn ipv4(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = 20 + payload.len();
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&u16::try_from(total).expect("bounded").to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&src);
+        packet[16..20].copy_from_slice(&dst);
+        packet[20..].copy_from_slice(payload);
+        let header = checksum_value(&packet[..20]);
+        packet[10..12].copy_from_slice(&header.to_be_bytes());
+        packet
+    }
+
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Circuit stand-in for the host-to-peer direction: records the frames.
+    #[derive(Clone)]
+    struct OutboundSink {
+        log: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl OutboundSink {
+        fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    log: Rc::clone(&log),
+                },
+                log,
+            )
+        }
+    }
+
+    impl Read for OutboundSink {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for OutboundSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.log.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Circuit stand-in for the peer-to-host direction: replays recorded frames.
+    struct InboundSource {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl InboundSource {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { bytes, offset: 0 }
+        }
+    }
+
+    impl Read for InboundSource {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.offset >= self.bytes.len() || out.is_empty() {
+                return Ok(0);
+            }
+            let take = out.len().min(self.bytes.len() - self.offset);
+            out[..take].copy_from_slice(&self.bytes[self.offset..self.offset + take]);
+            self.offset += take;
+            Ok(take)
+        }
+    }
+
+    impl Write for InboundSource {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Circuit stand-in that records whether the path actually dropped it.
+    struct Droppable {
+        dropped: Rc<Cell<bool>>,
+        written: usize,
+    }
+
+    impl Droppable {
+        fn new() -> (Self, Rc<Cell<bool>>) {
+            let dropped = Rc::new(Cell::new(false));
+            (
+                Self {
+                    dropped: Rc::clone(&dropped),
+                    written: 0,
+                },
+                dropped,
+            )
+        }
+    }
+
+    impl Read for Droppable {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Droppable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written = self.written.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for Droppable {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    #[test]
+    fn bind_accepts_only_canonical_permanent_pairs() {
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let bound = endpoints(local, peer);
+        assert_eq!(bound.local.vip, Ipv4Addr::new(10, 20, 3, 1));
+        assert_eq!(bound.peer.vip, Ipv4Addr::new(10, 20, 3, 9));
+        assert_eq!(bound.circuit_id, [0x11; 16]);
+        assert_eq!(bound.path_hops, 1);
+        assert_eq!(bound.mtu_cap, u16::try_from(DEFAULT_MTU).unwrap());
+
+        let bind = |circuit: [u8; 16], hops: u8, peer: PeerIdentity, local: PeerIdentity| {
+            AuthorizedEndpoints::bind(
+                circuit,
+                hops,
+                peer,
+                local,
+                u16::try_from(DEFAULT_MTU).unwrap(),
+            )
+        };
+        // An enrollment-service node has no packet endpoint.
+        assert_eq!(
+            bind(
+                [0x11; 16],
+                1,
+                peer,
+                identity(0x0201, NodeRole::EnrollmentService)
+            )
+            .unwrap_err(),
+            PacketPathError::InvalidPermanentSlot
+        );
+        // A Core node may not claim the Edge octet.
+        assert_eq!(
+            bind([0x11; 16], 1, peer, identity(0x0209, NodeRole::Core)).unwrap_err(),
+            PacketPathError::InvalidPermanentSlot
+        );
+        // Cross-network and same-node bindings fail closed.
+        let mut other_network = peer;
+        other_network.net_id = [0x2b; 16];
+        assert_eq!(
+            bind([0x11; 16], 1, other_network, local).unwrap_err(),
+            PacketPathError::IdentityMismatch
+        );
+        assert_eq!(
+            bind([0x11; 16], 1, peer, peer).unwrap_err(),
+            PacketPathError::IdentityMismatch
+        );
+        // No circuit, no hops, no binding.
+        assert_eq!(
+            bind([0; 16], 1, peer, local).unwrap_err(),
+            PacketPathError::CircuitMismatch
+        );
+        assert_eq!(
+            bind([0x11; 16], 0, peer, local).unwrap_err(),
+            PacketPathError::CircuitMismatch
+        );
+        assert_eq!(
+            bind([0x11; 16], MAX_RELAY_HOPS + 1, peer, local).unwrap_err(),
+            PacketPathError::CircuitMismatch
+        );
+        assert_eq!(
+            bind([0x11; 16], 1, peer, identity(0, NodeRole::Core)).unwrap_err(),
+            PacketPathError::InvalidIdentity
+        );
+
+        // A multi-hop cipher stream is still one endpoint pair: `path_hops` may be
+        // above 1, and the adapter is not a forwarder.
+        assert!(bind([0x11; 16], 3, peer, local).is_ok());
+
+        // MTU bounds and the circuit's negotiated cap.
+        let pair = VirtualTun::try_pair(1, 1, DEFAULT_MTU).expect("bounded pair");
+        match PacketPath::try_new(
+            &pair.0,
+            OutboundSink::new().0,
+            endpoints(local, peer),
+            MIN_MTU - 1,
+        ) {
+            Err(PacketPathError::MtuOutOfRange) => {}
+            Err(other) => panic!("unexpected mtu error: {other:?}"),
+            Ok(_) => panic!("out-of-range mtu must be refused"),
+        }
+        match PacketPath::try_new(
+            &pair.0,
+            OutboundSink::new().0,
+            endpoints(local, peer),
+            MAX_MTU + 1,
+        ) {
+            Err(PacketPathError::MtuAboveCircuitCap) => {}
+            Err(other) => panic!("unexpected mtu error: {other:?}"),
+            Ok(_) => panic!("mtu above the circuit cap must be refused"),
+        }
+        let capped = AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, 1400)
+            .expect("capped permanent pair");
+        match PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1401) {
+            Err(PacketPathError::MtuAboveCircuitCap) => {}
+            Err(other) => panic!("unexpected mtu error: {other:?}"),
+            Ok(_) => panic!("mtu above the circuit cap must be refused"),
+        }
+        let capped = AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, 1400)
+            .expect("capped permanent pair");
+        assert!(PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1400).is_ok());
+    }
+
+    #[test]
+    fn real_virtual_tun_packets_cross_the_framed_path_and_are_hashed() {
+        let mtu = DEFAULT_MTU;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        // `device` is the tunnel-side endpoint: `inject` feeds its reader with a
+        // packet the host stack emitted, and `write_packet` lands in the peer
+        // endpoint's queue, which stands in for the local host stack.
+        let (device, host) = VirtualTun::try_pair(8, 8, mtu).expect("bounded pair");
+
+        let outbound = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"outbound-payload");
+        let inbound = ipv4([10, 20, 3, 9], [10, 20, 3, 1], b"inbound-payload");
+        assert_eq!(
+            inspect_packet(&outbound).map(|info| info.packet_len),
+            Ok(outbound.len())
+        );
+
+        device.inject(&outbound).expect("valid host packet");
+        let (sink, log) = OutboundSink::new();
+        let mut sender =
+            PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
+        assert_eq!(sender.mtu(), mtu);
+        assert_eq!(sender.step_outbound(), Ok(Some(outbound.len())));
+        assert_eq!(sender.step_outbound(), Ok(None), "one packet per step");
+        assert_eq!(
+            sender.stats(),
+            PacketStats {
+                outbound_packets: 1,
+                outbound_bytes: u64::try_from(outbound.len()).unwrap(),
+                ..PacketStats::default()
+            }
+        );
+        assert!(sender.is_open());
+
+        let frames = log.borrow().clone();
+        assert_eq!(frames.len(), FRAME_PREFIX_LEN + outbound.len());
+        assert_eq!(
+            u16::from_be_bytes([frames[0], frames[1]]),
+            u16::try_from(outbound.len()).unwrap()
+        );
+        // The wire bytes decode back to exactly the packet the host emitted.
+        let decoded = decode_packet_frame(&frames, mtu).expect("one complete frame");
+        assert_eq!(decoded, outbound.as_slice());
+        assert_eq!(fnv1a_64(decoded), fnv1a_64(&outbound));
+        drop(sender);
+
+        // The peer side decodes exactly the same wire bytes: one frame, one
+        // packet, and the inbound direction of the same authorized pair.
+        let inbound_frame = encode_packet_frame(&inbound, mtu).expect("inbound frame");
+        let mut receiver = PacketPath::try_new(
+            &device,
+            InboundSource::new(inbound_frame),
+            endpoints(local, peer),
+            mtu,
+        )
+        .expect("bound path");
+        assert_eq!(receiver.step_inbound(), Ok(Some(inbound.len())));
+        assert_eq!(
+            receiver.step_inbound(),
+            Ok(None),
+            "clean close between frames"
+        );
+        assert!(!receiver.is_open(), "a clean peer close ends the path");
+        assert_eq!(receiver.first_error(), None, "a clean close is not a failure");
+        assert_eq!(
+            receiver.stats(),
+            PacketStats {
+                inbound_packets: 1,
+                inbound_bytes: u64::try_from(inbound.len()).unwrap(),
+                ..PacketStats::default()
+            }
+        );
+        let delivered = host.read_packet().expect("host reads").expect("one packet");
+        assert_eq!(delivered, inbound);
+        assert_eq!(fnv1a_64(&delivered), fnv1a_64(&inbound));
+        assert_eq!(
+            inspect_packet(&delivered).map(|info| info.source),
+            Ok(IpAddr::V4(Ipv4Addr::new(10, 20, 3, 9)))
+        );
+        assert_eq!(host.read_packet(), Ok(None), "exactly one delivery");
+    }
+
+    #[test]
+    fn spoofed_addresses_and_malformed_frames_poison_the_path() {
+        let mtu = DEFAULT_MTU;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let (device, host) = VirtualTun::try_pair(8, 8, mtu).expect("bounded pair");
+
+        // Structurally valid but sourced from a third host: refused.
+        let spoofed = ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoof");
+        device.inject(&spoofed).expect("structurally valid");
+        let (sink, log) = OutboundSink::new();
+        let mut path =
+            PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
+        assert_eq!(
+            path.step_outbound(),
+            Err(PacketPathError::Denied(PacketDeny::SourceNotLocal))
+        );
+        assert_eq!(path.first_error(), Some(PacketPathError::Denied(PacketDeny::SourceNotLocal)));
+        assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
+        assert_eq!(path.stats().failures, 1);
+        assert!(!path.is_open());
+        assert!(log.borrow().is_empty(), "nothing reaches the wire");
+
+        // A frame whose packet is addressed to the wrong host.
+        let wrong_destination = ipv4([10, 20, 3, 9], [10, 20, 3, 7], b"wrong");
+        let frame = encode_packet_frame(&wrong_destination, mtu).expect("frame");
+        let mut path = PacketPath::try_new(
+            &device,
+            InboundSource::new(frame),
+            endpoints(local, peer),
+            mtu,
+        )
+        .expect("bound path");
+        assert_eq!(
+            path.step_inbound(),
+            Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal))
+        );
+        assert_eq!(host.read_packet(), Ok(None), "nothing reaches the host stack");
+
+        // A frame that ends inside its declared packet.
+        let packet = ipv4([10, 20, 3, 9], [10, 20, 3, 1], b"cut");
+        let mut frame = encode_packet_frame(&packet, mtu).expect("frame");
+        frame.truncate(frame.len() - 2);
+        let mut path = PacketPath::try_new(
+            &device,
+            InboundSource::new(frame),
+            endpoints(local, peer),
+            mtu,
+        )
+        .expect("bound path");
+        assert_eq!(path.step_inbound(), Err(PacketPathError::TruncatedFrame));
+        assert_eq!(host.read_packet(), Ok(None));
+    }
+
+    #[test]
+    fn ipv6_is_refused_rather_than_forwarded() {
+        let mtu = DEFAULT_MTU;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let (device, _host) = VirtualTun::try_pair(4, 4, mtu).expect("bounded pair");
+
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[6] = 59;
+        v6[7] = 64;
+        v6[8..24].copy_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 9]);
+        v6[24..40].copy_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1]);
+        device.inject(&v6).expect("structurally valid IPv6");
+
+        let mut path = PacketPath::try_new(
+            &device,
+            OutboundSink::new().0,
+            endpoints(local, peer),
+            mtu,
+        )
+        .expect("bound path");
+        assert_eq!(
+            path.step_outbound(),
+            Err(PacketPathError::Denied(PacketDeny::Ipv6NotNegotiated))
+        );
+    }
+
+    #[test]
+    fn clean_peer_close_and_failures_release_the_circuit_and_end_business() {
+        let mtu = DEFAULT_MTU;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let (device, _host) = VirtualTun::try_pair(4, 4, mtu).expect("bounded pair");
+
+        // A clean peer close is terminal: the circuit is dropped and neither
+        // direction works afterwards, so the path cannot keep sending.
+        let (circuit, dropped) = Droppable::new();
+        let mut path =
+            PacketPath::try_new(&device, circuit, endpoints(local, peer), mtu).expect("bound path");
+        assert_eq!(path.step_inbound(), Ok(None));
+        assert!(!path.is_open());
+        assert_eq!(path.first_error(), None, "a clean close is not a failure");
+        assert!(dropped.get(), "a clean close must release the E2E circuit");
+        assert_eq!(path.step_outbound(), Err(PacketPathError::Closed));
+        assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+
+        // A refused packet releases the circuit in the same step that refused it.
+        let (circuit, dropped) = Droppable::new();
+        let mut path =
+            PacketPath::try_new(&device, circuit, endpoints(local, peer), mtu).expect("bound path");
+        device
+            .inject(&ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoofed"))
+            .expect("structurally valid");
+        assert_eq!(
+            path.step_outbound(),
+            Err(PacketPathError::Denied(PacketDeny::SourceNotLocal))
+        );
+        assert!(dropped.get(), "a refused packet must release the circuit");
+        assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
+
+        // Explicit close is idempotent and releases too.
+        let (circuit, dropped) = Droppable::new();
+        let mut path =
+            PacketPath::try_new(&device, circuit, endpoints(local, peer), mtu).expect("bound path");
+        path.close();
+        path.close();
+        assert!(dropped.get());
+        assert_eq!(path.first_error(), None);
+        assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+    }
+}

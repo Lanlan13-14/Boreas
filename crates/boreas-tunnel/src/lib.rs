@@ -46,6 +46,7 @@ pub mod failover;
 pub mod h2credit;
 pub mod hedge;
 pub mod memledger;
+pub mod packet_path;
 pub mod pmtu;
 pub mod probe_budget;
 pub mod relay;

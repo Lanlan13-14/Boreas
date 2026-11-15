@@ -510,10 +510,21 @@ pub trait E2eTlsBackend: Send + Sync {
 /// It owns the E2E TLS stream and the [`VerifiedE2eSession`] token created from
 /// the handshake facts. The token cannot be minted from network parameters: the
 /// constructor re-checks the strict pq768 policy and the exact expected peer.
+///
+/// The authenticated **local** identity is captured here from the hop session at
+/// establishment time. It is deliberately not part of [`E2eInfo`], which carries
+/// peer facts only, and it is not derived from any caller-declared value: a
+/// consumer that binds this circuit to a packet endpoint must read it through
+/// [`E2eCircuit::local`] instead of being trusted with its own declaration.
+///
+/// `mtu_cap` is the hop session's negotiated MTU ceiling, captured at the same
+/// time. A packet adapter must not use a link MTU above it.
 pub struct E2eCircuit<'a> {
     stream: Box<dyn Duplex + 'a>,
     token: VerifiedE2eSession,
     info: E2eInfo,
+    local: PeerIdentity,
+    mtu_cap: u16,
 }
 
 /// Candidate confirmation body inside E2E TLS. Not a cryptographic handshake.
@@ -704,6 +715,20 @@ impl<'a> E2eCircuit<'a> {
         self.info
     }
 
+    /// The authenticated local identity of the hop session this circuit runs on.
+    ///
+    /// Captured from [`EstablishedSession::local`] when the circuit was
+    /// completed, so it cannot be supplied or overridden by a later consumer.
+    pub fn local(&self) -> PeerIdentity {
+        self.local
+    }
+
+    /// The hop session's negotiated MTU ceiling, captured when the circuit was
+    /// completed. A packet adapter must not exceed it.
+    pub fn mtu_cap(&self) -> u16 {
+        self.mtu_cap
+    }
+
     pub fn circuit_id(&self) -> [u8; CIRCUIT_ID_LEN] {
         self.info.circuit_id
     }
@@ -725,14 +750,30 @@ impl Write for E2eCircuit<'_> {
     }
 }
 
+/// Authenticated local hop facts captured when a circuit is completed.
+///
+/// Grouped so the completion helper stays under the argument-count lint without
+/// suppressing it. This is not part of [`E2eInfo`], which carries peer facts only.
+struct E2ePolicy {
+    local: PeerIdentity,
+    suite: MessageSuite,
+    allow_pq1024: bool,
+    /// Hop-local negotiated MTU ceiling, not a full end-to-end PMTU.
+    mtu_cap: u16,
+}
+
 fn finish_e2e<'a>(
     established: E2eEstablished<'a>,
     info: E2eInfo,
-    local: PeerIdentity,
     expected_peer: PeerIdentity,
-    suite: MessageSuite,
-    allow_pq1024: bool,
+    policy: E2ePolicy,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
+    let E2ePolicy {
+        local,
+        suite,
+        allow_pq1024,
+        mtu_cap,
+    } = policy;
     let (mut stream, tls) = established.into_parts();
     if tls.peer() != expected_peer {
         return Err(SessionReject::PeerIdentityMismatch.into());
@@ -747,6 +788,8 @@ fn finish_e2e<'a>(
         stream,
         token,
         info,
+        local,
+        mtu_cap,
     })
 }
 
@@ -776,6 +819,7 @@ pub fn open_e2e<'a>(
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
     let local = session.local();
+    let mtu_cap = session.mtu_cap();
     let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
     let destination = NodeRef {
         node_id: expected_peer.node_id,
@@ -790,7 +834,17 @@ pub fn open_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(established, info, local, expected_peer, suite, allow_pq1024)
+    finish_e2e(
+        established,
+        info,
+        expected_peer,
+        E2ePolicy {
+            local,
+            suite,
+            allow_pq1024,
+            mtu_cap,
+        },
+    )
 }
 
 /// Accept a circuit and run the E2E TLS handshake over it in the
@@ -803,6 +857,7 @@ pub fn accept_e2e<'a>(
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
     let local = session.local();
+    let mtu_cap = session.mtu_cap();
     let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
     let (circuit, circuit_info) = accept_circuit(session)?;
     let established = run_e2e(circuit, backend, tls_role)?;
@@ -813,7 +868,17 @@ pub fn accept_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(established, info, local, expected_peer, suite, allow_pq1024)
+    finish_e2e(
+        established,
+        info,
+        expected_peer,
+        E2ePolicy {
+            local,
+            suite,
+            allow_pq1024,
+            mtu_cap,
+        },
+    )
 }
 
 // --- relay forwarding --------------------------------------------------------

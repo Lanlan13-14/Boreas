@@ -22,6 +22,10 @@ openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backen
 boreas-crypto = { path = "../boreas-crypto" }
 boreas-pki = { path = "../boreas-pki", optional = true }
 boreas-proto = { path = "../boreas-proto" }
+# Real bounded L3 packet I/O and `inspect_packet` validation for the E2E packet
+# stream adapter. The default build has no TLS backend, so the adapter compiles
+# but cannot reach an E2E circuit without `openssl-inner-tls`.
+boreas-tun = { path = "../boreas-tun" }
 # Same reviewed release as `boreas-crypto`'s backend; used by the outer TLS
 # adapter and the certificate SPKI binding.
 openssl = { version = "=0.10.82", optional = true }

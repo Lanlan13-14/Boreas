@@ -1092,3 +1092,131 @@ fn truncate_utf8_never_splits_a_code_point() {
         );
     }
 }
+
+/// One IPv4/UDP packet with a correct header checksum, for the packet path.
+fn ipv4_packet(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let total = 20 + payload.len();
+    let mut packet = vec![0u8; total];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&u16::try_from(total).expect("bounded").to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 17;
+    packet[12..16].copy_from_slice(&src);
+    packet[16..20].copy_from_slice(&dst);
+    packet[20..].copy_from_slice(payload);
+    let mut sum = 0u32;
+    for chunk in packet[..20].chunks(2) {
+        sum += if chunk.len() == 2 {
+            u32::from(u16::from_be_bytes([chunk[0], chunk[1]]))
+        } else {
+            u32::from(chunk[0]) << 8
+        };
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = !(sum as u16);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+/// Real WSS + hop mTLS + E2E TLS circuit carrying VirtualTun packets through the
+/// bounded L3 adapter, both directions.
+///
+/// This is the only test that exercises the token-gated public constructor
+/// against a real circuit. It does not claim status freshness, revocation or
+/// performance acceptance, and it is loopback-origin evidence only.
+#[test]
+fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
+    use boreas_tun::PacketIo;
+
+    let t = Temp::new();
+    setup(&t);
+    let (client_side, server_side) = sides(&t);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let address = listener.local_addr().expect("listener address");
+    // Edge node 2 holds 10.20.1.2; Core node 1 holds 10.20.1.1.
+    let outbound = ipv4_packet([10, 20, 1, 2], [10, 20, 1, 1], b"e2e-packet-outbound");
+    let inbound = ipv4_packet([10, 20, 1, 1], [10, 20, 1, 2], b"e2e-packet-inbound");
+    let expected_inbound = inbound.clone();
+    let outbound_len = outbound.len();
+    let expected_outbound_hash = sha256(&outbound);
+    // `policy` negotiates a 1400-byte hop MTU cap; stay at it.
+    let mtu = 1400usize;
+
+    let server = thread::spawn(move || {
+        let (mut accepted, backend, peer) =
+            accept_session(&listener, server_side).map_err(|e| format!("hop: {e}"))?;
+        let e2e = accept_e2e(&mut accepted.session, &backend, peer)
+            .map_err(|e| format!("E2E: {e}"))?;
+        let (device, host) = boreas_tun::VirtualTun::try_pair(4, 4, mtu)
+            .map_err(|e| format!("server tun: {e}"))?;
+        let mut path = boreas_tunnel::packet_path::PacketPath::try_new_over_e2e(&device, e2e, mtu)
+            .map_err(|e| format!("server path: {e}"))?;
+        let received = path.step_inbound().map_err(|e| e.to_string())?;
+        let delivered = host
+            .read_packet()
+            .map_err(|e| format!("server tun read: {e}"))?;
+        device
+            .inject(&expected_inbound)
+            .map_err(|e| format!("server tun inject: {e}"))?;
+        let sent = path.step_outbound().map_err(|e| e.to_string())?;
+        Ok::<_, String>((received, delivered, sent))
+    });
+
+    let link = LinkClient::new(Box::new(client_side.outer), client_side.hop);
+    let session = link.connect(
+        &target(address, "wss.boreas.test"),
+        policy(client_side.local, client_side.peer),
+        IO_TIMEOUT,
+    );
+    let mut hop = match session {
+        Ok(s) => s,
+        Err(e) => {
+            let joined = server.join();
+            panic!("client WSS/session failed: {e}; server={joined:?}");
+        }
+    };
+    let e2e = match open_e2e(&mut hop, &client_side.e2e, client_side.peer, 1) {
+        Ok(s) => s,
+        Err(e) => {
+            let joined = server.join();
+            panic!("E2E TLS/confirmation failed: {e}; server={joined:?}");
+        }
+    };
+    let (device, host) =
+        boreas_tun::VirtualTun::try_pair(4, 4, mtu).expect("bounded client pair");
+    let mut path = boreas_tunnel::packet_path::PacketPath::try_new_over_e2e(&device, e2e, mtu)
+        .expect("client packet path");
+
+    device.inject(&outbound).expect("host emitted outbound packet");
+    assert_eq!(
+        path.step_outbound().expect("outbound authorization and framing"),
+        Some(outbound.len())
+    );
+    assert_eq!(
+        path.step_inbound().expect("inbound authorization"),
+        Some(inbound.len())
+    );
+    let delivered = host
+        .read_packet()
+        .expect("host readable")
+        .expect("exactly one packet delivered");
+    assert_eq!(delivered, inbound);
+    assert_eq!(sha256(&delivered), sha256(&inbound));
+
+    let server_result = server
+        .join()
+        .expect("join server thread")
+        .expect("server packet path");
+    assert_eq!(server_result.0, Some(outbound_len));
+    let server_delivered = server_result
+        .1
+        .expect("server delivered exactly one packet");
+    assert_eq!(
+        sha256(&server_delivered),
+        expected_outbound_hash,
+        "the packet crossed the real circuit unchanged"
+    );
+    assert_eq!(server_result.2, Some(inbound.len()));
+}
