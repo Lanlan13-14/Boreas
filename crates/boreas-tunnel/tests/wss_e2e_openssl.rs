@@ -213,7 +213,7 @@ fn sanitize_cli_stderr(bytes: &[u8], dir: &str) -> String {
         if remaining == 0 {
             break;
         }
-        if cleaned.len() + 1 <= remaining {
+        if cleaned.len() < remaining {
             kept.push_str(cleaned);
             kept.push('\n');
             continue;
@@ -1066,7 +1066,7 @@ fn sanitizer_cap_is_utf8_safe_for_multibyte_lines() {
 fn sanitizer_marks_truncation_even_when_only_a_sliver_remains() {
     // 455 lines of "error: B\n" fill 4095 of the 4096 bytes, so the deciding
     // line gets 1 remaining byte -- less than the marker itself needs.
-    let input = format!("error: {}\n", "B".repeat(1)).repeat(500);
+    let input = "error: B\n".repeat(500);
     let out = sanitize_cli_stderr(input.as_bytes(), "/tmp/boreas-wss-e2e-unit");
     assert!(
         out.len() <= STDERR_TEXT_LIMIT,
