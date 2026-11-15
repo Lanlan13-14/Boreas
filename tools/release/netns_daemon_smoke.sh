@@ -28,6 +28,16 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+trap 'echo "ERROR: netns smoke failed at line $LINENO" >&2; for log in "$WORK/core.err" "$WORK/edge.err"; do if [[ -f "$log" ]]; then cat "$log" >&2; fi; done' ERR
+
+# LinuxTunDevice sets MTU through sysfs. A network namespace alone retains
+# the host sysfs view; remount it in a private mount namespace after setns.
+run_node() {
+  local ns="$1"
+  shift
+  exec ip netns exec "$ns" unshare --mount --propagation private \
+    bash -c 'mount -t sysfs sysfs /sys; exec "$@"' boreas-node "$@"
+}
 
 CA_DIR="$WORK/ca"
 CORE_MAT="$WORK/core-mat"
@@ -123,7 +133,7 @@ ip netns exec "$EDGE_NS" ip addr add 192.0.2.2/24 dev veth-edge
 ip netns exec "$EDGE_NS" ip link set veth-edge up
 
 # Start Core daemon inside CORE_NS (creates real /dev/net/tun `btun0`).
-ip netns exec "$CORE_NS" "$BIN" daemon serve \
+run_node "$CORE_NS" "$BIN" daemon serve \
   --config "$WORK/core.toml" \
   --material-dir "$CORE_MAT" \
   --listen "192.0.2.1:8443" \
@@ -145,7 +155,7 @@ ip netns exec "$CORE_NS" ip link set btun0 up
 ip netns exec "$CORE_NS" ip route add 10.20.1.2/32 dev btun0
 
 # Start Edge daemon inside EDGE_NS (creates real /dev/net/tun `btun0` and dials 192.0.2.1:8443).
-ip netns exec "$EDGE_NS" "$BIN" daemon connect \
+run_node "$EDGE_NS" "$BIN" daemon connect \
   --config "$WORK/edge.toml" \
   --material-dir "$EDGE_MAT" \
   --connect "192.0.2.1:8443" \
