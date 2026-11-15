@@ -212,7 +212,7 @@ jobs:
         with:
           name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
           path: |
-            dist/*
+            dist
             functional-smoke.json
             toolchain.txt
           if-no-files-found: error
@@ -295,7 +295,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p pkg
-          archive=(artifact/boreas-*-${{ matrix.target }}.tar.gz)
+          archive=(artifact/dist/boreas-*-${{ matrix.target }}.tar.gz)
           if [ "${#archive[@]}" -ne 1 ] || [ ! -f "${archive[0]}" ]; then
             printf 'expected one development archive, found: %s\n' "${archive[*]}" >&2
             exit 1
