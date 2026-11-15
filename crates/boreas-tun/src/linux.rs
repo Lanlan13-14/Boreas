@@ -61,7 +61,7 @@ impl IfReq {
             .iter()
             .position(|c| *c == 0)
             .ok_or(LinuxTunError::InvalidInterface)?;
-        String::from_utf8(self.name[..end].iter().map(|c| (*c) as i8 as u8).collect())
+        String::from_utf8(self.name[..end].iter().map(|c| c.to_ne_bytes()[0]).collect())
             .map_err(|_| LinuxTunError::InvalidInterface)
     }
 }
