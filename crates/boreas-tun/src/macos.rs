@@ -454,9 +454,9 @@ fn make_ifreq(name: &str) -> Result<libc::ifreq, UtunError> {
 fn set_mtu(name: &str, mtu: usize) -> Result<(), UtunError> {
     let socket = ioctl_socket()?;
     let mut request = make_ifreq(name)?;
-    // SAFETY: ifreq is zeroed except for the name; assigning the only union
-    // member used by SIOCSIFMTU is valid.
-    unsafe { request.ifr_ifru.ifru_mtu = mtu as libc::c_int };
+    // ifreq is zeroed except for the name; this is a write to the only union
+    // member used by SIOCSIFMTU (union writes do not require an unsafe block).
+    request.ifr_ifru.ifru_mtu = mtu as libc::c_int;
     // SAFETY: request is a valid ifreq whose name identifies the utun
     // interface; the ioctl reads the mtu member.
     let result = unsafe {

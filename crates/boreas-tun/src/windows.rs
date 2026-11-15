@@ -60,7 +60,9 @@ const DEFAULT_RING_CAPACITY: u32 = 0x0004_0000;
 const IF_MAX_STRING_SIZE: usize = 256;
 const MAX_CACHED_DRIVERS: usize = 4;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static API_CACHE: OnceLock<Mutex<HashMap<(PathBuf, [u8; 32]), Arc<WintunApi>>>> = OnceLock::new();
+type DriverKey = (PathBuf, [u8; 32]);
+type DriverCache = HashMap<DriverKey, Arc<WintunApi>>;
+static API_CACHE: OnceLock<Mutex<DriverCache>> = OnceLock::new();
 
 type AdapterHandle = *mut core::ffi::c_void;
 type SessionHandle = *mut core::ffi::c_void;
