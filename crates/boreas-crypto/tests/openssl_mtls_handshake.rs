@@ -727,8 +727,7 @@ fn run_mtls_with(
             .expect("set write timeout");
     }
     std::thread::scope(|scope| {
-        let server =
-            scope.spawn(|| into_side(|| acceptor.accept(InterruptionShield(server_end))));
+        let server = scope.spawn(|| into_side(|| acceptor.accept(InterruptionShield(server_end))));
         let client_result = into_side(|| connector.connect(InterruptionShield(client_end)));
         let server_result = server.join().expect("Acceptor thread panicked");
         (client_result, server_result)
@@ -827,9 +826,11 @@ fn rust_to_rust_mutual_tls13_handshake_and_plaintext_roundtrip() {
         let (client_result, server_result) = run_mtls_with(&connector, &acceptor);
         // Report both ends on failure: in a concurrent handshake the root
         // cause usually sits on the side that is *not* unwrapped first.
-        let ((mut client, client_elapsed), (mut server, server_elapsed)) =
-            match (client_result, server_result) {
-                (Ok(client_ok), Ok(server_ok)) => (client_ok, server_ok),
+        let ((mut client, client_elapsed), (mut server, server_elapsed)) = match (
+            client_result,
+            server_result,
+        ) {
+            (Ok(client_ok), Ok(server_ok)) => (client_ok, server_ok),
             (client_result, server_result) => {
                 let client_msg = match &client_result {
                     Ok((_, elapsed)) => format!("Ok in {elapsed:?}"),

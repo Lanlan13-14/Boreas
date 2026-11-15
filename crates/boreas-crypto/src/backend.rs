@@ -19,7 +19,7 @@ use openssl::ssl::{
     Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslRef, SslSessionCacheMode,
     SslStream, SslVerifyMode, SslVersion,
 };
-use openssl::x509::{X509Ref, X509VerifyResult, X509};
+use openssl::x509::{X509, X509Ref, X509VerifyResult};
 
 use crate::{
     Aead, HybridGroup, IdentitySignature, NegotiatedParameters, Policy, PolicyError, Suite,
