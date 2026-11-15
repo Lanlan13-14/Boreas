@@ -59,7 +59,10 @@ def require_tool(name: str) -> str:
 def parse_readelf_header(output: str) -> dict:
     fields = {}
     for line in output.splitlines():
-        match = re.match(r"\s*(Class|Type|Machine):\s*(.+?)\s*$", line)
+        match = re.match(r"\s*(Class|Type|Machine):\s+(.+?)\s*$", line)
+        if match and match.group(1) == "Type":
+            fields["Type"] = match.group(2).split(" ", 1)[0]
+            continue
         if match:
             fields[match.group(1)] = match.group(2)
     return fields

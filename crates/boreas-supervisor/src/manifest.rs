@@ -1359,6 +1359,7 @@ impl<'a> JsonParser<'a> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::useless_vec)]
     use super::*;
 
     const GOOD: &str = r#"{"product":"boreas","manifest_version":1,"sequence":4,"published_at":"2026-01-01T00:00:00Z","issued_at":"2026-01-01T00:00:01Z","expires":"2026-02-01T00:00:00Z","min_compatible_state":"state-v1","signing_key_id":"root-1","assets":[{"name":"boreas-linux-x86_64","arch":"x86_64-unknown-linux-gnu","size":42,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","url":"https://releases.example.test/boreas"}]}"#;
@@ -1447,9 +1448,16 @@ mod tests {
             parse(&format!("{GOOD} {{}}")),
             Err(ManifestError::InvalidJson)
         );
-        // Trailing *whitespace* is allowed by JSON; the exact bytes are kept.
-        let padded = parse(&format!("{GOOD}\n\n"));
-        assert!(padded.is_ok(), "trailing whitespace must not be a parse error");
+        // Trailing whitespace is legal JSON and is retained verbatim in `raw`.
+        // Semantic fields must match the compact fixture; the bytes must not.
+        let padded = format!("{GOOD}\n\n");
+        let padded_manifest = parse(&padded).expect("trailing whitespace is valid JSON");
+        let compact = parse(GOOD).unwrap();
+        assert_eq!(padded_manifest.sequence(), compact.sequence());
+        assert_eq!(padded_manifest.product(), compact.product());
+        assert_eq!(padded_manifest.assets(), compact.assets());
+        assert_eq!(padded_manifest.raw_bytes(), padded.as_bytes());
+        assert_ne!(padded_manifest.raw_bytes(), compact.raw_bytes());
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(GOOD.as_bytes());
         assert!(parse_unsigned(&bom).is_err());
@@ -1810,6 +1818,9 @@ mod tests {
         );
         ledger.observe(&b).unwrap();
         assert_eq!(ledger.highest_sequence(), Some(5));
+        // Sequence 4 is still retained, so a different body at that sequence is
+        // equivocation. A lower sequence that was never observed is a rollback.
+        let older = verified(GOOD.replace("\"sequence\":4", "\"sequence\":3").as_bytes());
         assert_eq!(
             ledger.observe(&older),
             Err(ManifestError::SequenceRollback {

@@ -2664,6 +2664,7 @@ mod tests {
         ids
     }
 
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn decode_hex(text: &str) -> Vec<u8> {
         assert_eq!(text.len() % 2, 0, "odd-length hex");
         text.as_bytes()

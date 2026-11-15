@@ -135,21 +135,28 @@ fn fragment_tracker_bounds_overlap_expiry_and_key_dimensions() {
         protocol: 17,
         identification: 1,
     };
-    t.observe(k, 0, 8, true, now).unwrap();
-    assert_eq!(t.observe(k, 0, 8, true, now), Err(Error::FragmentOverlap));
+    let eight = [0u8; 8];
+    assert_eq!(t.observe(k, 0, &eight, true, now), Ok(None));
+    assert_eq!(
+        t.observe(k, 0, &eight, true, now),
+        Err(Error::FragmentOverlap)
+    );
     assert_eq!(t.tracked_streams(), 0);
-    assert_eq!(t.observe(k, 0, 8, true, now), Err(Error::FragmentTimeout));
+    assert_eq!(
+        t.observe(k, 0, &eight, true, now),
+        Err(Error::FragmentTimeout)
+    );
     let k2 = FragmentKey {
         identification: 2,
         ..k
     };
-    t.observe(k2, 0, 8, true, now).unwrap();
+    assert_eq!(t.observe(k2, 0, &eight, true, now), Ok(None));
     let k3 = FragmentKey {
         identification: 3,
         ..k
     };
     assert_eq!(
-        t.observe(k3, 0, 8, true, now + Duration::from_secs(1)),
+        t.observe(k3, 0, &eight, true, now + Duration::from_secs(1)),
         Err(Error::FragmentLimit)
     );
     assert_eq!(t.expire(now + Duration::from_secs(5)), 1);

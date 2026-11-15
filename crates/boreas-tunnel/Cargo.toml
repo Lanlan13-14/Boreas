@@ -12,12 +12,13 @@ path = "src/lib.rs"
 [features]
 default = []
 # Links the reviewed OpenSSL pq768 inner-TLS backend from `boreas-crypto`, plus
-# the in-tree outer HTTPS(WSS) adapter and the `boreas-pki` verified-object
-# identity extractor. The default build stays backend-free and therefore cannot
-# negotiate or bind any TLS session.
+# the in-tree outer HTTPS(WSS) adapter, the `boreas-pki` verified-object
+# identity extractor, and the diagnostic inner-TLS seam helpers. The default
+# build keeps policy types but no TLS backend and cannot negotiate a TLS session.
 openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki"]
 
 [dependencies]
+# Runtime authorization uses these policy types even without a TLS backend.
 boreas-crypto = { path = "../boreas-crypto" }
 boreas-pki = { path = "../boreas-pki", optional = true }
 boreas-proto = { path = "../boreas-proto" }

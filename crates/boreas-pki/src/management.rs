@@ -1046,8 +1046,8 @@ mod tests {
         MAX_SIGNED_OBJECT_LEN, SignedObject, SignerRole, SignerSignatures,
     };
     use boreas_proto::objects::{
-        AttachmentLease, CoreLsa, DirectGrant, Endpoint, NodeIdentity,
-        NodeRole as ObjectNodeRole, ObjectType, RouteGrant, StatusSnapshot,
+        AttachmentLease, CoreLsa, DirectGrant, Endpoint, NodeIdentity, NodeRole as ObjectNodeRole,
+        ObjectType, RouteGrant, StatusSnapshot,
     };
     use openssl::pkey::{Id, KeyType, PKey, Private};
     use openssl::sign::Signer;
@@ -1527,6 +1527,9 @@ mod tests {
         let mut object =
             node_identity_object(&signer, ObjectNodeRole::Edge, 1, 2, 1, &identity_public);
         object.net_id = [0x41; 16];
+        if let ObjectBody::NodeIdentity(body) = &mut object.body {
+            body.net_id = object.net_id;
+        }
         let raw = objects::encode_tbs(&object).unwrap();
         let signatures = signer.sign(&object);
         let mut trust = trust_with(&[&signer]);

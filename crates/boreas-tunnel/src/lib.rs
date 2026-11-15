@@ -3,8 +3,12 @@
 //! # Layers
 //!
 //! * Pure policy primitives ([`directory`], [`relay`], [`resource`],
-//!   [`scheduler`], prefix classification): no I/O, no cryptography. Callers
-//!   must supply inputs already validated by the appropriate trust layer.
+//!   [`scheduler`], prefix classification), plus bounded policy models
+//!   ([`budget`], [`capacity`], [`circuit`], [`dataplane`], [`failover`],
+//!   [`h2credit`], [`hedge`], [`memledger`], [`pmtu`], [`probe_budget`],
+//!   [`tcp_opts`]): no network I/O, no cryptography. Callers must supply inputs
+//!   already validated by the appropriate trust layer. The policy models do not
+//!   themselves wire their limits into the blocking runtime or pass any gate.
 //! * Blocking hop-transport runtime ([`ws`], [`tls`], [`session`], [`e2e`],
 //!   [`runtime`]): an RFC 6455 HTTP/1.1 WebSocket baseline whose binary payloads
 //!   are concatenated into the hop inner-TLS byte stream, the
@@ -30,10 +34,20 @@
 //! * [`runtime_capabilities`] reports what this build can actually do. It is
 //!   not a substitute for the Phase 0–5 gates, and no gate is claimed complete.
 
+pub mod budget;
+pub mod capacity;
+pub mod circuit;
 pub mod csprng;
+pub mod dataplane;
 pub mod directory;
 pub mod e2e;
 pub mod error;
+pub mod failover;
+pub mod h2credit;
+pub mod hedge;
+pub mod memledger;
+pub mod pmtu;
+pub mod probe_budget;
 pub mod relay;
 pub mod resource;
 pub mod runtime;
@@ -41,6 +55,7 @@ pub mod scheduler;
 pub mod session;
 pub mod sha1;
 pub mod stream;
+pub mod tcp_opts;
 pub mod tls;
 pub mod ws;
 

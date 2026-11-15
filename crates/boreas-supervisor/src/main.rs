@@ -1622,7 +1622,8 @@ mod tests {
     fn help_prints_usage_and_exits_zero() {
         let (code, stdout, _) = done_parts(run_cli(&[os("--help")]));
         assert_eq!(code, 0);
-        assert!(stdout.contains("supervise --store <DIR> -- <argv...>"));
+        assert!(stdout.contains("supervise --store <DIR>"));
+        assert!(stdout.contains("-- <argv...>"));
         assert!(stdout.contains("never downloads, installs, or authenticates"));
     }
 

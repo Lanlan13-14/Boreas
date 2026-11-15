@@ -16,12 +16,13 @@
 //! this. `crates/boreas-tunnel` currently exposes only in-process session APIs
 //! (`LinkClient` / `LinkServer`), no status snapshot and no `control.sock`, so
 //! `status` keeps saying `daemon: not connected` and never fabricates a live
-//! state. The full interactive raw-mode TUI (§10.4.1, 77x18 menu screen) is NOT
-//! part of this slice.
+//! state. `menu` renders the §10.4.1 screen from an offline model only: no
+//! raw mode, no DSR probe and no control socket (G-UI is not met).
 
 mod config;
 mod i18n;
 mod render;
+mod tui;
 
 use std::env;
 use std::io::IsTerminal;
@@ -30,6 +31,7 @@ use std::process::ExitCode;
 use config::RuntimeCapabilities;
 use i18n::{Lang, lang_from_env, parse_lang};
 use render::{StatusSnapshot, render_status};
+use tui::{DangerAction, MenuModel, confirm_dangerous, render_menu};
 
 const IMPLEMENTATION_SCOPE: &str = "Phase 0 policy/config/console-rendering foundation only";
 
@@ -148,6 +150,8 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
             "error: unexpected argument; run `boreas help`".into(),
         ),
         Some("status") => run_status(&args[1..], lang, stdout_tty),
+        Some("menu") => run_menu(&args[1..], lang, stdout_tty),
+        Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => {
@@ -189,6 +193,101 @@ fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Str
     } else {
         (0, render_status(&snapshot, lang), String::new())
     }
+}
+
+/// `menu [--json] [--narrow]`: render the §10.4.1 nine-entry screen from an
+/// offline model. Non-TTY or `--json` prints JSON with `"daemon": false`.
+/// `--narrow` prints the degraded list. A non-empty `NO_COLOR` is read only
+/// here and only sets `no_color`; this command never emits color either way.
+/// No control socket is opened and no live mesh is invented.
+fn run_menu(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+    let mut json = false;
+    let mut narrow = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--narrow" => narrow = true,
+            other => {
+                return (
+                    2,
+                    String::new(),
+                    format!("error: unexpected argument `{other}`; run `boreas help`"),
+                );
+            }
+        }
+    }
+    let mut model = MenuModel::offline(env!("CARGO_PKG_VERSION"), lang);
+    model.narrow = narrow;
+    model.no_color = no_color_set();
+    if json || !stdout_tty {
+        return (0, model.to_json(), String::new());
+    }
+    match render_menu(&model) {
+        Ok(screen) => (0, screen, String::new()),
+        Err(error) => (2, String::new(), format!("error: {error}")),
+    }
+}
+
+/// `NO_COLOR` is set when the variable exists and is non-empty. Read only by
+/// [`run_menu`]; other commands ignore it.
+fn no_color_set() -> bool {
+    match std::env::var("NO_COLOR") {
+        Ok(value) => !value.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// `confirm <hop-only|revoke:<id>|uninstall> <typed...>`: compare the joined
+/// typed phrase and stop. Accept prints `applied: false` because no daemon
+/// action exists. Reject exits 2. The mode is never changed.
+fn run_confirm(args: &[String]) -> (u8, String, String) {
+    let Some(action_arg) = args.first() else {
+        return (
+            2,
+            String::new(),
+            "error: confirm requires an action (hop-only, revoke:<id>, uninstall)".into(),
+        );
+    };
+    let action = match parse_danger_action(action_arg) {
+        Ok(action) => action,
+        Err(message) => return (2, String::new(), message),
+    };
+    let typed = args[1..].join(" ");
+    match confirm_dangerous(&action, &typed) {
+        Ok(()) => (
+            0,
+            "{\"accepted\":true,\"applied\":false,\"reason\":\"confirmation recorded; no daemon action exists\"}".to_string(),
+            String::new(),
+        ),
+        Err(_) => (
+            2,
+            "{\"accepted\":false,\"applied\":false}".to_string(),
+            String::new(),
+        ),
+    }
+}
+
+fn parse_danger_action(raw: &str) -> Result<DangerAction, String> {
+    if raw == "hop-only" {
+        return Ok(DangerAction::HopOnly);
+    }
+    if raw == "uninstall" {
+        return Ok(DangerAction::Uninstall);
+    }
+    if let Some(id) = raw.strip_prefix("revoke:") {
+        if !id.is_empty()
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(node_id) = id.parse::<u64>()
+        {
+            return Ok(DangerAction::Revoke { node_id });
+        }
+        return Err(format!(
+            "error: revoke id must be a decimal integer; got `{id}`"
+        ));
+    }
+    Err(format!(
+        "error: unknown confirm action `{raw}`; expected hop-only, revoke:<id> or uninstall"
+    ))
 }
 
 /// `config-check <path>`: parse and statically validate one TOML file, then
@@ -239,11 +338,14 @@ fn run_config_migrate(args: &[String]) -> (u8, String, String) {
 fn help_text() -> String {
     "boreas — Phase 0 policy/config/console foundation\n\n\
      USAGE:\n\
-     \x20 boreas [doctor|self-check|status [--json]|config-check <path>|config-migrate <path>|help]\n\
+     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|help]\n\
      \x20 boreas-easy   (one-shot status screen; interactive TUI not implemented)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
-     \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\n\
+     \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\
+     \x20 boreas menu [--narrow]    offline 9-entry screen (JSON when not a TTY)\n\
+     \x20 boreas confirm hop-only|revoke:<id>|uninstall <phrase>\n\
+     \x20                          records the phrase only; never applies it\n\n\
      config-check parses one TOML file (`version = 1` legacy or `version = 2`),\n\
      validates static policy and prints redacted JSON. config-migrate prints the\n\
      canonical version = 2 document for a legacy file and never rewrites it.\n\
@@ -255,7 +357,7 @@ fn help_text() -> String {
 
 fn doctor_json() -> String {
     format!(
-        "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"control_socket\":false,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"runtime_capabilities\":\"not_integrated\",\"phase0_complete\":false}}"
+        "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"control_socket\":false,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"console_menu\":true,\"runtime_capabilities\":\"not_integrated\",\"phase0_complete\":false}}"
     )
 }
 
@@ -660,6 +762,97 @@ uplinks = ["wss://hub-us-c.example.net"]
         let status = run(&args(&["status"]), Lang::En, false);
         assert_eq!(easy, status);
         assert_eq!(easy.0, 0);
+    }
+
+    #[test]
+    fn menu_non_tty_is_offline_json() {
+        let (code, stdout, stderr) = run(&args(&["menu"]), Lang::ZhCn, false);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"command\":\"menu\""));
+        assert!(stdout.contains("\"daemon\":false"));
+        assert!(stdout.contains("\"lang\":\"zh-CN\""));
+        assert!(stdout.contains("\"mode\":\"e2e-required\""));
+        assert!(stdout.contains("\"selected\":1"));
+        assert!(stdout.contains("\"console_menu\":true"));
+        assert!(!stdout.contains("\"daemon\":true"));
+    }
+
+    #[test]
+    fn menu_tty_is_boxed_and_narrow_is_not() {
+        let (code, stdout, stderr) = run(&args(&["menu"]), Lang::En, true);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("BOREAS CONSOLE"));
+        assert!(stdout.contains("e2e-required"));
+        assert!(!stdout.as_bytes().contains(&0x1B));
+        assert_eq!(stdout.split('\n').count(), 18);
+
+        let (code, narrow, _) = run(&args(&["menu", "--narrow"]), Lang::En, true);
+        assert_eq!(code, 0);
+        assert!(!narrow.contains('┌'));
+        assert!(narrow.contains("[1]"));
+        assert_ne!(narrow.split('\n').count(), 18);
+    }
+
+    #[test]
+    fn menu_json_flag_forces_json_on_tty() {
+        let (code, stdout, _) = run(&args(&["menu", "--json", "--narrow"]), Lang::ZhTw, true);
+        assert_eq!(code, 0);
+        assert!(stdout.starts_with('{'));
+        assert!(stdout.contains("\"narrow\":true"));
+        assert!(stdout.contains("\"daemon\":false"));
+        assert!(stdout.contains("\"lang\":\"zh-TW\""));
+    }
+
+    #[test]
+    fn confirm_accepts_exact_phrase_without_applying() {
+        let (code, stdout, stderr) =
+            run(&args(&["confirm", "hop-only", "HOP-ONLY"]), Lang::En, false);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            "{\"accepted\":true,\"applied\":false,\"reason\":\"confirmation recorded; no daemon action exists\"}"
+        );
+        let (code, stdout, _) = run(
+            &args(&["confirm", "revoke:42", "REVOKE", "42"]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 0);
+        assert!(stdout.contains("\"applied\":false"));
+        let (code, stdout, _) = run(
+            &args(&["confirm", "uninstall", "UNINSTALL"]),
+            Lang::En,
+            true,
+        );
+        assert_eq!(code, 0);
+        assert!(stdout.contains("\"accepted\":true"));
+    }
+
+    #[test]
+    fn confirm_rejects_wrong_phrase_with_exit_2() {
+        let (code, stdout, _) = run(&args(&["confirm", "hop-only", "hop-only"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert_eq!(stdout, "{\"accepted\":false,\"applied\":false}");
+        let (code, stdout, _) = run(
+            &args(&["confirm", "revoke:7", "REVOKE", "8"]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 2);
+        assert!(stdout.contains("\"accepted\":false"));
+        let (code, _, stderr) = run(&args(&["confirm"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("confirm requires"));
+        let (code, _, stderr) = run(
+            &args(&["confirm", "revoke:nope", "REVOKE nope"]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 2);
+        assert!(stderr.contains("decimal"));
     }
 
     #[test]

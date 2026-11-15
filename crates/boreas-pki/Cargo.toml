@@ -11,10 +11,15 @@ path = "src/lib.rs"
 default = []
 # Real ML-DSA/Ed25519 verification and IdentityAuthority signing. Requires OpenSSL 3.5+
 # (the CI rust-tls workflow pins 3.6.1); the default workspace build stays backend-free.
-openssl-backend = ["dep:openssl"]
+openssl-backend = [
+    "dep:openssl",
+    "dep:boreas-crypto",
+    "boreas-crypto/openssl-backend",
+]
 
 [dependencies]
 boreas-proto = { path = "../boreas-proto" }
+boreas-crypto = { path = "../boreas-crypto", optional = true }
 # Pinned to the same reviewed rust-openssl release as boreas-crypto.
 openssl = { version = "=0.10.82", optional = true }
 # Constant-time comparison for the fixed-size invitation bearer secret.

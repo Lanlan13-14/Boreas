@@ -60,7 +60,12 @@ mod macos;
 // `UpgradeStore::open` must keep failing closed on Windows. See
 // `docs/upgrade/README.md` for the exact remaining gate.
 
+pub mod control_auth;
+pub mod drain;
+pub mod install;
 pub mod manifest;
+pub mod preflight;
+pub mod sandbox;
 
 /// Real Ed25519 + ML-DSA-65 verification and artifact SHA-256. Compiled only
 /// with the `openssl-backend` feature (OpenSSL 3.5+); `manifest::verify_release`
@@ -1104,13 +1109,15 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
+            let thread = std::thread::current().id();
             let p = std::env::temp_dir().join(format!(
-                "boreas-supervisor-test-{}-{}",
+                "boreas-supervisor-test-{}-{}-{:?}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                thread
             ));
             fs::create_dir(&p).unwrap();
             // The store rejects symlinked path components, and macOS keeps

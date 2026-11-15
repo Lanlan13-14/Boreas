@@ -48,10 +48,11 @@ fn driver() -> Option<(PathBuf, [u8; 32])> {
 
 fn unique_name() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // The official Wintun DLL rejects long aliases with Windows error 87
+    // before ConvertInterfaceAliasToLuid can return an LUID.
     format!(
-        "BoreasTun{}{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        "B{}",
+        (std::process::id() as usize).wrapping_mul(10) + NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
 

@@ -41,11 +41,23 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+"
 )
+# `gh run view --log` puts `<job>\t<step>\t` after the timestamp.
+JOB_PREFIX_RE = re.compile(r"^[^\t]+\t[^\t]+\t")
 RESULT_RE = re.compile(
     r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;"
 )
 RUNNING_RE = re.compile(r"^running (\d+) tests?$")
-TEST_OK_RE = re.compile(r"^test ([^ ]+) \.\.\. ok$")
+# `--nocapture` lets the test print its evidence marker between `...` and
+# `ok`. The marker is still required separately; this only recovers the name.
+# `--nocapture` may print the evidence marker between `...` and `ok`.
+# The line must still end at `ok`; a later `...` (an env dump, for example)
+# is not a test result.
+# The evidence marker may contain dots. A second cargo separator (` ... `)
+# means this line is an env dump or another test, not this result.
+# The evidence marker may contain dots. A second cargo separator (` ... `)
+# means this line is an env dump or another test, not this result. The
+# result itself must end at `ok`.
+TEST_OK_RE = re.compile(r"^test ([^ ]+) \.\.\.(?: (?!.* \.\.\. ).*)?ok$")
 
 DRIVER = {"windows": "wintun", "macos": "utun", "linux": "tun"}
 
@@ -55,7 +67,11 @@ def normalize_lines(text: str) -> list[str]:
     for raw in text.splitlines():
         line = ANSI_RE.sub("", raw)
         line = TIMESTAMP_RE.sub("", line)
-        normalized.append(line.rstrip("\r"))
+        line = JOB_PREFIX_RE.sub("", line)
+        # GitHub's log exporter prefixes each captured line with a timestamp
+        # and a space. A leading space left after that is indentation, not
+        # part of cargo's test line.
+        normalized.append(line.strip())
     return normalized
 
 
@@ -135,6 +151,18 @@ def evaluate_text(
         for line in lines
         if (match := TEST_OK_RE.match(line))
     }
+    # Windows `--nocapture` wraps after `...`, so the evidence and `ok`
+    # land on the following lines. Pair a bare start with the next `ok`
+    # before another test starts.
+    pending = None
+    for line in lines:
+        if line.startswith("test ") and line.endswith(" ..."):
+            pending = line[len("test ") : -len(" ...")]
+        elif line == "ok" and pending is not None:
+            ok_tests.add(pending)
+            pending = None
+        elif line.startswith("test "):
+            pending = None
     for name in require_tests:
         present = name in ok_tests
         report["required_tests"][name] = present
