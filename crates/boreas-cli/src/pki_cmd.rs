@@ -36,7 +36,7 @@ pub fn run_pki_command(args: &[String]) -> Result<(), String> {
         "issue-node" => cmd_issue_node(&args[1..]),
         "sign-status" => cmd_sign_status(&args[1..]),
         "verify-bundle" => cmd_verify_bundle(&args[1..]),
-        _ => Err(format!("pki: unknown subcommand (run `boreas pki --help`)")),
+        _ => Err("pki: unknown subcommand (run `boreas pki --help`)".to_string()),
     }
 }
 

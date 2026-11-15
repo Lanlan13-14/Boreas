@@ -605,33 +605,35 @@ mod linux_daemon {
                 .map_err(|_| "daemon: duplicate or invalid SPKIs".to_string())?,
         );
 
+        let id_pem = mat_dir.join("identity.pem");
+        let id_ca_pem = mat_dir.join("identity-ca.pem");
         let tls_policy = Policy::production_default();
         let inner_conn = OpenSslConnector::from_pem_files(
-            &mat_dir.join("identity.pem"),
+            &id_pem,
             &config.identity.private_key,
-            &mat_dir.join("identity-ca.pem"),
+            &id_ca_pem,
             tls_policy,
         )
         .map_err(|_| "daemon: inner pq768 connector setup failed".to_string())?;
         let inner_acc = OpenSslAcceptor::from_pem_files(
-            &mat_dir.join("identity.pem"),
+            &id_pem,
             &config.identity.private_key,
-            &mat_dir.join("identity-ca.pem"),
+            &id_ca_pem,
             tls_policy,
         )
         .map_err(|_| "daemon: inner pq768 acceptor setup failed".to_string())?;
 
         let e2e_conn = OpenSslConnector::from_pem_files(
-            &mat_dir.join("identity.pem"),
+            &id_pem,
             &config.identity.private_key,
-            &mat_dir.join("identity-ca.pem"),
+            &id_ca_pem,
             tls_policy,
         )
         .map_err(|_| "daemon: E2E pq768 connector setup failed".to_string())?;
         let e2e_acc = OpenSslAcceptor::from_pem_files(
-            &mat_dir.join("identity.pem"),
+            &id_pem,
             &config.identity.private_key,
-            &mat_dir.join("identity-ca.pem"),
+            &id_ca_pem,
             tls_policy,
         )
         .map_err(|_| "daemon: E2E pq768 acceptor setup failed".to_string())?;
