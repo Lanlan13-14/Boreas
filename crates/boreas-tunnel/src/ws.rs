@@ -444,6 +444,7 @@ impl OpCode {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawFrame {
     fin: bool,
     opcode: OpCode,
@@ -580,7 +581,6 @@ fn encode_frame(
     Ok(out)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 fn valid_close_code(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
@@ -974,6 +974,7 @@ mod tests {
             &mut Cursor::new(bytes.to_vec()),
             WsRole::Server,
             &WsLimits::default(),
+            Instant::now() + WsLimits::default().bounded().message_deadline,
         )
         .expect("valid client frame")
     }
