@@ -205,7 +205,10 @@ if [ "$1" = "link" ] && [ "$2" = "show" ]; then
   case "$mode" in
     tun_exists) exit 0 ;;
     *)
-      n=$(cat "$count" 2>/dev/null || echo 0)
+      n=0
+      if [ -f "$count" ]; then
+        IFS= read -r n < "$count"
+      fi
       n=$((n + 1))
       printf '%s\n' "$n" > "$count"
       [ "$n" -ge 2 ] && exit 0
