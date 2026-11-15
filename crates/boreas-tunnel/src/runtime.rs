@@ -21,6 +21,7 @@ use crate::resource::{
     Admission, AuthenticatedPeer, ByteCredit, ConnectionCredit, HandshakeCredit,
 };
 use crate::session::{self, EstablishedSession, SessionPolicy};
+use crate::stream::Duplex;
 use crate::tls::{InnerTlsAcceptor, InnerTlsConnector, OuterTlsConnector};
 use crate::ws::{self, MAX_WS_FRAME_PAYLOAD};
 
