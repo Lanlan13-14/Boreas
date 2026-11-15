@@ -26,7 +26,7 @@ use std::{
 pub const MAX_IP_PACKET: usize = 65_535;
 pub const MAX_IPV6_EXT_HEADERS: usize = 4;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     EmptyPacket,
     Truncated,
