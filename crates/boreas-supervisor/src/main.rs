@@ -786,10 +786,7 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
 /// `begin_activation`, so an exhausted candidate is never activated; the
 /// durable increment in [`UpgradeStore::reserve_trial`] remains the
 /// authoritative check.
-fn trial_budget_spent(
-    store: &UpgradeStore,
-    max_attempts: u32,
-) -> Result<Option<String>> {
+fn trial_budget_spent(store: &UpgradeStore, max_attempts: u32) -> Result<Option<String>> {
     let Some(journal) = store.journal()? else {
         return Ok(None);
     };
@@ -1665,7 +1662,10 @@ mod unix_tests {
         let trial = store.trial_state().unwrap().unwrap();
         assert_eq!(trial.version, "2.0.0");
         assert_eq!(trial.attempts, 1);
-        assert!(!trial.in_flight, "outcome must be recorded, not left pending");
+        assert!(
+            !trial.in_flight,
+            "outcome must be recorded, not left pending"
+        );
     }
 
     #[test]

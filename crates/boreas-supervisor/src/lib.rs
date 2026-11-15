@@ -93,7 +93,10 @@ pub enum UpgradeError {
     Locked(String),
     /// The durable trial ledger shows every permitted launch of this candidate
     /// was consumed. Only an operator (`reset-trial`) may clear it.
-    TrialExhausted { version: String, attempts: u32 },
+    TrialExhausted {
+        version: String,
+        attempts: u32,
+    },
     UnsupportedPlatform(&'static str),
 }
 impl fmt::Display for UpgradeError {
@@ -599,7 +602,11 @@ impl UpgradeStore {
     }
 
     fn write_trial(&self, state: &TrialState) -> Result<()> {
-        let outcome = if state.in_flight { "in-flight" } else { "failed" };
+        let outcome = if state.in_flight {
+            "in-flight"
+        } else {
+            "failed"
+        };
         let data = format!(
             "{TRIAL_FORMAT}\n{}\n{}\n{outcome}\n",
             state.version, state.attempts

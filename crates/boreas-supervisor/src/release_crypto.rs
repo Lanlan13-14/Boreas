@@ -142,8 +142,8 @@ pub(crate) fn verify_dual(
         return Err("Ed25519 signature does not match the release bytes");
     }
 
-    let mut ml_dsa_65_verifier =
-        Verifier::new_without_digest(&ml_dsa_65_key).map_err(|_| "ML-DSA-65 verifier unavailable")?;
+    let mut ml_dsa_65_verifier = Verifier::new_without_digest(&ml_dsa_65_key)
+        .map_err(|_| "ML-DSA-65 verifier unavailable")?;
     let ml_dsa_65_valid = ml_dsa_65_verifier
         .verify_oneshot(ml_dsa_65_signature, message)
         .map_err(|_| "ML-DSA-65 verification backend error")?;
@@ -242,28 +242,20 @@ mod tests {
         verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &mldsa_sig).expect("both valid");
 
         // A valid Ed25519 half plus an invalid ML-DSA-65 half must fail.
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &vec![0u8; 3309]).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &vec![0u8; 3309]).is_err());
         // A valid ML-DSA-65 half plus an invalid Ed25519 half must also fail.
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &vec![0u8; 64], &mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &vec![0u8; 64], &mldsa_sig).is_err());
         // A correct-length ML-DSA-65 signature from a different key must fail
         // against the configured root key (not merely fail a length check).
         let other_mldsa = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[9u8; 32])
             .expect("other ml-dsa-65 key");
         let other_mldsa_sig = sign(&other_mldsa, message);
         assert_eq!(other_mldsa_sig.len(), ML_DSA_65_SIGNATURE_BYTES);
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &other_mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &other_mldsa_sig).is_err());
         // A bit-flipped but correctly sized ML-DSA-65 signature must fail.
         let mut tampered_mldsa = mldsa_sig.clone();
         tampered_mldsa[0] ^= 0x01;
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &tampered_mldsa).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &tampered_mldsa).is_err());
         // Any mutation of the signed message invalidates both halves.
         assert!(
             verify_dual(
@@ -293,15 +285,11 @@ mod tests {
         // against the configured root key.
         let other_ed_sig = sign(&other_ed, message);
         assert_eq!(other_ed_sig.len(), ED25519_SIGNATURE_BYTES);
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &other_ed_sig, &mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &other_ed_sig, &mldsa_sig).is_err());
         // A bit-flipped but correctly sized Ed25519 signature must fail.
         let mut tampered_ed = ed_sig.clone();
         tampered_ed[0] ^= 0x01;
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &tampered_ed, &mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &tampered_ed, &mldsa_sig).is_err());
     }
 
     #[test]
@@ -342,20 +330,12 @@ mod tests {
         let ed_sig = sign(&ed25519, message);
         let mldsa_sig = sign(&ml_dsa_65, message);
 
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig[..63], &mldsa_sig).is_err()
-        );
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &mldsa_sig[..3308]).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig[..63], &mldsa_sig).is_err());
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &mldsa_sig[..3308]).is_err());
         let oversized_ed_sig = vec![0u8; ED25519_SIGNATURE_BYTES + 1];
         let oversized_mldsa_sig = vec![0u8; ML_DSA_65_SIGNATURE_BYTES + 1];
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &oversized_ed_sig, &mldsa_sig).is_err()
-        );
-        assert!(
-            verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &oversized_mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &oversized_ed_sig, &mldsa_sig).is_err());
+        assert!(verify_dual(message, &ed_der, &mldsa_der, &ed_sig, &oversized_mldsa_sig).is_err());
 
         let oversized_ed = vec![0u8; MAX_ED25519_PUBLIC_KEY_DER_BYTES + 1];
         let oversized_mldsa = vec![0u8; MAX_ML_DSA_65_PUBLIC_KEY_DER_BYTES + 1];
@@ -382,12 +362,10 @@ mod tests {
         assert!(check_key_types(&[0u8; 44], &mldsa_der).is_err());
         assert!(check_key_types(&ed_der, &[0u8; 44]).is_err());
         assert!(
-            check_key_types(&vec![0u8; MAX_ED25519_PUBLIC_KEY_DER_BYTES + 1], &mldsa_der)
-                .is_err()
+            check_key_types(&vec![0u8; MAX_ED25519_PUBLIC_KEY_DER_BYTES + 1], &mldsa_der).is_err()
         );
         assert!(
-            check_key_types(&ed_der, &vec![0u8; MAX_ML_DSA_65_PUBLIC_KEY_DER_BYTES + 1])
-                .is_err()
+            check_key_types(&ed_der, &vec![0u8; MAX_ML_DSA_65_PUBLIC_KEY_DER_BYTES + 1]).is_err()
         );
     }
 
@@ -407,12 +385,8 @@ mod tests {
 
         assert!(check_key_types(&trailing_ed, &mldsa_der).is_err());
         assert!(check_key_types(&ed_der, &trailing_mldsa).is_err());
-        assert!(
-            verify_dual(message, &trailing_ed, &mldsa_der, &ed_sig, &mldsa_sig).is_err()
-        );
-        assert!(
-            verify_dual(message, &ed_der, &trailing_mldsa, &ed_sig, &mldsa_sig).is_err()
-        );
+        assert!(verify_dual(message, &trailing_ed, &mldsa_der, &ed_sig, &mldsa_sig).is_err());
+        assert!(verify_dual(message, &ed_der, &trailing_mldsa, &ed_sig, &mldsa_sig).is_err());
         // The corresponding canonical DER still passes, so the trailing-byte
         // check did not reject valid provisioned material.
         check_key_types(&ed_der, &mldsa_der).expect("canonical keys");
