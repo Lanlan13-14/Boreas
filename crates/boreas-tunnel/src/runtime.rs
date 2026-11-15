@@ -97,7 +97,10 @@ impl LinkClient {
         io_timeout: Duration,
     ) -> Result<EstablishedSession, TunnelError> {
         let tcp = TcpStream::connect_timeout(&target.address, io_timeout)?;
-        configure(&tcp, io_timeout)?;
+        // The handshake budget belongs to the whole exchange, not to each
+        // socket read. A public path can split one TLS record across several
+        // RTTs; a per-read deadline makes that look like a handshake failure.
+        configure(&tcp)?;
         let outer = self.outer.connect(tcp, &target.tls_server_name)?;
         let websocket = ws::client_handshake(outer, &target.ws_host, &target.path)?;
         let inner = self.inner.connect(Box::new(websocket))?;
@@ -155,7 +158,7 @@ impl LinkServer {
     ) -> Result<AcceptedSession, TunnelError> {
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
-        configure(&tcp, io_timeout)?;
+        configure(&tcp)?;
         let transport = outer.accept(tcp)?;
         self.accept_established(transport, handshake, buffer_credit, policy)
     }
@@ -174,7 +177,7 @@ impl LinkServer {
         let (tcp, _peer_address) = listener.accept()?;
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
-        configure(&tcp, io_timeout)?;
+        configure(&tcp)?;
         self.accept_established(tcp, handshake, buffer_credit, policy)
     }
 
@@ -216,10 +219,12 @@ impl LinkServer {
     }
 }
 
-fn configure(tcp: &TcpStream, io_timeout: Duration) -> io::Result<()> {
+fn configure(tcp: &TcpStream) -> io::Result<()> {
     tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(Some(io_timeout))?;
-    tcp.set_write_timeout(Some(io_timeout))
+    // Handshake reads stay blocking. A per-read timeout is not a handshake
+    // deadline: public paths split one record across multiple reads.
+    tcp.set_read_timeout(None)?;
+    tcp.set_write_timeout(None)
 }
 
 #[cfg(test)]
