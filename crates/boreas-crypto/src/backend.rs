@@ -910,7 +910,10 @@ mod tests {
                 assert_eq!(kind, "certificate");
                 assert_eq!(limit, MAX_CERTIFICATE_PEM_BYTES);
             }
-            other => panic!("expected IdentityTooLarge before OpenSSL parsing, got {other:?}"),
+            Err(other) => {
+                panic!("expected IdentityTooLarge before OpenSSL parsing, got {other:?}")
+            }
+            Ok(_) => panic!("expected IdentityTooLarge before OpenSSL parsing, got a connector"),
         }
     }
 

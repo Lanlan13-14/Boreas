@@ -155,7 +155,9 @@ impl RuntimeCapabilities {
         e2e_relay: false,
     };
 
-    /// Capabilities of a runtime that reports everything §1.3 requires.
+    /// Capabilities of a runtime that reports everything §1.3 requires. Test-only:
+    /// production code must never assume a capability exists.
+    #[cfg(test)]
     pub const FULL: Self = Self {
         dns_tcp: true,
         control_socket: true,
@@ -268,6 +270,13 @@ pub struct DnsConfig {
 /// Static validation failures. Variant names are diagnostic codes; [`fmt::Display`]
 /// carries the human-readable, secret-free message the CLI prints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "Unix mode/owner policy cannot be enforced on Windows; those refusal categories are Unix-only and documented rather than silently dropped"
+    )
+)]
 pub enum ConfigError {
     SchemaVersionRequired,
     UnsupportedSchemaVersion,
@@ -668,11 +677,14 @@ impl Config {
     pub fn read_file(path: &Path, capabilities: RuntimeCapabilities) -> Result<Self, ConfigError> {
         let file = open_no_follow(path)?;
         let metadata = file.metadata().map_err(|_| ConfigError::ReadFailed)?;
+        // A symlink or reparse point is refused on every platform. On Unix the
+        // `O_NOFOLLOW` open normally fails first with ELOOP; on Windows the file
+        // is opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so this branch is the
+        // one that detects it.
+        if metadata.file_type().is_symlink() {
+            return Err(ConfigError::SymlinkNotAllowed);
+        }
         if !metadata.file_type().is_file() {
-            #[cfg(unix)]
-            if metadata.file_type().is_symlink() {
-                return Err(ConfigError::SymlinkNotAllowed);
-            }
             return Err(ConfigError::NotRegularFile);
         }
         #[cfg(unix)]
@@ -923,6 +935,10 @@ impl Config {
     /// security mode, the network binding, the permanent identity slot, the
     /// identity generation, the key reference, the trust anchors, or the suite.
     /// Such a change is not a failover action (§1.3, §5.5).
+    #[allow(
+        dead_code,
+        reason = "reachable only through the not-yet-integrated transition API; tested directly"
+    )]
     pub fn security_transition_requires_high_risk(&self, next: &Self) -> bool {
         self.security.mode != next.security.mode
             || self.security.suite != next.security.suite
@@ -1158,7 +1174,7 @@ pub enum TransitionError<E> {
     dead_code,
     reason = "no daemon loads or applies configuration yet; the contract is tested directly"
 )]
-pub fn authorize_security_transition<A: SecurityAudit, D: SessionDisconnect>(
+pub fn authorize_security_transition<A: SecurityAudit, D>(
     old: &Config,
     new: &Config,
     confirmation: Option<&str>,
