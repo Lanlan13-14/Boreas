@@ -406,9 +406,7 @@ pub fn parse_frame(input: &[u8], max_frame_size: u32) -> Result<(Frame, usize), 
     }
     let payload = &input[FRAME_HEADER_LEN..total];
     let frame_type = FrameType::from_u8(type_byte)?;
-    if flags & FLAG_PADDED != 0
-        && matches!(frame_type, FrameType::Data | FrameType::Headers)
-    {
+    if flags & FLAG_PADDED != 0 && matches!(frame_type, FrameType::Data | FrameType::Headers) {
         return Err(Error::Padded);
     }
     let frame = match frame_type {
@@ -559,7 +557,7 @@ pub fn write_frame(frame: &Frame, max_frame_size: u32) -> Result<Vec<u8>, Error>
 /// rejected. `SETTINGS_ENABLE_CONNECT_PROTOCOL` other than 0 or 1 is rejected.
 /// A non-multiple of 6 is rejected.
 pub fn parse_settings_payload(payload: &[u8]) -> Result<Vec<Setting>, Error> {
-    if payload.len() % 6 != 0 {
+    if !payload.len().is_multiple_of(6) {
         return Err(Error::BadLength);
     }
     let mut settings = Vec::with_capacity(payload.len() / 6);
@@ -698,7 +696,10 @@ fn split_header(line: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn trim_ows(v: &[u8]) -> &[u8] {
-    let start = v.iter().position(|b| *b != b' ' && *b != b'\t').unwrap_or(v.len());
+    let start = v
+        .iter()
+        .position(|b| *b != b' ' && *b != b'\t')
+        .unwrap_or(v.len());
     let end = v
         .iter()
         .rposition(|b| *b != b' ' && *b != b'\t')
@@ -725,9 +726,9 @@ fn token_eq_ignore_ascii_case(value: &[u8], token: &[u8]) -> bool {
 }
 
 fn connection_has_upgrade(value: &[u8]) -> bool {
-    value.split(|&b| b == b',').any(|part| {
-        token_eq_ignore_ascii_case(trim_ows(part), b"upgrade")
-    })
+    value
+        .split(|&b| b == b',')
+        .any(|part| token_eq_ignore_ascii_case(trim_ows(part), b"upgrade"))
 }
 
 fn status_is_101(line: &[u8]) -> bool {
@@ -833,6 +834,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         let mut c = h2;
         let mut d = h3;
         let mut e = h4;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..80 {
             let (f, k) = if i < 20 {
                 ((b & c) | ((!b) & d), 0x5A82_7999)
@@ -881,10 +883,7 @@ mod tests {
     fn rfc6455_accept_vector() {
         let accept = websocket_accept(&SAMPLE_KEY);
         assert_eq!(&accept, b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-        assert_eq!(
-            base64_encode(&SAMPLE_KEY),
-            b"dGhlIHNhbXBsZSBub25jZQ=="
-        );
+        assert_eq!(base64_encode(&SAMPLE_KEY), b"dGhlIHNhbXBsZSBub25jZQ==");
     }
 
     #[test]
@@ -893,7 +892,10 @@ mod tests {
             sha1(b""),
             hex20(b"da39a3ee5e6b4b0d3255bfef95601890afd80709")
         );
-        assert_eq!(sha1(b"abc"), hex20(b"a9993e364706816aba3e25717850c26c9cd0d89d"));
+        assert_eq!(
+            sha1(b"abc"),
+            hex20(b"a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
         assert_eq!(
             sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             hex20(b"84983e441c3bd26ebaae4aa1f95129e5e54670f1")
@@ -945,9 +947,7 @@ mod tests {
 
     #[test]
     fn deflate_on_either_side_is_rejected() {
-        let mut offered = build_upgrade_request("h", "/x", SAMPLE_KEY)
-            .unwrap()
-            .bytes;
+        let mut offered = build_upgrade_request("h", "/x", SAMPLE_KEY).unwrap().bytes;
         // The builder never emits the token. Injecting it into a response must fail.
         let _ = &mut offered;
         let bad = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
@@ -994,7 +994,10 @@ mod tests {
             _ => panic!("data"),
         }
         big[3] = 0x7;
-        assert_eq!(parse_frame(&big, HARD_MAX_FRAME_SIZE), Err(Error::Unsupported));
+        assert_eq!(
+            parse_frame(&big, HARD_MAX_FRAME_SIZE),
+            Err(Error::Unsupported)
+        );
         assert!(parse_frame(&[0, 0, 1], DEFAULT_MAX_FRAME_SIZE).is_err());
     }
 
@@ -1134,8 +1137,8 @@ mod tests {
     fn hex20(s: &[u8]) -> [u8; 20] {
         let mut out = [0u8; 20];
         for i in 0..20 {
-            out[i] = u8::from_str_radix(std::str::from_utf8(&s[i * 2..i * 2 + 2]).unwrap(), 16)
-                .unwrap();
+            out[i] =
+                u8::from_str_radix(std::str::from_utf8(&s[i * 2..i * 2 + 2]).unwrap(), 16).unwrap();
         }
         out
     }

@@ -139,7 +139,10 @@ mod tests {
             ResourceBudget::new(292, 291, 32, 256),
             Err(BudgetError::Rejected)
         );
-        assert_eq!(ResourceBudget::new(0, 291, 32, 256), Err(BudgetError::Rejected));
+        assert_eq!(
+            ResourceBudget::new(0, 291, 32, 256),
+            Err(BudgetError::Rejected)
+        );
         assert_eq!(
             ResourceBudget::new(195, 4097, 32, 256),
             Err(BudgetError::Rejected)

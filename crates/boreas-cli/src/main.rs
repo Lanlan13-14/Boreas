@@ -404,7 +404,6 @@ probe_paths = 1
 "#
         )
     }
-}
 
     fn legacy_source() -> String {
         format!(
@@ -808,17 +807,26 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn confirm_accepts_exact_phrase_without_applying() {
-        let (code, stdout, stderr) = run(&args(&["confirm", "hop-only", "HOP-ONLY"]), Lang::En, false);
+        let (code, stdout, stderr) =
+            run(&args(&["confirm", "hop-only", "HOP-ONLY"]), Lang::En, false);
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert_eq!(
             stdout,
             "{\"accepted\":true,\"applied\":false,\"reason\":\"confirmation recorded; no daemon action exists\"}"
         );
-        let (code, stdout, _) = run(&args(&["confirm", "revoke:42", "REVOKE", "42"]), Lang::En, false);
+        let (code, stdout, _) = run(
+            &args(&["confirm", "revoke:42", "REVOKE", "42"]),
+            Lang::En,
+            false,
+        );
         assert_eq!(code, 0);
         assert!(stdout.contains("\"applied\":false"));
-        let (code, stdout, _) = run(&args(&["confirm", "uninstall", "UNINSTALL"]), Lang::En, true);
+        let (code, stdout, _) = run(
+            &args(&["confirm", "uninstall", "UNINSTALL"]),
+            Lang::En,
+            true,
+        );
         assert_eq!(code, 0);
         assert!(stdout.contains("\"accepted\":true"));
     }
@@ -828,13 +836,21 @@ uplinks = ["wss://hub-us-c.example.net"]
         let (code, stdout, _) = run(&args(&["confirm", "hop-only", "hop-only"]), Lang::En, false);
         assert_eq!(code, 2);
         assert_eq!(stdout, "{\"accepted\":false,\"applied\":false}");
-        let (code, stdout, _) = run(&args(&["confirm", "revoke:7", "REVOKE", "8"]), Lang::En, false);
+        let (code, stdout, _) = run(
+            &args(&["confirm", "revoke:7", "REVOKE", "8"]),
+            Lang::En,
+            false,
+        );
         assert_eq!(code, 2);
         assert!(stdout.contains("\"accepted\":false"));
         let (code, _, stderr) = run(&args(&["confirm"]), Lang::En, false);
         assert_eq!(code, 2);
         assert!(stderr.contains("confirm requires"));
-        let (code, _, stderr) = run(&args(&["confirm", "revoke:nope", "REVOKE nope"]), Lang::En, false);
+        let (code, _, stderr) = run(
+            &args(&["confirm", "revoke:nope", "REVOKE nope"]),
+            Lang::En,
+            false,
+        );
         assert_eq!(code, 2);
         assert!(stderr.contains("decimal"));
     }
@@ -847,5 +863,4 @@ uplinks = ["wss://hub-us-c.example.net"]
         let (code, _, _) = dispatch("boreas-easy", &args(&["bogus"]), probe_en, false);
         assert_eq!(code, 2);
     }
-}
 }

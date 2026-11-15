@@ -52,7 +52,10 @@ impl Display for MenuError {
         match self {
             MenuError::BadSelection => write!(f, "menu selection must be 1..=9"),
             MenuError::Injection => {
-                write!(f, "menu field rejected: control character or terminal escape")
+                write!(
+                    f,
+                    "menu field rejected: control character or terminal escape"
+                )
             }
         }
     }
@@ -199,14 +202,24 @@ fn render_boxed(model: &MenuModel) -> String {
         text(model.lang, Msg::ModeLabel),
         &model.mode_label,
     ));
-    lines.push(field_row("TUN", &model.tun_label, row_tun_right, &model.inbound_label));
+    lines.push(field_row(
+        "TUN",
+        &model.tun_label,
+        row_tun_right,
+        &model.inbound_label,
+    ));
     lines.push(field_row(
         row_mesh_left,
         &model.mesh_label,
         row_mesh_right,
         &model.auth_label,
     ));
-    lines.push(field_row("MEM", &model.mem_label, "GUARD", &model.guard_label));
+    lines.push(field_row(
+        "MEM",
+        &model.mem_label,
+        "GUARD",
+        &model.guard_label,
+    ));
     lines.push(rule('├', '┤'));
     for index in 1..=9 {
         lines.push(entry_row(model, index));
@@ -304,33 +317,111 @@ fn hint_line(lang: Lang) -> String {
 /// stay untranslated, matching §10.4.1.
 fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
     match (lang, index) {
-        (Lang::ZhCn, 1) => ("实时链路遥测", "内外层 KEX / 证书新鲜度 / RTT / 电路与窗口信用"),
-        (Lang::ZhCn, 2) => ("身份注册与直连", "Enrollment 状态 / CDN-DIR 监听 / DirectGrant"),
-        (Lang::ZhCn, 3) => ("核心互联与上行", "核心网格 DIR-CDN 自动择优 / 边缘主备上行切路"),
-        (Lang::ZhCn, 4) => ("目录租约与路由", "身份-挂靠-LSA 名录 / 子网路由裁决 / 权威 DNS"),
-        (Lang::ZhCn, 5) => ("压测与回源探针", "boreas bench 分层开销 / probe 回源与流控检测"),
-        (Lang::ZhCn, 6) => ("安全模式与吊销", "e2e-required 策略 / 状态快照与吊销 / RPF 审计"),
+        (Lang::ZhCn, 1) => (
+            "实时链路遥测",
+            "内外层 KEX / 证书新鲜度 / RTT / 电路与窗口信用",
+        ),
+        (Lang::ZhCn, 2) => (
+            "身份注册与直连",
+            "Enrollment 状态 / CDN-DIR 监听 / DirectGrant",
+        ),
+        (Lang::ZhCn, 3) => (
+            "核心互联与上行",
+            "核心网格 DIR-CDN 自动择优 / 边缘主备上行切路",
+        ),
+        (Lang::ZhCn, 4) => (
+            "目录租约与路由",
+            "身份-挂靠-LSA 名录 / 子网路由裁决 / 权威 DNS",
+        ),
+        (Lang::ZhCn, 5) => (
+            "压测与回源探针",
+            "boreas bench 分层开销 / probe 回源与流控检测",
+        ),
+        (Lang::ZhCn, 6) => (
+            "安全模式与吊销",
+            "e2e-required 策略 / 状态快照与吊销 / RPF 审计",
+        ),
         (Lang::ZhCn, 7) => ("可恢复热升级", "独立验双签清单 / 升级日志切换 / supervisor"),
-        (Lang::ZhCn, 8) => ("服务与脱敏诊断", "启停守护进程 / 净化控制符日志 / 导出脱敏诊断包"),
-        (Lang::ZhCn, 9) => ("解绑或干净卸载", "撤销挂靠租约 / 清理本实例网卡、规则与版本目录"),
-        (Lang::ZhTw, 1) => ("即時鏈路遙測", "內外層 KEX / 憑證新鮮度 / RTT / 電路與視窗信用"),
-        (Lang::ZhTw, 2) => ("身分註冊與憑證", "檢視 NodeIdentity / 申請憑證續期 / DirectGrant"),
-        (Lang::ZhTw, 3) => ("核心互聯與上行", "主備上行切換 / 授權 DIR-CDN 擇優與路徑探測"),
-        (Lang::ZhTw, 4) => ("目錄租約與路由", "查詢名錄 / 通告與接受子網路由 / 內網權威 DNS"),
-        (Lang::ZhTw, 5) => ("壓測與回源探針", "boreas bench 分層開銷 / probe 回源與流控檢測"),
-        (Lang::ZhTw, 6) => ("安全模式與吊銷", "e2e-required 策略 / 狀態快照與吊銷 / 本機審計"),
-        (Lang::ZhTw, 7) => ("可恢復熱升級", "獨立驗雙簽章清單 / 升級日誌切換 / 外部守護回退"),
-        (Lang::ZhTw, 8) => ("服務與脫敏診斷", "啟停守護行程 / 淨化控制符日誌 / 匯出脫敏診斷包"),
-        (Lang::ZhTw, 9) => ("解綁或解除安裝", "撤銷掛靠租約 / 清理本實例網卡、規則與版本目錄"),
-        (Lang::En, 1) => ("Live Telemetry", "Outer/inner KEX, cert freshness, RTT, circuits"),
-        (Lang::En, 2) => ("Identity & DIR", "Enrollment status, CDN/DIR listener, DirectGrant"),
-        (Lang::En, 3) => ("Mesh & Uplinks", "Core/auth-edge DIR-CDN path select and uplinks"),
-        (Lang::En, 4) => ("Directory/Routes", "Identity, lease, LSA, subnet conflict, auth DNS"),
-        (Lang::En, 5) => ("Bench & Probe", "boreas bench layer cost or probe CDN flow-ctrl"),
-        (Lang::En, 6) => ("Mode & Revoke", "e2e-required policy, status snapshot, RPF audit"),
-        (Lang::En, 7) => ("Safe Upgrade", "Verify dual-sig manifest, journal & supervisor"),
-        (Lang::En, 8) => ("Service & Diag", "Manage daemon, sanitized logs, redacted bundle"),
-        (Lang::En, 9) => ("Leave/Uninstall", "Revoke lease or purge owned TUN, rules & files"),
+        (Lang::ZhCn, 8) => (
+            "服务与脱敏诊断",
+            "启停守护进程 / 净化控制符日志 / 导出脱敏诊断包",
+        ),
+        (Lang::ZhCn, 9) => (
+            "解绑或干净卸载",
+            "撤销挂靠租约 / 清理本实例网卡、规则与版本目录",
+        ),
+        (Lang::ZhTw, 1) => (
+            "即時鏈路遙測",
+            "內外層 KEX / 憑證新鮮度 / RTT / 電路與視窗信用",
+        ),
+        (Lang::ZhTw, 2) => (
+            "身分註冊與憑證",
+            "檢視 NodeIdentity / 申請憑證續期 / DirectGrant",
+        ),
+        (Lang::ZhTw, 3) => (
+            "核心互聯與上行",
+            "主備上行切換 / 授權 DIR-CDN 擇優與路徑探測",
+        ),
+        (Lang::ZhTw, 4) => (
+            "目錄租約與路由",
+            "查詢名錄 / 通告與接受子網路由 / 內網權威 DNS",
+        ),
+        (Lang::ZhTw, 5) => (
+            "壓測與回源探針",
+            "boreas bench 分層開銷 / probe 回源與流控檢測",
+        ),
+        (Lang::ZhTw, 6) => (
+            "安全模式與吊銷",
+            "e2e-required 策略 / 狀態快照與吊銷 / 本機審計",
+        ),
+        (Lang::ZhTw, 7) => (
+            "可恢復熱升級",
+            "獨立驗雙簽章清單 / 升級日誌切換 / 外部守護回退",
+        ),
+        (Lang::ZhTw, 8) => (
+            "服務與脫敏診斷",
+            "啟停守護行程 / 淨化控制符日誌 / 匯出脫敏診斷包",
+        ),
+        (Lang::ZhTw, 9) => (
+            "解綁或解除安裝",
+            "撤銷掛靠租約 / 清理本實例網卡、規則與版本目錄",
+        ),
+        (Lang::En, 1) => (
+            "Live Telemetry",
+            "Outer/inner KEX, cert freshness, RTT, circuits",
+        ),
+        (Lang::En, 2) => (
+            "Identity & DIR",
+            "Enrollment status, CDN/DIR listener, DirectGrant",
+        ),
+        (Lang::En, 3) => (
+            "Mesh & Uplinks",
+            "Core/auth-edge DIR-CDN path select and uplinks",
+        ),
+        (Lang::En, 4) => (
+            "Directory/Routes",
+            "Identity, lease, LSA, subnet conflict, auth DNS",
+        ),
+        (Lang::En, 5) => (
+            "Bench & Probe",
+            "boreas bench layer cost or probe CDN flow-ctrl",
+        ),
+        (Lang::En, 6) => (
+            "Mode & Revoke",
+            "e2e-required policy, status snapshot, RPF audit",
+        ),
+        (Lang::En, 7) => (
+            "Safe Upgrade",
+            "Verify dual-sig manifest, journal & supervisor",
+        ),
+        (Lang::En, 8) => (
+            "Service & Diag",
+            "Manage daemon, sanitized logs, redacted bundle",
+        ),
+        (Lang::En, 9) => (
+            "Leave/Uninstall",
+            "Revoke lease or purge owned TUN, rules & files",
+        ),
         _ => ("", ""),
     }
 }

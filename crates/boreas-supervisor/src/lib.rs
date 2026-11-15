@@ -60,12 +60,12 @@ mod macos;
 // `UpgradeStore::open` must keep failing closed on Windows. See
 // `docs/upgrade/README.md` for the exact remaining gate.
 
-pub mod manifest;
-pub mod sandbox;
-pub mod preflight;
-pub mod install;
 pub mod control_auth;
 pub mod drain;
+pub mod install;
+pub mod manifest;
+pub mod preflight;
+pub mod sandbox;
 
 /// Real Ed25519 + ML-DSA-65 verification and artifact SHA-256. Compiled only
 /// with the `openssl-backend` feature (OpenSSL 3.5+); `manifest::verify_release`

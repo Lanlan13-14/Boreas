@@ -218,14 +218,20 @@ mod tests {
         assert_eq!(policy.user_timeout_ms(), 6_000);
         assert_eq!(checked_user_timeout_ms(6_000), Ok(6_000));
         assert_eq!(
-            policy.with_user_timeout_ms(6_000).unwrap().user_timeout_ms(),
+            policy
+                .with_user_timeout_ms(6_000)
+                .unwrap()
+                .user_timeout_ms(),
             6_000
         );
     }
 
     #[test]
     fn user_timeout_zero_is_not_the_system_default() {
-        assert_eq!(checked_user_timeout_ms(0), Err(TcpOptError::UserTimeoutZero));
+        assert_eq!(
+            checked_user_timeout_ms(0),
+            Err(TcpOptError::UserTimeoutZero)
+        );
         assert_eq!(
             TcpOptionPolicy::defaults().with_user_timeout_ms(0),
             Err(TcpOptError::UserTimeoutZero)

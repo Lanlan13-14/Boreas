@@ -237,12 +237,7 @@ mod tests {
         let empty = cfg(BootstrapTransport::DnsOverTls, unicast_v4(), "", true);
         assert_eq!(validate(&empty), Err(BootError::CertificateNameEmpty));
         let ip = unicast_v4();
-        let same = cfg(
-            BootstrapTransport::DnsOverTls,
-            ip,
-            &ip.to_string(),
-            true,
-        );
+        let same = cfg(BootstrapTransport::DnsOverTls, ip, &ip.to_string(), true);
         assert_eq!(validate(&same), Err(BootError::CertificateNameEqualsIp));
     }
 

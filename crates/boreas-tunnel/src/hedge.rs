@@ -35,7 +35,7 @@ pub fn observe(seen: &mut Vec<HedgeId>, id: HedgeId, window: u64) -> Result<(), 
     if window == 0 {
         return Err(HedgeError::Window);
     }
-    if seen.iter().any(|old| *old == id) {
+    if seen.contains(&id) {
         return Err(HedgeError::Duplicate);
     }
     if let Some(high) = seen
@@ -43,10 +43,9 @@ pub fn observe(seen: &mut Vec<HedgeId>, id: HedgeId, window: u64) -> Result<(), 
         .filter(|old| old.session == id.session)
         .map(|old| old.sequence)
         .max()
+        && id.sequence < high.saturating_sub(window)
     {
-        if id.sequence < high.saturating_sub(window) {
-            return Err(HedgeError::SequenceWrapped);
-        }
+        return Err(HedgeError::SequenceWrapped);
     }
     seen.push(id);
     Ok(())
@@ -57,7 +56,10 @@ mod tests {
     use super::*;
 
     fn id(seq: u64) -> HedgeId {
-        HedgeId { session: [7; 16], sequence: seq }
+        HedgeId {
+            session: [7; 16],
+            sequence: seq,
+        }
     }
 
     #[test]

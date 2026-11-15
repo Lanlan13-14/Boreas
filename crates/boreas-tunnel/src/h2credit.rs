@@ -154,7 +154,10 @@ impl CreditLedger {
 
     /// Open streams. Closed streams that are still draining do not count.
     pub fn open_stream_count(&self) -> usize {
-        self.streams.values().filter(|stream| !stream.closed).count()
+        self.streams
+            .values()
+            .filter(|stream| !stream.closed)
+            .count()
     }
 
     /// Remaining window of an open stream.
@@ -440,7 +443,10 @@ impl CreditLedger {
     }
 
     fn assert_within_budget(&self) {
-        debug_assert!(self.try_committed().is_ok_and(|total| total <= self.receive_budget));
+        debug_assert!(
+            self.try_committed()
+                .is_ok_and(|total| total <= self.receive_budget)
+        );
         debug_assert_eq!(
             self.queued_bytes,
             self.streams
@@ -506,29 +512,24 @@ mod tests {
         assert_eq!(credit.queued_bytes(), 0);
         credit.recv_data(1, 10).unwrap();
         assert_eq!(credit.stream_window(1).unwrap(), 0);
-        assert_eq!(
-            credit.connection_window(),
-            INITIAL_CONNECTION_WINDOW - 10
-        );
+        assert_eq!(credit.connection_window(), INITIAL_CONNECTION_WINDOW - 10);
         // Connection credit remains; the empty stream window still refuses.
         assert_eq!(credit.recv_data(1, 1), Err(CreditError::WindowExceeded));
         assert_eq!(credit.stream_window(1).unwrap(), 0);
-        assert_eq!(
-            credit.connection_window(),
-            INITIAL_CONNECTION_WINDOW - 10
-        );
+        assert_eq!(credit.connection_window(), INITIAL_CONNECTION_WINDOW - 10);
         assert_eq!(credit.queued_bytes(), 10);
 
-        let mut wide = ledger(INITIAL_CONNECTION_WINDOW, 2, u64::from(INITIAL_CONNECTION_WINDOW) * 2);
+        let mut wide = ledger(
+            INITIAL_CONNECTION_WINDOW,
+            2,
+            u64::from(INITIAL_CONNECTION_WINDOW) * 2,
+        );
         wide.open_stream(1).unwrap();
         wide.open_stream(3).unwrap();
         wide.recv_data(1, INITIAL_CONNECTION_WINDOW).unwrap();
         assert_eq!(wide.connection_window(), 0);
         assert_eq!(wide.stream_window(3).unwrap(), INITIAL_CONNECTION_WINDOW);
-        assert_eq!(
-            wide.recv_data(3, 1),
-            Err(CreditError::WindowExceeded)
-        );
+        assert_eq!(wide.recv_data(3, 1), Err(CreditError::WindowExceeded));
         assert_eq!(wide.connection_window(), 0);
         assert_eq!(wide.stream_window(3).unwrap(), INITIAL_CONNECTION_WINDOW);
         assert_eq!(wide.queued_bytes(), u64::from(INITIAL_CONNECTION_WINDOW));

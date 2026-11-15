@@ -177,12 +177,20 @@ mod tests {
         assert_eq!(apply_unverified(&mut table, 7, 2), ApplyResult::Refused);
         assert_eq!(apply_unverified(&mut table, 8, 2), ApplyResult::Refused);
         assert_eq!(table, before);
-        assert!(table
-            .lookup(7, 2)
-            .unwrap()
-            .tls_sessions
-            .contains(&TlsSessionId(11)));
-        assert!(table.lookup(8, 2).unwrap().circuits.contains(&CircuitId(32)));
+        assert!(
+            table
+                .lookup(7, 2)
+                .unwrap()
+                .tls_sessions
+                .contains(&TlsSessionId(11))
+        );
+        assert!(
+            table
+                .lookup(8, 2)
+                .unwrap()
+                .circuits
+                .contains(&CircuitId(32))
+        );
         assert!(!core_may_revoke_other(false));
         assert!(core_may_revoke_other(true));
     }

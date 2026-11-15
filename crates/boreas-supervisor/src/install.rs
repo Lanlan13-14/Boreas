@@ -150,9 +150,9 @@ pub const fn install_outcome(
                 )
             }
         }
-        Verifier::None => Outcome::Refused(
-            "no verifier; a binary checking itself is not the trust root",
-        ),
+        Verifier::None => {
+            Outcome::Refused("no verifier; a binary checking itself is not the trust root")
+        }
     }
 }
 

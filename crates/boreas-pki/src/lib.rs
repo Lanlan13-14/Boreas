@@ -4,12 +4,12 @@
 #![forbid(unsafe_code)]
 
 pub mod enforcement;
-pub mod revoke_cleanup;
 pub mod enrollment;
 /// Real Ed25519 + ML-DSA management-object verification and IdentityAuthority signing.
 /// It requires OpenSSL 3.5+ for the ML-DSA provider and is therefore feature-gated.
 #[cfg(feature = "openssl-backend")]
 pub mod management;
+pub mod revoke_cleanup;
 
 use core::fmt;
 

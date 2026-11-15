@@ -165,7 +165,11 @@ impl Ledger {
     ///
     /// The caller has to pass the truth; this function cannot see the allocator.
     pub const fn same_payload_charged_twice(copied: bool) -> u64 {
-        if copied { PAYLOAD_BYTES * 2 } else { PAYLOAD_BYTES }
+        if copied {
+            PAYLOAD_BYTES * 2
+        } else {
+            PAYLOAD_BYTES
+        }
     }
 
     /// Adds the three class counters so a display can show one number.
@@ -317,7 +321,10 @@ mod tests {
     fn partial_fill_that_would_cross_the_quota_does_not_move() {
         let mut ledger = Ledger::new(Role::Edge);
         let cap = 8 * MIB;
-        assert_eq!(ledger.charge(Class::RssClass, Bucket::Slab, cap - 1), Ok(()));
+        assert_eq!(
+            ledger.charge(Class::RssClass, Bucket::Slab, cap - 1),
+            Ok(())
+        );
         let before = ledger;
         assert_eq!(
             ledger.charge(Class::RssClass, Bucket::Slab, 2),
@@ -355,14 +362,20 @@ mod tests {
             Err(LedgerError::Overflow)
         );
         assert_unchanged(before, ledger);
-        assert_eq!(ledger.charged(Class::CommittedCredit, Bucket::Circuits), u64::MAX);
+        assert_eq!(
+            ledger.charged(Class::CommittedCredit, Bucket::Circuits),
+            u64::MAX
+        );
     }
 
     #[test]
     fn core_circuits_have_no_numeric_cap_including_1024() {
         assert_eq!(Ledger::core_circuit_cap(), None);
         let mut ledger = Ledger::new(Role::Core);
-        assert_eq!(ledger.charge(Class::RssClass, Bucket::Circuits, 1024), Ok(()));
+        assert_eq!(
+            ledger.charge(Class::RssClass, Bucket::Circuits, 1024),
+            Ok(())
+        );
         assert_eq!(ledger.charge(Class::RssClass, Bucket::Circuits, 1), Ok(()));
         assert_eq!(ledger.charged(Class::RssClass, Bucket::Circuits), 1025);
         assert_eq!(
@@ -451,7 +464,10 @@ mod tests {
         let copied = Ledger::same_payload_charged_twice(true);
         assert_eq!(ledger.charge(Class::RssClass, Bucket::L3Tx, shared), Ok(()));
         assert_eq!(ledger.charged(Class::RssClass, Bucket::L3Tx), 1000);
-        assert_eq!(ledger.charge(Class::KernelClass, Bucket::L3Tx, copied), Ok(()));
+        assert_eq!(
+            ledger.charge(Class::KernelClass, Bucket::L3Tx, copied),
+            Ok(())
+        );
         assert_eq!(ledger.charged(Class::KernelClass, Bucket::L3Tx), 2000);
         assert_eq!(ledger.sum_for_display(), 3000);
     }

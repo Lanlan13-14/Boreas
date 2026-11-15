@@ -361,7 +361,11 @@ pub fn program(target: TargetArch) -> Vec<SockFilter> {
     }
 
     // 3. io_uring trio: kill, do not merely return EPERM.
-    for nr in [sys.io_uring_setup, sys.io_uring_enter, sys.io_uring_register] {
+    for nr in [
+        sys.io_uring_setup,
+        sys.io_uring_enter,
+        sys.io_uring_register,
+    ] {
         insns.push(jump_eq(nr, 0, 1));
         insns.push(ret(SECCOMP_RET_KILL_PROCESS));
     }
@@ -522,9 +526,7 @@ pub fn install_current() -> Result<(), SandboxError> {
 
 #[cfg(target_os = "linux")]
 fn last_errno() -> i32 {
-    io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(EPERM)
+    io::Error::last_os_error().raw_os_error().unwrap_or(EPERM)
 }
 
 /// Userspace classic-BPF interpreter covering only the opcodes [`program`] emits:
@@ -714,7 +716,11 @@ mod tests {
         for target in [TargetArch::X86_64, TargetArch::Aarch64] {
             let prog = program(target);
             let sys = target.syscalls();
-            for nr in [sys.io_uring_setup, sys.io_uring_enter, sys.io_uring_register] {
+            for nr in [
+                sys.io_uring_setup,
+                sys.io_uring_enter,
+                sys.io_uring_register,
+            ] {
                 assert_eq!(
                     action(&prog, nr, target.audit_arch(), [8, 0, 0, 0, 0, 0]),
                     SECCOMP_RET_KILL_PROCESS,
@@ -729,7 +735,12 @@ mod tests {
         for target in [TargetArch::X86_64, TargetArch::Aarch64] {
             let prog = program(target);
             assert_eq!(
-                action(&prog, X86_32_SOCKETCALL, target.audit_arch(), [1, 0, 0, 0, 0, 0]),
+                action(
+                    &prog,
+                    X86_32_SOCKETCALL,
+                    target.audit_arch(),
+                    [1, 0, 0, 0, 0, 0]
+                ),
                 SECCOMP_RET_KILL_PROCESS
             );
         }
@@ -787,6 +798,9 @@ mod tests {
         // Compiles the non-installing path only. Calling install_current from
         // a unit test would apply an irreversible filter to this process.
         let _ = std::any::type_name::<fn() -> Result<(), SandboxError>>();
-        assert!(native_target().is_some() || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")));
+        assert!(
+            native_target().is_some()
+                || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        );
     }
 }

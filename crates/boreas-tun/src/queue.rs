@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(hold(check_flags(single, 1)), Ok(()));
 
         let missing_tun = Flags(single.bits() & !Flags::IFF_TUN.bits());
-        assert_eq!(hold(check_flags(missing_tun, 1)), Err(QueueError::MissingFlags));
+        assert_eq!(
+            hold(check_flags(missing_tun, 1)),
+            Err(QueueError::MissingFlags)
+        );
         assert_eq!(
             hold(check_flags(single.union(Flags::IFF_MULTI_QUEUE), 1)),
             Err(QueueError::UnexpectedFlags)
@@ -405,7 +408,10 @@ mod tests {
         };
         let header_gso_tcp4 = header.gso_type & !VIRTIO_NET_HDR_GSO_ECN == VIRTIO_NET_HDR_GSO_TCPV4;
         assert!(hold(header_gso_tcp4));
-        assert!(!hold(foreign_gso_type_is_kernel_safe(false, header_gso_tcp4)));
+        assert!(!hold(foreign_gso_type_is_kernel_safe(
+            false,
+            header_gso_tcp4
+        )));
         assert!(hold(foreign_gso_type_is_kernel_safe(true, true)));
         assert!(!hold(foreign_gso_type_is_kernel_safe(true, false)));
         assert!(!hold(foreign_gso_type_is_kernel_safe(false, false)));

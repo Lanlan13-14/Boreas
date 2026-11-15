@@ -119,7 +119,10 @@ mod tests {
         let steady_n = 4u32;
         let held = reserve(steady_n, 0, steady_n + 1).expect("N+1 first");
         assert_eq!(held, steady_n + 1);
-        assert_ne!(held, steady_n, "steady N must not be reported as covering the overlap");
+        assert_ne!(
+            held, steady_n,
+            "steady N must not be reported as covering the overlap"
+        );
     }
 
     #[test]

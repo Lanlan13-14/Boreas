@@ -142,16 +142,16 @@ impl fmt::Display for PreflightError {
             Self::BadType => f.write_str("ELF type is not ET_EXEC or ET_DYN"),
             Self::BadMachine => f.write_str("ELF machine is not EM_X86_64 or EM_AARCH64"),
             Self::Truncated => f.write_str("ELF image is truncated"),
-            Self::BadProgramHeaders => f.write_str(
-                "ELF program-header table is absent or not a bounded ELF64 phdr table",
-            ),
+            Self::BadProgramHeaders => {
+                f.write_str("ELF program-header table is absent or not a bounded ELF64 phdr table")
+            }
             Self::Interpreter => f.write_str(
                 "ELF has PT_INTERP; a release candidate must be fully static, \
                  including when the interpreter is musl",
             ),
-            Self::DynamicSegment => f.write_str(
-                "ELF has PT_DYNAMIC; a PIE with a dynamic segment is not static enough",
-            ),
+            Self::DynamicSegment => {
+                f.write_str("ELF has PT_DYNAMIC; a PIE with a dynamic segment is not static enough")
+            }
         }
     }
 }
@@ -236,9 +236,8 @@ pub fn inspect_elf_file(path: &Path) -> Result<ElfImage, PreflightError> {
     let file = File::open(path)?;
     let cap = usize::try_from(len).map_err(|_| PreflightError::TooLarge { len })?;
     let mut buf = Vec::new();
-    buf.try_reserve_exact(cap).map_err(|err| {
-        PreflightError::Io(io::Error::new(io::ErrorKind::OutOfMemory, err))
-    })?;
+    buf.try_reserve_exact(cap)
+        .map_err(|err| PreflightError::Io(io::Error::new(io::ErrorKind::OutOfMemory, err)))?;
     file.take(len).read_to_end(&mut buf)?;
     inspect_elf(&buf)
 }
@@ -341,9 +340,7 @@ fn check_program_headers(bytes: &[u8], header: &Header) -> Result<(), PreflightE
     let table = phnum
         .checked_mul(usize::from(ELF64_PHDR_SIZE))
         .ok_or(PreflightError::BadProgramHeaders)?;
-    let end = phoff
-        .checked_add(table)
-        .ok_or(PreflightError::Truncated)?;
+    let end = phoff.checked_add(table).ok_or(PreflightError::Truncated)?;
     if end > bytes.len() {
         return Err(PreflightError::Truncated);
     }
@@ -582,7 +579,10 @@ mod tests {
     fn class32_wrong_magic_and_em386_are_rejected() {
         let mut class32 = one_load(EM_X86_64, ET_DYN);
         class32[EI_CLASS] = 1;
-        assert!(matches!(inspect_elf(&class32), Err(PreflightError::NotElf64)));
+        assert!(matches!(
+            inspect_elf(&class32),
+            Err(PreflightError::NotElf64)
+        ));
 
         let mut magic = one_load(EM_X86_64, ET_EXEC);
         magic[0] = 0;
@@ -597,7 +597,10 @@ mod tests {
         ));
 
         let em386 = one_load(3, ET_DYN);
-        assert!(matches!(inspect_elf(&em386), Err(PreflightError::BadMachine)));
+        assert!(matches!(
+            inspect_elf(&em386),
+            Err(PreflightError::BadMachine)
+        ));
     }
 
     #[test]

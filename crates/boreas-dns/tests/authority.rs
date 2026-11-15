@@ -20,7 +20,20 @@ fn wire(labels: &[&[u8]]) -> Vec<u8> {
 }
 
 fn query(name: &[u8], qtype: u16, rd: bool) -> Vec<u8> {
-    let mut msg = vec![0xab, 0xcd, if rd { 0x01 } else { 0x00 }, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    let mut msg = vec![
+        0xab,
+        0xcd,
+        if rd { 0x01 } else { 0x00 },
+        0x00,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     msg.extend_from_slice(name);
     msg.extend_from_slice(&qtype.to_be_bytes());
     msg.extend_from_slice(&1u16.to_be_bytes());
@@ -29,8 +42,11 @@ fn query(name: &[u8], qtype: u16, rd: bool) -> Vec<u8> {
 
 fn service(max: usize) -> AuthoritativeDns {
     let mut zone = Zone::new("corp.example").unwrap();
-    zone.add_address("host.corp.example", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
-        .unwrap();
+    zone.add_address(
+        "host.corp.example",
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+    )
+    .unwrap();
     zone.add_address(
         "dual.corp.example",
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
@@ -134,10 +150,13 @@ fn aaaa_only_name_is_nodata_for_a_not_nxdomain() {
         "v6.corp.example",
         IpAddr::V6("2001:db8::6".parse::<Ipv6Addr>().unwrap()),
     )
-        .unwrap();
+    .unwrap();
     let dns = AuthoritativeDns::new(zone, SourceAuthorization::new([CLIENT]), 512).unwrap();
     let response = dns
-        .respond_udp(CLIENT, &query(&wire(&[b"v6", b"corp", b"example"]), 1, false))
+        .respond_udp(
+            CLIENT,
+            &query(&wire(&[b"v6", b"corp", b"example"]), 1, false),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(flags(&response) & 0x000f, 0);
@@ -172,7 +191,10 @@ fn qclass_other_than_in_is_formerr_not_a_refused_message() {
         dns.respond_udp(CLIENT, &msg),
         Err(DnsError::InvalidQuestion)
     );
-    assert_eq!(dns.respond_tcp(CLIENT, &msg), Err(DnsError::InvalidQuestion));
+    assert_eq!(
+        dns.respond_tcp(CLIENT, &msg),
+        Err(DnsError::InvalidQuestion)
+    );
 }
 
 #[test]

@@ -760,7 +760,10 @@ mod tests {
         );
         // 32 cannot hold this question, so truncation must fail closed
         // instead of emitting a header that drops the question.
-        assert_eq!(small.udp_truncate(&q, 32), Err(DnsError::TruncatedWouldExceed));
+        assert_eq!(
+            small.udp_truncate(&q, 32),
+            Err(DnsError::TruncatedWouldExceed)
+        );
         let tc = small.udp_truncate(&q, q.len()).unwrap();
         assert_eq!(tc.len(), q.len());
         assert_eq!(u16_at(&tc, 6).unwrap(), 0);

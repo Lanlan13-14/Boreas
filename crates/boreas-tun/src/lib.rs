@@ -5,13 +5,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod icmp;
-pub mod queue;
-pub mod route_audit;
-pub mod virtio;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod queue;
+pub mod route_audit;
+pub mod virtio;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

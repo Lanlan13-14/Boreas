@@ -73,7 +73,10 @@ mod tests {
     fn documented_products_stay_arithmetic() {
         assert_eq!(bdp_bytes(1_000_000_000, 200).unwrap(), BDP_1G_200MS);
         assert_eq!(bdp_bytes(1_280_000_000, 200).unwrap(), 32_000_000);
-        assert_eq!(window_bits_per_sec(32 * 1024 * 1024, 200).unwrap(), 1_342_177_280);
+        assert_eq!(
+            window_bits_per_sec(32 * 1024 * 1024, 200).unwrap(),
+            1_342_177_280
+        );
         assert_eq!(
             tcp_mem_pages_to_bytes(65_536, Some(4096)).unwrap(),
             256 * 1024 * 1024

@@ -111,7 +111,12 @@ impl Error for AuthError {}
 /// Check order, first failure wins: path, mode, peer uid 0
 /// ([`Decision::RefusedRoot`]), daemon uid 0 while
 /// [`daemon_uid_may_be_root`] is false, then uid equality.
-pub fn authorize(path: &str, mode: u32, daemon_uid: u32, peer_uid: u32) -> Result<Decision, AuthError> {
+pub fn authorize(
+    path: &str,
+    mode: u32,
+    daemon_uid: u32,
+    peer_uid: u32,
+) -> Result<Decision, AuthError> {
     if path != CONTROL_SOCKET_PATH {
         return Err(AuthError {
             decision: Decision::RefusedPath,
@@ -165,7 +170,9 @@ mod tests {
 
     #[test]
     fn other_modes_fail() {
-        for mode in [0o000, 0o400, 0o200, 0o640, 0o660, 0o700, 0o755, 0o777, 0o1600, 0o100600] {
+        for mode in [
+            0o000, 0o400, 0o200, 0o640, 0o660, 0o700, 0o755, 0o777, 0o1600, 0o100600,
+        ] {
             let err = authorize(CONTROL_SOCKET_PATH, mode, DAEMON, DAEMON).unwrap_err();
             assert_eq!(err.decision(), Decision::RefusedMode, "mode {mode:#o}");
         }
@@ -208,7 +215,8 @@ mod tests {
 
     #[test]
     fn mismatched_nonzero_uid_is_refused() {
-        let err = authorize(CONTROL_SOCKET_PATH, CONTROL_SOCKET_MODE, DAEMON, DAEMON + 1).unwrap_err();
+        let err =
+            authorize(CONTROL_SOCKET_PATH, CONTROL_SOCKET_MODE, DAEMON, DAEMON + 1).unwrap_err();
         assert_eq!(err.decision(), Decision::RefusedUid);
     }
 

@@ -88,15 +88,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(floor, Budget::Floor { sum_ms: 8_200 });
-        assert!(recovery_floor(Components {
-            detect_ms: 6_000,
-            backoff_ms: 1_001,
-            handshake_rtt_ms: 1,
-            handshake_trips: 1,
-            authorize_ms: 0,
-            rebuild_ms: 0,
-            first_success_rtt_ms: 1,
-        })
-        .is_err());
+        assert!(
+            recovery_floor(Components {
+                detect_ms: 6_000,
+                backoff_ms: 1_001,
+                handshake_rtt_ms: 1,
+                handshake_trips: 1,
+                authorize_ms: 0,
+                rebuild_ms: 0,
+                first_success_rtt_ms: 1,
+            })
+            .is_err()
+        );
     }
 }

@@ -11,9 +11,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use boreas_crypto::backend::{
-    BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector,
-};
+use boreas_crypto::backend::{BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector};
 use boreas_crypto::{Policy, PolicyError, Suite};
 
 /// Bound for one seam exchange. Production framing stays in `boreas-proto`.
@@ -79,21 +77,28 @@ pub fn accept_inner(
 ) -> Result<EstablishedStream<TcpStream>, SeamError> {
     let policy = require_pq768(required_policy())?;
     let acceptor = OpenSslAcceptor::from_pem_files(certificate, private_key, trust_anchor, policy)?;
-    let (stream, _) = listener.accept().map_err(|error| SeamError::Io(error.kind()))?;
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| SeamError::Io(error.kind()))?;
     let _ = stream.set_read_timeout(Some(HANDSHAKE_WAIT));
     let _ = stream.set_write_timeout(Some(HANDSHAKE_WAIT));
     Ok(acceptor.accept(stream)?)
 }
 
 /// Write one bounded payload and read the same number of bytes back.
-pub fn exchange(stream: &mut EstablishedStream<TcpStream>, payload: &[u8]) -> Result<Vec<u8>, SeamError> {
+pub fn exchange(
+    stream: &mut EstablishedStream<TcpStream>,
+    payload: &[u8],
+) -> Result<Vec<u8>, SeamError> {
     if payload.is_empty() || payload.len() > MAX_SEAM_PAYLOAD {
         return Err(SeamError::PayloadTooLarge);
     }
     stream
         .write_all(payload)
         .map_err(|error| SeamError::Io(error.kind()))?;
-    stream.flush().map_err(|error| SeamError::Io(error.kind()))?;
+    stream
+        .flush()
+        .map_err(|error| SeamError::Io(error.kind()))?;
     let mut received = vec![0; payload.len()];
     stream
         .read_exact(&mut received)
@@ -133,12 +138,7 @@ pub fn loopback_echo(
         }
         Ok(())
     });
-    let mut client = connect_inner(
-        address,
-        client_certificate,
-        client_key,
-        trust_anchor,
-    )?;
+    let mut client = connect_inner(address, client_certificate, client_key, trust_anchor)?;
     let echoed = exchange(&mut client, payload)?;
     match server.join() {
         Ok(Ok(())) => Ok(echoed),
