@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "release_commit": null,
+  "production_approved": false,
+  "blocking_findings": [
+    "Full production data-plane and topology acceptance evidence is absent.",
+    "Independent cryptographic/protocol audit and issue closure are absent.",
+    "Exact-release native functional and static TLS evidence is absent."
+  ],
+  "gates": {
+    "G-CRYPTO": {"status": "open", "evidence": []},
+    "G-FRAME": {"status": "open", "evidence": []},
+    "G-DATA": {"status": "open", "evidence": []},
+    "G-RESOURCE": {"status": "open", "evidence": []},
+    "G-PERF": {"status": "open", "evidence": []},
+    "G-ENROLL": {"status": "open", "evidence": []},
+    "G-AUTHZ": {"status": "open", "evidence": []},
+    "G-REVOKE": {"status": "open", "evidence": []},
+    "G-DOS": {"status": "open", "evidence": []},
+    "G-TUN": {"status": "open", "evidence": []},
+    "G-MTU": {"status": "open", "evidence": []},
+    "G-DNS": {"status": "open", "evidence": []},
+    "G-SANDBOX": {"status": "open", "evidence": []},
+    "G-UPGRADE": {"status": "open", "evidence": []},
+    "G-CONVERGE": {"status": "open", "evidence": []},
+    "G-PREFIX": {"status": "open", "evidence": []},
+    "G-FAILOVER": {"status": "open", "evidence": []},
+    "G-SUPPLY": {"status": "open", "evidence": []},
+    "G-UI": {"status": "open", "evidence": []},
+    "G-E2E": {"status": "open", "evidence": []},
+    "G-NO-DOWNGRADE": {"status": "open", "evidence": []},
+    "G-E2E-COST": {"status": "open", "evidence": []},
+    "G-EXTERNAL-REVIEW": {"status": "open", "evidence": []},
+    "G-OPERATIONS": {"status": "open", "evidence": []}
+  },
+  "platforms": {}
+}
