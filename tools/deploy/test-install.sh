@@ -105,7 +105,7 @@ cat > "$FAKE/stat" <<'EOF'
 target=
 for arg do target=$arg; done
 if [ -n "${TEST_STAT_PATH:-}" ] && [ "$target" != "$TEST_STAT_PATH" ]; then
-  printf '0 700\n'
+  "$TEST_REAL_STAT" -c '%u %a' -- "$target"
 else
   printf '%s %s\n' "${TEST_FAKE_UID:-0}" "${TEST_FAKE_MODE:-700}"
 fi
@@ -274,7 +274,7 @@ invoke() {
   TEST_HASH_CONST=${HASH_CONST-$GOOD} TEST_ELF_MODE=${ELF_MODE:-static} \
   TEST_ELF_MACHINE="$ELF_MACHINE" TEST_CAND_LOG="$CAND_LOG" \
   TEST_HASH_LOG="$HASH_LOG" TEST_SYSTEM_LOG="$SYSTEM_LOG" \
-  TEST_REAL_SHA="$REAL_SHA" \
+  TEST_REAL_SHA="$REAL_SHA" TEST_REAL_STAT="$REAL_STAT" \
   sh "$INSTALL" "$@"
 }
 
