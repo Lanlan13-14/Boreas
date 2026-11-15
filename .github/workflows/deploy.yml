@@ -43,7 +43,8 @@ jobs:
           done
           # SC2317 is a false positive on the sourceable procd template, and
           # SC2016 is intentional shell code inside single-quoted test cases.
-          shellcheck -s sh -e SC2317,SC2016 tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh
+          # SC1090 cannot resolve the absolute template path at static-check time.
+          shellcheck -s sh -e SC2317,SC2016,SC1090 tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh
       - name: Run deployment regressions under all supported shell parsers
         run: |
           set -euo pipefail
