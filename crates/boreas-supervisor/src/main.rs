@@ -186,7 +186,8 @@ const VERSION_PLACEHOLDER: &str = "{version}";
 const USAGE: &str = "\
 boreas-supervisor — external Boreas upgrade supervisor
 USAGE:
-    boreas-supervisor supervise --store <DIR> [--ready-timeout-ms <MS>]
+    boreas-supervisor supervise --store <DIR> --ready-expected-schema <ID>
+                                [--ready-timeout-ms <MS>]
                                 [--ready-require-tun <yes|no>]
                                 [--ready-min-workers <N>]
                                 [--stop-grace-ms <MS>]
@@ -1110,6 +1111,7 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             stop_grace: parsed.stop_grace,
             ready_require_tun: parsed.ready_require_tun,
             ready_min_workers: parsed.ready_min_workers,
+            ready_expected_schema: parsed.ready_expected_schema,
             store_lock,
         },
         notes,
@@ -1241,6 +1243,7 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
                 ready_timeout: plan.ready_timeout,
                 stop_grace: plan.stop_grace,
                 policy: readiness::ReadinessPolicy {
+                    expected_schema: plan.ready_expected_schema.clone(),
                     require_tun: plan.ready_require_tun,
                     min_workers: plan.ready_min_workers,
                 },
@@ -1329,6 +1332,7 @@ fn trial_loop(
 ) -> u8 {
     let deadline = Instant::now() + plan.ready_timeout;
     let mut confirmed = false;
+    let mut pending_handshake = None;
     let mut stop: Option<(i32, Instant)> = None;
     loop {
         // 1. Controlled stop: forward the signal to the child. A stop that
@@ -1398,8 +1402,13 @@ fn trial_loop(
                 let _ = child.wait();
                 return fail_trial(store);
             }
-            let budget = deadline.saturating_duration_since(now);
-            match readiness::probe_once(listener, child.id(), &plan.policy, budget) {
+            match readiness::probe_once(
+                listener,
+                child.id(),
+                &plan.policy,
+                &mut pending_handshake,
+                deadline,
+            ) {
                 Ok(Some(report)) => {
                     eprintln!(
                         "boreas-supervisor: readiness accepted (schema={}, workers={}, tun={:?})",
@@ -1880,6 +1889,8 @@ mod unix_tests {
             os(&f.store_str()),
             os("--ready-timeout-ms"),
             os(&ready_timeout_ms.to_string()),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--max-trial-attempts"),
             os(&max_attempts.to_string()),
             os("--"),
@@ -1910,6 +1921,8 @@ mod unix_tests {
             os(&f.store_str()),
             os("--ready-timeout-ms"),
             os(&ready_timeout_ms.to_string()),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--max-trial-attempts"),
             os(&max.to_string()),
             os("--"),

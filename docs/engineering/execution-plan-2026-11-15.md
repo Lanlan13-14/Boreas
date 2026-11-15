@@ -169,7 +169,9 @@ P05 + P06 + P07 + P08 + P09 -> P10 规模/故障/外部审计 -> 生产审批
 
 ## 7. 本轮执行日志
 
-- 已获取远端并保留原始本地工作；合并冲突由分离写范围的任务处理。
-- 原主计划哈希已核实。逐条审计详表由审计任务产出至 [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md)。
-- 正在修复发布报告复用问题、故障切换目标语义；README/部署/发布规范并行补齐。
-- 下一门槛：完成合并，推送集成基线并通过 Actions 刷新锁与定位实际失败；随后由 Luna 按依赖实施，不盲目同时写整个workspace。
+- 已保留原始本地工作并完成安全合并，`3d5665b` 正常推送；后续 bot rustfmt 已安全合入，无 force-push。
+- 原主计划哈希已核实；逐条审计详表见 [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md)。
+- 发布报告复用修复、故障切换目标/迟滞修复、README/部署/发布规范和发布说明结构检查器已提交推送；代码提交不是测试通过，各自仍需 exact-commit Actions。
+- Refresh-lock `43678497934` 在 `8090fd6` 生成成功，compile validation 暴露 supervisor readiness 接口错误。主代理核对 manifests 未变和 artifact 哈希后恢复锁为 `dc484f6`，不放宽 `--locked`，不将恢复视为编译验收。
+- GPT6 Luna 当前分工：readiness 编译修复；E2E 加密应用绑定确认候选及实际调用；NetworkRoot 授权链验证；最小双节点真实数据面接口合同。已有审查记录只读/有限修复任务完成后不重复计算。
+- 下一门槛：修复 supervisor 和本轮实际编译/测试失败，验证默认及 backend feature 的 exact commit；其后先落地根授权/持久信任输入，再接真正 E2E + PacketIo 纵切，不盲目同时写整个 workspace。

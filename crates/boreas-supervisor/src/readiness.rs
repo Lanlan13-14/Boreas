@@ -205,6 +205,33 @@ pub fn accept(
     }))
 }
 
+/// Advance at most one non-blocking step of the readiness exchange.
+///
+/// The caller retains `pending` between supervisor iterations so accepting a
+/// client and receiving its response may span multiple polls without losing the
+/// authorized peer. The absolute deadline is shared with the supervisor loop.
+pub fn probe_once(
+    listener: &UnixListener,
+    child_pid: u32,
+    policy: &ReadinessPolicy,
+    pending: &mut Option<Handshake>,
+    deadline: Instant,
+) -> Result<Option<ReadyReport>, ReadinessError> {
+    if pending.is_none() {
+        *pending = accept(listener, child_pid, policy)?;
+    }
+    let Some(handshake) = pending.as_mut() else {
+        return Ok(None);
+    };
+    match handshake.poll(deadline)? {
+        Progress::Pending => Ok(None),
+        Progress::Ready(report) => {
+            *pending = None;
+            Ok(Some(report))
+        }
+    }
+}
+
 impl Handshake {
     /// Read whatever is available without blocking.
     ///
@@ -608,15 +635,13 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pending = None;
         let report = loop {
-            match accept(&listener, std::process::id(), &policy()).expect("accept") {
+            match probe_once(&listener, std::process::id(), &policy(), &mut pending, deadline)
+                .expect("readiness poll")
+            {
+                Some(report) => break report,
                 None => std::thread::sleep(Duration::from_millis(10)),
-                Some(mut handshake) => loop {
-                    match handshake.poll(deadline).expect("poll") {
-                        Progress::Pending => std::thread::sleep(Duration::from_millis(10)),
-                        Progress::Ready(report) => break report,
-                    }
-                },
             }
         };
         client.join().expect("client thread");

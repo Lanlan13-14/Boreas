@@ -66,12 +66,18 @@ impl Fixture {
     }
 
     fn supervise(&self) -> Command {
+        self.supervise_with_schema("state-v1")
+    }
+
+    fn supervise_with_schema(&self, expected_schema: &str) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.arg("supervise")
             .arg("--store")
             .arg(self.store_path())
             .arg("--ready-timeout-ms")
             .arg("5000")
+            .arg("--ready-expected-schema")
+            .arg(expected_schema)
             .arg("--max-trial-attempts")
             .arg("3")
             .arg("--");
@@ -151,6 +157,41 @@ fn readiness_answer_confirms_the_trial_and_retains_old_version() {
         f.store.version_dir("1.0.0").unwrap().is_dir(),
         "old version directory must be retained"
     );
+}
+
+/// A protocol-valid answer with the wrong state schema must roll back rather than
+/// silently accepting a schema the target release did not authorize.
+#[test]
+fn unexpected_schema_is_refused_and_rolled_back() {
+    let f = Fixture::new();
+    f.prepare("2.0.0");
+
+    let output = f
+        .supervise_with_schema("state-v1")
+        .arg(BIN)
+        .arg("__ready-stub")
+        .arg("--schema")
+        .arg("state-v2")
+        .arg("--exit-after-ms")
+        .arg("2500")
+        .output()
+        .expect("spawn supervisor");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "schema refusal must exit non-zero: {}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("schema"), "{err}");
+    assert_eq!(
+        f.store.active_version().unwrap().as_deref(),
+        Some("1.0.0"),
+        "pointer must be rolled back"
+    );
+    assert_eq!(f.store.journal().unwrap().unwrap().phase, Phase::Prepared);
+    assert_eq!(f.store.trial_state().unwrap().unwrap().attempts, 1);
 }
 
 /// A protocol-valid answer that fails the deployment policy (no TUN when one is

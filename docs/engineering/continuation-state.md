@@ -1,5 +1,20 @@
 # Full-plan execution state
 
+## Current handoff — 2026-11-15 12:58 +08
+
+- Human renewed the full-plan request and explicitly asked lead to write a detailed rigorous plan, delegate implementation to GPT6 Luna to reduce lead model tokens. New implementation agents use `provider=lightcode`, `model=gpt-6-luna`; lead integrates/reviews and owns Git/Actions evidence.
+- Exact supplied plan `C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md` was read and hash-compared to the repository plan: both SHA-256 `23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`.
+- Start was local `dac120a`, ahead 6 / behind 14 plus substantial dirty work. Backup branch `backup/pre-sync-20261115`; original pending work checkpoint `22d268c`; safely merged upstream `8457d06` as `3d5665b`, normal push only. Bot formatting `8090fd6`/`08b0978` was integrated without dropping parallel work.
+- Detailed dependency-ordered task contracts are in [execution-plan-2026-11-15.md](execution-plan-2026-11-15.md); granular audit is [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md). Neither is a completion report; all gates remain open.
+- Committed promotion stale-report repair `97e240d`, failover target/hysteresis fix `ced45fa`, README/deployment/release policy `5d768a8` (merged into `71080fe`). New release-note policy automation is under Luna review; not yet verified.
+- Refresh-lock run `43678497934`, dispatch `8090fd6`, generated artifact `14147481274` successfully; compile validation failed in supervisor readiness interfaces, not dependency metadata. Retrieved under ignored `.local/ci-review/refresh-lock-43678497934/`. Reviewed manifests unchanged since dispatch; generated lock SHA-256 `626c7f75a0993566c0ea1524d6b80406b87d8d2cd9382205b592b5f73a056b9c` recovered and pushed as `dc484f6`. This restores diagnostics, not compiler acceptance.
+- Luna CI agent authorized only supervisor `src/main.rs`, `src/readiness.rs`, `tests/readiness.rs` to fix observed compiler errors and owns new `ci-integration-2026-11-15.md`. E2E agent owns only `e2e.rs` plus candidate confirmation spec. Status agent owns implementation-status/platform-support. Release hygiene agent owns four new release template/config/validator/test files. Runtime design agent owns new contract; unexported lifecycle scaffold must not be mistaken for integrated daemon.
+- All builds/tests/formatters remain GitHub Actions-only; local Git/static reads/API downloads/hash checks allowed. Ignored `.local/github-api.ps1` obtains configured credentials in memory; never print its token. Invoke with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` (no `pwsh` executable in PATH). POST without Body defaults to `{ref:main}` for workflow dispatch.
+- Upstream `8457d06` Rust/platform/Linux TUN/TLS/native-device runs succeeded in scoped tests, but post-merge `3d5665b` runs `43678457694`/`43678457712`/`43678457749`/`43678457779`/`43678457711` failed. Never copy upstream green status to merged commits. Further exact-commit results must be collected.
+- Continue from P00 compiler baseline, then trust/identity and actual default-E2E two-node PacketIo vertical slice; do not add more standalone policy models instead of product integration. External audit, real CDN and sustained multi-host performance cannot be self-certified.
+
+The older checkpoints below are historical; do not treat their stale paths/run statuses as current.
+
 ## Human requirements
 
 - Complete the entire v1.11 master plan, all Phase 0–5 implementations and applicable acceptance evidence; a skeleton or isolated subset is not completion.
