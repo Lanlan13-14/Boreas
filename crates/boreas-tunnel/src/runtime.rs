@@ -17,7 +17,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use crate::error::TunnelError;
-use crate::resource::{Admission, AuthenticatedPeer, ByteCredit, ConnectionCredit};
+use crate::resource::{
+    Admission, AuthenticatedPeer, ByteCredit, ConnectionCredit, HandshakeCredit,
+};
 use crate::session::{self, EstablishedSession, SessionPolicy};
 use crate::tls::{InnerTlsAcceptor, InnerTlsConnector, OuterTlsConnector};
 use crate::ws::{self, MAX_WS_FRAME_PAYLOAD};
@@ -121,11 +123,12 @@ impl LinkServer {
         Self { tls }
     }
 
-    /// Production accept path: reserve admission only after the TCP connection
-    /// exists, terminate the outer TLS layer, then run the WebSocket upgrade,
-    /// inner TLS handshake, session authorization and admission accounting.
-    /// The authenticated per-peer slot is charged only after authorization; a
-    /// peer identifier is never charged before it is authenticated.
+    /// Production accept path: reserve admission **before** the outer TLS
+    /// handshake, so an attacker cannot make the process perform expensive TLS
+    /// work without consuming a global pre-authentication slot. The slot is
+    /// converted to an authenticated per-peer slot only after the session is
+    /// authorized; the buffer reservation is charged for the connection's
+    /// lifetime.
     pub fn accept_tls(
         &self,
         listener: &TcpListener,
@@ -135,9 +138,11 @@ impl LinkServer {
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
         let (tcp, _peer_address) = listener.accept()?;
+        let handshake = admission.reserve_handshake()?;
+        let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, io_timeout)?;
         let transport = outer.accept(tcp)?;
-        self.accept_transport(transport, policy, admission)
+        self.accept_established(transport, handshake, buffer_credit, policy)
     }
 
     /// Explicitly insecure development path: TCP straight into the WebSocket
@@ -152,8 +157,10 @@ impl LinkServer {
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
         let (tcp, _peer_address) = listener.accept()?;
+        let handshake = admission.reserve_handshake()?;
+        let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, io_timeout)?;
-        self.accept_transport(tcp, policy, admission)
+        self.accept_established(tcp, handshake, buffer_credit, policy)
     }
 
     /// Test-only shorthand: plaintext transport, no outer TLS. Never exists in a
@@ -169,18 +176,17 @@ impl LinkServer {
         self.accept_plaintext_for_tests(listener, policy, io_timeout, admission)
     }
 
-    /// Accept over an already-established transport, for example a stream whose
-    /// outer TLS was terminated locally or by the CDN origin leg. Runs the
-    /// WebSocket upgrade, inner TLS handshake, session authorization and
-    /// admission accounting exactly like [`LinkServer::accept_tls`].
-    pub fn accept_transport<T: Read + Write + Send + 'static>(
+    /// Private: reached only through a path that already reserved admission and
+    /// terminated the outer TLS layer (or, in tests, deliberately skipped it).
+    /// Keeping this private prevents an arbitrary stream from bypassing the
+    /// outer TLS seam.
+    fn accept_established<T: Read + Write + Send + 'static>(
         &self,
         transport: T,
+        handshake: HandshakeCredit,
+        buffer_credit: ByteCredit,
         policy: SessionPolicy,
-        admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
-        let handshake = admission.reserve_handshake()?;
-        let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         let websocket = ws::server_handshake(transport)?;
         let inner = self.tls.accept(Box::new(websocket))?;
         let (stream, tls) = inner.into_parts();

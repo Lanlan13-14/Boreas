@@ -49,6 +49,18 @@ pub const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 pub const MAX_CONTROL_FRAMES_PER_READ: usize = 16;
 /// Maximum control-frame bytes handled during one data read.
 pub const MAX_CONTROL_BYTES_PER_READ: usize = 4096;
+/// Maximum frames of any kind consumed during one `Read` call. This bounds both
+/// control floods and empty binary frames: an empty frame makes no progress and
+/// must not restart the per-frame deadline.
+pub const MAX_FRAMES_PER_READ: usize = 32;
+/// Hard ceiling for `WsLimits::max_frame_payload`.
+pub const HARD_MAX_WS_FRAME_PAYLOAD: usize = 64 * 1024;
+/// Hard ceiling for `WsLimits::max_message_bytes`.
+pub const HARD_MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Hard ceiling for `WsLimits::max_fragments`.
+pub const HARD_MAX_WS_FRAGMENTS: usize = 64;
+/// Hard ceiling for one read's absolute deadline budget.
+pub const HARD_MAX_MESSAGE_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WsRole {
@@ -124,6 +136,9 @@ pub enum WsError {
     BadCloseFrame,
     /// Too many control frames arrived while one data read was pending.
     ControlFlood,
+    /// Too many frames (including empty binary frames) were consumed by one
+    /// `Read` call without making progress.
+    FrameFlood,
     /// A previous framing error poisoned the stream; no resynchronisation.
     Poisoned,
 }
@@ -163,6 +178,21 @@ impl Default for WsLimits {
     }
 }
 
+impl WsLimits {
+    /// Clamp caller-supplied limits to the compiled hard ceilings. Public limits
+    /// are a tuning surface, not a way to disable the protocol bounds.
+    pub fn bounded(self) -> Self {
+        Self {
+            max_frame_payload: self.max_frame_payload.clamp(1, HARD_MAX_WS_FRAME_PAYLOAD),
+            max_message_bytes: self.max_message_bytes.clamp(1, HARD_MAX_WS_MESSAGE_BYTES),
+            max_fragments: self.max_fragments.clamp(1, HARD_MAX_WS_FRAGMENTS),
+            message_deadline: self
+                .message_deadline
+                .clamp(Duration::from_secs(1), HARD_MAX_MESSAGE_DEADLINE),
+        }
+    }
+}
+
 /// A WebSocket connection exposed as a byte stream.
 ///
 /// `Read` yields payload bytes of binary messages only. `Write` emits one
@@ -192,7 +222,7 @@ impl<T: Read + Write> WsStream<T> {
         Self {
             io,
             role,
-            limits,
+            limits: limits.bounded(),
             pending: Vec::new(),
             pending_pos: 0,
             message: MessageState::default(),
@@ -259,11 +289,20 @@ impl<T: Read + Write> WsStream<T> {
 
     /// Read frames until a payload byte is available. Control frames are fully
     /// handled here; `Ok(None)` means the peer closed the connection.
+    ///
+    /// One absolute deadline covers the whole call, and a frame budget bounds
+    /// both control floods and empty binary frames. An empty data frame makes no
+    /// progress, so it must not restart the deadline or loop forever.
     fn next_data_payload(&mut self) -> Result<Option<Vec<u8>>, WsError> {
+        let deadline = Instant::now() + self.limits.message_deadline;
+        let mut frames = 0usize;
         let mut control_frames = 0usize;
         let mut control_bytes = 0usize;
         loop {
-            let deadline = Instant::now() + self.limits.message_deadline;
+            frames += 1;
+            if frames > MAX_FRAMES_PER_READ {
+                return Err(WsError::FrameFlood);
+            }
             let frame = read_frame(&mut self.io, self.role, &self.limits, deadline)?;
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
@@ -281,7 +320,6 @@ impl<T: Read + Write> WsStream<T> {
                             self.respond_close(&frame.payload)?;
                             return Ok(None);
                         }
-                        OpCode::Pong => {}
                         _ => {}
                     }
                 }

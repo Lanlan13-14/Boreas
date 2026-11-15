@@ -315,11 +315,22 @@ impl<'a> CircuitStream<'a> {
                 Kind::Control => {
                     let subtype = frame.body.first().copied().ok_or(CircuitReject::BadBody)?;
                     if subtype == ControlType::CircuitReset as u8 {
+                        // The subtype is not enough: a reset for a different
+                        // circuit must never tear this stream down.
+                        let circuit_id = decode_control_id(&frame.body, ControlType::CircuitReset)?;
+                        if circuit_id != self.circuit_id {
+                            self.closed = true;
+                            return Err(CircuitReject::UnknownCircuit.into());
+                        }
                         self.closed = true;
                         return Err(CircuitReject::ResetReceived.into());
                     }
                     if subtype == ControlType::CircuitClose as u8 {
-                        decode_control_id(&frame.body, ControlType::CircuitClose)?;
+                        let circuit_id = decode_control_id(&frame.body, ControlType::CircuitClose)?;
+                        if circuit_id != self.circuit_id {
+                            self.closed = true;
+                            return Err(CircuitReject::UnknownCircuit.into());
+                        }
                         self.closed = true;
                         return Ok(());
                     }
@@ -683,6 +694,11 @@ impl RelayHop {
                     }
                     ControlType::CircuitReset | ControlType::CircuitClose => {
                         let circuit_id = decode_control_id(&frame.body, control)?;
+                        // Only tear down a circuit this relay actually carries;
+                        // a reset/close for an unknown id is not forwarded.
+                        if !self.routes.contains_key(&CircuitId(circuit_id)) {
+                            return Err(CircuitReject::UnknownCircuit.into());
+                        }
                         self.drop_circuit(circuit_id);
                         downstream.send_control(control, &frame.body)?;
                         Ok(if control == ControlType::CircuitClose {
