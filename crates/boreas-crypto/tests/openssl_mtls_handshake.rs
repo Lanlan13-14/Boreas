@@ -324,7 +324,10 @@ impl TestPki {
         };
         let pki = Self { dir, bin };
         let version = pki.run(&["version".to_owned()], "version");
-        eprintln!("openssl runtime ({tag}): {}", sanitize(&version.stdout).trim());
+        eprintln!(
+            "openssl runtime ({tag}): {}",
+            sanitize(&version.stdout).trim()
+        );
 
         pki.make_ca("root", "Boreas Test ML-DSA-65 Root");
         pki.make_ca("rogue", "Rogue ML-DSA-65 Root");
@@ -866,7 +869,10 @@ fn pump_stream(from: &mut WsByteStream, to: &mut WsByteStream, chunk: usize) -> 
     }
     // `room` was computed before draining; a shortfall would mean ciphertext
     // was silently dropped, which this harness must never permit.
-    assert_eq!(fed, drained, "inbound queue accepted less than its checked room");
+    assert_eq!(
+        fed, drained,
+        "inbound queue accepted less than its checked room"
+    );
     true
 }
 
@@ -909,7 +915,10 @@ fn stream_read_exact(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let _ = pump_stream(to.get_mut(), from.get_mut(), chunk);
                 idle += 1;
-                assert!(idle < 100_000, "TLS plaintext read stalled after {read} bytes");
+                assert!(
+                    idle < 100_000,
+                    "TLS plaintext read stalled after {read} bytes"
+                );
             }
             Err(error) => panic!("TLS read failed after {read} bytes: {error}"),
         }
@@ -1176,23 +1185,27 @@ fn finish_before_completed_handshake_is_rejected() {
             DriveState::Incomplete
         );
         while client.transport().outbound_len() > 0 {
-            assert!(pump_stream(client.transport_mut(), server.transport_mut(), 31));
+            assert!(pump_stream(
+                client.transport_mut(),
+                server.transport_mut(),
+                31
+            ));
         }
         assert_eq!(
             server.drive_handshake().expect("server flight"),
             DriveState::Incomplete
         );
         while server.transport().outbound_len() > 0 {
-            assert!(pump_stream(server.transport_mut(), client.transport_mut(), 37));
+            assert!(pump_stream(
+                server.transport_mut(),
+                client.transport_mut(),
+                37
+            ));
         }
 
         let mut client_done = false;
         for _ in 0..8 {
-            if client
-                .drive_handshake()
-                .expect("client final flight")
-                == DriveState::Complete
-            {
+            if client.drive_handshake().expect("client final flight") == DriveState::Complete {
                 client_done = true;
                 break;
             }
@@ -1212,7 +1225,11 @@ fn finish_before_completed_handshake_is_rejected() {
         let stop_at = before / 2;
         while client.transport().outbound_len() > stop_at {
             let chunk = (client.transport().outbound_len() - stop_at).min(23);
-            assert!(pump_stream(client.transport_mut(), server.transport_mut(), chunk));
+            assert!(pump_stream(
+                client.transport_mut(),
+                server.transport_mut(),
+                chunk
+            ));
         }
         assert_eq!(
             server.drive_handshake().expect("partial client flight"),
@@ -1353,11 +1370,9 @@ fn malformed_and_truncated_ciphertext_fail_closed_promptly() {
     let Some(pki) = TestPki::create("malformed") else {
         return;
     };
-    let acceptor = OpenSslAcceptor::from_pem_identity(
-        &pki.server_identity(),
-        Policy::production_default(),
-    )
-    .expect("acceptor construction");
+    let acceptor =
+        OpenSslAcceptor::from_pem_identity(&pki.server_identity(), Policy::production_default())
+            .expect("acceptor construction");
 
     // Wrong record version/length followed by EOF.
     let (mut peer, transport) = UnixStream::pair().expect("UnixStream::pair");
@@ -1751,13 +1766,7 @@ fn s_client_args(
 /// acceptor must reject it on protocol version, so the "TLS 1.3 only" gate is
 /// exercised at the wire level instead of being inferred from configuration.
 fn s_client_tls12_args(dir: &TempDir, port: u16) -> Vec<String> {
-    let mut args = s_client_args(
-        dir,
-        port,
-        "TLS_AES_256_GCM_SHA384",
-        "X25519MLKEM768",
-        true,
-    );
+    let mut args = s_client_args(dir, port, "TLS_AES_256_GCM_SHA384", "X25519MLKEM768", true);
     let version = args
         .iter()
         .position(|arg| arg == "-tls1_3")

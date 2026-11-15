@@ -182,8 +182,8 @@ fn read_bounded_pem(
     limit: u64,
     kind: &'static str,
 ) -> Result<Vec<u8>, BackendError> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| BackendError::IdentityIo(error.to_string()))?;
+    let file =
+        std::fs::File::open(path).map_err(|error| BackendError::IdentityIo(error.to_string()))?;
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -648,7 +648,10 @@ impl OpenSslConnector {
         &self,
         transport: S,
     ) -> Result<EstablishedStream<S>, BackendError> {
-        let stream = self.new_ssl()?.connect(transport).map_err(|_| BackendError::Handshake)?;
+        let stream = self
+            .new_ssl()?
+            .connect(transport)
+            .map_err(|_| BackendError::Handshake)?;
         finish_established(stream, self.policy)
     }
 
@@ -661,7 +664,8 @@ impl OpenSslConnector {
         &self,
         transport: S,
     ) -> Result<HandshakeDriver<S>, BackendError> {
-        let stream = SslStream::new(self.new_ssl()?, transport).map_err(BackendError::from_stack)?;
+        let stream =
+            SslStream::new(self.new_ssl()?, transport).map_err(BackendError::from_stack)?;
         Ok(HandshakeDriver {
             stream,
             policy: self.policy,
@@ -716,7 +720,10 @@ impl OpenSslAcceptor {
         &self,
         transport: S,
     ) -> Result<EstablishedStream<S>, BackendError> {
-        let stream = self.new_ssl()?.accept(transport).map_err(|_| BackendError::Handshake)?;
+        let stream = self
+            .new_ssl()?
+            .accept(transport)
+            .map_err(|_| BackendError::Handshake)?;
         finish_established(stream, self.policy)
     }
 
@@ -729,7 +736,8 @@ impl OpenSslAcceptor {
         &self,
         transport: S,
     ) -> Result<HandshakeDriver<S>, BackendError> {
-        let stream = SslStream::new(self.new_ssl()?, transport).map_err(BackendError::from_stack)?;
+        let stream =
+            SslStream::new(self.new_ssl()?, transport).map_err(BackendError::from_stack)?;
         Ok(HandshakeDriver {
             stream,
             policy: self.policy,
