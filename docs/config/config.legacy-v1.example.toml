@@ -1,0 +1,43 @@
+# Legacy `version = 1` layout — migration input only
+#
+# This layout is no longer the canonical one. It is still parsed so an existing
+# installation can be inspected, but every output marks it `"migrated": true`,
+# and `boreas config-migrate <path>` prints the canonical `version = 2`
+# document on stdout (the file is never rewritten in place).
+#
+# Migration is explicit and refuses to lose information: a legacy uplink that
+# carries a path, query or fragment is rejected instead of silently dropping it,
+# and more than two legacy uplinks is an error.
+
+version = 1
+
+[network]
+net_id = "0123456789abcdef0123456789abcdef"
+
+[identity]
+role = "core"
+home_core_id = 1
+vip_octet = 1
+node_id = 1
+identity_generation = 1
+private_key = "/etc/boreas/keys/identity.key"
+
+[security]
+mode = "e2e-required"
+suite = "pq768"
+
+[paths]
+roots = ["/etc/boreas/roots.cbor"]
+state_dir = "/var/lib/boreas"
+
+[transport]
+# `wss://host[:port]` only; no path/query/fragment. Migrates to `[uplink].primary`
+# (port defaults to 443 when omitted).
+uplinks = ["wss://hub-us-c.example.net"]
+
+[features]
+ipv6 = false
+advertise_routes = false
+accept_routes = false
+edge_direct = false
+default_route = false

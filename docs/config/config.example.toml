@@ -1,0 +1,71 @@
+# Boreas node configuration — canonical `version = 2` layout
+#
+# Install as /etc/boreas/config.toml with mode 0600 (master plan §5.5).
+# Validate with: boreas config-check /etc/boreas/config.toml
+#
+# The `version` key is mandatory. `version = 1` selects the legacy layout kept
+# only for explicit migration (see config.legacy-v1.example.toml); a document
+# without `version` is rejected rather than assigned a default.
+#
+# config-check parses the document and applies static policy only. It does not
+# start a daemon, open a socket, read the private-key or trust-anchor contents,
+# resolve an endpoint, authenticate a peer, or establish TLS.
+
+version = 2
+
+[node]
+# Network genesis parameter: exactly 32 hexadecimal digits (16 bytes).
+net_id = "0123456789abcdef0123456789abcdef"
+# "core" | "edge". "enrollment" exists in the model but cannot be provisioned
+# by this generic node schema (no VIP slot is defined for it here).
+role = "core"
+# Permanent slot encoding (§3.2): node_id = ((home_core_id - 1) << 8) | vip_octet
+# home_core_id is 1..=16; Core requires vip_octet 1, Edge requires 2..=251.
+home_core_id = 1
+vip_octet = 1
+node_id = 1
+identity_generation = 1
+# Production default (§1.3); changing it is a high-risk, audited transition.
+security_mode = "e2e-required"
+# pq1024 is refused until its separate PoC and review are accepted.
+suite = "pq768"
+
+[paths]
+# Absolute path reference only; the key is generated locally and never leaves
+# this host. Its contents are not opened by config-check.
+identity_key = "/etc/boreas/keys/identity.key"
+# Trust anchors contain public keys only and may be copied between nodes.
+roots = ["/etc/boreas/roots.cbor"]
+state_dir = "/var/lib/boreas"
+
+[uplink]
+# `host:port` endpoints, exactly as in §5.5; the runtime builds the wss:// URL.
+# Never resolved or dialled by config-check. IPv6 literals are not modelled.
+primary = "hub-us-c.example.net:443"
+backup = "hub-us-d.example.net:443"
+# A: active connection slots. Bounded to 1..=8 by this slice; this is not a
+# capacity claim and must be re-derived from the §8.1 measured budget.
+paths = 4
+# D: standby path probing, 0 or 1.
+probe_paths = 1
+
+[limits]
+# Every high-exposure switch defaults off (§1.1 item 6).
+ipv6 = false
+advertise_routes = false
+accept_routes = false
+# Edge DIR requires a DirectGrant from the parent Core at runtime, not just this.
+edge_direct = false
+# Core-only admission of edges; refused for other roles.
+allow_edges = false
+# Whole-network default-route egress is refused in this release.
+default_route = false
+
+[dns]
+# Optional section. listen_vip is a VIP owned by this node, not a bind address.
+listen_vip = "10.20.0.53"
+zone = ".boreas"
+# Requires a runtime that polls the bounded TCP DNS endpoint. This binary
+# integrates no runtime, so `tcp = true` is refused with an explanation naming
+# the missing capability — it is not banned by the schema.
+tcp = false

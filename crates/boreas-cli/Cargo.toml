@@ -11,3 +11,11 @@ name = "boreas"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=1.2.1+spec-1.1.0"
+
+# Unix-only: O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC for the safe config open and
+# geteuid for the owner check. Already present in Cargo.lock via other crates,
+# so this adds no new locked package.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"

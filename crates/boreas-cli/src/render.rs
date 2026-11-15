@@ -20,6 +20,11 @@ use crate::i18n::{Lang, Msg, text};
 /// Total box width in terminal columns (master plan §10.4.1).
 pub(crate) const BOX_WIDTH: usize = 77;
 
+/// Maximum display columns reserved for the version token. Every snapshot field
+/// is untrusted; an unbounded version would otherwise push the title line past
+/// `BOX_WIDTH` and make the frame ragged.
+const VERSION_COLS: usize = 24;
+
 /// Inner content width: total minus the two border columns and one padding
 /// space on each side.
 const INNER_WIDTH: usize = BOX_WIDTH - 4;
@@ -127,14 +132,16 @@ impl StatusSnapshot {
 pub fn render_status(snapshot: &StatusSnapshot, lang: Lang) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(10);
 
+    // The version comes from the snapshot, i.e. eventually from the control
+    // socket. It is exactly as untrusted as the node name, so it is sanitized
+    // (no control characters/ESC/newlines) and truncated to its reserved
+    // columns before it can reach the terminal.
+    let version_display = truncate(&sanitize(&snapshot.version), VERSION_COLS);
+
     // Title line, following the §10.4.1 shape:
     //   ┌─ BOREAS CONSOLE ───── v<version> / [L] <lang> ┐
     let title_left = format!("─ {} ", text(lang, Msg::ConsoleTitle));
-    let title_right = format!(
-        " v{} / [L] {} ",
-        snapshot.version,
-        text(lang, Msg::LangLabel)
-    );
+    let title_right = format!(" v{version_display} / [L] {} ", text(lang, Msg::LangLabel));
     let fill = BOX_WIDTH
         .saturating_sub(2)
         .saturating_sub(display_width(&title_left))
@@ -148,7 +155,7 @@ pub fn render_status(snapshot: &StatusSnapshot, lang: Lang) -> String {
         sanitize(&snapshot.node_name)
     };
     let node_left = format!("{}  {node_display}", text(lang, Msg::NodeLabel));
-    let version_right = format!("v{}", snapshot.version);
+    let version_right = format!("v{version_display}");
     lines.push(row(&two_col(&node_left, &version_right)));
 
     // Security mode + daemon connection state.
@@ -300,6 +307,22 @@ fn fit(s: &str, max_width: usize) -> String {
     while width < max_width {
         out.push(' ');
         width += 1;
+    }
+    out
+}
+
+/// Truncate `s` to at most `max_width` display columns without splitting a wide
+/// character. Unlike [`fit`] it never pads.
+fn truncate(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0usize;
+    for c in s.chars() {
+        let w = char_width(c);
+        if width + w > max_width {
+            break;
+        }
+        out.push(c);
+        width += w;
     }
     out
 }

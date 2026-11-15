@@ -2,15 +2,24 @@
 //! binary also serves as the `boreas-easy` console when invoked through
 //! that symlink name (argv[0] detection, §10.5).
 //!
-//! This is the console's first slice: a pure rendering layer. There is NO
-//! daemon, control socket, networking or TLS backend behind it yet
-//! (`doctor`/`self-check` keep reporting that honestly). The full
-//! interactive raw-mode TUI (master plan §10.4.1, 77x18 menu screen) is NOT
-//! part of this slice; `boreas-easy` with no arguments currently renders
-//! the same one-shot status screen as `boreas status`, and a future slice
-//! will replace that with the raw-mode event loop fed by
-//! `/run/boreas/control.sock`.
+//! This slice contains four honest pieces and nothing more:
+//!
+//! - a trilingual (`zh-CN` / `zh-TW` / `en`) one-shot rendering layer for the
+//!   status screen (`status`, and `boreas-easy` with no arguments);
+//! - a typed, fail-closed TOML configuration model with `config-check <path>`
+//!   static policy validation and `config-migrate <path>` schema migration
+//!   (stdout only; no file is rewritten);
+//! - `doctor` / `self-check`, which keep reporting the missing daemon, TLS
+//!   backend and networking.
+//!
+//! There is NO daemon, control socket, networking or TLS backend behind any of
+//! this. `crates/boreas-tunnel` currently exposes only in-process session APIs
+//! (`LinkClient` / `LinkServer`), no status snapshot and no `control.sock`, so
+//! `status` keeps saying `daemon: not connected` and never fabricates a live
+//! state. The full interactive raw-mode TUI (§10.4.1, 77x18 menu screen) is NOT
+//! part of this slice.
 
+mod config;
 mod i18n;
 mod render;
 
@@ -18,10 +27,11 @@ use std::env;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use config::RuntimeCapabilities;
 use i18n::{Lang, lang_from_env, parse_lang};
 use render::{StatusSnapshot, render_status};
 
-const IMPLEMENTATION_SCOPE: &str = "Phase 0 policy/parser foundation only";
+const IMPLEMENTATION_SCOPE: &str = "Phase 0 policy/config/console-rendering foundation only";
 
 fn main() -> ExitCode {
     let mut argv = env::args();
@@ -52,6 +62,18 @@ fn stdout_is_tty() -> bool {
 fn is_easy_entrypoint(argv0: &str) -> bool {
     let base = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
     base.strip_suffix(".exe").unwrap_or(base) == "boreas-easy"
+}
+
+/// Capability facts for this binary.
+///
+/// No runtime is integrated: `crates/boreas-tunnel` exposes only in-process
+/// session APIs, there is no `control.sock`, and `boreas_dns::TcpDnsSupport`
+/// reports `Unsupported`. When the tunnel crate publishes
+/// `runtime_capabilities()`, this function must forward it verbatim instead of
+/// hardcoding `NO_RUNTIME`; until then every capability-gated field is refused
+/// rather than assumed.
+fn runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities::NO_RUNTIME
 }
 
 /// Testable entry point: resolves the `boreas-easy` argv[0] alias, strips
@@ -126,9 +148,16 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
             "error: unexpected argument; run `boreas help`".into(),
         ),
         Some("status") => run_status(&args[1..], lang, stdout_tty),
+        Some("config-check") => run_config_check(&args[1..]),
+        Some("config-migrate") => run_config_migrate(&args[1..]),
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => {
             (0, help_text(), String::new())
         }
+        Some("help") | Some("--help") | Some("-h") => (
+            2,
+            String::new(),
+            "error: unexpected argument; run `boreas help`".into(),
+        ),
         Some(command) => (
             2,
             String::new(),
@@ -162,20 +191,78 @@ fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Str
     }
 }
 
+/// `config-check <path>`: parse and statically validate one TOML file, then
+/// print redacted JSON. This never starts a daemon, opens a socket, reads key or
+/// trust-anchor contents, resolves an endpoint or establishes TLS, so success
+/// means "the document matches the declared schema and static policy" only.
+/// Output is machine-readable JSON in every language, so `--lang` intentionally
+/// does not change it; only human-facing console screens are localized (§10.4).
+fn run_config_check(args: &[String]) -> (u8, String, String) {
+    let [path] = args else {
+        return (
+            2,
+            String::new(),
+            "error: config-check requires exactly one config path".into(),
+        );
+    };
+    match config::Config::read_file(std::path::Path::new(path), runtime_capabilities()) {
+        Ok(config) => (0, config.redacted_json(), String::new()),
+        Err(error) => (
+            2,
+            String::new(),
+            format!("error: configuration rejected: {error}"),
+        ),
+    }
+}
+
+/// `config-migrate <path>`: read a legacy (`version = 1`) document and print its
+/// canonical `version = 2` equivalent on stdout. The file on disk is never
+/// modified, so migration is explicit: the operator reviews and installs it.
+fn run_config_migrate(args: &[String]) -> (u8, String, String) {
+    let [path] = args else {
+        return (
+            2,
+            String::new(),
+            "error: config-migrate requires exactly one config path".into(),
+        );
+    };
+    match config::Config::read_file(std::path::Path::new(path), runtime_capabilities()) {
+        Ok(config) => (0, config.to_v2_toml(), String::new()),
+        Err(error) => (
+            2,
+            String::new(),
+            format!("error: configuration rejected: {error}"),
+        ),
+    }
+}
+
 fn help_text() -> String {
-    "boreas — minimal Phase 0 policy/parser foundation\n\nUSAGE:\n  boreas [doctor|self-check|status|help]\n  boreas-easy   (status screen; interactive TUI not yet implemented)\n\nOPTIONS:\n  --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n  boreas status --json      JSON snapshot (also the default when not a TTY)\n\nNo daemon, TLS backend, or networking is implemented."
+    "boreas — Phase 0 policy/config/console foundation\n\n\
+     USAGE:\n\
+     \x20 boreas [doctor|self-check|status [--json]|config-check <path>|config-migrate <path>|help]\n\
+     \x20 boreas-easy   (one-shot status screen; interactive TUI not implemented)\n\n\
+     OPTIONS:\n\
+     \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
+     \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\n\
+     config-check parses one TOML file (`version = 1` legacy or `version = 2`),\n\
+     validates static policy and prints redacted JSON. config-migrate prints the\n\
+     canonical version = 2 document for a legacy file and never rewrites it.\n\
+     Neither starts a daemon, opens sockets, loads key or trust-anchor contents,\n\
+     or establishes TLS.\n\n\
+     No daemon, TLS backend, or networking is implemented."
         .to_string()
 }
 
 fn doctor_json() -> String {
     format!(
-        "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"phase0_complete\":false}}"
+        "{{\"status\":\"foundation_only\",\"phase\":\"Phase 0\",\"scope\":\"{IMPLEMENTATION_SCOPE}\",\"daemon\":false,\"tls_backend\":false,\"networking\":false,\"control_socket\":false,\"config_check\":true,\"config_migrate\":true,\"status_screen\":true,\"runtime_capabilities\":\"not_integrated\",\"phase0_complete\":false}}"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
+    use crate::config::RuntimeCapabilities;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).into()).collect()
@@ -184,6 +271,79 @@ mod tests {
     /// Default probe: English regardless of input (tests stay hermetic).
     fn probe_en(_: Option<&str>) -> Lang {
         Lang::En
+    }
+
+    /// Absolute fixture root valid on the host family. TOML basic strings
+    /// interpret backslashes, so Windows uses forward slashes (`C:/...`).
+    #[cfg(windows)]
+    const TEST_BASE: &str = "C:/boreas-tests";
+    #[cfg(not(windows))]
+    const TEST_BASE: &str = "/boreas-tests";
+
+    fn config_source() -> String {
+        format!(
+            r#"
+version = 2
+[node]
+net_id = "0123456789abcdef0123456789abcdef"
+role = "core"
+home_core_id = 1
+vip_octet = 1
+node_id = 1
+identity_generation = 1
+[paths]
+identity_key = "{TEST_BASE}/secret/identity.key"
+roots = ["{TEST_BASE}/secret/roots.cbor"]
+state_dir = "{TEST_BASE}/secret/state"
+[uplink]
+primary = "hub-us-c.example.net:443"
+paths = 4
+probe_paths = 1
+"#
+        )
+    }
+
+    fn legacy_source() -> String {
+        format!(
+            r#"
+version = 1
+[network]
+net_id = "0123456789abcdef0123456789abcdef"
+[identity]
+role = "core"
+home_core_id = 1
+vip_octet = 1
+node_id = 1
+identity_generation = 1
+private_key = "{TEST_BASE}/secret/identity.key"
+[paths]
+roots = ["{TEST_BASE}/secret/roots.cbor"]
+state_dir = "{TEST_BASE}/secret/state"
+[transport]
+uplinks = ["wss://hub-us-c.example.net"]
+"#
+        )
+    }
+
+    /// Write a fixture with `0600` on Unix; returns the path.
+    fn write_fixture(name: &str, body: &str) -> std::path::PathBuf {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "boreas-{name}-{}-{unique}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
     }
 
     // --- Pre-existing tests (behavior must stay compatible) ---
@@ -195,6 +355,8 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"daemon\":false"));
         assert!(stdout.contains("\"tls_backend\":false"));
+        assert!(stdout.contains("\"control_socket\":false"));
+        assert!(stdout.contains("\"runtime_capabilities\":\"not_integrated\""));
         assert!(stdout.contains("\"phase0_complete\":false"));
     }
 
@@ -215,13 +377,192 @@ mod tests {
     }
 
     #[test]
+    fn config_check_validates_v2_file_and_redacts_secrets() {
+        let path = write_fixture("config-check", &config_source());
+        let (code, stdout, stderr) = run(
+            &args(&["config-check", path.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("\"valid\":true"));
+        assert!(stdout.contains("\"schema_version\":2"));
+        assert!(stdout.contains("\"migrated\":false"));
+        assert!(stdout.contains("[REDACTED]"));
+        assert!(!stdout.contains("identity.key"));
+        assert!(!stdout.contains("hub-us-c.example.net"));
+    }
+
+    #[test]
+    fn config_check_marks_legacy_documents_as_migrated() {
+        let path = write_fixture("config-legacy", &legacy_source());
+        let (code, stdout, stderr) = run(
+            &args(&["config-check", path.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("\"schema\":\"legacy-v1\""));
+        assert!(stdout.contains("\"migrated\":true"));
+    }
+
+    #[test]
+    fn config_migrate_prints_v2_and_never_rewrites_the_file() {
+        let path = write_fixture("config-migrate", &legacy_source());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (code, stdout, stderr) = run(
+            &args(&["config-migrate", path.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("version = 2"));
+        assert!(stdout.contains("[node]"));
+        assert!(stdout.contains("primary = \"hub-us-c.example.net:443\""));
+        assert_eq!(before, after, "config-migrate must not touch the file");
+    }
+
+    #[test]
+    fn migrated_output_passes_config_check() {
+        let legacy = write_fixture("config-roundtrip-src", &legacy_source());
+        let (code, migrated, stderr) = run(
+            &args(&["config-migrate", legacy.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_file(&legacy);
+        assert_eq!(code, 0, "{stderr}");
+        let v2 = write_fixture("config-roundtrip-dst", &migrated);
+        let (code, stdout, stderr) = run(
+            &args(&["config-check", v2.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_file(&v2);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("\"schema_version\":2"));
+    }
+
+    #[test]
+    fn config_check_requires_path_and_never_starts_daemon() {
+        let (code, stdout, stderr) = run(&args(&["config-check"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("requires exactly one config path"));
+
+        let (code, stdout, stderr) = run(&args(&["config-check", "a.toml", "b.toml"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("requires exactly one config path"));
+    }
+
+    #[test]
+    fn config_check_rejects_missing_and_unsafe_files() {
+        let missing = std::env::temp_dir().join("boreas-config-check-missing-does-not-exist.toml");
+        let _ = std::fs::remove_file(&missing);
+        let (code, stdout, stderr) = run(
+            &args(&["config-check", missing.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("could not be read"));
+
+        // §5.5 requires 0600; an explicitly world-readable copy must be refused.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "boreas-config-check-perm-{}-{unique}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, config_source()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let (code, stdout, stderr) = run(
+                &args(&["config-check", path.to_str().unwrap()]),
+                Lang::En,
+                false,
+            );
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(code, 2);
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("group- or world-accessible"));
+        }
+    }
+
+    #[test]
+    fn config_check_output_is_json_even_with_lang_flag() {
+        let path = write_fixture("config-check-lang", &config_source());
+        let (code, stdout, stderr) = dispatch(
+            "boreas",
+            &args(&["--lang", "zh-CN", "config-check", path.to_str().unwrap()]),
+            probe_en,
+            true,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.starts_with('{'), "{stdout}");
+        assert!(stdout.contains("\"valid\":true"));
+        assert!(stdout.contains("\"security_mode\":\"e2e-required\""));
+    }
+
+    #[test]
+    fn config_check_refuses_capability_gated_fields_without_a_runtime() {
+        // `[dns].tcp` is not schema-banned: the same document flips to accepted
+        // purely by changing the capability value.
+        let with_tcp = format!("{}[dns]\ntcp = true\n", config_source());
+        let path = write_fixture("config-capability", &with_tcp);
+        let (code, _, stderr) = run(
+            &args(&["config-check", path.to_str().unwrap()]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 2);
+        assert!(
+            stderr.contains("no integrated runtime reported that capability"),
+            "{stderr}"
+        );
+
+        assert!(
+            crate::config::Config::parse_toml(&with_tcp, RuntimeCapabilities::FULL)
+                .expect("same document must validate once the capability exists")
+                .dns
+                .unwrap()
+                .tcp
+        );
+    }
+
+    #[test]
+    fn help_lists_config_commands_and_never_claims_a_daemon() {
+        let (code, stdout, _) = run(&args(&["help"]), Lang::En, false);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("config-check <path>"));
+        assert!(stdout.contains("config-migrate <path>"));
+        assert!(stdout.contains("No daemon, TLS backend, or networking is implemented."));
+        let (code, _, stderr) = run(&args(&["help", "extra"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("unexpected argument"));
+    }
+
+    #[test]
     fn rejects_extra_arguments() {
         let (code, _, stderr) = run(&args(&["doctor", "unexpected"]), Lang::En, false);
         assert_eq!(code, 2);
         assert!(stderr.contains("unexpected argument"));
     }
 
-    // --- New: status subcommand ---
+    // --- status subcommand ---
 
     #[test]
     fn status_non_tty_outputs_json_snapshot() {
@@ -231,6 +572,8 @@ mod tests {
         assert!(stdout.contains("\"command\":\"status\""));
         assert!(stdout.contains("\"daemon\":\"not_connected\""));
         assert!(stdout.contains("\"security_mode\":\"e2e-required\""));
+        // Never claim a live daemon or a PQ channel.
+        assert!(!stdout.contains("\"daemon\":\"connected\""));
     }
 
     #[test]
@@ -262,7 +605,7 @@ mod tests {
         assert!(stdout.is_empty());
     }
 
-    // --- New: --lang handling ---
+    // --- --lang handling ---
 
     #[test]
     fn lang_flag_is_extracted_before_the_command() {
@@ -294,7 +637,7 @@ mod tests {
         }
     }
 
-    // --- New: boreas-easy argv[0] alias ---
+    // --- boreas-easy argv[0] alias ---
 
     #[test]
     fn easy_entrypoint_detection() {
