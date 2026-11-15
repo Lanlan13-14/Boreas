@@ -181,21 +181,34 @@ impl fmt::Debug for VerifiedEnrollmentRequest {
             .finish()
     }
 }
+#[cfg(any(feature = "openssl-backend", test))]
+struct VerifiedCsrFields {
+    invite_id: [u8; 16],
+    enrollment_id: [u8; 16],
+    bearer_secret: [u8; 32],
+    raw_csr_der: Vec<u8>,
+    raw_csr_sha256: [u8; 32],
+    role: NodeRole,
+    home_core_id: u8,
+    identity_pub_ed25519: [u8; 32],
+}
+
 impl VerifiedEnrollmentRequest {
     /// Internal verifier boundary: future CSR integration must hash exact DER and verify its
     /// proof-of-possession before constructing this type. Unit tests alone can bypass that.
     /// Only the in-crate CSR verifier may construct a request after cryptographic validation.
-    #[allow(dead_code)] // Intentionally unavailable until a real verifier is integrated.
-    fn from_verified_csr(
-        invite_id: [u8; 16],
-        enrollment_id: [u8; 16],
-        bearer_secret: [u8; 32],
-        raw_csr_der: Vec<u8>,
-        raw_csr_sha256: [u8; 32],
-        role: NodeRole,
-        home_core_id: u8,
-        identity_pub_ed25519: [u8; 32],
-    ) -> Result<Self, EnrollmentError> {
+    #[cfg(any(feature = "openssl-backend", test))]
+    fn from_verified_csr(fields: VerifiedCsrFields) -> Result<Self, EnrollmentError> {
+        let VerifiedCsrFields {
+            invite_id,
+            enrollment_id,
+            bearer_secret,
+            raw_csr_der,
+            raw_csr_sha256,
+            role,
+            home_core_id,
+            identity_pub_ed25519,
+        } = fields;
         if raw_csr_der.is_empty() || raw_csr_der.len() > MAX_CSR_BYTES {
             return Err(EnrollmentError::CsrTooLarge);
         }
@@ -214,26 +227,8 @@ impl VerifiedEnrollmentRequest {
         })
     }
     #[cfg(test)]
-    fn test_request(
-        invite_id: [u8; 16],
-        enrollment_id: [u8; 16],
-        bearer_secret: [u8; 32],
-        raw_csr_der: Vec<u8>,
-        raw_csr_sha256: [u8; 32],
-        role: NodeRole,
-        home_core_id: u8,
-        identity_pub_ed25519: [u8; 32],
-    ) -> Result<Self, EnrollmentError> {
-        Self::from_verified_csr(
-            invite_id,
-            enrollment_id,
-            bearer_secret,
-            raw_csr_der,
-            raw_csr_sha256,
-            role,
-            home_core_id,
-            identity_pub_ed25519,
-        )
+    fn test_request(fields: VerifiedCsrFields) -> Result<Self, EnrollmentError> {
+        Self::from_verified_csr(fields)
     }
 }
 
@@ -362,6 +357,7 @@ pub struct EnrollmentStore {
     /// Durable per-home-core allocation watermark. It only moves forward and is
     /// recovered from the journal before any new allocation is attempted.
     allocation_watermarks: BTreeMap<u8, u64>,
+    #[cfg(feature = "openssl-backend")]
     csr_policy: CsrPolicy,
 }
 impl fmt::Debug for EnrollmentStore {
@@ -454,6 +450,8 @@ impl EnrollmentStore {
         slots: Vec<Slot>,
         csr_policy: CsrPolicy,
     ) -> Result<Self, EnrollmentError> {
+        #[cfg(not(feature = "openssl-backend"))]
+        let _ = csr_policy;
         if invites.len() > MAX_INVITES || slots.len() > MAX_SLOTS {
             return Err(EnrollmentError::StoreFull);
         }
@@ -493,6 +491,7 @@ impl EnrollmentStore {
             transactions: BTreeMap::new(),
             invite_bindings: BTreeMap::new(),
             allocation_watermarks: BTreeMap::new(),
+            #[cfg(feature = "openssl-backend")]
             csr_policy,
         };
         store.recover()?;
@@ -735,16 +734,16 @@ impl EnrollmentStore {
                 // The exact DER was already verified when first admitted. Recovery retries
                 // reuse that decision instead of paying for a second ML-DSA verification;
                 // the Ed key is the one durably bound to that exact DER.
-                return VerifiedEnrollmentRequest::from_verified_csr(
+                return VerifiedEnrollmentRequest::from_verified_csr(VerifiedCsrFields {
                     invite_id,
                     enrollment_id,
-                    *bearer_secret,
-                    tx.csr_der.clone(),
-                    tx.csr_hash,
-                    invite.role,
-                    invite.home_core_id,
-                    tx.identity_pub_ed25519,
-                );
+                    bearer_secret: *bearer_secret,
+                    raw_csr_der: tx.csr_der.clone(),
+                    raw_csr_sha256: tx.csr_hash,
+                    role: invite.role,
+                    home_core_id: invite.home_core_id,
+                    identity_pub_ed25519: tx.identity_pub_ed25519,
+                });
             }
             // A bound transaction cannot be rebound to different bytes; reject cheaply.
             return Err(EnrollmentError::InviteBoundToDifferentRequest);
@@ -760,16 +759,16 @@ impl EnrollmentStore {
             .ed25519_pop_oid()
             .ok_or(EnrollmentError::CsrPolicyMissing)?;
         let (csr_hash, identity_pub_ed25519) = verify_ml_dsa_csr(csr_der, oid)?;
-        VerifiedEnrollmentRequest::from_verified_csr(
+        VerifiedEnrollmentRequest::from_verified_csr(VerifiedCsrFields {
             invite_id,
             enrollment_id,
-            *bearer_secret,
-            csr_der.to_vec(),
-            csr_hash,
-            invite.role,
-            invite.home_core_id,
+            bearer_secret: *bearer_secret,
+            raw_csr_der: csr_der.to_vec(),
+            raw_csr_sha256: csr_hash,
+            role: invite.role,
+            home_core_id: invite.home_core_id,
             identity_pub_ed25519,
-        )
+        })
     }
 
     /// Complete the recoverable enrollment and signing path in one call.
@@ -1374,7 +1373,9 @@ impl<'a> Reader<'a> {
 /// Candidate, explicitly unregistered OID for offline/controlled Ed25519 PoP evidence.
 /// Production must configure a formally assigned enterprise OID through [`CsrPolicy`].
 pub const EXPERIMENTAL_ED25519_CSR_POP_OID: &str = "1.3.6.1.4.1.55555.1.1";
+#[cfg(feature = "openssl-backend")]
 const ED25519_POP_DOMAIN: &[u8] = b"BOREAS-NODE-ED25519-POP-v1\0";
+#[cfg(feature = "openssl-backend")]
 const ED25519_POP_PAYLOAD_LEN: usize = 1 + 32 + 64;
 
 /// Verify a standard PKCS#10 DER request carrying an ML-DSA-65 key.
@@ -1721,6 +1722,7 @@ mod tests {
             slots(),
         )
     }
+    #[cfg(feature = "openssl-backend")]
     fn setup_with_policy(path: &Path, policy: CsrPolicy) -> EnrollmentStore {
         EnrollmentStore::open_with_csr_policy(
             path,
@@ -1745,16 +1747,16 @@ mod tests {
     fn request_with(invite_id: [u8; 16], enroll: u8, fill: u8) -> VerifiedEnrollmentRequest {
         let csr = vec![fill; 256];
         let digest = [fill; 32];
-        VerifiedEnrollmentRequest::test_request(
+        VerifiedEnrollmentRequest::test_request(VerifiedCsrFields {
             invite_id,
-            [enroll; 16],
-            [7; 32],
-            csr,
-            digest,
-            NodeRole::Edge,
-            1,
-            [8; 32],
-        )
+            enrollment_id: [enroll; 16],
+            bearer_secret: [7; 32],
+            raw_csr_der: csr,
+            raw_csr_sha256: digest,
+            role: NodeRole::Edge,
+            home_core_id: 1,
+            identity_pub_ed25519: [8; 32],
+        })
         .unwrap()
     }
     fn cleanup(path: &Path) {
