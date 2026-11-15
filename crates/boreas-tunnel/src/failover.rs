@@ -6,34 +6,33 @@
 //! not a measured P99 and not a proof that a failover finished within 10s.
 //!
 //! Decision order used by [`select_path`]:
-//! 1. `SameCoreDir` if it has been [`Health::Healthy`] for at least the recover hold.
-//! 2. Else `SameCoreCdn` under that same hold.
-//! 3. Else `BackupCdn` under that hold, and only when neither same-core path is
-//!    [`Health::Healthy`]. [`Health::Suspect`] is not healthy and does not block backup.
-//! 4. A move onto a strictly better path that already passed steps 1–2 is a
-//!    restore. It happens once that path meets the recover hold, even if the
-//!    current path is still healthy. That is the fail-back the 120s hold exists for.
-//! 5. Any other move, including every move onto backup, waits until the current
-//!    path is [`Health::Down`] or has been [`Health::Suspect`] for the degrade hold.
-//!    Until then the current path is kept. Keeping an already-selected healthy
-//!    backup while a same-core path is healthy but not yet adoptable is that
-//!    gate, not a new choice of backup.
-//! 6. If nothing is adoptable and the current path is down, the result is
+//! 1. Prefer a healthy `SameCoreDir`, then a healthy `SameCoreCdn`.
+//! 2. Newly select `BackupCdn` only if both primary paths are [`Health::Down`].
+//!    [`Health::Suspect`] alone is not proof that a primary path has failed.
+//!    An already-selected backup is retained until a fail-back is eligible.
+//! 3. A down current path switches to an eligible healthy path immediately;
+//!    recovery hysteresis must not impose a 120s outage on hard failover.
+//! 4. A suspect current path may switch after the configured degrade hold.
+//! 5. A healthy current path fails back to a better healthy path only after
+//!    that target has met the configured recover hold. Otherwise keep it.
+//! 6. If no eligible healthy path exists and the current path is down, return
 //!    [`Selection::StayDown`].
+//!
+//! The caller classifies health, supplies trustworthy monotonic timestamps and
+//! one outcome per probe interval, and enforces authentication, authorization,
+//! directory freshness and resource admission separately. A selection is not
+//! permission to skip those checks or a measurement of completed recovery.
 
-/// Plan floor for the probe interval. Two seconds, in caller-supplied milliseconds.
+/// Initial probe interval from §8.5, in caller-supplied milliseconds; not a floor.
 pub const PROBE_INTERVAL: u64 = 2_000;
-/// Plan floor for consecutive failed probe intervals.
+/// Initial number of consecutive failed probe intervals; not a floor.
 pub const FAIL_THRESHOLD: u32 = 3;
-/// Plan ceiling on the backoff term inside [`estimate_switch_floor`]. One second.
+/// Plan ceiling for configured backoff. Not a connection-time guarantee.
 pub const BACKOFF_MAX: u64 = 1_000;
-/// Plan floor before a non-restoring switch away from a suspect path. Thirty seconds.
+/// Initial quality-degradation hysteresis. Configurable, not a minimum.
 pub const DEGRADE_HOLD: u64 = 30_000;
-/// Plan floor before a recovered path may be used. One hundred twenty seconds.
+/// Initial stable-recovery hysteresis for fail-back. Configurable, not a minimum.
 pub const RECOVER_HOLD: u64 = 120_000;
-
-/// A sum below this is an incomplete budget, not a passing failover.
-const INCOMPLETE_BELOW_MS: u64 = 10_000;
 
 /// Preference among paths. [`Selection::StayDown`] is the absence of a path, not an entry.
 pub const PATH_PREFERENCE: [PathId; 3] =
@@ -41,10 +40,8 @@ pub const PATH_PREFERENCE: [PathId; 3] =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailoverError {
-    /// A policy asked to go below a plan floor.
-    PolicyBelowFloor,
-    /// `detect + clamped backoff + rtt * rounds` is under 10s. Not a pass.
-    FloorBelowTarget { sum_ms: u64 },
+    /// A probe interval or failed-interval threshold was zero.
+    InvalidProbePolicy,
     /// The explicit components overflowed `u64`.
     BudgetOverflow,
     /// `attachment` does not own `current`.
@@ -55,10 +52,12 @@ pub enum FailoverError {
     BackupCapExceedsPrimary,
 }
 
-/// Floors from §8.5. Construction can raise them and cannot lower them.
+/// Tunable detection and hysteresis with the initial values from §8.5.
 ///
-/// There is no setter. A value below [`PROBE_INTERVAL`], [`FAIL_THRESHOLD`],
-/// [`DEGRADE_HOLD`], or [`RECOVER_HOLD`] is [`FailoverError::PolicyBelowFloor`].
+/// Probe intervals and failure thresholds must be nonzero. Holds may be shorter
+/// or longer than the initial 30s/120s, including zero to disable hysteresis.
+/// Tuning needs deployment measurements; no setting proves the P99 target or
+/// changes authentication, cryptographic policy, or resource budgets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Policy {
     probe_interval_ms: u64,
@@ -68,6 +67,7 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// The plan's initial settings, not a measured performance guarantee.
     pub const fn plan() -> Self {
         Self {
             probe_interval_ms: PROBE_INTERVAL,
@@ -83,12 +83,8 @@ impl Policy {
         degrade_hold_ms: u64,
         recover_hold_ms: u64,
     ) -> Result<Self, FailoverError> {
-        if probe_interval_ms < PROBE_INTERVAL
-            || fail_threshold < FAIL_THRESHOLD
-            || degrade_hold_ms < DEGRADE_HOLD
-            || recover_hold_ms < RECOVER_HOLD
-        {
-            return Err(FailoverError::PolicyBelowFloor);
+        if probe_interval_ms == 0 || fail_threshold == 0 {
+            return Err(FailoverError::InvalidProbePolicy);
         }
         Ok(Self {
             probe_interval_ms,
@@ -119,11 +115,11 @@ impl Policy {
 /// returns `PathLoss`, and none turns misses into a loss percentage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeVerdict {
-    /// Matching reply with `now <= sent_at + probe_interval`. Clears the streak.
+    /// Matching reply with `sent_at <= now <= sent_at + probe_interval`. Clears the streak.
     Success,
     /// This interval had no matching timely reply. Not a public loss sample.
     ProbeMiss,
-    /// Matching reply after the interval already expired. Does not clear the streak.
+    /// Matching reply outside the interval, including backwards time. Does not clear the streak.
     Late,
     /// `fail_threshold` consecutive failed intervals. Not a loss percentage.
     Suspect,
@@ -152,12 +148,14 @@ impl ProbeWatch {
 
     /// Match one reply against the challenge that was sent for that interval.
     ///
+    /// The caller must generate a fresh unpredictable challenge and associate
+    /// each reply with its outstanding interval; this helper does neither.
     /// A mismatched challenge is [`ProbeVerdict::ProbeMiss`]. It does not clear
-    /// the streak. A match with `now > sent_at + probe_interval` is
-    /// [`ProbeVerdict::Late`] and does not clear the streak. A timely match is
-    /// [`ProbeVerdict::Success`] and clears it. The interval that reaches
-    /// `fail_threshold` returns [`ProbeVerdict::Suspect`] instead of `ProbeMiss`
-    /// or `Late`.
+    /// the streak. A match outside `sent_at <= now <= sent_at + probe_interval`
+    /// is [`ProbeVerdict::Late`] and does not clear the streak (including an
+    /// invalid backwards timestamp). A timely match clears it. The interval
+    /// that reaches `fail_threshold` returns [`ProbeVerdict::Suspect`] instead
+    /// of `ProbeMiss` or `Late`. Repeated calls are not deduplicated.
     pub fn observe_reply(
         &mut self,
         sent_challenge: [u8; 16],
@@ -210,10 +208,15 @@ pub enum CoreAttachment {
 }
 
 /// Health of one path, as already classified by the caller.
+///
+/// Probe suspicion does not automatically become a hard failure here; the
+/// caller must apply its failure policy before reporting `Down`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Health {
     Healthy,
+    /// Quality degradation or probe suspicion, not a declared path failure.
     Suspect,
+    /// Declared failed/unusable, not merely a quality-degradation timer.
     Down,
 }
 
@@ -282,14 +285,23 @@ pub fn select_path(
     if !attachment_matches(attachment, current) {
         return Err(FailoverError::AttachmentMismatch);
     }
-    if let Some(target) = preferred(policy, paths, now_ms) {
+    for target in PATH_PREFERENCE {
+        if target == PathId::BackupCdn && !primary_failed(paths) {
+            continue;
+        }
+        let status = paths.get(target);
+        if status.health != Health::Healthy || status.since_ms > now_ms {
+            continue;
+        }
         if target == current || may_switch(policy, current, target, paths, now_ms) {
             return Ok(Selection::path(target));
         }
-    } else if paths.get(current).health == Health::Down {
-        return Ok(Selection::StayDown);
     }
-    Ok(Selection::path(current))
+    if paths.get(current).health == Health::Down {
+        Ok(Selection::StayDown)
+    } else {
+        Ok(Selection::path(current))
+    }
 }
 
 fn attachment_matches(attachment: CoreAttachment, current: PathId) -> bool {
@@ -302,21 +314,8 @@ fn attachment_matches(attachment: CoreAttachment, current: PathId) -> bool {
     )
 }
 
-fn preferred(policy: &Policy, paths: PathSet, now_ms: u64) -> Option<PathId> {
-    PATH_PREFERENCE.into_iter().find(|path| {
-        if *path == PathId::BackupCdn && same_core_healthy(paths) {
-            return false;
-        }
-        adoptable(policy, paths.get(*path), now_ms)
-    })
-}
-
-fn same_core_healthy(paths: PathSet) -> bool {
-    paths.same_core_dir.health == Health::Healthy || paths.same_core_cdn.health == Health::Healthy
-}
-
-fn adoptable(policy: &Policy, status: PathStatus, now_ms: u64) -> bool {
-    status.health == Health::Healthy && dwell(status.since_ms, now_ms) >= policy.recover_hold_ms()
+fn primary_failed(paths: PathSet) -> bool {
+    paths.same_core_dir.health == Health::Down && paths.same_core_cdn.health == Health::Down
 }
 
 fn may_switch(
@@ -326,17 +325,13 @@ fn may_switch(
     paths: PathSet,
     now_ms: u64,
 ) -> bool {
-    if rank(target) < rank(current) {
-        return true;
-    }
-    degrade_ready(policy, paths.get(current), now_ms)
-}
-
-fn degrade_ready(policy: &Policy, status: PathStatus, now_ms: u64) -> bool {
-    match status.health {
+    match paths.get(current).health {
         Health::Down => true,
-        Health::Suspect => dwell(status.since_ms, now_ms) >= policy.degrade_hold_ms(),
-        Health::Healthy => false,
+        Health::Suspect => held_for(paths.get(current), now_ms, policy.degrade_hold_ms()),
+        Health::Healthy => {
+            rank(target) < rank(current)
+                && held_for(paths.get(target), now_ms, policy.recover_hold_ms())
+        }
     }
 }
 
@@ -348,44 +343,52 @@ fn rank(path: PathId) -> u8 {
     }
 }
 
-fn dwell(since_ms: u64, now_ms: u64) -> u64 {
-    now_ms.saturating_sub(since_ms)
+fn held_for(status: PathStatus, now_ms: u64, hold_ms: u64) -> bool {
+    now_ms
+        .checked_sub(status.since_ms)
+        .is_some_and(|elapsed| elapsed >= hold_ms)
 }
 
-/// Lower bound `detect + min(backoff, BACKOFF_MAX) + rtt * round_trips`.
+/// Partial lower-bound estimate `detect + backoff + rtt * rounds`.
 ///
-/// The components are the only inputs. This does not add a 2ms handshake or a
-/// 100ms cross-continent LSA. `Ok(sum)` means the sum is at least 10s and is
-/// an input to a real test, not a measured P99. A smaller sum is
-/// [`FailoverError::FloorBelowTarget`], an incomplete budget, not a pass.
-/// `G-FAILOVER` is not decided here.
+/// All representable sums are returned, whether below, at, or above 10s. The
+/// 10s value is a measured P99 *target*, not a minimum or an arithmetic pass
+/// condition. A smaller lower bound does not prove the target is achievable.
+/// Configured backoff must separately respect [`BACKOFF_MAX`]. This arithmetic
+/// does not enforce that configuration: a supplied delay above the ceiling is
+/// counted in full, never clamped away to conceal a budget overrun.
+///
+/// The explicit components omit scheduling drift, authorization/freshness
+/// checks, route/circuit reconstruction, and the first successful round trip
+/// unless the caller included them in its inputs. `handshake_round_trips` must
+/// account for the required TCP/TLS/WSS/innerTLS setup, not a fixed loopback
+/// 2ms handshake or 100ms cross-continent LSA. Neither this partial sum nor
+/// `Ok` measures recovery or decides `G-FAILOVER`; real tests must time each
+/// stage under the plan's RTT/loss/failure injections.
 pub fn estimate_switch_floor(
     detect_ms: u64,
     backoff_ms: u64,
     rtt_ms: u64,
     handshake_round_trips: u32,
 ) -> Result<u64, FailoverError> {
-    let backoff = backoff_ms.min(BACKOFF_MAX);
     let trips = u64::from(handshake_round_trips);
     let rtt_total = rtt_ms
         .checked_mul(trips)
         .ok_or(FailoverError::BudgetOverflow)?;
     let sum = detect_ms
-        .checked_add(backoff)
+        .checked_add(backoff_ms)
         .and_then(|partial| partial.checked_add(rtt_total))
         .ok_or(FailoverError::BudgetOverflow)?;
-    if sum < INCOMPLETE_BELOW_MS {
-        Err(FailoverError::FloorBelowTarget { sum_ms: sum })
-    } else {
-        Ok(sum)
-    }
+    Ok(sum)
 }
 
 /// Accepted circuits on primary and backup.
 ///
 /// §8.5 lets backup accept fewer circuits. It does not let backup pick a weaker
 /// suite. This struct is not generic, has no suite or crypto-policy field, and
-/// [`CircuitCaps::new`] takes no such argument.
+/// [`CircuitCaps::new`] takes no such argument. These per-path limits are not
+/// aggregate admission control: the caller must still account for backup
+/// expansion, transient connections, memory and handshake budgets (§8.1–8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CircuitCaps {
     primary_circuit_cap: u8,
@@ -456,56 +459,39 @@ mod tests {
     }
 
     #[test]
-    fn policy_below_the_floors_is_rejected_and_a_longer_probe_is_accepted() {
-        assert_eq!(
-            Policy::try_new(
-                PROBE_INTERVAL - 1,
-                FAIL_THRESHOLD,
-                DEGRADE_HOLD,
-                RECOVER_HOLD
-            ),
-            Err(FailoverError::PolicyBelowFloor)
-        );
-        assert_eq!(
-            Policy::try_new(
-                PROBE_INTERVAL,
-                FAIL_THRESHOLD - 1,
-                DEGRADE_HOLD,
-                RECOVER_HOLD
-            ),
-            Err(FailoverError::PolicyBelowFloor)
-        );
-        assert_eq!(
-            Policy::try_new(
-                PROBE_INTERVAL,
-                FAIL_THRESHOLD,
-                DEGRADE_HOLD - 1,
-                RECOVER_HOLD
-            ),
-            Err(FailoverError::PolicyBelowFloor)
-        );
-        assert_eq!(
-            Policy::try_new(
-                PROBE_INTERVAL,
-                FAIL_THRESHOLD,
-                DEGRADE_HOLD,
-                RECOVER_HOLD - 1
-            ),
-            Err(FailoverError::PolicyBelowFloor)
-        );
-        let raised = Policy::try_new(5_000, 4, DEGRADE_HOLD, RECOVER_HOLD).unwrap();
-        assert_eq!(raised.probe_interval_ms(), 5_000);
-        assert_eq!(raised.fail_threshold(), 4);
+    fn policy_initial_values_are_defaults_not_floors() {
+        let initial = Policy::plan();
+        assert_eq!(initial.probe_interval_ms(), 2_000);
+        assert_eq!(initial.fail_threshold(), 3);
+        assert_eq!(initial.degrade_hold_ms(), 30_000);
+        assert_eq!(initial.recover_hold_ms(), 120_000);
 
+        let shorter = Policy::try_new(1_000, 2, 5_000, 10_000).unwrap();
+        assert_eq!(shorter.probe_interval_ms(), 1_000);
+        assert_eq!(shorter.fail_threshold(), 2);
+        assert_eq!(shorter.degrade_hold_ms(), 5_000);
+        assert_eq!(shorter.recover_hold_ms(), 10_000);
+        assert!(Policy::try_new(1, 1, 0, 0).is_ok());
+        assert!(Policy::try_new(u64::MAX, u32::MAX, u64::MAX, u64::MAX).is_ok());
+        assert_eq!(
+            Policy::try_new(0, FAIL_THRESHOLD, DEGRADE_HOLD, RECOVER_HOLD),
+            Err(FailoverError::InvalidProbePolicy)
+        );
+        assert_eq!(
+            Policy::try_new(PROBE_INTERVAL, 0, DEGRADE_HOLD, RECOVER_HOLD),
+            Err(FailoverError::InvalidProbePolicy)
+        );
+
+        let raised = Policy::try_new(5_000, 4, 31_000, 121_000).unwrap();
         let sent = [9u8; 16];
         let mut watch = ProbeWatch::new(raised);
         assert_eq!(
             watch.observe_reply(sent, sent, 0, 5_000),
             ProbeVerdict::Success
         );
-        let mut floor = ProbeWatch::new(Policy::plan());
+        let mut initial_watch = ProbeWatch::new(initial);
         assert_eq!(
-            floor.observe_reply(sent, sent, 0, 5_000),
+            initial_watch.observe_reply(sent, sent, 0, 5_000),
             ProbeVerdict::Late
         );
     }
@@ -579,6 +565,35 @@ mod tests {
     }
 
     #[test]
+    fn probe_deadline_overflow_and_backwards_time_are_handled_without_wraparound() {
+        let sent = [0x55; 16];
+        let mut watch = ProbeWatch::new(Policy::plan());
+        // The mathematical deadline exceeds u64::MAX; representable times
+        // after send are still within the interval, not wrapped deadlines.
+        assert_eq!(
+            watch.observe_reply(sent, sent, u64::MAX - 1_000, u64::MAX),
+            ProbeVerdict::Success
+        );
+        assert_eq!(watch.observe_reply(sent, sent, 10, 9), ProbeVerdict::Late);
+        assert_eq!(watch.consecutive_failures(), 1);
+        assert_eq!(
+            watch.observe_reply(sent, sent, 0, PROBE_INTERVAL),
+            ProbeVerdict::Success
+        );
+    }
+
+    #[test]
+    fn probe_failure_counter_saturates_instead_of_wrapping() {
+        let mut watch = ProbeWatch {
+            policy: Policy::try_new(1, u32::MAX, 0, 0).unwrap(),
+            consecutive_failures: u32::MAX - 1,
+        };
+        assert_eq!(watch.observe_missed_interval(), ProbeVerdict::Suspect);
+        assert_eq!(watch.observe_missed_interval(), ProbeVerdict::Suspect);
+        assert_eq!(watch.consecutive_failures(), u32::MAX);
+    }
+
+    #[test]
     fn healthy_dir_is_preferred_over_cdn_and_cdn_over_backup() {
         assert_eq!(
             PATH_PREFERENCE,
@@ -610,25 +625,40 @@ mod tests {
         assert_eq!(on_dead_cdn, Selection::SameCoreDir);
         assert_ne!(on_dead_cdn, Selection::BackupCdn);
 
-        // DIR has been healthy for 1s, so it is not adoptable yet, and it still
-        // blocks backup. The dead current path cannot stay up, so the result
-        // is StayDown rather than BackupCdn.
+        // A healthy DIR is immediately usable when the current CDN is down;
+        // the recover hold protects fail-back, not hard-failure availability.
         let blocked = choose(
             PathId::SameCoreCdn,
             paths(status(Health::Healthy, NOW - 1_000), down(), held(NOW)),
             NOW,
         );
-        assert_eq!(blocked, Selection::StayDown);
+        assert_eq!(blocked, Selection::SameCoreDir);
         assert_ne!(blocked, Selection::BackupCdn);
+    }
 
-        // Suspect is not Healthy, so it does not block backup once the degrade hold is open.
-        let suspect_dir = status(Health::Suspect, NOW - DEGRADE_HOLD);
-        let backup = choose(
-            PathId::SameCoreDir,
-            paths(suspect_dir, down(), held(NOW)),
-            NOW,
+    #[test]
+    fn backup_requires_both_primary_paths_down_not_merely_suspect() {
+        let suspect = status(Health::Suspect, NOW - DEGRADE_HOLD);
+        for set in [
+            paths(suspect, down(), held(NOW)),
+            paths(down(), suspect, held(NOW)),
+            paths(suspect, suspect, held(NOW)),
+        ] {
+            assert_ne!(choose(PathId::SameCoreDir, set, NOW), Selection::BackupCdn);
+        }
+        let recently_healthy_backup = status(Health::Healthy, NOW);
+        assert_eq!(
+            choose(
+                PathId::SameCoreDir,
+                paths(down(), down(), recently_healthy_backup),
+                NOW,
+            ),
+            Selection::BackupCdn
         );
-        assert_eq!(backup, Selection::BackupCdn);
+        assert_eq!(
+            choose(PathId::SameCoreDir, paths(down(), down(), suspect), NOW),
+            Selection::StayDown
+        );
     }
 
     #[test]
@@ -668,24 +698,24 @@ mod tests {
     }
 
     #[test]
-    fn recovered_path_is_not_used_at_119s_and_is_used_at_120s() {
-        let too_soon = paths(status(Health::Healthy, NOW - 119_000), down(), down());
+    fn healthy_current_path_fails_back_at_120s_not_119s() {
+        let too_soon = paths(status(Health::Healthy, NOW - 119_000), held(NOW), down());
         assert_eq!(
             choose(PathId::SameCoreCdn, too_soon, NOW),
-            Selection::StayDown
+            Selection::SameCoreCdn
         );
         assert_ne!(
             choose(PathId::SameCoreCdn, too_soon, NOW),
             Selection::SameCoreDir
         );
 
-        let boundary = paths(status(Health::Healthy, NOW - 119_999), down(), down());
+        let boundary = paths(status(Health::Healthy, NOW - 119_999), held(NOW), down());
         assert_eq!(
             choose(PathId::SameCoreCdn, boundary, NOW),
-            Selection::StayDown
+            Selection::SameCoreCdn
         );
 
-        let ready = paths(status(Health::Healthy, NOW - RECOVER_HOLD), down(), down());
+        let ready = paths(status(Health::Healthy, NOW - RECOVER_HOLD), held(NOW), down());
         assert_eq!(
             choose(PathId::SameCoreCdn, ready, NOW),
             Selection::SameCoreDir
@@ -706,31 +736,167 @@ mod tests {
     }
 
     #[test]
-    fn estimate_under_10s_is_an_incomplete_budget_not_a_pass() {
-        // 6_000 + min(1_000, BACKOFF_MAX) + 50 * 4 = 7_200.
-        // FloorBelowTarget is not Ok. This does not claim a failover finished within 10s.
+    fn hard_failure_uses_healthy_same_core_path_without_recovery_hold() {
+        let just_healthy = status(Health::Healthy, NOW);
         assert_eq!(
-            estimate_switch_floor(6_000, 1_000, 50, 4),
-            Err(FailoverError::FloorBelowTarget { sum_ms: 7_200 })
-        );
-        // Backoff above the plan ceiling is clamped. 8_000 + 1_000 = 9_000, not 13_000.
-        assert_eq!(
-            estimate_switch_floor(8_000, 5_000, 0, 0),
-            Err(FailoverError::FloorBelowTarget { sum_ms: 9_000 })
+            choose(
+                PathId::SameCoreDir,
+                paths(down(), just_healthy, held(NOW)),
+                NOW,
+            ),
+            Selection::SameCoreCdn
         );
         assert_eq!(
-            estimate_switch_floor(8_999, BACKOFF_MAX, 0, 0),
-            Err(FailoverError::FloorBelowTarget { sum_ms: 9_999 })
+            choose(
+                PathId::SameCoreCdn,
+                paths(just_healthy, down(), held(NOW)),
+                NOW,
+            ),
+            Selection::SameCoreDir
         );
-        // The Ok value is the sum, a lower bound to feed a real test, not a measured P99.
-        let sum = estimate_switch_floor(6_000, 1_000, 400, 8).unwrap();
-        assert_eq!(sum, 6_000 + 1_000 + 400 * 8);
-        assert!(sum >= 10_000);
-        assert_eq!(estimate_switch_floor(9_000, 1_000, 0, 0), Ok(10_000));
         assert_eq!(
-            estimate_switch_floor(u64::MAX, 0, u64::MAX, 2),
+            choose(PathId::BackupCdn, paths(down(), just_healthy, down()), NOW),
+            Selection::SameCoreCdn
+        );
+    }
+
+    #[test]
+    fn failback_considers_the_next_stable_primary_path() {
+        // DIR is preferred but has not stabilized; that must not hide a
+        // stable same-core CDN when moving back from a healthy backup.
+        assert_eq!(
+            choose(
+                PathId::BackupCdn,
+                paths(status(Health::Healthy, NOW), held(NOW), held(NOW)),
+                NOW,
+            ),
+            Selection::SameCoreCdn
+        );
+        assert_eq!(
+            choose(
+                PathId::SameCoreDir,
+                paths(held(NOW), held(NOW), held(NOW)),
+                NOW,
+            ),
+            Selection::SameCoreDir
+        );
+    }
+
+    #[test]
+    fn shorter_holds_apply_at_the_configured_boundaries() {
+        let policy = Policy::try_new(PROBE_INTERVAL, FAIL_THRESHOLD, 5_000, 10_000).unwrap();
+        for (elapsed, expected) in [
+            (4_999, Selection::SameCoreDir),
+            (5_000, Selection::SameCoreCdn),
+        ] {
+            assert_eq!(
+                select_path(
+                    &policy,
+                    CoreAttachment::Primary,
+                    PathId::SameCoreDir,
+                    paths(status(Health::Suspect, NOW - elapsed), held(NOW), down()),
+                    NOW,
+                ),
+                Ok(expected)
+            );
+        }
+        for (elapsed, expected) in [
+            (9_999, Selection::SameCoreCdn),
+            (10_000, Selection::SameCoreDir),
+        ] {
+            assert_eq!(
+                select_path(
+                    &policy,
+                    CoreAttachment::Primary,
+                    PathId::SameCoreCdn,
+                    paths(status(Health::Healthy, NOW - elapsed), held(NOW), down()),
+                    NOW,
+                ),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn hold_checks_reject_future_timestamps_even_with_zero_hysteresis() {
+        let policy = Policy::try_new(PROBE_INTERVAL, FAIL_THRESHOLD, 0, 0).unwrap();
+        let future = status(Health::Healthy, NOW + 1);
+        assert_eq!(
+            select_path(
+                &policy,
+                CoreAttachment::Primary,
+                PathId::SameCoreCdn,
+                paths(future, down(), down()),
+                NOW,
+            ),
+            Ok(Selection::StayDown)
+        );
+        assert_eq!(
+            select_path(
+                &policy,
+                CoreAttachment::Primary,
+                PathId::SameCoreDir,
+                paths(status(Health::Suspect, NOW + 1), held(NOW), down()),
+                NOW,
+            ),
+            Ok(Selection::SameCoreDir)
+        );
+        assert!(!held_for(status(Health::Healthy, 1), 0, 0));
+        assert!(!held_for(status(Health::Healthy, 1), u64::MAX, u64::MAX));
+        assert!(held_for(status(Health::Healthy, 0), u64::MAX, u64::MAX));
+        assert!(held_for(status(Health::Healthy, NOW), NOW, 0));
+        for (current, set) in [
+            (
+                PathId::SameCoreCdn,
+                paths(status(Health::Healthy, NOW), held(NOW), down()),
+            ),
+            (
+                PathId::SameCoreCdn,
+                paths(status(Health::Healthy, NOW), status(Health::Suspect, NOW), down()),
+            ),
+        ] {
+            assert_eq!(
+                select_path(&policy, CoreAttachment::Primary, current, set, NOW),
+                Ok(Selection::SameCoreDir)
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_returns_partial_arithmetic_on_both_sides_of_the_p99_target() {
+        // None of these Ok values is a measured P99 or a gate pass.
+        for (rtt, sum) in [(50, 7_200), (200, 7_800), (400, 8_600)] {
+            assert_eq!(estimate_switch_floor(6_000, 1_000, rtt, 4), Ok(sum));
+        }
+        assert_eq!(estimate_switch_floor(8_999, BACKOFF_MAX, 0, 0), Ok(9_999));
+        assert_eq!(estimate_switch_floor(9_000, BACKOFF_MAX, 0, 0), Ok(10_000));
+        assert_eq!(estimate_switch_floor(9_001, BACKOFF_MAX, 0, 0), Ok(10_001));
+        assert_eq!(estimate_switch_floor(0, 0, 0, 0), Ok(0));
+        // Zero rounds must not overflow even with a large RTT input.
+        assert_eq!(estimate_switch_floor(0, 0, u64::MAX, 0), Ok(0));
+        // An over-ceiling delay is counted honestly, not hidden by a clamp.
+        // Returning its sum does not approve the backoff configuration.
+        assert_eq!(estimate_switch_floor(8_000, 5_000, 0, 0), Ok(13_000));
+        assert_eq!(estimate_switch_floor(0, u64::MAX, 0, 0), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn estimate_checks_multiplication_and_each_addition_without_saturating() {
+        assert_eq!(
+            estimate_switch_floor(0, 0, u64::MAX, 2),
             Err(FailoverError::BudgetOverflow)
         );
+        assert_eq!(
+            estimate_switch_floor(u64::MAX, 1, 0, 0),
+            Err(FailoverError::BudgetOverflow)
+        );
+        assert_eq!(
+            estimate_switch_floor(u64::MAX - 1, 1, 1, 1),
+            Err(FailoverError::BudgetOverflow)
+        );
+        assert_eq!(estimate_switch_floor(u64::MAX, 0, 0, 0), Ok(u64::MAX));
+        assert_eq!(estimate_switch_floor(u64::MAX - 1, 0, 1, 1), Ok(u64::MAX));
+        assert_eq!(estimate_switch_floor(0, 0, u64::MAX, 1), Ok(u64::MAX));
     }
 
     #[test]
