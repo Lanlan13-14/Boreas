@@ -740,16 +740,21 @@ impl<'a> E2eCircuit<'a> {
         self.info.circuit_id
     }
 
-    /// End the circuit cleanly: `close_notify` on the E2E TLS stream, then the
-    /// circuit's own `CircuitClose`. A peer reading the byte stream sees a
-    /// finished TLS record layer (`Ok(0)`) instead of a truncated record.
+    /// End the E2E TLS record layer with `close_notify` before the circuit is
+    /// torn down.
+    ///
+    /// The circuit's own `CircuitClose` frame cannot be sent from here: this
+    /// circuit holds the E2E byte stream, and the `CircuitStream` underneath it
+    /// is no longer reachable. `close_notify` is what the peer's reader
+    /// observes — it turns the next read into a clean end of stream (`Ok(0)`)
+    /// instead of a truncated TLS record. The `CircuitStream` drop that follows
+    /// still sends its best-effort `CircuitReset`, exactly as any other drop of
+    /// this circuit does.
     ///
     /// Best-effort by design. A planned stop must not turn a peer that already
-    /// went away into a local failure, and the circuit drop path still sends a
-    /// `CircuitReset` if this close did not complete.
+    /// went away into a local failure.
     pub fn close_gracefully(&mut self) {
         let _ = self.stream.close_stream();
-        let _ = self.stream.finish();
     }
 }
 
