@@ -5,22 +5,22 @@
 //! current validity using caller-supplied trusted UTC on every use.
 #![cfg(feature = "openssl-backend")]
 
-use crate::root_authorization::{NetworkRootPin, VerifiedIssuerAuthorization};
 #[cfg(target_os = "linux")]
 use crate::root_authorization::{self, MAX_CANDIDATE_BYTES};
+use crate::root_authorization::{NetworkRootPin, VerifiedIssuerAuthorization};
 #[cfg(target_os = "linux")]
 use openssl::hash::{MessageDigest, hash};
-use std::{fmt, io, path::Path};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::{fmt, io, path::Path};
 #[cfg(target_os = "linux")]
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::PathBuf,
 };
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRTS\0\0\0\x01";
