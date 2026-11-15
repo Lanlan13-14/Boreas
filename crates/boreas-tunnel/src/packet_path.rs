@@ -502,11 +502,14 @@ impl AuthorizedEndpoints {
         if circuit_id == [0; 16] || path_hops == 0 || path_hops > MAX_RELAY_HOPS {
             return Err(PacketPathError::CircuitMismatch);
         }
+        // Slot validity is a property of one identity, not of the pair. A Core
+        // that claims an Edge octet is `InvalidPermanentSlot` even when the
+        // other endpoint happens to carry the same node id.
+        let local = EndpointFacts::from_verified_identity(local)?;
+        let peer = EndpointFacts::from_verified_identity(peer)?;
         if local.net_id != peer.net_id || local.node_id == peer.node_id {
             return Err(PacketPathError::IdentityMismatch);
         }
-        let local = EndpointFacts::from_verified_identity(local)?;
-        let peer = EndpointFacts::from_verified_identity(peer)?;
         if local.vip == peer.vip {
             return Err(PacketPathError::SelfPair);
         }
