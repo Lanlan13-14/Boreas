@@ -1379,23 +1379,18 @@ mod tests {
         let peer = identity(0x0209, NodeRole::Edge);
         let (device, host) = VirtualTun::try_pair(8, 8, mtu).expect("bounded pair");
 
-        // Structurally valid but sourced from a third host: refused.
+        // Structurally valid but sourced from a third host: discarded locally.
         let spoofed = ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoof");
         device.inject(&spoofed).expect("structurally valid");
         let (sink, log) = OutboundSink::new();
         let mut path =
             PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
-        assert_eq!(
-            path.step_outbound(),
-            Err(PacketPathError::Denied(PacketDeny::SourceNotLocal))
-        );
-        assert_eq!(
-            path.first_error(),
-            Some(PacketPathError::Denied(PacketDeny::SourceNotLocal))
-        );
-        assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
-        assert_eq!(path.stats().failures, 1);
-        assert!(!path.is_open());
+        assert_eq!(path.step_outbound(), Ok(None));
+        assert_eq!(path.first_error(), None);
+        assert_eq!(path.step_outbound(), Ok(None));
+        assert_eq!(path.stats().dropped_outbound, 1);
+        assert_eq!(path.stats().failures, 0);
+        assert!(path.is_open());
         assert!(log.borrow().is_empty(), "nothing reaches the wire");
 
         // A frame whose packet is addressed to the wrong host.
