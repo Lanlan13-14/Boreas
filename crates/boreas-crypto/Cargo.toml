@@ -9,10 +9,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
-openssl-backend = ["dep:openssl", "dep:openssl-sys"]
+openssl-backend = ["dep:openssl", "dep:openssl-sys", "dep:foreign-types-shared"]
 
 [dependencies]
 # Pinned to the maintained upstream rust-openssl release reviewed in docs/research.
 # This opts into actual OpenSSL via feature only; the default workspace build stays backend-free.
 openssl = { version = "=0.10.82", optional = true }
 openssl-sys = { version = "=0.9.118", optional = true }
+# Importing ForeignTypeRef is required to pass SslRef's borrowed pointer to
+# openssl-sys introspection functions without owning/freeing the SSL object.
+foreign-types-shared = { version = "=0.1.1", optional = true }

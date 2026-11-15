@@ -22,6 +22,7 @@ version = "0.1.0"
 name = "boreas-crypto"
 version = "0.1.0"
 dependencies = [
+ "foreign-types-shared",
  "openssl",
  "openssl-sys",
 ]

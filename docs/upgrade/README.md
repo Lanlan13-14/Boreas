@@ -1,9 +1,11 @@
 # Upgrade transaction core (initial implementation)
 
 `boreas-supervisor` is an independent Rust 2024, version `0.1.0`, GPL-3.0-only
-library with no third-party dependencies. It is intended for later integration
-into the existing single `boreas` CLI binary; it does **not** add a daemon,
-installer command, updater, or service unit.
+library with no third-party dependencies, plus a minimal external-supervisor
+executable (`[[bin]] boreas-supervisor`, master plan §1.1/§10.3). It is still
+intended for later integration into the shipped filesystem layout; it does
+**not** add a daemon, installer command, updater, download, or service unit,
+and it does not claim the master plan's `G-UPGRADE` gate.
 
 ## Current API and transaction model
 
@@ -24,9 +26,56 @@ Old version directories are deliberately not deleted.
 Crash safety covers the pointer-rename / journal-update ordering: even if a crash
 occurs after the new pointer is durable but before the journal reaches
 `Activated`, the durable `Prepared` record directs recovery to restore the old
-pointer. Recovery is a library state transition, not a process launcher: the
-external supervisor must invoke it before starting the program. Restarting a
-broken active executable repeatedly is not recovery.
+pointer. `recover()` itself is a library state transition, not a process
+launcher: the external supervisor must invoke it before starting the program.
+Restarting a broken active executable repeatedly is not recovery.
+
+`UpgradeStore::begin_activation()` is the one reviewed composition of
+"recover before launch" with the single permitted first launch of a
+`Prepared` candidate: no journal or a consistent `Confirmed` journal reports
+the steady version; an `Activated` journal (trial already consumed, never
+confirmed) rolls back without retrying; a `Prepared` journal is recovered
+first (repairing the crash-mid-`activate` window) and only then activated
+once as a trial launch; a `Confirmed` journal whose pointer disagrees with
+it is refused for operator inspection rather than retried. Existing
+`prepare`/`activate`/`confirm`/`recover` semantics are unchanged.
+
+## External supervisor executable (minimal real process slice)
+
+The `boreas-supervisor` binary exposes exactly four commands — it has no
+`prepare`/`activate`, so nobody can stage an unverified artifact through it:
+
+* `supervise --store <DIR> -- <argv...>` — open the store, run
+  `begin_activation()` (which starts in `recover()`), then spawn `<argv...>`
+  as a real child process with inherited stdio and wait for it. A leading
+  `{version}` in `argv[0]` is replaced with the absolute active-version
+  directory *after* recovery/activation, so the program started is the one
+  the pointer names (the candidate on a trial, the old program after a
+  rollback); it fails closed when no version is active, when the pointer is
+  dangling, or when `{version}` appears outside `argv[0]`. A trial launch
+  calls `confirm()` only on a zero exit and `recover()` on any other
+  outcome (non-zero exit, death by signal, spawn/wait failure), returning
+  non-zero; a boot that starts from `Activated` runs the already
+  rolled-back program and propagates its status (child code, `128+signal`
+  when killed); an inconsistent journal refuses the launch. Old version
+  directories are never deleted.
+* `recover --store <DIR> [--json]` — `UpgradeStore::open + recover()` only;
+  launches nothing.
+* `status --store <DIR> [--json]` — prints the real journal, the recorded
+  active pointer (including a dangling one, via `pointer_ok: false`), and
+  the count of retained version directories. Nothing is synthesised.
+* `--help`.
+
+Documented gaps, deliberately not papered over: no signal forwarding to the
+child yet; the only health signal is the child's exit status (a zero exit
+at any time confirms — the §10.3/§10.5 health channel does not exist yet);
+no store locking beyond the library's single-writer requirement; and no
+cross-lifetime "candidate already failed" ledger — after a failed trial the
+journal returns to `Prepared`, so a fresh `supervise` trials it again.
+Bounding that loop is service policy (trial budget/cooldown/operator
+acknowledgement) that belongs to the §10.5 systemd/OS integration; until
+then the service manager must bound restarts. `G-UPGRADE` remains unproven
+(power-cut/fault-injection matrix, real service wiring, full trial policy).
 
 ## Authenticity and integration boundary
 
@@ -44,9 +93,12 @@ key rotation/revocation and anti-rollback state are not implemented.
 
 Other unimplemented integration work includes executable-format/architecture
 checks, preflight (state schema, seccomp/capability, disk space), health
-supervision/timeout, process restart/exec, service manager wiring, permissions
-and lock/concurrency policy, state migration, artifact cleanup, fd handoff,
-and fault-injection/power-cut validation.
+supervision beyond exit status (health channel, timeouts, signal
+forwarding), fingerprint state schema across exec, service manager wiring,
+permissions and lock/concurrency policy, state migration, artifact cleanup,
+fd handoff, and fault-injection/power-cut validation. The supervisor binary
+above implements child spawn/wait and journal-driven confirm/rollback only;
+it is not a service manager and does no restart loop of its own.
 
 ## Filesystem security and platform boundary
 
@@ -80,12 +132,21 @@ testing.
 
 ## Required CI gates before release
 
-Run crate unit tests and formatting/lint checks in GitHub Actions only (per the
-repository's development constraint; do not run cargo/rustc/test/formatter
-locally). Expand tests to cover process-level crash injection at each durable
-write boundary, corrupt/missing pointer and journal, disk-full/permission
-failures, symlink and traversal races, concurrency, supported filesystem
-matrix, real external supervisor restart, and old-version executable recovery.
-Then satisfy the master plan's `G-UPGRADE` and `G-SUPPLY` gates plus the common
-production exit conditions. The code here is an initial core, not proof those
-gates pass.
+Run `cargo test -p boreas-supervisor`, `cargo clippy -p boreas-supervisor
+--all-targets -- -D warnings`, and `cargo fmt --check` in CI; local runs are
+development feedback only and are not release evidence. Current tests cover
+the journal/pointer primitives plus the supervisor CLI driving real child
+scripts: trial non-zero exit and death-by-signal roll back, zero exit
+confirms and retains the old directory, an unconfirmed `Activated` journal
+is rolled back before the old program launches (never confirming after
+`recover()`), repeated `supervise` runs keep the pointer consistent, and
+missing argv/program or a dangling pointer fail closed with `status`
+reporting the on-disk truth. Still to expand before any gate claim:
+process-level crash injection at each durable write boundary (including
+`SIGKILL` of the supervisor itself mid-trial), disk-full/permission failures,
+symlink and traversal races, concurrency, supported filesystem matrix,
+power-cut testing, real service-manager restart integration, and
+old-version executable recovery in the shipped layout. Then satisfy the
+master plan's `G-UPGRADE` and `G-SUPPLY` gates plus the common production
+exit conditions. The code here is an initial core plus a minimal supervisor
+boundary, not proof those gates pass.

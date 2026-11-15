@@ -5,6 +5,7 @@
 //! trust layer. Nothing here implements a production packet data plane or TLS;
 //! it does not relax the Phase 0 TLS requirements.
 
+pub mod directory;
 pub mod relay;
 pub mod resource;
 pub mod scheduler;

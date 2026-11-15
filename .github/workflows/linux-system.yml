@@ -30,4 +30,4 @@ jobs:
       - name: Clippy crate
         run: cargo clippy -p boreas-tun --all-targets --locked -- -D warnings
       - name: Unit and real-device tests as root
-        run: sudo -E env "PATH=$PATH" cargo test -p boreas-tun --locked -- --test-threads=1
+        run: sudo -E env "PATH=$PATH" BOREAS_REQUIRE_TUN=1 cargo test -p boreas-tun --locked -- --test-threads=1

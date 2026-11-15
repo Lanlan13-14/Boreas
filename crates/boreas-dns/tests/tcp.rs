@@ -245,7 +245,7 @@ fn real_smoltcp_v4_handshake_dns_frame_and_reply() {
     use smoltcp::socket::tcp;
     let (mut c, mut s, mut endpoint) = setup_v4();
     let dh = dns();
-    let ch = connect(&mut c, &mut s, 0, SERVER4.into(), 53000);
+    let ch = connect(&mut c, &mut s, 0, IpAddress::Ipv4(SERVER4), 53000);
     let mut got = Vec::new();
     for n in 0..12 {
         let q = query(0x1234);
@@ -274,7 +274,7 @@ fn tcp_framing_survives_split_prefix_body_and_coalesced_queries() {
     use smoltcp::socket::tcp;
     let (mut c, mut s, mut endpoint) = setup_v4();
     let dh = dns();
-    let ch = connect(&mut c, &mut s, 0, SERVER4.into(), 53001);
+    let ch = connect(&mut c, &mut s, 0, IpAddress::Ipv4(SERVER4), 53001);
     let q1 = framed(&query(1));
     let q2 = framed(&query(2));
     let split = q1.len() / 2;
@@ -316,7 +316,7 @@ fn v6_tcp_and_invalid_frame_close() {
     use smoltcp::socket::tcp;
     let (mut c, mut s, mut endpoint) = setup_v6();
     let dh = dns();
-    let ch = connect(&mut c, &mut s, 0, SERVER6.into(), 53002);
+    let ch = connect(&mut c, &mut s, 0, IpAddress::Ipv6(SERVER6), 53002);
     c.sockets
         .get_mut::<tcp::Socket>(ch)
         .send_slice(&framed(&query(0xbeef)))
@@ -327,7 +327,7 @@ fn v6_tcp_and_invalid_frame_close() {
         let _ = receive_tcp(&mut c.sockets, ch, &mut got);
     }
     assert!(got.len() > 2);
-    let ch2 = connect(&mut c, &mut s, 500, SERVER6.into(), 53003);
+    let ch2 = connect(&mut c, &mut s, 500, IpAddress::Ipv6(SERVER6), 53003);
     c.sockets
         .get_mut::<tcp::Socket>(ch2)
         .send_slice(&[0, 0])
