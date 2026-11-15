@@ -52,6 +52,21 @@
 
 ## 4. 变更日志模板
 
+可复用的完整模板见 [Release 模板](<../../.github/RELEASE_TEMPLATE.md>)；
+[GitHub 变更分类配置](<../../.github/release.yml>)仅整理合并的 PR，不发布版本，
+不保证 PR 标题已净化。发布前必须人工审查最终说明。
+[结构检查器](<../../tools/release/validate_release_notes.py>)提供以下接口：
+
+```sh
+python tools/release/validate_release_notes.py /path/to/release-notes.md --json
+```
+
+正常结构退出 `0`，拒绝退出 `1`，参数错误由 argparse 返回 `2`。
+它检查有限的 Emoji/控制字符范围、256 KiB 输入上限、UTF-8、软件 SemVer、
+唯一 source commit/channel、开发版非生产标记与必需章节；Unicode 检查不是完整
+Emoji 数据库，结构通过也不证明内容真实、安全、签名或门禁通过。模板占位符须先填实。
+检查器回归测试只在 Actions 执行；它不会创建 tag 或 GitHub Release。
+
 下列是待填写模板，不代表任何字段已经完成。章节名统一，简体中文或 English 均可，禁止 Emoji。明确区分实现、实测证据、设计目标和待证项。
 
 ```markdown

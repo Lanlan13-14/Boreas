@@ -1,0 +1,30 @@
+# GitHub-generated draft notes organize merged PRs; this does not publish a release.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release-notes
+    authors:
+      - github-actions[bot]
+  categories:
+    - title: Security
+      labels:
+        - security
+    - title: Added
+      labels:
+        - enhancement
+        - feature
+    - title: Changed
+      labels:
+        - change
+        - compatibility
+    - title: Fixed
+      labels:
+        - bug
+        - fix
+    - title: Maintenance
+      labels:
+        - maintenance
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"
