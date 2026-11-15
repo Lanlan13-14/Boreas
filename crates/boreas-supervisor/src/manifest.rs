@@ -1802,12 +1802,6 @@ mod tests {
         let a = verified(GOOD.as_bytes());
         let b = verified(GOOD.replace("\"sequence\":4", "\"sequence\":5").as_bytes());
         let equiv = verified(GOOD.replace("\"size\":42", "\"size\":43").as_bytes());
-        // A genuinely *new*, lower-numbered manifest, for the rollback case.
-        let older = verified(
-            GOOD.replace("\"sequence\":4", "\"sequence\":3")
-                .replace("\"size\":42", "\"size\":43")
-                .as_bytes(),
-        );
         let mut ledger = SequenceLedger::default();
         ledger.observe(&a).unwrap();
         // Re-observing the same bytes is idempotent, not a rollback.

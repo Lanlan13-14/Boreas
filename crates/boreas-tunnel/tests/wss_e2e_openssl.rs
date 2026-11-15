@@ -5,9 +5,10 @@
 //! candidate confirmation -> business stream. Loopback-origin evidence only;
 //! not CDN support or independent implementation interop.
 use boreas_crypto::{
-    NodeRole, Policy,
+    Policy,
     backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
 };
+use boreas_pki::NodeRole as PkiNodeRole;
 use boreas_pki::management::{
     IdentityAuthority, IdentityTemplate, IssuerScope, ManagementTrust, VerifiedObject,
 };
@@ -297,7 +298,7 @@ fn verified_identity(
             .expect("issuer ML-DSA PKCS8"),
     )
     .expect("IdentityAuthority");
-    let scope = IssuerScope::for_identity(vec![NodeRole::Edge, NodeRole::Core], vec![1])
+    let scope = IssuerScope::for_identity(vec![PkiNodeRole::Edge, PkiNodeRole::Core], vec![1])
         .expect("bounded identity scope");
     let body = authority
         .node_identity_from_csr(
@@ -306,9 +307,9 @@ fn verified_identity(
                 home_core_id: 1,
                 vip_octet: node as u8,
                 role: match role {
-                    ObjectRole::Edge => NodeRole::Edge,
-                    ObjectRole::Core => NodeRole::Core,
-                    ObjectRole::EnrollmentService => NodeRole::EnrollmentService,
+                    ObjectRole::Edge => PkiNodeRole::Edge,
+                    ObjectRole::Core => PkiNodeRole::Core,
+                    ObjectRole::EnrollmentService => PkiNodeRole::EnrollmentService,
                 },
                 identity_generation: generation,
                 identity_pub_ed25519: ed_public,
