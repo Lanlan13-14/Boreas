@@ -13,12 +13,12 @@ pub mod revoke_cleanup;
 /// Bounded NetworkRoot authorization candidate validation; requires the real crypto backend.
 #[cfg(feature = "openssl-backend")]
 pub mod root_authorization;
-/// Durable NetworkRoot authorization store; Linux durability only, backend required.
-#[cfg(feature = "openssl-backend")]
-pub mod trust_store;
 /// Durable signed-status freshness store; Linux durability only, backend required.
 #[cfg(feature = "openssl-backend")]
 pub mod status_store;
+/// Durable NetworkRoot authorization store; Linux durability only, backend required.
+#[cfg(feature = "openssl-backend")]
+pub mod trust_store;
 
 use core::fmt;
 

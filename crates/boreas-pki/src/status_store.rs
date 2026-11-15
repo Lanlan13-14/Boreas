@@ -62,7 +62,7 @@ use boreas_proto::{
 use openssl::hash::{MessageDigest, hash};
 
 use crate::{
-    CLOCK_ROLLBACK_TOLERANCE_US, PolicyError, SnapshotResult, STATUS_MAX_AGE_US,
+    CLOCK_ROLLBACK_TOLERANCE_US, PolicyError, STATUS_MAX_AGE_US, SnapshotResult,
     management::{self, MAX_SIGNED_OBJECT_BYTES, ManagementTrust, VerifiedObject},
 };
 
@@ -674,7 +674,12 @@ impl StatusStore {
             file.sync_all()?;
             drop(file);
             fs::rename(&staging, &self.path)?;
-            File::open(self.path.parent().ok_or_else(|| io::Error::other("parent"))?)?.sync_all()
+            File::open(
+                self.path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("parent"))?,
+            )?
+            .sync_all()
         })();
         if let Err(error) = result {
             let _ = fs::remove_file(&staging);
@@ -769,9 +774,7 @@ fn snapshot_from_verified(verified: &VerifiedObject, net: [u8; 16]) -> Result<Sn
     {
         return Err(Error::BadStatus);
     }
-    if body.issued_at >= body.next_update
-        || body.next_update - body.issued_at > STATUS_MAX_AGE_US
-    {
+    if body.issued_at >= body.next_update || body.next_update - body.issued_at > STATUS_MAX_AGE_US {
         return Err(Error::Policy(PolicyError::InvalidSnapshotWindow));
     }
     Ok(Snapshot {
@@ -793,10 +796,7 @@ struct ConflictCandidate {
     object_id: [u8; 32],
 }
 
-fn decode_conflict_candidate(
-    raw_signed: &[u8],
-    net: [u8; 16],
-) -> Result<ConflictCandidate, Error> {
+fn decode_conflict_candidate(raw_signed: &[u8], net: [u8; 16]) -> Result<ConflictCandidate, Error> {
     if raw_signed.is_empty() || raw_signed.len() > MAX_SIGNED_OBJECT_BYTES {
         return Err(Error::TooLarge);
     }
@@ -826,9 +826,7 @@ fn decode_conflict_candidate(
     {
         return Err(Error::BadStatus);
     }
-    if body.issued_at >= body.next_update
-        || body.next_update - body.issued_at > STATUS_MAX_AGE_US
-    {
+    if body.issued_at >= body.next_update || body.next_update - body.issued_at > STATUS_MAX_AGE_US {
         return Err(Error::Policy(PolicyError::InvalidSnapshotWindow));
     }
     Ok(ConflictCandidate {
@@ -1004,10 +1002,7 @@ struct Reader<'a> {
 #[cfg(target_os = "linux")]
 impl<'a> Reader<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or(Error::Corrupt)?;
+        let end = self.position.checked_add(length).ok_or(Error::Corrupt)?;
         if end > self.bytes.len() {
             return Err(Error::Corrupt);
         }
@@ -1149,10 +1144,7 @@ fn open_private(path: &Path, create: bool) -> Result<File, Error> {
 #[cfg(target_os = "linux")]
 fn open_existing(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .custom_flags(0x20000 | 0x800);
+    options.read(true).write(true).custom_flags(0x20000 | 0x800);
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));
@@ -1206,8 +1198,8 @@ mod tests {
     use boreas_proto::{
         messages::{SignedObject, SignerRole, SignerSignatures},
         objects::{
-            ManagementObject, MldsaParameterSet, ObjectType, StatusSnapshot as ObjectStatusSnapshot,
-            SubjectIdentity,
+            ManagementObject, MldsaParameterSet, ObjectType,
+            StatusSnapshot as ObjectStatusSnapshot, SubjectIdentity,
         },
     };
     use openssl::{
@@ -1241,13 +1233,8 @@ mod tests {
                 generation: 1,
                 authority,
                 ed25519: PKey::generate_ed25519().unwrap(),
-                mldsa: PKey::private_key_from_seed(
-                    None,
-                    KeyType::ML_DSA_65,
-                    None,
-                    &[key_id; 32],
-                )
-                .unwrap(),
+                mldsa: PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[key_id; 32])
+                    .unwrap(),
             }
         }
 
@@ -1535,10 +1522,7 @@ mod tests {
             ));
             assert_eq!(store.recover_trusted_utc(100_000_000).unwrap(), 100_000_000);
             assert!(!store.is_clock_latched());
-            assert_eq!(
-                store.observe_trusted_utc(100_000_001).unwrap(),
-                100_000_001
-            );
+            assert_eq!(store.observe_trusted_utc(100_000_001).unwrap(), 100_000_001);
         }
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1817,16 +1801,10 @@ mod tests {
         }
 
         let wrong_authority = TestSigner::new(12, Authority::IdentityAuthority);
-        let raw_wrong_authority =
-            wrong_authority.sign_snapshot(1_000_000, 2_000_000, 1, b"a");
+        let raw_wrong_authority = wrong_authority.sign_snapshot(1_000_000, 2_000_000, 1, b"a");
         let authority_path = directory.join("authority-state");
-        let mut store = StatusStore::open(
-            &authority_path,
-            NET,
-            uid,
-            trust_for(&wrong_authority),
-        )
-        .unwrap();
+        let mut store =
+            StatusStore::open(&authority_path, NET, uid, trust_for(&wrong_authority)).unwrap();
         assert!(matches!(
             store.accept_signed_snapshot(&raw_wrong_authority, 1_500_000, Instant::now()),
             Err(Error::BadStatus)
@@ -1844,8 +1822,7 @@ mod tests {
         let raw_first = first.sign_snapshot(1_000_000, 3_000_000, 1, b"a");
         let raw_second_same = second.sign_snapshot(1_000_000, 3_000_000, 1, b"b");
         let raw_second_next = second.sign_snapshot(1_100_000, 3_100_000, 2, b"c");
-        let mut store =
-            StatusStore::open(&path, NET, uid, trust_with(&[&first, &second])).unwrap();
+        let mut store = StatusStore::open(&path, NET, uid, trust_with(&[&first, &second])).unwrap();
         assert!(matches!(
             store.accept_signed_snapshot(&raw_first, 1_500_000, Instant::now()),
             Ok(SnapshotResult::Accepted)
