@@ -28,10 +28,11 @@ openssl-backend = ["dep:openssl"]
 # default workspace build, which keeps the musl static artifacts crypto-free.
 openssl = { version = "=0.10.82", optional = true }
 
-# macOS only. The store's `F_FULLFSYNC` and directory-fsync backend uses the
-# generated bindings of the same pinned `libc` release the rest of the
+# Unix only. Two backends use it: the macOS store flush (`F_FULLFSYNC`) and the
+# Linux/macOS readiness + signal handling (`SO_PEERCRED` / `getpeereid`,
+# `signal`/`kill`). It is the same pinned `libc` release the rest of the
 # workspace already locks (`boreas-tun`), so no new package enters
 # `Cargo.lock`. Windows needs `windows-sys`, which is *not* locked, so its
 # adapter stays unwired and the store keeps failing closed there.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

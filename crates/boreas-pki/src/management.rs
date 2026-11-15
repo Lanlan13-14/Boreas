@@ -23,14 +23,15 @@
 //! directory must persist accepted object IDs/watermarks (and both evidence sides) before
 //! acting or before restart. This is not yet a durable global replay database.
 //!
-//! `AttachmentLease` is intentionally rejected with [`Error::UnsupportedTwoPartyObject`].
-//! The proto envelope now supports two signers, but `objects::NodeIdentity` still carries
-//! only `identity_pub_mldsa`, with no node Ed25519 management key bound into the signed
-//! identity. A node Primary Ed25519 signature therefore cannot be verified from the
-//! identity record. This slice does not downgrade the AND rule to ML-DSA-only and does not
-//! claim `G-AUTHZ` complete for leases; the schema ADR must add a node Ed25519 management
-//! public key (IdentityAuthority-bound, never addable by a forwarding Core) or explicitly
-//! redefine the lease signer rule.
+//! `AttachmentLease` uses two mandatory signers: the Primary signature must verify with
+//! the node Ed25519 + ML-DSA public keys in an already verified `NodeIdentity`, and the
+//! CoSign signature must verify with the target Core's `CoreOperationalKey`. The two
+//! signatures cover the same exact TBS. A node Ed25519 key is accepted only through the
+//! IdentityAuthority-bound NodeIdentity object; a forwarding Core cannot add it.
+//!
+//! The NodeIdentity schema revision is still a candidate. Online enrollment Ed binding
+//! remains gated on a controlled CSR proof-of-possession design and a formally assigned
+//! extension OID; offline/controlled provisioning is the only claimed path until then.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -42,7 +43,7 @@ use boreas_proto::objects::{
     ObjectBody, ObjectType, SubjectIdentity,
 };
 use openssl::hash::{MessageDigest, hash};
-use openssl::pkey::{KeyType, PKey, Private};
+use openssl::pkey::{Id, KeyType, PKey, Private};
 use openssl::sign::{Signer, Verifier};
 
 use crate::{Authority, NodeRole};
@@ -59,6 +60,8 @@ pub const MAX_TRUSTED_ISSUERS: usize = 256;
 /// Bounded replay/equivocation slot table. Route grants can address many prefixes,
 /// so the table needs its own cap rather than assuming one entry per issuer.
 pub const MAX_REPLAY_SLOTS: usize = 16_384;
+/// Maximum verified NodeIdentity records retained for Lease two-party verification.
+pub const MAX_NODE_IDENTITIES: usize = 4_096;
 const MAX_SCOPE_ROLES: usize = 3;
 const MAX_SCOPE_CORES: usize = 16;
 const MAX_SCOPE_PREFIXES: usize = 256;
@@ -82,6 +85,8 @@ pub enum Error {
     NotYetValid,
     Expired,
     UnknownIssuer,
+    UnknownNodeIdentity,
+    StaleNodeIdentity,
     IssuerGenerationMismatch,
     UnauthorizedObjectType,
     OutOfScope,
@@ -243,6 +248,10 @@ enum ReplayKey {
         issuer_key_id: Vec<u8>,
         subject_node_id: u16,
     },
+    Lease {
+        node_id: u16,
+        target_core_id: u8,
+    },
     StatusSnapshot,
 }
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +270,9 @@ struct ReplayState {
 pub struct ManagementTrust {
     net_id: [u8; 16],
     issuers: BTreeMap<Vec<u8>, IssuerRecord>,
+    /// Only NodeIdentity records accepted through this verifier; a Lease Primary key is
+    /// never taken from an unsigned caller-supplied map.
+    node_identities: BTreeMap<u16, NodeIdentity>,
     replay: BTreeMap<ReplayKey, ReplayState>,
     /// Last conflicting envelope bytes, retained for evidence. Bounded to one object;
     /// a durable directory must copy it to its own append-only evidence store.
@@ -271,6 +283,7 @@ impl ManagementTrust {
         Self {
             net_id,
             issuers: BTreeMap::new(),
+            node_identities: BTreeMap::new(),
             replay: BTreeMap::new(),
             conflict_evidence: None,
         }
@@ -284,6 +297,10 @@ impl ManagementTrust {
     /// Full envelope bytes of the most recent equivocation, if any.
     pub fn conflict_evidence(&self) -> Option<&[u8]> {
         self.conflict_evidence.as_deref()
+    }
+    /// Verified NodeIdentity used for the Lease Primary signer, if already accepted.
+    pub fn node_identity(&self, node_id: u16) -> Option<&NodeIdentity> {
+        self.node_identities.get(&node_id)
     }
 
     /// Provision one issuer. Key material is parsed and algorithm-checked here, and key IDs
@@ -372,7 +389,9 @@ impl ManagementTrust {
             return Err(Error::IssuerGenerationMismatch);
         }
         let kind = object_kind(&object.body)?;
-        if signed.signers.len() != 1 {
+        let is_lease = matches!(&object.body, ObjectBody::AttachmentLease(_));
+        let expected_signers = if is_lease { 2 } else { 1 };
+        if signed.signers.len() != expected_signers {
             return Err(Error::ImproperSignerRole);
         }
         let target_core_id = target_core_id(issuer.authority, &object.body);
@@ -380,13 +399,29 @@ impl ManagementTrust {
             return Err(Error::UnauthorizedObjectType);
         }
         authorize_scope(&issuer, &object)?;
+        if let ObjectBody::NodeIdentity(node) = &object.body {
+            if !self.node_identities.contains_key(&node.node_id)
+                && self.node_identities.len() >= MAX_NODE_IDENTITIES
+            {
+                return Err(Error::ReplayFull);
+            }
+        }
         let message = objects::signature_input(
             &raw_tbs,
             object.body.object_type(),
             MANAGEMENT_SCHEMA_VERSION,
         )
         .map_err(|_| Error::MalformedObject)?;
-        verify_dual_signatures(&issuer, &message, &signed.signers[0])?;
+        if is_lease {
+            self.verify_lease(&object, &issuer, &signed, &message)?;
+        } else {
+            verify_signer_signatures(
+                &issuer,
+                &message,
+                &signed.signers[0],
+                SignerRole::Primary,
+            )?;
+        }
         let object_id = sha256(&raw_tbs)?;
         let duplicate = match self.record_replay(
             replay_key(&object)?,
@@ -401,6 +436,9 @@ impl ManagementTrust {
             }
             Err(error) => return Err(error),
         };
+        if let ObjectBody::NodeIdentity(node) = &object.body {
+            self.node_identities.insert(node.node_id, node.clone());
+        }
         Ok(VerifiedObject {
             object_id,
             object,
@@ -409,6 +447,39 @@ impl ManagementTrust {
             raw_signed_object: raw_signed_object.to_vec(),
             duplicate,
         })
+    }
+
+    /// True two-party AttachmentLease authorization: the Primary signer must be the
+    /// already-verified NodeIdentity's Ed25519 + ML-DSA keys, and the CoSign signer must
+    /// be the target CoreOperationalKey. Both signatures cover the same TBS.
+    fn verify_lease(
+        &self,
+        object: &ManagementObject,
+        issuer: &IssuerRecord,
+        signed: &SignedObject,
+        message: &[u8],
+    ) -> Result<(), Error> {
+        let ObjectBody::AttachmentLease(body) = &object.body else {
+            return Err(Error::UnsupportedTwoPartyObject);
+        };
+        if signed.signers.len() != 2 {
+            return Err(Error::ImproperSignerRole);
+        }
+        let primary = &signed.signers[0];
+        let co_sign = &signed.signers[1];
+        if primary.role != SignerRole::Primary || co_sign.role != SignerRole::CoSign {
+            return Err(Error::ImproperSignerRole);
+        }
+        let node = self
+            .node_identities
+            .get(&body.node_id)
+            .ok_or(Error::UnknownNodeIdentity)?;
+        if node.identity_generation != body.identity_generation {
+            return Err(Error::StaleNodeIdentity);
+        }
+        verify_node_signatures(node, message, primary)?;
+        verify_signer_signatures(issuer, message, co_sign, SignerRole::CoSign)?;
+        Ok(())
     }
 
     /// Test convenience that binds the separately supplied TBS to the envelope's exact
@@ -497,6 +568,9 @@ pub struct IdentityTemplate {
     pub vip_octet: u8,
     pub role: NodeRole,
     pub identity_generation: u64,
+    /// Node management-signing Ed25519 public key, bound by the IdentityAuthority.
+    /// It is distinct from the ML-DSA TLS identity key and must be supplied by the node.
+    pub identity_pub_ed25519: [u8; 32],
     pub not_before_us: u64,
     pub expires_us: u64,
     pub scope: Vec<u8>,
@@ -586,7 +660,13 @@ impl IdentityAuthority {
         if template.scope.len() > MAX_SCOPE_LEN
             || template.identity_generation == 0
             || template.not_before_us >= template.expires_us
+            || template.identity_pub_ed25519 == [0; 32]
         {
+            return Err(Error::InvalidTemplate);
+        }
+        let ed_key = PKey::public_key_from_raw_bytes(&template.identity_pub_ed25519, Id::ED25519)
+            .map_err(|_| Error::InvalidTemplate)?;
+        if !ed_key.is_a(KeyType::ED25519) {
             return Err(Error::InvalidTemplate);
         }
         let expected_node_id =
@@ -631,6 +711,7 @@ impl IdentityAuthority {
             role,
             mldsa_parameter_set: MldsaParameterSet::Mldsa65,
             identity_pub_mldsa: raw_public_key,
+            identity_pub_ed25519: template.identity_pub_ed25519,
             identity_generation: template.identity_generation,
             not_before: template.not_before_us,
             expires: template.expires_us,
@@ -707,11 +788,7 @@ fn object_kind(body: &ObjectBody) -> Result<crate::ObjectKind, Error> {
     Ok(match body {
         ObjectBody::NodeIdentity(_) => crate::ObjectKind::Identity,
         ObjectBody::CoreLsa(_) => crate::ObjectKind::CoreLsa,
-        // A Lease needs the node identity key as Primary plus the target Core's
-        // CoreOperationalKey as CoSign. proto can carry both, but NodeIdentity has no
-        // Ed25519 management public key to verify the Primary Ed25519 half. Fail closed
-        // instead of downgrading the AND rule or treating an ML-DSA-only signer as complete.
-        ObjectBody::AttachmentLease(_) => return Err(Error::UnsupportedTwoPartyObject),
+        ObjectBody::AttachmentLease(_) => crate::ObjectKind::AttachmentLeaseConfirmation,
         ObjectBody::RouteGrant(_) => crate::ObjectKind::RouteGrant,
         ObjectBody::DirectGrant(_) => crate::ObjectKind::OwnDirectGrant,
         ObjectBody::StatusSnapshot(_) => crate::ObjectKind::StatusSnapshot,
@@ -764,6 +841,14 @@ fn authorize_scope(issuer: &IssuerRecord, object: &ManagementObject) -> Result<(
 }
 
 fn validate_identity_public_key(body: &NodeIdentity) -> Result<(), Error> {
+    if body.identity_pub_ed25519 == [0; 32] {
+        return Err(Error::InvalidIdentityKey);
+    }
+    let ed_key = PKey::public_key_from_raw_bytes(&body.identity_pub_ed25519, Id::ED25519)
+        .map_err(|_| Error::InvalidIdentityKey)?;
+    if !ed_key.is_a(KeyType::ED25519) {
+        return Err(Error::InvalidIdentityKey);
+    }
     let expected_length = match body.mldsa_parameter_set {
         MldsaParameterSet::Mldsa65 => MLDSA65_PUBLIC_KEY_LEN,
         MldsaParameterSet::Mldsa87 => MLDSA87_PUBLIC_KEY_LEN,
@@ -780,12 +865,64 @@ fn validate_identity_public_key(body: &NodeIdentity) -> Result<(), Error> {
     Ok(())
 }
 
-fn verify_dual_signatures(
-    issuer: &IssuerRecord,
+fn verify_node_signatures(
+    node: &NodeIdentity,
     message: &[u8],
     signer: &SignerSignatures,
 ) -> Result<(), Error> {
     if signer.role != SignerRole::Primary {
+        return Err(Error::ImproperSignerRole);
+    }
+    if signer.mldsa_parameter_set != node.mldsa_parameter_set {
+        return Err(Error::MlDsaParameterMismatch);
+    }
+    let expected_mldsa_len = match node.mldsa_parameter_set {
+        MldsaParameterSet::Mldsa65 => MLDSA65_SIGNATURE_LEN,
+        MldsaParameterSet::Mldsa87 => MLDSA87_SIGNATURE_LEN,
+    };
+    if signer.mldsa.len() != expected_mldsa_len
+        || node.identity_pub_ed25519 == [0; 32]
+    {
+        return Err(Error::InvalidMlDsaSignature);
+    }
+    let ed_key = PKey::public_key_from_raw_bytes(&node.identity_pub_ed25519, Id::ED25519)
+        .map_err(|_| Error::InvalidIdentityKey)?;
+    if !ed_key.is_a(KeyType::ED25519) {
+        return Err(Error::InvalidIdentityKey);
+    }
+    let mut ed_verifier =
+        Verifier::new_without_digest(&ed_key).map_err(|_| Error::SignatureBackend)?;
+    if !ed_verifier
+        .verify_oneshot(&signer.ed25519, message)
+        .map_err(|_| Error::SignatureBackend)?
+    {
+        return Err(Error::InvalidEd25519Signature);
+    }
+    let key_type = mldsa_key_type(node.mldsa_parameter_set);
+    let mldsa_key =
+        PKey::public_key_from_raw_bytes_ex(None, key_type, None, &node.identity_pub_mldsa)
+            .map_err(|_| Error::InvalidIdentityKey)?;
+    if !mldsa_key.is_a(key_type) {
+        return Err(Error::InvalidIdentityKey);
+    }
+    let mut mldsa_verifier =
+        Verifier::new_without_digest(&mldsa_key).map_err(|_| Error::SignatureBackend)?;
+    if !mldsa_verifier
+        .verify_oneshot(&signer.mldsa, message)
+        .map_err(|_| Error::SignatureBackend)?
+    {
+        return Err(Error::InvalidMlDsaSignature);
+    }
+    Ok(())
+}
+
+fn verify_signer_signatures(
+    issuer: &IssuerRecord,
+    message: &[u8],
+    signer: &SignerSignatures,
+    expected_role: SignerRole,
+) -> Result<(), Error> {
+    if signer.role != expected_role {
         return Err(Error::ImproperSignerRole);
     }
     if signer.mldsa_parameter_set != issuer.mldsa_parameter_set {
@@ -844,7 +981,10 @@ fn replay_key(object: &ManagementObject) -> Result<ReplayKey, Error> {
             subject_node_id: body.subject_node_id,
         },
         ObjectBody::StatusSnapshot(_) => ReplayKey::StatusSnapshot,
-        ObjectBody::AttachmentLease(_) => return Err(Error::UnsupportedTwoPartyObject),
+        ObjectBody::AttachmentLease(body) => ReplayKey::Lease {
+            node_id: body.node_id,
+            target_core_id: body.target_core_id,
+        },
     })
 }
 
@@ -906,10 +1046,10 @@ mod tests {
         MAX_SIGNED_OBJECT_LEN, SignedObject, SignerRole, SignerSignatures,
     };
     use boreas_proto::objects::{
-        AttachmentLease, CoreLsa, Endpoint, NodeIdentity, NodeRole as ObjectNodeRole, ObjectType,
-        RouteGrant, StatusSnapshot,
+        AttachmentLease, CoreLsa, DirectGrant, Endpoint, NodeIdentity,
+        NodeRole as ObjectNodeRole, ObjectType, RouteGrant, StatusSnapshot,
     };
-    use openssl::pkey::{KeyType, PKey, Private};
+    use openssl::pkey::{Id, KeyType, PKey, Private};
     use openssl::sign::Signer;
 
     const NET: [u8; 16] = [0x42; 16];
@@ -987,6 +1127,52 @@ mod tests {
             .unwrap()
         }
     }
+    fn sign_bytes(key: &PKey<Private>, message: &[u8]) -> Vec<u8> {
+        let mut signer = Signer::new_without_digest(key).unwrap();
+        signer.sign_oneshot_to_vec(message).unwrap()
+    }
+    fn sign_lease(
+        object: &ManagementObject,
+        node_ed25519: &PKey<Private>,
+        node_mldsa: &PKey<Private>,
+        core: &TestSigner,
+    ) -> Vec<u8> {
+        let raw_tbs = objects::encode_tbs(object).unwrap();
+        let message = objects::signature_input(
+            &raw_tbs,
+            object.body.object_type(),
+            MANAGEMENT_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let node_ed: [u8; ED25519_SIGNATURE_LEN] = sign_bytes(node_ed25519, &message)
+            .try_into()
+            .unwrap();
+        let node_ml = sign_bytes(node_mldsa, &message);
+        let core_ed: [u8; ED25519_SIGNATURE_LEN] = sign_bytes(&core.ed25519, &message)
+            .try_into()
+            .unwrap();
+        let core_ml = sign_bytes(&core.mldsa, &message);
+        SignedObject {
+            object_type: object.body.object_type(),
+            raw_tbs,
+            signers: vec![
+                SignerSignatures {
+                    role: SignerRole::Primary,
+                    ed25519: node_ed,
+                    mldsa_parameter_set: MldsaParameterSet::Mldsa65,
+                    mldsa: node_ml,
+                },
+                SignerSignatures {
+                    role: SignerRole::CoSign,
+                    ed25519: core_ed,
+                    mldsa_parameter_set: MldsaParameterSet::Mldsa65,
+                    mldsa: core_ml,
+                },
+            ],
+        }
+        .encode()
+        .unwrap()
+    }
     fn trust_with(signers: &[&TestSigner]) -> ManagementTrust {
         let mut trust = ManagementTrust::new(NET);
         for signer in signers {
@@ -996,6 +1182,12 @@ mod tests {
     }
     fn ml_identity_key(seed: u8) -> PKey<Private> {
         PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[seed; 32]).unwrap()
+    }
+    fn node_ed_key() -> PKey<Private> {
+        PKey::private_key_from_raw_bytes(&[0x77; 32], Id::ED25519).unwrap()
+    }
+    fn node_ed_public() -> [u8; 32] {
+        node_ed_key().raw_public_key().unwrap().try_into().unwrap()
     }
     fn node_identity_object(
         signer: &TestSigner,
@@ -1024,6 +1216,7 @@ mod tests {
                 role,
                 mldsa_parameter_set: MldsaParameterSet::Mldsa65,
                 identity_pub_mldsa: identity_public_key.to_vec(),
+                identity_pub_ed25519: node_ed_public(),
                 identity_generation: generation,
                 not_before: 100,
                 expires: 1_000,
@@ -1369,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_grant_status_snapshot_and_two_party_lease_policy() {
+    fn direct_grant_status_snapshot_and_real_two_party_lease() {
         let core = TestSigner::new(
             9,
             Authority::CoreOperationalKey { core_id: 1 },
@@ -1387,6 +1580,28 @@ mod tests {
         let signatures = status.sign(&snapshot);
         trust.add_issuer(status.record()).unwrap();
         assert!(trust.verify_test(&raw, &signatures, 200).is_ok());
+
+        let identity_authority = TestSigner::new(
+            11,
+            Authority::IdentityAuthority,
+            IssuerScope::for_identity(vec![NodeRole::Edge], vec![1]).unwrap(),
+        );
+        trust.add_issuer(identity_authority.record()).unwrap();
+        let node_ml = ml_identity_key(31);
+        let node_ml_public = node_ml.raw_public_key().unwrap();
+        let identity = node_identity_object(
+            &identity_authority,
+            ObjectNodeRole::Edge,
+            1,
+            2,
+            1,
+            &node_ml_public,
+        );
+        let raw_identity = objects::encode_tbs(&identity).unwrap();
+        let identity_signatures = identity_authority.sign(&identity);
+        assert!(trust
+            .verify_test(&raw_identity, &identity_signatures, 200)
+            .is_ok());
 
         let lease = ManagementObject {
             net_id: NET,
@@ -1407,10 +1622,33 @@ mod tests {
             }),
         };
         let raw = objects::encode_tbs(&lease).unwrap();
-        let signatures = core.sign(&lease);
+        let node_ed = node_ed_key();
+        let lease_signatures = sign_lease(&lease, &node_ed, &node_ml, &core);
+        assert!(trust.verify_test(&raw, &lease_signatures, 200).is_ok());
+
+        // A different Ed25519 key cannot take the Primary slot for the verified node.
+        let attacker_ed = PKey::generate_ed25519().unwrap();
+        let signatures = sign_lease(&lease, &attacker_ed, &node_ml, &core);
         assert_eq!(
             trust.verify_test(&raw, &signatures, 200),
-            Err(Error::UnsupportedTwoPartyObject)
+            Err(Error::InvalidEd25519Signature)
+        );
+        // A stale node generation is not accepted even with a valid counter-signature.
+        let mut stale = lease.clone();
+        if let ObjectBody::AttachmentLease(body) = &mut stale.body {
+            body.identity_generation = 2;
+        }
+        let raw_stale = objects::encode_tbs(&stale).unwrap();
+        let signatures = sign_lease(&stale, &node_ed, &node_ml, &core);
+        assert_eq!(
+            trust.verify_test(&raw_stale, &signatures, 200),
+            Err(Error::StaleNodeIdentity)
+        );
+        // Without an already verified NodeIdentity, Lease Primary is unknown.
+        let mut bare_trust = trust_with(&[&core]);
+        assert_eq!(
+            bare_trust.verify_test(&raw, &lease_signatures, 200),
+            Err(Error::UnknownNodeIdentity)
         );
     }
 

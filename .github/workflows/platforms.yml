@@ -377,11 +377,35 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Download all five per-target development artifacts
+      - name: Download Linux x86_64 development artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: boreas-development-*-${{ github.run_id }}
-          path: downloaded
+          name: boreas-development-x86_64-unknown-linux-musl-${{ github.run_id }}
+          path: downloaded/x86_64-unknown-linux-musl
+
+      - name: Download Linux aarch64 development artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: boreas-development-aarch64-unknown-linux-musl-${{ github.run_id }}
+          path: downloaded/aarch64-unknown-linux-musl
+
+      - name: Download Windows x86_64 development artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: boreas-development-x86_64-pc-windows-msvc-${{ github.run_id }}
+          path: downloaded/x86_64-pc-windows-msvc
+
+      - name: Download macOS Intel development artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: boreas-development-x86_64-apple-darwin-${{ github.run_id }}
+          path: downloaded/x86_64-apple-darwin
+
+      - name: Download macOS Apple Silicon development artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: boreas-development-aarch64-apple-darwin-${{ github.run_id }}
+          path: downloaded/aarch64-apple-darwin
 
       - name: Assemble and verify the five-target bundle
         run: |

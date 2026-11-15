@@ -946,24 +946,46 @@ mod tests {
     use super::*;
     const FIXTURES: &str =
         include_str!("../../../docs/protocol/vectors/management-objects-candidate-v1.json");
-    fn fixture_entry(id: &str) -> String {
-        let marker = format!("\"id\": \"{id}\"");
-        let at = FIXTURES.find(&marker).expect("fixture id present");
-        let start = FIXTURES[..at].rfind('{').expect("fixture object start");
-        let end = FIXTURES[at..].find('}').expect("fixture object end") + at + 1;
-        FIXTURES[start..end].to_owned()
+    fn fixture_document() -> serde_json::Value {
+        serde_json::from_str(FIXTURES).expect("management fixture JSON")
+    }
+    fn fixture_array(document: &serde_json::Value) -> &[serde_json::Value] {
+        document
+            .get("vectors")
+            .and_then(|value| value.as_array())
+            .map(|values| values.as_slice())
+            .expect("management vectors array")
+    }
+    fn fixture_by_id<'a>(
+        document: &'a serde_json::Value,
+        id: &str,
+    ) -> &'a serde_json::Value {
+        let matches: Vec<&serde_json::Value> = fixture_array(document)
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    == Some(id)
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "management fixture id {id} must be unique");
+        matches[0]
     }
     fn fixture_field(id: &str, field: &str) -> String {
-        let entry = fixture_entry(id);
-        let marker = format!("\"{field}\"");
-        let at = entry.find(&marker).expect("fixture field present") + marker.len();
-        let value = entry[at..]
-            .trim_start()
-            .strip_prefix(':')
-            .expect("field colon")
-            .trim_start();
-        let value = value.strip_prefix('\"').expect("string fixture field");
-        value[..value.find('\"').expect("fixture string terminator")].to_owned()
+        let document = fixture_document();
+        fixture_field_in(&document, id, field)
+    }
+    fn fixture_field_in(
+        document: &serde_json::Value,
+        id: &str,
+        field: &str,
+    ) -> String {
+        fixture_by_id(document, id)
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| panic!("management fixture {id} field {field}"))
+            .to_owned()
     }
     fn decode_hex(hex: &str) -> Vec<u8> {
         let digit = |b: u8| match b {
@@ -1227,15 +1249,34 @@ mod tests {
         }
     }
     fn fixture_error(id: &str) -> String {
-        let marker = format!("\"id\": \"{id}\"");
-        let item = FIXTURES.find(&marker).expect("fixture id present");
-        let object_start = FIXTURES[..item].rfind('{').expect("fixture object start");
-        let object_end = FIXTURES[item..].find('}').expect("fixture object end") + item + 1;
-        let tail = &FIXTURES[object_start..object_end];
-        let field = "\"expected_error\": \"";
-        let start = tail.find(field).expect("negative fixture error category") + field.len();
-        let value = &tail[start..];
-        value[..value.find('\"').expect("quoted error")].to_owned()
+        fixture_field(id, "expected_error")
+    }
+
+    #[test]
+    fn fixture_ids_and_shapes_are_strict() {
+        let document = fixture_document();
+        let vectors = fixture_array(&document);
+        assert_eq!(vectors.len(), 16, "management fixture count changed");
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, vector) in vectors.iter().enumerate() {
+            let id = vector
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("management fixture[{index}] has no string id"));
+            assert!(!id.is_empty(), "management fixture[{index}] has an empty id");
+            assert!(
+                ids.insert(id.to_owned()),
+                "duplicate management fixture id {id}"
+            );
+            assert!(
+                vector.get("kind").and_then(|value| value.as_str()).is_some(),
+                "management fixture {id} has no string kind"
+            );
+            assert!(
+                vector.get("valid").and_then(|value| value.as_bool()).is_some(),
+                "management fixture {id} has no boolean valid"
+            );
+        }
     }
     #[test]
     fn negative_fixed_tbs_vectors_match_error_categories() {

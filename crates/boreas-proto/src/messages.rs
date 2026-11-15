@@ -2617,6 +2617,53 @@ mod tests {
     const VECTORS: &str =
         include_str!("../../../docs/protocol/vectors/control-messages-candidate-v1.json");
 
+    fn vector_document() -> serde_json::Value {
+        serde_json::from_str(VECTORS).expect("control vector JSON")
+    }
+
+    fn vector_array(document: &serde_json::Value) -> &[serde_json::Value] {
+        document
+            .get("vectors")
+            .and_then(|value| value.as_array())
+            .map(|values| values.as_slice())
+            .expect("control vectors array")
+    }
+
+    fn vector_by_id<'a>(
+        document: &'a serde_json::Value,
+        id: &str,
+    ) -> &'a serde_json::Value {
+        let matches: Vec<&serde_json::Value> = vector_array(document)
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    == Some(id)
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "control vector id {id} must be unique");
+        matches[0]
+    }
+
+    fn vector_ids(document: &serde_json::Value) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (index, vector) in vector_array(document).iter().enumerate() {
+            let id = vector
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("control vector[{index}] has no string id"));
+            assert!(!id.is_empty(), "control vector[{index}] has an empty id");
+            assert!(
+                seen.insert(id.to_owned()),
+                "duplicate control vector id {id}"
+            );
+            ids.push(id.to_owned());
+        }
+        ids
+    }
+
     fn decode_hex(text: &str) -> Vec<u8> {
         assert_eq!(text.len() % 2, 0, "odd-length hex");
         text.as_bytes()
@@ -2632,76 +2679,65 @@ mod tests {
             .collect()
     }
 
-    fn vector_ids() -> Vec<&'static str> {
-        let section = &VECTORS[..VECTORS.find("\"session_pairs\"").unwrap_or(VECTORS.len())];
-        let mut ids = Vec::new();
-        let mut offset = 0;
-        while let Some(found) = section[offset..].find("\"id\": \"") {
-            let start = offset + found + "\"id\": \"".len();
-            let end = start
-                + section[start..]
-                    .find('"')
-                    .unwrap_or_else(|| panic!("unterminated vector id"));
-            assert!(end > start, "empty vector id");
-            ids.push(&section[start..end]);
-            offset = end;
+    fn string_field<'a>(vector: &'a serde_json::Value, field: &str) -> &'a str {
+        vector
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| panic!("control vector field {field} must be a string"))
+    }
+
+    fn bool_field(vector: &serde_json::Value, field: &str) -> bool {
+        vector
+            .get(field)
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| panic!("control vector field {field} must be a boolean"))
+    }
+
+    fn message_for_subtype(subtype: u8) -> Option<&'static str> {
+        match subtype {
+            1 => Some("SessionHello"),
+            2 => Some("SessionAccept"),
+            3 => Some("Enrollment"),
+            4 => Some("DirectoryPage"),
+            5 => Some("Lease"),
+            6 => Some("Lsa"),
+            7 => Some("Grant"),
+            8 => Some("Revoke"),
+            9 => Some("Probe"),
+            10 => Some("Drain"),
+            16 => Some("CircuitOpen"),
+            17 => Some("CircuitAccept"),
+            18 => Some("CircuitReset"),
+            19 => Some("CircuitClose"),
+            _ => None,
         }
-        ids
     }
 
-    fn vector_object(id: &str) -> &'static str {
-        let marker = format!("\"id\": \"{id}\"");
-        let at = VECTORS
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing vector {id}"));
-        let start = VECTORS[..at]
-            .rfind('{')
-            .unwrap_or_else(|| panic!("vector {id} has no object start"));
-        let end = VECTORS[at..]
-            .find('}')
-            .unwrap_or_else(|| panic!("vector {id} has no object end"))
-            + at
-            + 1;
-        &VECTORS[start..end]
-    }
-
-    fn quoted_field<'a>(object: &'a str, field: &str) -> &'a str {
-        let key = format!("\"{field}\"");
-        let at = object
-            .find(&key)
-            .unwrap_or_else(|| panic!("missing field {field}"))
-            + key.len();
-        let rest = object[at..].trim_start();
-        let rest = rest
-            .strip_prefix(':')
-            .unwrap_or_else(|| panic!("field {field} has no colon"))
-            .trim_start();
-        let rest = rest
-            .strip_prefix('"')
-            .unwrap_or_else(|| panic!("field {field} is not a string"));
-        &rest[..rest
-            .find('"')
-            .unwrap_or_else(|| panic!("field {field} is unterminated"))]
-    }
-
-    fn bool_field(object: &str, field: &str) -> bool {
-        let key = format!("\"{field}\"");
-        let at = object
-            .find(&key)
-            .unwrap_or_else(|| panic!("missing field {field}"))
-            + key.len();
-        let rest = object[at..].trim_start();
-        let rest = rest
-            .strip_prefix(':')
-            .unwrap_or_else(|| panic!("field {field} has no colon"))
-            .trim_start();
-        if rest.starts_with("true") {
-            true
-        } else if rest.starts_with("false") {
-            false
-        } else {
-            panic!("field {field} is not a boolean")
+    fn checked_message<'a>(vector: &'a serde_json::Value, data: &[u8]) -> &'a str {
+        let kind = string_field(vector, "kind");
+        let message = string_field(vector, "message");
+        match kind {
+            "control" => {
+                if message != "ControlBody" {
+                    let subtype = data.first().copied().unwrap_or_else(|| {
+                        panic!("control vector {message} has an empty body")
+                    });
+                    let expected = message_for_subtype(subtype).unwrap_or_else(|| {
+                        panic!("control vector {message} uses unregistered subtype {subtype}")
+                    });
+                    assert_eq!(
+                        message, expected,
+                        "control vector message/subtype mismatch"
+                    );
+                }
+            }
+            "relay" => assert_eq!(message, "RelayFragment", "relay vector message"),
+            "signed_object" => {
+                assert_eq!(message, "SignedObject", "signed-object vector message")
+            }
+            other => panic!("unknown control vector kind {other}"),
         }
+        message
     }
 
     fn decode_vector(message: &str, data: &[u8]) -> Result<(), MessageError> {
@@ -2750,56 +2786,128 @@ mod tests {
         Ok(())
     }
 
+    fn encode_vector(message: &str, data: &[u8]) -> Result<Vec<u8>, MessageError> {
+        match message {
+            "SessionHello" => Ok(SessionHello::decode(data)?.encode()?.to_vec()),
+            "SessionAccept" => {
+                Ok(SessionAccept::decode_bound(data, sample_accept().params)?
+                    .encode()?
+                    .to_vec())
+            }
+            "Enrollment" => Ok(Enrollment::decode(data)?.encode()?),
+            "DirectoryPage" => Ok(DirectoryPage::decode(data)?.encode()?),
+            "SignedObject" => Ok(SignedObject::decode(data)?.encode()?),
+            "RelayFragment" => Ok(RelayFragment::decode(data)?.encode()?),
+            "Probe" => Ok(Probe::decode(data)?.encode()?),
+            "Drain" => Ok(Drain::decode(data)?.encode()?),
+            "CircuitOpen" => Ok(CircuitOpen::decode(data)?.encode()?),
+            "CircuitAccept" => Ok(CircuitAccept::decode(data)?.encode()?),
+            "CircuitReset" => Ok(CircuitReset::decode(data)?.encode()?),
+            "CircuitClose" => Ok(CircuitClose::decode(data)?.encode()?),
+            "ControlBody" => panic!("ControlBody vectors are not re-encodable"),
+            other => panic!("unknown vector message {other}"),
+        }
+    }
+
     #[test]
     fn fixed_vectors_decode_or_reject_with_expected_categories() {
-        let ids = vector_ids();
-        assert_eq!(ids.len(), 48, "vector count changed; update this assertion");
-        let mut seen = BTreeSet::new();
-        for id in ids {
-            assert!(seen.insert(id), "duplicate vector id {id}");
-            let object = vector_object(id);
-            let message = quoted_field(object, "message");
-            let valid = bool_field(object, "valid");
-            let result = if valid {
-                decode_vector(message, &decode_hex(quoted_field(object, "expected_hex")))
+        let document = vector_document();
+        assert_eq!(
+            vector_array(&document).len(),
+            48,
+            "control vector count changed; update this assertion"
+        );
+        assert_eq!(
+            document
+                .get("session_pairs")
+                .and_then(|value| value.as_array())
+                .map(|pairs| pairs.len()),
+            Some(4),
+            "session_pairs count changed; update this assertion"
+        );
+        for id in vector_ids(&document) {
+            let vector = vector_by_id(&document, &id);
+            let valid = bool_field(vector, "valid");
+            let data = decode_hex(if valid {
+                string_field(vector, "expected_hex")
             } else {
-                decode_vector(message, &decode_hex(quoted_field(object, "input_hex")))
-            };
-            match (valid, result) {
-                (true, Ok(())) => {}
-                (true, Err(error)) => panic!("{id}: valid vector rejected as {error:?}"),
-                (false, Ok(())) => panic!("{id}: invalid vector accepted"),
-                (false, Err(error)) => assert_eq!(
+                string_field(vector, "input_hex")
+            });
+            let message = checked_message(vector, &data);
+            if valid {
+                decode_vector(message, &data)
+                    .unwrap_or_else(|error| panic!("{id}: valid vector rejected as {error:?}"));
+                let encoded = encode_vector(message, &data)
+                    .unwrap_or_else(|error| panic!("{id}: valid vector re-encode failed as {error:?}"));
+                assert_eq!(encoded, data, "{id}: decode/encode is not byte-exact");
+            } else {
+                let error = match decode_vector(message, &data) {
+                    Ok(()) => panic!("{id}: invalid vector accepted"),
+                    Err(error) => error,
+                };
+                assert_eq!(
                     error.category(),
-                    quoted_field(object, "expected_error"),
+                    string_field(vector, "expected_error"),
                     "{id}"
-                ),
+                );
             }
         }
     }
 
     #[test]
+    fn vector_parsing_ignores_json_whitespace_and_key_order() {
+        let document = vector_document();
+        let compact = serde_json::to_string(&document).unwrap();
+        let pretty = serde_json::to_string_pretty(&document).unwrap();
+        for text in [&compact, &pretty] {
+            let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(vector_array(&parsed).len(), 48);
+            assert_eq!(vector_ids(&parsed).len(), 48);
+        }
+
+        // Same Probe vector with fields in a different textual order. This
+        // must not depend on the hand-written `\"field\": \"` spacing that
+        // broke the previous extractor.
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{
+                "vectors": [
+                    {
+                        "valid": true,
+                        "expected_hex": "090109090909090909090909090909090909000000000000000a0000000000000000",
+                        "message": "Probe",
+                        "kind": "control",
+                        "id": "reordered-probe"
+                    }
+                ],
+                "session_pairs": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(vector_ids(&reordered), vec!["reordered-probe".to_owned()]);
+        let vector = vector_by_id(&reordered, "reordered-probe");
+        let data = decode_hex(string_field(vector, "expected_hex"));
+        let message = checked_message(vector, &data);
+        decode_vector(message, &data).unwrap();
+        assert_eq!(encode_vector(message, &data).unwrap(), data);
+    }
+
+    #[test]
     fn minimal_vectors_pin_exact_sample_bytes() {
+        let document = vector_document();
+        let expected = |id: &str| {
+            decode_hex(string_field(vector_by_id(&document, id), "expected_hex"))
+        };
         assert_eq!(
             sample_hello().encode().unwrap().to_vec(),
-            decode_hex(quoted_field(
-                vector_object("session-hello-minimal"),
-                "expected_hex"
-            ))
+            expected("session-hello-minimal")
         );
         assert_eq!(
             sample_accept().encode().unwrap().to_vec(),
-            decode_hex(quoted_field(
-                vector_object("session-accept-minimal"),
-                "expected_hex"
-            ))
+            expected("session-accept-minimal")
         );
         assert_eq!(
             sample_relay().encode().unwrap(),
-            decode_hex(quoted_field(
-                vector_object("relay-fragment-minimal"),
-                "expected_hex"
-            ))
+            expected("relay-fragment-minimal")
         );
         assert_eq!(
             Probe {
@@ -2810,10 +2918,7 @@ mod tests {
             }
             .encode()
             .unwrap(),
-            decode_hex(quoted_field(
-                vector_object("probe-ping-minimal"),
-                "expected_hex"
-            ))
+            expected("probe-ping-minimal")
         );
         assert_eq!(
             Drain {
@@ -2823,7 +2928,7 @@ mod tests {
             }
             .encode()
             .unwrap(),
-            decode_hex(quoted_field(vector_object("drain-minimal"), "expected_hex"))
+            expected("drain-minimal")
         );
         assert_eq!(
             CircuitOpen {
@@ -2834,10 +2939,7 @@ mod tests {
             }
             .encode()
             .unwrap(),
-            decode_hex(quoted_field(
-                vector_object("circuit-open-minimal"),
-                "expected_hex"
-            ))
+            expected("circuit-open-minimal")
         );
     }
 }

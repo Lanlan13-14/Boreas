@@ -27,8 +27,9 @@
 //!    * no journal / consistent `Confirmed` → run `<argv...>` as the steady
 //!      program and propagate its exit status (128+signal when killed);
 //!    * `Prepared` → activate the candidate for one trial launch, run
-//!      `<argv...>`, and confirm only after the liveness soak (see below); an
-//!      early exit with any status, a spawn/wait failure or a failed `confirm()`
+//!      `<argv...>`, and confirm only after an **authorized readiness answer**
+//!      (see below); an early exit with any status, a readiness timeout, a
+//!      rejected peer, a spawn/wait failure or a failed `confirm()`
 //!      ⇒ `recover()` rollback, with the old version directory retained;
 //!    * `Activated` (a previous trial never confirmed, e.g. this supervisor
 //!      or the candidate was `SIGKILL`ed before the outcome was recorded)
@@ -47,7 +48,7 @@
 //!
 //! In production the pair is driven as `recover` once at service start,
 //! then one `supervise` per OS-service restart; the first restart after an
-//! upgrade runs the candidate once, and a crash before the soak deadline leaves
+//! upgrade runs the candidate once, and a crash before readiness leaves
 //! the journal `Activated`, so the next `supervise` boots the rolled-back
 //! version instead of retrying the candidate. A candidate that keeps failing
 //! early is bounded by the durable trial budget
@@ -55,24 +56,30 @@
 //! budget is spent the supervisor refuses to activate it and the operator must
 //! inspect the store and run `reset-trial`.
 //!
-//! # Liveness soak, store lock and durable trial budget
+//! # Readiness: authorized handshake, not liveness
 //!
-//! **This is a liveness gate, not a health/readiness gate.** A trial launch is
-//! confirmed only after the candidate process has stayed *alive* for
-//! `--trial-soak-ms` (default 30 000 ms); the pointer is committed while the
-//! child is still running. A candidate that stops before the deadline — with
-//! *any* status, including 0 — is a failed attempt and is rolled back. After
-//! confirmation a later exit is an ordinary runtime stop: its status is
-//! propagated and the committed upgrade is not rolled back.
+//! A trial is confirmed only when the candidate proves it is *ready*, not when
+//! it merely stayed alive. Before spawning, the supervisor binds a private
+//! `AF_UNIX` socket (`<store>/ready.sock`, mode `0600`) and exports its path as
+//! `BOREAS_READY_SOCKET`. The candidate must connect, satisfy peer-credential
+//! checks (same uid always; on Linux the exact spawned pid) and answer a fresh
+//! per-run random challenge with:
 //!
-//! What it cannot detect: a process that is alive but deadlocked, wedged before
-//! binding its TUN device, missing its workers, or serving a stale state
-//! schema. "Survived the soak" is **not** application readiness. The real gate
-//! is the next round's authorized `AF_UNIX` health endpoint with peer
-//! credentials, where the supervisor sends a random challenge bound to the
-//! candidate SHA, state schema, worker count and TUN status, and only a
-//! correct, freshly signed response confirms. Until that exists, every message
-//! here says "liveness", never "healthy".
+//! * its state schema identifier,
+//! * the number of ready workers,
+//! * whether its TUN device is ready or absent.
+//!
+//! `--ready-timeout-ms` (default 30 000) bounds the answer, `--ready-min-workers`
+//! (default 1) and `--ready-require-tun` (default `yes`) define acceptance.
+//! Anything else — no connection, wrong peer, wrong echo, unacceptable state —
+//! fails the trial and rolls back. A deadlocked-but-alive process can no longer
+//! be confirmed.
+//!
+//! Deliberate limit: the challenge is **not yet bound to the candidate artifact
+//! SHA-256**, because `verify_release` → `prepare` is not wired; that binding
+//! belongs with the installer. There is also no Boreas daemon in this workspace
+//! yet, so the protocol is exercised against the `__ready-stub` candidate in
+//! integration tests. It is **not** claimed to be integrated in production.
 //!
 //! Every mutating subcommand (`supervise`, `recover`, `reset-trial`) holds the
 //! store's exclusive OS file lock for its whole run, so two supervisors cannot
@@ -86,32 +93,31 @@
 //! The ledger can only ever *restrict* launches, so tampering with it causes a
 //! denial of upgrades, never an unauthorised one.
 //!
-//! # Signals: the contract, stated precisely
+//! # Signals: forwarding and controlled stop
 //!
-//! This process installs **no** signal handler, and that is a contract rather
-//! than an omission:
+//! `supervise` installs handlers for `SIGTERM`, `SIGINT` and `SIGHUP`. The
+//! handler only stores the signal number in an atomic (async-signal-safe); the
+//! wait loop forwards it to the child and gives it `--stop-grace-ms` (default
+//! 10 000) before escalating to `SIGKILL`. A stop that arrives *before*
+//! readiness fails the trial and rolls back, because an interrupted candidate
+//! never proved itself.
 //!
-//! * the child is spawned into this process's group/console, so a
-//!   group-directed `SIGTERM`/`SIGINT` — systemd's default cgroup-wide stop, or
-//!   Ctrl+C in the same terminal — reaches the child directly;
-//! * if this supervisor dies mid-trial, the durable `Activated` journal plus the
-//!   `in-flight` trial reservation make the next `supervise` roll back and
-//!   count the attempt, so no `trap` is ever relied upon (§10.3);
-//! * the service unit must therefore use the default cgroup-wide kill
-//!   (`KillMode=control-group`) and a bounded `Restart=`.
+//! The group/console contract still applies underneath: a cgroup-wide stop
+//! reaches the child directly, and if this supervisor is killed the durable
+//! `Activated` journal plus the `in-flight` reservation make the next
+//! `supervise` roll back and count the attempt (§10.3).
 //!
-//! What is *not* provided, and must not be claimed: forwarding a signal that is
-//! delivered only to the supervisor, a graceful stop window, or per-signal exit
-//! mapping beyond the `128+n` convention. Those need reviewed
-//! `sigaction`/console-handler code per platform and remain an external gate.
+//! What is *not* provided: per-signal exit mapping beyond `128+n`, a graceful
+//! stop of an already-confirmed daemon beyond the forwarded signal, and any
+//! Windows signal semantics (Windows has no POSIX disposition; its store path
+//! stays fail-closed).
 //!
 //! # Still missing (explicit, not silently claimed)
 //!
-//! * **No health channel beyond survival + exit status.** `sd_notify`/control
-//!   socket readiness, timeouts and liveness probes do not exist; "alive for
-//!   the soak" is a floor, not a readiness proof.
-//! * **No release verification.** Nothing here downloads, authenticates or
-//!   stages a release; `prepare`/`activate` are deliberately absent from the
+//! * **No artifact-SHA binding in the challenge**, and no real daemon to answer
+//!   it: the protocol is real, the integration is not.
+//! * **No release verification wiring.** Nothing here downloads, authenticates
+//!   or stages a release; `prepare`/`activate` are deliberately absent from the
 //!   CLI so no unverified artifact can be executed through it.
 //! * **Durability** inherits the library audit: Linux directory `fsync`, macOS
 //!   `F_FULLFSYNC` + directory `fsync`, Windows fail-closed, and the power-cut /
@@ -119,32 +125,55 @@
 //!   slice claims `G-UPGRADE` or `G-SUPPLY` completion.
 //!
 //! Exit codes: `0` success/confirm/child exit 0; `1` any supervisor-side
-//! error (usage, store open/lock/recovery failure, spawn failure, failed liveness
-//! gate, rollback after a failed trial — the exact cause is on stderr); `<n>`
-//! for steady launches, confirmed launches that later exit, and rolled-back
-//! launches it is the child's own exit code, and `128+n` when the child was
-//! killed by signal `n` (shell convention).
+//! error (usage, store open/lock/recovery failure, spawn failure, rejected
+//! readiness, rollback after a failed trial — the exact cause is on stderr);
+//! `<n>` for steady launches, confirmed launches that later exit, and
+//! rolled-back launches it is the child's own exit code, and `128+n` when the
+//! child was killed by signal `n` (shell convention).
 
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+#[cfg(unix)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use boreas_supervisor::{
     Activation, Journal, Phase, Recovery, Result, StoreLock, TrialState, UpgradeStore,
 };
 
+/// POSIX signal forwarding + controlled stop (no-ops off Unix).
+mod signals;
+
+/// Authorized AF_UNIX readiness handshake. Unix-only: Windows has no `AF_UNIX`
+/// in `std` and no peer-credential binding here, so a trial launch there fails
+/// closed instead of confirming on liveness alone.
+#[cfg(unix)]
+mod readiness;
+
 const EXIT_ERROR: u8 = 1;
 
-/// Poll interval while watching a trial child and its liveness-soak deadline.
+/// Poll interval for child waits, readiness probes and stop deadlines.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// A trial candidate must stay alive this long before its launch counts as
-/// alive. Overridable with `--trial-soak-ms` (tests use short values).
-const DEFAULT_TRIAL_SOAK_MS: u64 = 30_000;
+/// A trial candidate must answer the readiness challenge within this window.
+/// Overridable with `--ready-timeout-ms` (tests use short values).
+const DEFAULT_READY_TIMEOUT_MS: u64 = 30_000;
+
+/// How long a forwarded stop signal may take before `SIGKILL` is sent.
+const DEFAULT_STOP_GRACE_MS: u64 = 10_000;
+
+/// Minimum ready workers a candidate must report.
+const DEFAULT_READY_MIN_WORKERS: u32 = 1;
+
+/// Whether a ready TUN device is required (VPN deployments usually are).
+const DEFAULT_READY_REQUIRE_TUN: bool = true;
 
 /// Durable per-candidate trial budget. Overridable with
 /// `--max-trial-attempts`; only the operator-only `reset-trial` clears it.
@@ -157,7 +186,10 @@ const VERSION_PLACEHOLDER: &str = "{version}";
 const USAGE: &str = "\
 boreas-supervisor — external Boreas upgrade supervisor
 USAGE:
-    boreas-supervisor supervise --store <DIR> [--trial-soak-ms <MS>]
+    boreas-supervisor supervise --store <DIR> [--ready-timeout-ms <MS>]
+                                [--ready-require-tun <yes|no>]
+                                [--ready-min-workers <N>]
+                                [--stop-grace-ms <MS>]
                                 [--max-trial-attempts <N>] -- <argv...>
     boreas-supervisor recover --store <DIR> [--json]
     boreas-supervisor status --store <DIR> [--json]
@@ -170,17 +202,24 @@ subcommands:
                 replaced with the resolved active-version directory;
                 fail-closed when no version is active.
                 A prepared candidate gets one trial launch. It is confirmed
-                only after a liveness soak (--trial-soak-ms, default 30000):
-                the process must still be alive, and exiting 0 *before* the
-                soak is a failed attempt and is rolled back. This is liveness,
-                NOT application readiness — a deadlocked or unready process
-                passes it. The attempt is written to the store before the
-                launch, so a killed supervisor still consumes budget;
-                --max-trial-attempts (default 3) bounds the retry loop across
-                restarts. Once confirmed, a later exit is an ordinary runtime
-                stop and is propagated.
-                Steady launches propagate the child's exit status
-                (128+signal when killed).
+                only after an AUTHORIZED READINESS ANSWER: the supervisor
+                binds <store>/ready.sock (mode 0600), exports it as
+                BOREAS_READY_SOCKET, and the candidate must connect, prove it
+                is the process we spawned (SO_PEERCRED / getpeereid: same uid,
+                and on Linux the exact pid) and echo this run's fresh random
+                challenge together with its state schema, ready worker count
+                and TUN status. Liveness alone confirms nothing: a child that
+                merely stays alive until --ready-timeout-ms (default 30000) is
+                rolled back. --ready-require-tun (default yes) and
+                --ready-min-workers (default 1) set the acceptance policy.
+                The attempt is written to the store before the launch, so a
+                killed supervisor still consumes budget; --max-trial-attempts
+                (default 3) bounds the retry loop across restarts. Once
+                confirmed, a later exit is an ordinary runtime stop and is
+                propagated.
+                Stops delivered to this process are forwarded to the child
+                (SIGTERM/SIGINT/SIGHUP), with SIGKILL after --stop-grace-ms
+                (default 10000).
     recover     run UpgradeStore::recover() under the store lock; launches
                 nothing
     status      report the store's real journal/active-pointer/trial state
@@ -192,8 +231,10 @@ subcommands:
 
 Every mutating subcommand takes an OS file lock on the store, so concurrent
 supervisors cannot race the journal. The lock dies with the process and never
-goes stale. No signal handler is installed: see the module documentation for
-the process-group contract this relies on.
+goes stale.
+
+`__ready-stub` is a hidden test-support candidate (not an operator command); it
+exists so integration tests exercise the real handshake with a real subprocess.
 
 This binary never downloads, installs, or authenticates a release.
 prepare/activate are deliberately not exposed: staging artifacts requires
@@ -201,6 +242,15 @@ the independent manifest-verification layer (master plan Sec.10.1-10.2).";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
+    // Handlers are installed only for `supervise`, the one command that spawns a
+    // child and must forward stops to it. Installing them for the test stub
+    // would make the stub ignore SIGTERM and hang the forwarding test.
+    if args.first().and_then(|arg| arg.to_str()) == Some("supervise")
+        && let Err(e) = signals::install()
+    {
+        // Not fatal: the group-directed contract still applies.
+        eprintln!("boreas-supervisor: warning: cannot install signal handlers: {e}");
+    }
     match run_cli(&args) {
         CliOutcome::Done {
             code,
@@ -244,8 +294,16 @@ struct SupervisePlan {
     argv: Vec<OsString>,
     /// Candidate whose trial launch is in flight (trial launches only).
     trial_candidate: Option<String>,
-    /// How long the candidate must stay alive before the upgrade is committed.
-    soak: Duration,
+    /// How long the candidate gets to connect and answer the readiness
+    /// challenge before the trial is failed and rolled back.
+    ready_timeout: Duration,
+    /// How long a forwarded stop signal may take before `SIGKILL`.
+    stop_grace: Duration,
+    /// Readiness requirements the answer is validated against.
+    ready_require_tun: bool,
+    ready_min_workers: u32,
+    /// Exact state schema the candidate must report.
+    ready_expected_schema: String,
     /// Exclusive store lock, held from before recovery until the child exits.
     /// Dropping the plan releases it.
     store_lock: StoreLock,
@@ -302,6 +360,10 @@ fn run_cli(args: &[OsString]) -> CliOutcome {
         "recover" => cmd_recover(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "reset-trial" => cmd_reset_trial(&args[1..]),
+        // Test-support candidate side of the readiness handshake. Hidden (`__`)
+        // because it is not an operator command: it exists so integration tests
+        // drive the real protocol with a real subprocess instead of a mock.
+        "__ready-stub" => cmd_ready_stub(&args[1..]),
         other => usage_err(&format!("unknown subcommand: {other}")),
     }
 }
@@ -356,14 +418,22 @@ fn parse_store_args(args: &[OsString], subcommand: &str) -> std::result::Result<
 
 struct SuperviseArgs {
     store: String,
-    soak: Duration,
+    ready_timeout: Duration,
+    stop_grace: Duration,
+    ready_require_tun: bool,
+    ready_min_workers: u32,
+    ready_expected_schema: String,
     max_trial_attempts: u32,
     child_argv: Vec<OsString>,
 }
 
 fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs, String> {
     let mut store: Option<String> = None;
-    let mut soak: Option<Duration> = None;
+    let mut ready_timeout: Option<Duration> = None;
+    let mut stop_grace: Option<Duration> = None;
+    let mut ready_require_tun: Option<bool> = None;
+    let mut ready_min_workers: Option<u32> = None;
+    let mut ready_expected_schema: Option<String> = None;
     let mut max_trial_attempts: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
@@ -385,22 +455,112 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                         .to_owned(),
                 );
             }
-            "--trial-soak-ms" => {
-                if soak.is_some() {
-                    return Err("supervise: duplicate --trial-soak-ms".to_string());
+            "--ready-timeout-ms" => {
+                if ready_timeout.is_some() {
+                    return Err("supervise: duplicate --ready-timeout-ms".to_string());
                 }
                 i += 1;
                 let raw = args
                     .get(i)
-                    .ok_or_else(|| "supervise: --trial-soak-ms requires a value".to_string())?
+                    .ok_or_else(|| "supervise: --ready-timeout-ms requires a value".to_string())?
                     .to_str()
                     .ok_or_else(|| {
-                        "supervise: --trial-soak-ms value is not valid UTF-8".to_string()
+                        "supervise: --ready-timeout-ms value is not valid UTF-8".to_string()
                     })?;
                 let ms: u64 = raw.parse().map_err(|_| {
-                    "supervise: --trial-soak-ms must be a whole number of milliseconds".to_string()
+                    "supervise: --ready-timeout-ms must be a whole number of milliseconds"
+                        .to_string()
                 })?;
-                soak = Some(Duration::from_millis(ms));
+                ready_timeout = Some(Duration::from_millis(ms));
+            }
+            "--stop-grace-ms" => {
+                if stop_grace.is_some() {
+                    return Err("supervise: duplicate --stop-grace-ms".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "supervise: --stop-grace-ms requires a value".to_string())?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --stop-grace-ms value is not valid UTF-8".to_string()
+                    })?;
+                let ms: u64 = raw.parse().map_err(|_| {
+                    "supervise: --stop-grace-ms must be a whole number of milliseconds".to_string()
+                })?;
+                stop_grace = Some(Duration::from_millis(ms));
+            }
+            "--ready-require-tun" => {
+                if ready_require_tun.is_some() {
+                    return Err("supervise: duplicate --ready-require-tun".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "supervise: --ready-require-tun requires a value".to_string())?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --ready-require-tun value is not valid UTF-8".to_string()
+                    })?;
+                ready_require_tun = Some(match raw {
+                    "yes" => true,
+                    "no" => false,
+                    _ => {
+                        return Err(
+                            "supervise: --ready-require-tun must be `yes` or `no`".to_string()
+                        );
+                    }
+                });
+            }
+            "--ready-min-workers" => {
+                if ready_min_workers.is_some() {
+                    return Err("supervise: duplicate --ready-min-workers".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "supervise: --ready-min-workers requires a value".to_string())?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --ready-min-workers value is not valid UTF-8".to_string()
+                    })?;
+                let workers: u32 = raw.parse().map_err(|_| {
+                    "supervise: --ready-min-workers must be a positive integer".to_string()
+                })?;
+                if workers == 0 {
+                    return Err("supervise: --ready-min-workers must be at least 1".to_string());
+                }
+                ready_min_workers = Some(workers);
+            }
+            "--ready-expected-schema" => {
+                if ready_expected_schema.is_some() {
+                    return Err("supervise: duplicate --ready-expected-schema".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "supervise: --ready-expected-schema requires a value".to_string()
+                    })?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --ready-expected-schema value is not valid UTF-8".to_string()
+                    })?;
+                if raw.is_empty() || raw.len() > 64 {
+                    return Err(
+                        "supervise: --ready-expected-schema must be 1..=64 bytes".to_string()
+                    );
+                }
+                if !raw
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+                    || raw.starts_with('.')
+                {
+                    return Err(
+                        "supervise: --ready-expected-schema is not a valid identifier".to_string()
+                    );
+                }
+                ready_expected_schema = Some(raw.to_owned());
             }
             "--max-trial-attempts" => {
                 if max_trial_attempts.is_some() {
@@ -433,7 +593,19 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                 }
                 return Ok(SuperviseArgs {
                     store,
-                    soak: soak.unwrap_or_else(|| Duration::from_millis(DEFAULT_TRIAL_SOAK_MS)),
+                    ready_timeout: ready_timeout
+                        .unwrap_or_else(|| Duration::from_millis(DEFAULT_READY_TIMEOUT_MS)),
+                    stop_grace: stop_grace
+                        .unwrap_or_else(|| Duration::from_millis(DEFAULT_STOP_GRACE_MS)),
+                    ready_require_tun: ready_require_tun.unwrap_or(DEFAULT_READY_REQUIRE_TUN),
+                    ready_min_workers: ready_min_workers.unwrap_or(DEFAULT_READY_MIN_WORKERS),
+                    // Required: the schema is bound to the target release, so a
+                    // default would silently accept whatever a candidate says.
+                    ready_expected_schema: ready_expected_schema.ok_or_else(|| {
+                        "supervise: --ready-expected-schema <ID> is required \
+                         (the state schema the target release expects)"
+                            .to_string()
+                    })?,
                     max_trial_attempts: max_trial_attempts.unwrap_or(DEFAULT_MAX_TRIAL_ATTEMPTS),
                     child_argv,
                 });
@@ -709,7 +881,90 @@ fn reset_trial_report(store: &UpgradeStore, confirm: &str) -> std::result::Resul
 }
 
 // ---------------------------------------------------------------------------
-// Subcommand: supervise (lock -> recover -> spawn -> liveness gate -> confirm)
+// Subcommand: __ready-stub (test-support candidate side of the handshake)
+// ---------------------------------------------------------------------------
+
+/// Candidate side of the readiness handshake, for integration tests only.
+///
+/// It is a real protocol client — not a mock — so `tests/readiness.rs` can run
+/// the supervisor and a `__ready-stub` child as two actual processes and
+/// exercise AF_UNIX, peer credentials and the challenge/response end to end.
+#[cfg(unix)]
+fn cmd_ready_stub(args: &[OsString]) -> CliOutcome {
+    let mut socket: Option<String> = None;
+    let mut schema = String::from("state-v1");
+    let mut workers: u32 = 1;
+    let mut tun = readiness::TunStatus::Ready;
+    let mut exit_after_ms: Option<u64> = None;
+    let mut exit_code: u8 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let Some(flag) = args[i].to_str() else {
+            return usage_err("__ready-stub: argument is not valid UTF-8");
+        };
+        match flag {
+            "--socket" | "--schema" | "--workers" | "--tun" | "--exit-after-ms" | "--exit-code" => {
+                i += 1;
+                let Some(raw) = args.get(i).and_then(|value| value.to_str()) else {
+                    return usage_err(&format!("__ready-stub: {flag} requires a UTF-8 value"));
+                };
+                match flag {
+                    "--socket" => socket = Some(raw.to_owned()),
+                    "--schema" => schema = raw.to_owned(),
+                    "--workers" => match raw.parse::<u32>() {
+                        Ok(value) => workers = value,
+                        Err(_) => return usage_err("__ready-stub: --workers must be an integer"),
+                    },
+                    "--tun" => {
+                        tun = match raw {
+                            "ready" => readiness::TunStatus::Ready,
+                            "absent" => readiness::TunStatus::Absent,
+                            _ => return usage_err("__ready-stub: --tun must be ready or absent"),
+                        };
+                    }
+                    "--exit-after-ms" => match raw.parse::<u64>() {
+                        Ok(value) => exit_after_ms = Some(value),
+                        Err(_) => {
+                            return usage_err("__ready-stub: --exit-after-ms must be a number");
+                        }
+                    },
+                    "--exit-code" => match raw.parse::<u8>() {
+                        Ok(value) => exit_code = value,
+                        Err(_) => return usage_err("__ready-stub: --exit-code must be 0-255"),
+                    },
+                    _ => {}
+                }
+            }
+            other => return usage_err(&format!("__ready-stub: unexpected argument: {other}")),
+        }
+        i += 1;
+    }
+    let socket = socket.or_else(|| {
+        env::var_os(readiness::SOCKET_ENV).map(|value| value.to_string_lossy().into_owned())
+    });
+    let Some(socket) = socket else {
+        return usage_err("__ready-stub: --socket or BOREAS_READY_SOCKET is required");
+    };
+    if let Err(e) = readiness::serve_once(std::path::Path::new(&socket), &schema, workers, tun) {
+        return err_out(&format!("__ready-stub: readiness handshake failed: {e}"));
+    }
+    match exit_after_ms {
+        Some(ms) => thread::sleep(Duration::from_millis(ms)),
+        None => loop {
+            // Stay alive until the supervisor stops us.
+            thread::sleep(Duration::from_secs(3600));
+        },
+    }
+    done(exit_code, String::new(), String::new())
+}
+
+#[cfg(not(unix))]
+fn cmd_ready_stub(_args: &[OsString]) -> CliOutcome {
+    err_out("__ready-stub: AF_UNIX readiness is not available on this platform")
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: supervise (lock -> recover -> spawn -> readiness -> confirm)
 // ---------------------------------------------------------------------------
 
 fn cmd_supervise(args: &[OsString]) -> CliOutcome {
@@ -761,11 +1016,14 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             match &reservation {
                 Some(state) if state.version == candidate => notes.push(format!(
                     "trial launch {}/{} of candidate {candidate} (previous: {}); \
-                     confirmed only after {} ms of liveness window",
+                     confirmed only after an authorized readiness answer within {} ms \
+                     (require_tun={}, min_workers={})",
                     state.attempts,
                     parsed.max_trial_attempts,
                     previous.as_deref().unwrap_or("(none)"),
-                    parsed.soak.as_millis(),
+                    parsed.ready_timeout.as_millis(),
+                    parsed.ready_require_tun,
+                    parsed.ready_min_workers,
                 )),
                 _ => {
                     // Refuse rather than launch a trial whose attempt was never
@@ -848,7 +1106,10 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             store_root: parsed.store,
             argv,
             trial_candidate,
-            soak: parsed.soak,
+            ready_timeout: parsed.ready_timeout,
+            stop_grace: parsed.stop_grace,
+            ready_require_tun: parsed.ready_require_tun,
+            ready_min_workers: parsed.ready_min_workers,
             store_lock,
         },
         notes,
@@ -973,10 +1234,32 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
         return EXIT_ERROR;
     };
     if plan.trial_candidate.is_some() {
-        run_trial(&store, program, rest, plan.soak)
-    } else {
-        run_steady(program, rest)
+        #[cfg(unix)]
+        {
+            let trial = TrialPlan {
+                socket: PathBuf::from(&plan.store_root).join("ready.sock"),
+                ready_timeout: plan.ready_timeout,
+                stop_grace: plan.stop_grace,
+                policy: readiness::ReadinessPolicy {
+                    require_tun: plan.ready_require_tun,
+                    min_workers: plan.ready_min_workers,
+                },
+            };
+            return run_trial(&store, program, rest, &trial);
+        }
+        #[cfg(not(unix))]
+        {
+            // No AF_UNIX readiness channel here: refusing is the only honest
+            // option, because confirming on "process is alive" is exactly the
+            // gate this round removes.
+            eprintln!(
+                "boreas-supervisor: error: readiness handshake is not implemented on this \
+                 platform; refusing to confirm a trial on liveness alone"
+            );
+            return EXIT_ERROR;
+        }
     }
+    run_steady(program, rest)
 }
 
 /// Steady launch: the store already points at a confirmed version.
@@ -993,39 +1276,137 @@ fn run_steady(program: &OsString, args: &[OsString]) -> u8 {
     }
 }
 
-/// Trial launch with the liveness soak.
-fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], soak: Duration) -> u8 {
-    let mut child = match spawn_child(program, args) {
+/// Everything one trial launch needs: the private socket, the readiness
+/// deadline/policy and the stop grace.
+#[cfg(unix)]
+struct TrialPlan {
+    socket: PathBuf,
+    ready_timeout: Duration,
+    stop_grace: Duration,
+    policy: readiness::ReadinessPolicy,
+}
+
+/// Trial launch: readiness-gated, signal-forwarding, rollback on any failure.
+///
+/// The upgrade is committed **only** after the launched child connects to the
+/// private socket, proves it is the process we spawned (peer credentials) and
+/// answers this run's fresh challenge with an acceptable schema/worker/TUN
+/// state. Being alive is not enough: the old liveness soak is gone.
+#[cfg(unix)]
+fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], plan: &TrialPlan) -> u8 {
+    let listener = match readiness::bind(&plan.socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "boreas-supervisor: error: cannot bind readiness socket {}: {e}",
+                plan.socket.display()
+            );
+            return fail_trial(store);
+        }
+    };
+    let mut child = match spawn_child_with_env(program, args, &plan.socket) {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
                 "boreas-supervisor: error: cannot run {}: {e}",
                 program.to_string_lossy()
             );
+            readiness::cleanup(&plan.socket);
             return fail_trial(store);
         }
     };
-    let started = Instant::now();
+    let outcome = trial_loop(store, &mut child, &listener, plan);
+    readiness::cleanup(&plan.socket);
+    outcome
+}
+
+#[cfg(unix)]
+fn trial_loop(
+    store: &UpgradeStore,
+    child: &mut Child,
+    listener: &std::os::unix::net::UnixListener,
+    plan: &TrialPlan,
+) -> u8 {
+    let deadline = Instant::now() + plan.ready_timeout;
     let mut confirmed = false;
+    let mut stop: Option<(i32, Instant)> = None;
     loop {
+        // 1. Controlled stop: forward the signal to the child. A stop that
+        //    arrives before readiness means the trial never proved itself.
+        if let Some(signal) = signals::take() {
+            if let Some(err) = signals::forward(child.id(), signal) {
+                eprintln!(
+                    "boreas-supervisor: warning: cannot forward signal {signal} to the child: {err}"
+                );
+            }
+            if confirmed {
+                stop.get_or_insert((signal, Instant::now() + plan.stop_grace));
+            } else {
+                eprintln!(
+                    "boreas-supervisor: stop signal {signal} before readiness; rolling back"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail_trial(store);
+            }
+        }
+        // 2. Child exit.
         match child.try_wait() {
             Ok(Some(status)) => {
                 if confirmed {
-                    // The upgrade was committed at the soak deadline; this is
-                    // an ordinary runtime stop of an already-accepted version.
+                    // Already accepted: an ordinary runtime stop.
                     return exit_code_of(status);
                 }
                 eprintln!(
-                    "boreas-supervisor: trial child stopped after {} ms, before the \
-                     {} ms liveness soak ({}); rolling back",
-                    started.elapsed().as_millis(),
-                    soak.as_millis(),
-                    describe_status(status),
+                    "boreas-supervisor: trial child exited before readiness ({}); rolling back",
+                    describe_status(status)
                 );
                 return fail_trial(store);
             }
-            Ok(None) => {
-                if !confirmed && started.elapsed() >= soak {
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("boreas-supervisor: error: cannot wait for the trial child: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail_trial(store);
+            }
+        }
+        // 3. Stop grace expired: escalate.
+        if let Some((signal, until)) = stop
+            && Instant::now() >= until
+        {
+            eprintln!(
+                "boreas-supervisor: child did not stop within {} ms; sending SIGKILL",
+                plan.stop_grace.as_millis()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return if confirmed {
+                signals::exit_code(signal)
+            } else {
+                fail_trial(store)
+            };
+        }
+        // 4. Readiness handshake.
+        if !confirmed {
+            let now = Instant::now();
+            if now >= deadline {
+                eprintln!(
+                    "boreas-supervisor: candidate did not become ready within {} ms; \
+                     rolling back",
+                    plan.ready_timeout.as_millis()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail_trial(store);
+            }
+            let budget = deadline.saturating_duration_since(now);
+            match readiness::probe_once(listener, child.id(), &plan.policy, budget) {
+                Ok(Some(report)) => {
+                    eprintln!(
+                        "boreas-supervisor: readiness accepted (schema={}, workers={}, tun={:?})",
+                        report.schema, report.workers, report.tun
+                    );
                     match store.confirm() {
                         Ok(()) => {
                             confirmed = true;
@@ -1036,14 +1417,13 @@ fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], soak: 
                                 );
                             }
                             eprintln!(
-                                "boreas-supervisor: candidate stayed up for {} ms (liveness \
-                                 soak); upgrade confirmed, previous version directory retained",
-                                started.elapsed().as_millis(),
+                                "boreas-supervisor: upgrade confirmed after readiness; \
+                                 previous version directory retained"
                             );
                         }
                         Err(e) => {
                             eprintln!(
-                                "boreas-supervisor: error: liveness soak passed but confirm \
+                                "boreas-supervisor: error: readiness passed but confirm \
                                  failed: {e}; stopping the candidate and rolling back"
                             );
                             let _ = child.kill();
@@ -1052,20 +1432,25 @@ fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], soak: 
                         }
                     }
                 }
-                thread::sleep(POLL_INTERVAL);
-            }
-            Err(e) => {
-                eprintln!("boreas-supervisor: error: cannot wait for the trial child: {e}");
-                let _ = child.kill();
-                let _ = child.wait();
-                return fail_trial(store);
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "boreas-supervisor: readiness failed: {e}; stopping the candidate \
+                         and rolling back"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return fail_trial(store);
+                }
             }
         }
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
 /// Record the consumed attempt durably (the reservation was written before the
 /// launch) and restore the retained version.
+#[cfg(unix)]
 fn fail_trial(store: &UpgradeStore) -> u8 {
     if let Err(e) = store.mark_trial_failed() {
         eprintln!("boreas-supervisor: error: cannot record the failed trial attempt: {e}");
@@ -1073,6 +1458,7 @@ fn fail_trial(store: &UpgradeStore) -> u8 {
     rollback_trial(store)
 }
 
+#[cfg(unix)]
 fn rollback_trial(store: &UpgradeStore) -> u8 {
     match store.recover() {
         Ok(Recovery::RolledBack { active }) => {
@@ -1103,12 +1489,29 @@ fn rollback_trial(store: &UpgradeStore) -> u8 {
 ///
 /// No new process group/console is created, deliberately: the child stays in
 /// this process's group, so a group-directed stop (systemd's default
-/// cgroup-wide kill, or Ctrl+C in the same terminal) reaches the child even
-/// though this supervisor installs no signal handler. See the module docs for
-/// the full contract.
+/// cgroup-wide kill, or Ctrl+C in the same terminal) reaches the child directly.
+/// Stops that target only the supervisor are handled by forwarding (see
+/// `signals`).
 fn spawn_child(program: &OsString, args: &[OsString]) -> io::Result<Child> {
     Command::new(program)
         .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+}
+
+/// Spawn the trial candidate with the readiness socket exported in its
+/// environment (`BOREAS_READY_SOCKET`).
+#[cfg(unix)]
+fn spawn_child_with_env(
+    program: &OsString,
+    args: &[OsString],
+    socket: &std::path::Path,
+) -> io::Result<Child> {
+    Command::new(program)
+        .args(args)
+        .env(readiness::SOCKET_ENV, socket)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1120,6 +1523,7 @@ fn run_child_once(program: &OsString, args: &[OsString]) -> io::Result<ExitStatu
     child.wait()
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn describe_status(status: ExitStatus) -> String {
     if let Some(code) = status.code() {
         format!("exit code {code}")
@@ -1464,19 +1868,19 @@ mod unix_tests {
         supervise_with(f, child, 250, DEFAULT_MAX_TRIAL_ATTEMPTS)
     }
 
-    /// Same, with an explicit liveness soak and trial budget.
+    /// Same, with an explicit readiness timeout and trial budget.
     fn supervise_with(
         f: &Fixture,
         child: &[&str],
-        soak_ms: u64,
+        ready_timeout_ms: u64,
         max_attempts: u32,
     ) -> (u8, Vec<String>) {
         let mut args = vec![
             os("supervise"),
             os("--store"),
             os(&f.store_str()),
-            os("--trial-soak-ms"),
-            os(&soak_ms.to_string()),
+            os("--ready-timeout-ms"),
+            os(&ready_timeout_ms.to_string()),
             os("--max-trial-attempts"),
             os(&max_attempts.to_string()),
             os("--"),
@@ -1495,13 +1899,13 @@ mod unix_tests {
     }
 
     /// Planning-only variant: never spawns, so refusals can be asserted.
-    fn supervise_plan(f: &Fixture, child: &[&str], soak_ms: u64, max: u32) -> (u8, String) {
+    fn supervise_plan(f: &Fixture, child: &[&str], ready_timeout_ms: u64, max: u32) -> (u8, String) {
         let mut args = vec![
             os("supervise"),
             os("--store"),
             os(&f.store_str()),
-            os("--trial-soak-ms"),
-            os(&soak_ms.to_string()),
+            os("--ready-timeout-ms"),
+            os(&ready_timeout_ms.to_string()),
             os("--max-trial-attempts"),
             os(&max.to_string()),
             os("--"),
@@ -1732,10 +2136,10 @@ mod unix_tests {
     }
 
     #[test]
-    fn trial_zero_exit_before_soak_is_a_failure_not_a_confirmation() {
-        // The exact hole this gate closes: a candidate that exits 0
-        // immediately (bad config, no-op build, operator stop) must not be
-        // confirmed just because its status was 0.
+    fn trial_zero_exit_without_readiness_is_not_confirmed() {
+        // The hole this gate closes: a candidate that exits 0 immediately (bad
+        // config, no-op build, operator stop) must never be confirmed just
+        // because its status was 0. Readiness is the only confirmation path.
         let f = Fixture::new();
         let old_dir = f.seed_active("1.0.0", "exit 0");
         let art = f.artifact("cand", "exit 0");
@@ -1749,7 +2153,7 @@ mod unix_tests {
             )
             .unwrap();
         let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 5_000, 3);
-        assert_eq!(code, EXIT_ERROR, "early clean exit must not confirm");
+        assert_eq!(code, EXIT_ERROR, "a clean exit is not readiness");
         assert_eq!(
             store.active_version().unwrap().as_deref(),
             Some("1.0.0"),
@@ -1767,47 +2171,12 @@ mod unix_tests {
     }
 
     #[test]
-    fn trial_that_survives_soak_is_confirmed_while_running_and_keeps_old_dir() {
-        let f = Fixture::new();
-        let old_dir = f.seed_active("1.0.0", "exit 0");
-        let art = f.artifact("cand", "sleep 1\nexit 0");
-        let store = f.store();
-        store
-            .prepare(
-                &Candidate {
-                    version: "2.0.0".into(),
-                },
-                &art,
-            )
-            .unwrap();
-        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 150, 3);
-        assert_eq!(code, 0);
-        assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
-        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
-        assert!(
-            old_dir.join("prog.sh").is_file(),
-            "old version dir must be retained"
-        );
-        assert_eq!(
-            store.trial_state().unwrap(),
-            None,
-            "a confirmed candidate must not leave a failed-trial record"
-        );
-        // A later supervise is a steady launch of the confirmed version.
-        let prog = store.version_dir("2.0.0").unwrap().join("prog.sh");
-        Fixture::write_prog(&prog, "exit 0");
-        let (code, _) = supervise(&f, &["{version}/prog.sh"]);
-        assert_eq!(code, 0);
-        assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
-    }
-
-    #[test]
-    fn confirmed_candidate_crashing_later_is_not_rolled_back() {
-        // After the soak the upgrade is committed. A later crash is an
-        // ordinary runtime outage: the status propagates, the pointer stays.
+    fn candidate_that_stays_alive_without_answering_readiness_is_rolled_back() {
+        // Alive is not ready: a child that never connects must time out and be
+        // rolled back, even though it is perfectly healthy process-wise.
         let f = Fixture::new();
         f.seed_active("1.0.0", "exit 0");
-        let art = f.artifact("cand", "sleep 1\nexit 7");
+        let art = f.artifact("cand", "exec sleep 30");
         let store = f.store();
         store
             .prepare(
@@ -1817,10 +2186,16 @@ mod unix_tests {
                 &art,
             )
             .unwrap();
-        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 150, 3);
-        assert_eq!(code, 7, "post-soak exit status is propagated");
-        assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
-        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
+        let started = Instant::now();
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 200, 3);
+        assert_eq!(code, EXIT_ERROR, "liveness must not confirm");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the readiness timeout must bound the wait"
+        );
+        assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
+        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
+        assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
     }
 
     #[test]
@@ -2029,31 +2404,11 @@ mod unix_tests {
         assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
     }
 
-    #[test]
-    fn explicit_argv_runs_without_placeholder_and_may_carry_arguments() {
-        // Operator-chosen argv (no {version}) still goes through recovery,
-        // the trial ledger and the liveness soak: surviving the soak confirms
-        // the candidate.
-        let f = Fixture::new();
-        f.seed_active("1.0.0", "exit 0");
-        let art = f.artifact("cand", "exit 0");
-        let store = f.store();
-        store
-            .prepare(
-                &Candidate {
-                    version: "2.0.0".into(),
-                },
-                &art,
-            )
-            .unwrap();
-        let script = f.src_dir.join("check.sh");
-        Fixture::write_prog(&script, "test \"$1\" = expected-arg || exit 9\nsleep 1");
-        let script = script.to_string_lossy().into_owned();
-        let (code, _) = supervise_with(&f, &[&script, "expected-arg"], 150, 3);
-        assert_eq!(code, 0);
-        assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
-        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
-    }
+    // Confirm-path coverage (readiness accepted, argv passthrough, post-confirm
+    // crash, signal forwarding) lives in `tests/readiness.rs`, because it needs
+    // the real binary as the candidate side of the handshake. Shell scripts
+    // cannot answer an AF_UNIX challenge, and a mock would not exercise the
+    // protocol.
 
     // -- supervise: fail-closed paths --------------------------------------
 

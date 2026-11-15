@@ -13,22 +13,22 @@ it does **not** claim `G-UPGRADE` or `G-SUPPLY`.
 | Journal / active pointer / recovery (Linux, macOS) | implemented, tested |
 | Windows transaction backend | **not integrated**, store fails closed |
 | Exclusive store lock | implemented (`File::try_lock` OS lock) |
-| Trial liveness soak (not readiness) | implemented |
-| Application health/readiness gate (AF_UNIX + peer credentials) | **not implemented** |
+| Trial readiness (AF_UNIX + peer credentials + challenge) | implemented (transport; no daemon integration yet) |
+| Signal forwarding + controlled stop | implemented on Unix; Windows fail-closed |
 | Durable trial budget across restarts | implemented (`trial.state`) |
-| Signal forwarding / graceful stop window | **not implemented**, contract documented |
 | Strict manifest parsing + policy | implemented, dependency-free |
 | Ed25519 + ML-DSA-65 verification | implemented behind `openssl-backend` (OpenSSL 3.5+); default build fails closed |
 | Artifact size + SHA-256 check | implemented on `VerifiedManifest` behind the same feature |
 | Durable anti-rollback / TUF roles / SBOM | **not implemented** |
 
-Dependencies: `libc = "=0.2.191"` for macOS only (already locked by `boreas-tun`),
+Dependencies: `libc = "=0.2.191"` for **Unix** (the macOS `F_FULLFSYNC` flush plus
+the Linux/macOS readiness and signal backends; already locked by `boreas-tun`),
 and `openssl = "=0.10.82"` as an **optional** dependency used only by the
 `openssl-backend` feature (the same pin `boreas-pki`/`boreas-crypto` use). The
-default workspace build compiles neither backend-specific path; `Cargo.lock`
-must be regenerated once by the `Refresh Cargo.lock` workflow before `--locked`
-jobs can resolve the new edges. `serde`/`serde_json` were deliberately not
-added: the manifest reader is a small, strict, hand-written JSON subset.
+default workspace build compiles no crypto; `Cargo.lock` must be regenerated
+once by the `Refresh Cargo.lock` workflow before `--locked` jobs resolve any new
+edges. `serde`/`serde_json` were deliberately not added: the manifest reader is
+a small, strict, hand-written JSON subset.
 
 ## Transaction model
 
@@ -40,7 +40,7 @@ symlinks/special files/hard links, flushes staged file data, then renames into
 `versions/<version>` and durably writes a `Prepared` journal recording the
 retained old version. `activate()` atomically replaces `active.version` and
 records `Activated`. `confirm()` records `Confirmed` only after the supervisor's
-liveness soak passes (see below — that is not a readiness check). `recover()`
+readiness handshake succeeds (see below). `recover()`
 rolls `Prepared`/`Activated` back to the retained
 old version (or clears the pointer on first install). Old version directories
 are deliberately never deleted.
@@ -86,7 +86,8 @@ extra trials: overflow is reported as an invalid ledger rather than treated as
 The binary exposes four commands and has no `prepare`/`activate`, so no
 unverified artifact can be staged through it:
 
-* `supervise --store <DIR> [--trial-soak-ms <MS>] [--max-trial-attempts <N>] -- <argv...>`
+* `supervise --store <DIR> [--ready-timeout-ms <MS>] [--ready-require-tun <yes|no>]
+  [--ready-min-workers <N>] [--stop-grace-ms <MS>] [--max-trial-attempts <N>] -- <argv...>`
   — take the store lock, run `begin_activation()` (which starts in `recover()`),
   then spawn `<argv...>` with inherited stdio. A leading `{version}` in `argv[0]`
   is replaced with the absolute active-version directory after
@@ -103,47 +104,67 @@ unverified artifact can be staged through it:
   and a failed audit write leaves the ledger untouched. Nothing else clears a
   spent budget.
 
-### Liveness soak (this is not readiness, and not "exit 0 ⇒ confirmed")
+### Trial readiness (the gate; liveness alone confirms nothing)
 
-A trial launch is confirmed only after the candidate has **stayed alive** for
-`--trial-soak-ms` (default 30 000 ms). `confirm()` is written at the deadline
-while the child is still running, so:
+A trial launch is confirmed only after an **authorized readiness answer**. Before
+spawning the candidate the supervisor:
 
-* exiting before the deadline — with **any** status, including `0` — is a failed
-  attempt: the attempt stays consumed, the pointer is rolled back immediately,
-  and the supervisor exits non-zero;
-* after confirmation, a later exit (clean or crash) is an ordinary runtime stop:
-  its status is propagated and the committed upgrade is not rolled back.
+1. binds `<store>/ready.sock` as an `AF_UNIX` stream socket with mode `0600` and
+   exports the path as `BOREAS_READY_SOCKET`;
+2. accepts one connection and checks peer credentials — same uid in all cases
+   (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and, on Linux, the **exact
+   spawned pid**;
+3. sends a fresh 32-byte random challenge (from `/dev/urandom`) and requires the
+   candidate to echo it together with its state schema, ready-worker count and
+   TUN status.
 
-This closes the "exit 0 because it was stopped right away" hole. It is **not**
-application health: a process that is alive but deadlocked, wedged before
-binding its TUN device, missing workers, or serving a stale state schema passes
-the soak. The real gate is the next round's authorized `AF_UNIX` health endpoint
-with peer credentials, where the supervisor sends a random challenge bound to
-the candidate SHA, state schema, worker count and TUN status, and only a
-correct, fresh response confirms. There is no `sd_notify` readiness, liveness
-probe, control socket or launch timeout yet.
+`--ready-timeout-ms` (default 30 000) bounds the whole exchange;
+`--ready-min-workers` (default 1) and `--ready-require-tun` (default `yes`)
+define acceptance. A silence, a foreign peer, a wrong echo, malformed framing, a
+worker count below policy or an absent TUN when one is required all fail the
+trial, consume the durable attempt and roll the pointer back.
+
+That is what closes two holes the old behaviour had: "exit 0 immediately" and
+"alive but deadlocked/unready" both used to look like success. A process that is
+alive but wedged can no longer be confirmed, because it cannot produce a valid
+answer.
+
+Deliberate limits, stated rather than implied:
+
+* the challenge is **not yet bound to the candidate artifact SHA-256** — that
+  belongs with the `verify_release` → `prepare` wiring, which is not done;
+* there is **no Boreas daemon** in this workspace yet, so the protocol is
+  exercised against the hidden `__ready-stub` candidate in integration tests
+  (`tests/readiness.rs`). The transport is real; the production integration is
+  not claimed;
+* there is no `sd_notify` readiness, no launch timeout beyond the readiness
+  deadline, and no health probing after confirmation.
 
 The durable budget bounds the restart loop across process lifetimes:
 `--max-trial-attempts` (default 3) attempts, then `supervise` refuses to even
 activate the candidate and points the operator at `reset-trial`.
 
-### Signals: the contract
+### Signals: forwarding and controlled stop
 
-No signal handler is installed, deliberately:
+`supervise` installs handlers for `SIGTERM`/`SIGINT`/`SIGHUP`. The handler only
+stores the signal number in an atomic (async-signal-safe), and the wait loop:
 
-* the child is spawned into this process's group/console, so a group-directed
-  `SIGTERM`/`SIGINT` (systemd's default cgroup-wide stop, or Ctrl+C in the same
-  terminal) reaches the child directly;
-* if the supervisor dies mid-trial, the durable `Activated` journal plus the
-  `in-flight` reservation make the next `supervise` roll back and count the
-  attempt — no `trap` is relied on (§10.3);
-* a service unit must therefore use the default cgroup-wide kill
-  (`KillMode=control-group`) and a bounded `Restart=`.
+* forwards the signal to the child, then gives it `--stop-grace-ms` (default
+  10 000) before escalating to `SIGKILL`;
+* fails the trial and rolls back if the stop arrives **before** readiness —
+  an interrupted candidate never proved itself;
+* after confirmation, treats the stop as an ordinary runtime stop and exits
+  `128+n` when the child dies from the forwarded signal.
 
-Not provided, and not claimed: forwarding a signal delivered only to the
-supervisor, a graceful stop window, and per-signal exit mapping beyond `128+n`.
-Those need reviewed `sigaction`/console-handler code per platform.
+The group/console contract still applies underneath: a cgroup-wide stop reaches
+the child directly, and a supervisor killed mid-trial leaves the durable
+`Activated` journal plus the `in-flight` reservation for the next boot (§10.3).
+A service unit should still use `KillMode=control-group` and a bounded
+`Restart=`.
+
+Not provided, and not claimed: Windows signal semantics (its store path stays
+fail-closed), per-signal exit mapping beyond `128+n`, and any graceful drain of
+an already-confirmed daemon past the forwarded signal.
 
 ## Release metadata layer (`manifest.rs`)
 
@@ -287,14 +308,18 @@ power cut is safe.
 are development feedback only and are not release evidence.
 
 Current supervisor tests cover: journal/pointer primitives; trial non-zero exit
-and death-by-signal roll back; **early zero-exit does not confirm**; a candidate
-that survives the soak is confirmed while running and a later crash is not
-rolled back; the durable budget bounds repeated failures and `reset-trial`
-clears it; the store lock rejects a second supervisor and a concurrent
-`recover`; `status` reports the trial ledger; missing argv/program and a
-dangling pointer fail closed. Manifest tests cover strict JSON (duplicate keys,
-unknown fields, non-integers, trailing data, UTF-8, nesting), the URL subset,
-timestamps, policy, asset selection, and the in-memory ledger.
+and death-by-signal roll back; **a clean exit is not readiness**; a candidate
+that stays alive but never answers is rolled back by the readiness deadline;
+`tests/readiness.rs` drives the real binary against the real `__ready-stub`
+candidate and asserts (a) a valid answer confirms and retains the old directory,
+(b) a policy-valid answer with no TUN rolls back and still consumes an attempt,
+(c) `SIGTERM` to the supervisor is forwarded to the confirmed child and the
+supervisor exits `143`; the durable budget bounds repeated failures and
+`reset-trial` clears it; the store lock rejects a second supervisor and a
+concurrent `recover`; `status` reports the trial ledger; missing argv/program
+and a dangling pointer fail closed. Manifest tests cover strict JSON (duplicate
+keys, unknown fields, non-integers, trailing data, UTF-8, nesting), the URL
+subset, timestamps, policy, asset selection, and the in-memory ledger.
 
 Two CI obligations for the crypto path, both outside this file's scope:
 `cargo test -p boreas-supervisor --features openssl-backend` must run on a runner
@@ -304,10 +329,11 @@ then the default (`--locked`) jobs exercise the fail-closed path only; that is a
 build-coverage gap, not a claim that the backend has been validated here.
 
 Still to expand before any gate claim: process-level crash injection at every
-durable write boundary (including `SIGKILL` of the supervisor mid-trial and in
-the activation→reservation window), disk-full/permission failures, symlink and
-traversal races, supported-filesystem matrix, power-cut testing, real
-service-manager restart integration, the signal-forwarding implementation, and
+durable write boundary (including `SIGKILL` of the supervisor mid-readiness),
+disk-full/permission failures, symlink and traversal races, supported-filesystem
+matrix, power-cut testing, real service-manager restart integration, a real
+daemon that answers the readiness challenge (the protocol currently has only the
+stub counterpart), binding the challenge to the candidate artifact SHA, and
 old-version executable recovery in the shipped layout. Then satisfy the master
 plan's `G-UPGRADE` and `G-SUPPLY` gates plus the common production exit
 conditions. This is an integrated core plus a tested supervision boundary, not

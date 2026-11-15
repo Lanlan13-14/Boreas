@@ -32,7 +32,7 @@ use openssl::pkey::KeyType;
 use openssl::x509::X509Req;
 
 const MAGIC: &[u8; 4] = b"BENR";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_FRAME: usize = 40 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECORDS: usize = 16_384;
@@ -40,6 +40,42 @@ const MAX_INVITES: usize = 100_000;
 const MAX_SLOTS: usize = 4_016;
 pub const MAX_CSR_BYTES: usize = 16 * 1024;
 pub const RECOVERY_WINDOW_US: u64 = 24 * 60 * 60 * 1_000_000;
+
+/// Candidate CSR policy for the phase-0/offline Ed25519 management-key proof.
+///
+/// The OID is deployment configuration, not a protocol constant. Tests and offline
+/// provisioning may use an explicitly unregistered candidate OID; production must replace
+/// it with a formally assigned enterprise OID (gate tracked in the ADR).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CsrPolicy {
+    ed25519_pop_oid: Option<String>,
+}
+impl CsrPolicy {
+    pub const fn disabled() -> Self {
+        Self {
+            ed25519_pop_oid: None,
+        }
+    }
+    pub fn with_ed25519_pop_oid(oid: impl Into<String>) -> Result<Self, EnrollmentError> {
+        let oid = oid.into();
+        if oid.is_empty()
+            || oid.len() > 128
+            || oid.starts_with('.')
+            || oid.ends_with('.')
+            || !oid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return Err(EnrollmentError::InvalidCsrPolicy);
+        }
+        Ok(Self {
+            ed25519_pop_oid: Some(oid),
+        })
+    }
+    pub fn ed25519_pop_oid(&self) -> Option<&str> {
+        self.ed25519_pop_oid.as_deref()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum NodeRole {
@@ -129,6 +165,7 @@ pub struct VerifiedEnrollmentRequest {
     raw_csr_der: Vec<u8>,
     role: NodeRole,
     home_core_id: u8,
+    identity_pub_ed25519: [u8; 32],
 }
 impl fmt::Debug for VerifiedEnrollmentRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -140,6 +177,7 @@ impl fmt::Debug for VerifiedEnrollmentRequest {
             .field("raw_csr_len", &self.raw_csr_der.len())
             .field("role", &self.role)
             .field("home_core_id", &self.home_core_id)
+            .field("identity_pub_ed25519", &self.identity_pub_ed25519)
             .finish()
     }
 }
@@ -156,9 +194,13 @@ impl VerifiedEnrollmentRequest {
         raw_csr_sha256: [u8; 32],
         role: NodeRole,
         home_core_id: u8,
+        identity_pub_ed25519: [u8; 32],
     ) -> Result<Self, EnrollmentError> {
         if raw_csr_der.is_empty() || raw_csr_der.len() > MAX_CSR_BYTES {
             return Err(EnrollmentError::CsrTooLarge);
+        }
+        if identity_pub_ed25519 == [0; 32] {
+            return Err(EnrollmentError::InvalidIdentityKey);
         }
         Ok(Self {
             invite_id,
@@ -168,6 +210,7 @@ impl VerifiedEnrollmentRequest {
             raw_csr_der,
             role,
             home_core_id,
+            identity_pub_ed25519,
         })
     }
     #[cfg(test)]
@@ -179,6 +222,7 @@ impl VerifiedEnrollmentRequest {
         raw_csr_sha256: [u8; 32],
         role: NodeRole,
         home_core_id: u8,
+        identity_pub_ed25519: [u8; 32],
     ) -> Result<Self, EnrollmentError> {
         Self::from_verified_csr(
             invite_id,
@@ -188,6 +232,7 @@ impl VerifiedEnrollmentRequest {
             raw_csr_sha256,
             role,
             home_core_id,
+            identity_pub_ed25519,
         )
     }
 }
@@ -246,6 +291,7 @@ struct Tx {
     enrollment_id: [u8; 16],
     csr_hash: [u8; 32],
     csr_der: Vec<u8>,
+    identity_pub_ed25519: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -269,6 +315,11 @@ pub enum EnrollmentError {
     InvalidCsr,
     UnsupportedCsrKey,
     CsrProofOfPossession,
+    InvalidCsrPolicy,
+    CsrPolicyMissing,
+    InvalidCsrExtension,
+    Ed25519ProofOfPossession,
+    InvalidIdentityKey,
     IdentityAuthorityRejected,
     InvalidIdentityValidity,
     StoreFull,
@@ -307,6 +358,7 @@ pub struct EnrollmentStore {
     /// Durable per-home-core allocation watermark. It only moves forward and is
     /// recovered from the journal before any new allocation is attempted.
     allocation_watermarks: BTreeMap<u8, u64>,
+    csr_policy: CsrPolicy,
 }
 impl fmt::Debug for EnrollmentStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -327,6 +379,21 @@ impl EnrollmentStore {
         fence: WriterFence,
         invites: Vec<InviteSpec>,
         slots: Vec<Slot>,
+    ) -> Result<Self, EnrollmentError> {
+        Self::open_with_csr_policy(path, fence, invites, slots, CsrPolicy::disabled())
+    }
+
+    /// Open with an explicit CSR Ed25519 management-key policy.
+    ///
+    /// `CsrPolicy::disabled()` deliberately rejects CSR-based Ed binding; production online
+    /// enrollment must opt in with a formally assigned OID and a reviewed registration design.
+    /// The candidate extension parser is for controlled/offline provisioning evidence first.
+    pub fn open_with_csr_policy(
+        path: impl AsRef<Path>,
+        fence: WriterFence,
+        invites: Vec<InviteSpec>,
+        slots: Vec<Slot>,
+        csr_policy: CsrPolicy,
     ) -> Result<Self, EnrollmentError> {
         if fence.epoch == 0 {
             return Err(EnrollmentError::StaleFence);
@@ -353,7 +420,7 @@ impl EnrollmentStore {
             }
         }
         sync_parent_dir(&lock_path)?;
-        match Self::open_locked(path, lock, fence, invites, slots) {
+        match Self::open_locked(path, lock, fence, invites, slots, csr_policy) {
             Ok(mut store) => {
                 if store.provided_fence < store.fence {
                     drop(store);
@@ -381,6 +448,7 @@ impl EnrollmentStore {
         fence: WriterFence,
         invites: Vec<InviteSpec>,
         slots: Vec<Slot>,
+        csr_policy: CsrPolicy,
     ) -> Result<Self, EnrollmentError> {
         if invites.len() > MAX_INVITES || slots.len() > MAX_SLOTS {
             return Err(EnrollmentError::StoreFull);
@@ -421,6 +489,7 @@ impl EnrollmentStore {
             transactions: BTreeMap::new(),
             invite_bindings: BTreeMap::new(),
             allocation_watermarks: BTreeMap::new(),
+            csr_policy,
         };
         store.recover()?;
         Ok(store)
@@ -447,7 +516,10 @@ impl EnrollmentStore {
             return Err(EnrollmentError::InviteScopeMismatch);
         }
         if let Some(tx) = self.transactions.get(&pair) {
-            if tx.csr_hash != req.raw_csr_sha256 || tx.csr_der != req.raw_csr_der {
+            if tx.csr_hash != req.raw_csr_sha256
+                || tx.csr_der != req.raw_csr_der
+                || tx.identity_pub_ed25519 != req.identity_pub_ed25519
+            {
                 return Err(EnrollmentError::InviteBoundToDifferentRequest);
             }
             if now_us > tx.result.recovery_until_us {
@@ -503,6 +575,7 @@ impl EnrollmentStore {
             enrollment_id: req.enrollment_id,
             csr_hash: req.raw_csr_sha256,
             csr_der: req.raw_csr_der.clone(),
+            identity_pub_ed25519: req.identity_pub_ed25519,
         };
         // The watermark is a separate durable record written before the binding.
         // A crash after this write may skip a number, but can never move backwards.
@@ -656,7 +729,8 @@ impl EnrollmentStore {
             }
             if tx.csr_der.as_slice() == csr_der {
                 // The exact DER was already verified when first admitted. Recovery retries
-                // reuse that decision instead of paying for a second ML-DSA verification.
+                // reuse that decision instead of paying for a second ML-DSA verification;
+                // the Ed key is the one durably bound to that exact DER.
                 return VerifiedEnrollmentRequest::from_verified_csr(
                     invite_id,
                     enrollment_id,
@@ -665,6 +739,7 @@ impl EnrollmentStore {
                     tx.csr_hash,
                     invite.role,
                     invite.home_core_id,
+                    tx.identity_pub_ed25519,
                 );
             }
             // A bound transaction cannot be rebound to different bytes; reject cheaply.
@@ -676,7 +751,11 @@ impl EnrollmentStore {
         if now_us >= invite.expires_at_us {
             return Err(EnrollmentError::InviteExpired);
         }
-        let csr_hash = verify_ml_dsa_csr(csr_der)?;
+        let oid = self
+            .csr_policy
+            .ed25519_pop_oid()
+            .ok_or(EnrollmentError::CsrPolicyMissing)?;
+        let (csr_hash, identity_pub_ed25519) = verify_ml_dsa_csr(csr_der, oid)?;
         VerifiedEnrollmentRequest::from_verified_csr(
             invite_id,
             enrollment_id,
@@ -685,6 +764,7 @@ impl EnrollmentStore {
             csr_hash,
             invite.role,
             invite.home_core_id,
+            identity_pub_ed25519,
         )
     }
 
@@ -712,6 +792,7 @@ impl EnrollmentStore {
         let invite_id = req.invite_id;
         let enrollment_id = req.enrollment_id;
         let bearer_secret = req.bearer_secret;
+        let identity_pub_ed25519 = req.identity_pub_ed25519;
         let claimed = self.claim(req, now_us)?;
         if claimed.phase != EnrollmentPhase::Prepared {
             return Ok(claimed);
@@ -728,6 +809,7 @@ impl EnrollmentStore {
             vip_octet: claimed.slot.vip_octet,
             role,
             identity_generation: claimed.identity_generation,
+            identity_pub_ed25519,
             not_before_us: validity.not_before_us,
             expires_us: validity.expires_us,
             scope: validity.scope,
@@ -1162,6 +1244,7 @@ fn encode_tx(w: &mut Vec<u8>, tx: &Tx) {
     w.extend_from_slice(&tx.invite_id);
     w.extend_from_slice(&tx.enrollment_id);
     w.extend_from_slice(&tx.csr_hash);
+    w.extend_from_slice(&tx.identity_pub_ed25519);
     w.push(match tx.result.phase {
         EnrollmentPhase::Prepared => 1,
         EnrollmentPhase::Issued => 2,
@@ -1183,6 +1266,10 @@ fn decode_tx(r: &mut Reader<'_>) -> Result<Tx, EnrollmentError> {
     let invite_id = r.array16()?;
     let enrollment_id = r.array16()?;
     let csr_hash = r.array32()?;
+    let identity_pub_ed25519 = r.array32()?;
+    if identity_pub_ed25519 == [0; 32] {
+        return Err(EnrollmentError::CorruptJournal);
+    }
     let phase = match r.u8()? {
         1 => EnrollmentPhase::Prepared,
         2 => EnrollmentPhase::Issued,
@@ -1224,6 +1311,7 @@ fn decode_tx(r: &mut Reader<'_>) -> Result<Tx, EnrollmentError> {
         enrollment_id,
         csr_hash,
         csr_der,
+        identity_pub_ed25519,
         result: EnrollmentResult {
             phase,
             node_id,
@@ -1279,13 +1367,24 @@ impl<'a> Reader<'a> {
             .map_err(|_| EnrollmentError::CorruptJournal)
     }
 }
+/// Candidate, explicitly unregistered OID for offline/controlled Ed25519 PoP evidence.
+/// Production must configure a formally assigned enterprise OID through [`CsrPolicy`].
+pub const EXPERIMENTAL_ED25519_CSR_POP_OID: &str = "1.3.6.1.4.1.55555.1.1";
+const ED25519_POP_DOMAIN: &[u8] = b"BOREAS-NODE-ED25519-POP-v1\0";
+const ED25519_POP_PAYLOAD_LEN: usize = 1 + 32 + 64;
+
 /// Verify a standard PKCS#10 DER request carrying an ML-DSA-65 key.
 ///
 /// `X509Req::verify` performs the actual proof-of-possession check. Re-encoding and
 /// comparing the whole DER rejects trailing bytes that some decoders would ignore.
-/// The returned digest is over the exact bytes persisted by the journal.
+/// The Ed25519 management key is carried only by the configured CSR extension and must
+/// prove possession over a fixed domain bound to the CSR's ML-DSA public key. The returned
+/// digest is over the exact bytes persisted by the journal.
 #[cfg(feature = "openssl-backend")]
-fn verify_ml_dsa_csr(csr_der: &[u8]) -> Result<[u8; 32], EnrollmentError> {
+fn verify_ml_dsa_csr(
+    csr_der: &[u8],
+    ed25519_pop_oid: &str,
+) -> Result<([u8; 32], [u8; 32]), EnrollmentError> {
     if csr_der.is_empty() || csr_der.len() > MAX_CSR_BYTES {
         return Err(EnrollmentError::CsrTooLarge);
     }
@@ -1309,11 +1408,148 @@ fn verify_ml_dsa_csr(csr_der: &[u8]) -> Result<[u8; 32], EnrollmentError> {
     if !proof_of_possession {
         return Err(EnrollmentError::CsrProofOfPossession);
     }
+    let ml_dsa_public = public_key
+        .raw_public_key()
+        .map_err(|_| EnrollmentError::InvalidCsr)?;
+    let ed25519_public =
+        verify_csr_ed25519_extension(&request, ed25519_pop_oid, &ml_dsa_public)?;
     let digest = hash(MessageDigest::sha256(), csr_der).map_err(|_| EnrollmentError::InvalidCsr)?;
     let digest_bytes: &[u8] = digest.as_ref();
     let mut csr_hash = [0u8; 32];
     csr_hash.copy_from_slice(digest_bytes);
-    Ok(csr_hash)
+    Ok((csr_hash, ed25519_public))
+}
+
+#[cfg(feature = "openssl-backend")]
+fn verify_csr_ed25519_extension(
+    request: &X509Req,
+    oid: &str,
+    ml_dsa_public: &[u8],
+) -> Result<[u8; 32], EnrollmentError> {
+    let expected_oid = openssl::asn1::Asn1Object::from_str(oid)
+        .map_err(|_| EnrollmentError::InvalidCsrPolicy)?
+        .to_der()
+        .map_err(|_| EnrollmentError::InvalidCsrPolicy)?;
+    let extensions = request
+        .extensions()
+        .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
+    let mut matched: Option<(bool, Vec<u8>)> = None;
+    for extension in &extensions {
+        let der = extension
+            .to_der()
+            .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
+        let (extension_oid, critical, value) = parse_extension_der(&der)?;
+        if extension_oid == expected_oid {
+            if matched.is_some() {
+                return Err(EnrollmentError::InvalidCsrExtension);
+            }
+            matched = Some((critical, value));
+        }
+    }
+    let (critical, value) = matched.ok_or(EnrollmentError::InvalidCsrExtension)?;
+    if !critical || value.len() != ED25519_POP_PAYLOAD_LEN || value[0] != 1 {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    let mut ed25519_public = [0u8; 32];
+    ed25519_public.copy_from_slice(&value[1..33]);
+    if ed25519_public == [0; 32] {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    let mut message = Vec::with_capacity(ED25519_POP_DOMAIN.len() + 32 + ml_dsa_public.len());
+    message.extend_from_slice(ED25519_POP_DOMAIN);
+    message.extend_from_slice(&ed25519_public);
+    message.extend_from_slice(ml_dsa_public);
+    let ed_key = openssl::pkey::PKey::public_key_from_raw_bytes(
+        &ed25519_public,
+        openssl::pkey::Id::ED25519,
+    )
+    .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
+    let mut verifier = openssl::sign::Verifier::new_without_digest(&ed_key)
+        .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
+    if !verifier
+        .verify_oneshot(&value[33..97], &message)
+        .map_err(|_| EnrollmentError::InvalidCsrExtension)?
+    {
+        return Err(EnrollmentError::Ed25519ProofOfPossession);
+    }
+    Ok(ed25519_public)
+}
+
+#[cfg(feature = "openssl-backend")]
+fn parse_extension_der(der: &[u8]) -> Result<(Vec<u8>, bool, Vec<u8>), EnrollmentError> {
+    let mut position = 0usize;
+    let (tag, content_start, content_end) = der_take(der, &mut position)?;
+    if tag != 0x30 || content_end != der.len() {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    let mut inner = content_start;
+    let oid_tlv_start = inner;
+    let (oid_tag, _oid_start, oid_end) = der_take(der, &mut inner)?;
+    if oid_tag != 0x06 {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    let oid = der[oid_tlv_start..oid_end].to_vec();
+    let before_boolean = inner;
+    let (boolean_tag, boolean_start, boolean_end) = der_take(der, &mut inner)?;
+    let critical = if boolean_tag == 0x01 {
+        if boolean_end != boolean_start + 1 {
+            return Err(EnrollmentError::InvalidCsrExtension);
+        }
+        match der[boolean_start] {
+            0xff => true,
+            0x00 => false,
+            _ => return Err(EnrollmentError::InvalidCsrExtension),
+        }
+    } else {
+        inner = before_boolean;
+        false
+    };
+    let (value_tag, value_start, value_end) = der_take(der, &mut inner)?;
+    if value_tag != 0x04 || value_end != content_end || inner != content_end {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    Ok((oid, critical, der[value_start..value_end].to_vec()))
+}
+
+#[cfg(feature = "openssl-backend")]
+fn der_take(
+    der: &[u8],
+    position: &mut usize,
+) -> Result<(u8, usize, usize), EnrollmentError> {
+    let tag = *der
+        .get(*position)
+        .ok_or(EnrollmentError::InvalidCsrExtension)?;
+    if tag & 0x1f == 0x1f {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    let length_byte = *der
+        .get(*position + 1)
+        .ok_or(EnrollmentError::InvalidCsrExtension)?;
+    let (length, header_len) = if length_byte & 0x80 == 0 {
+        (usize::from(length_byte), 2usize)
+    } else {
+        let count = usize::from(length_byte & 0x7f);
+        if count == 0 || count > 3 || der.len() < *position + 2 + count {
+            return Err(EnrollmentError::InvalidCsrExtension);
+        }
+        let mut length = 0usize;
+        for offset in 0..count {
+            length = (length << 8)
+                | usize::from(der[*position + 2 + offset]);
+        }
+        (length, 2 + count)
+    };
+    let content_start = (*position)
+        .checked_add(header_len)
+        .ok_or(EnrollmentError::InvalidCsrExtension)?;
+    let content_end = content_start
+        .checked_add(length)
+        .ok_or(EnrollmentError::InvalidCsrExtension)?;
+    if content_end > der.len() {
+        return Err(EnrollmentError::InvalidCsrExtension);
+    }
+    *position = content_end;
+    Ok((tag, content_start, content_end))
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -1488,6 +1724,16 @@ mod tests {
             slots(),
         )
     }
+    fn setup_with_policy(path: &Path, policy: CsrPolicy) -> EnrollmentStore {
+        EnrollmentStore::open_with_csr_policy(
+            path,
+            WriterFence::from_authority(1),
+            vec![invite()],
+            slots(),
+            policy,
+        )
+        .unwrap()
+    }
     fn open_two(path: &Path, fence: u64) -> Result<EnrollmentStore, EnrollmentError> {
         EnrollmentStore::open(
             path,
@@ -1510,6 +1756,7 @@ mod tests {
             digest,
             NodeRole::Edge,
             1,
+            [8; 32],
         )
         .unwrap()
     }
@@ -1651,7 +1898,7 @@ mod tests {
         let s = setup(&path);
         drop(s);
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"BENR\x01\0\0\0\x01\0\0\0\0\x99").unwrap();
+        f.write_all(b"BENR\x02\0\0\0\x01\0\0\0\0\x99").unwrap();
         f.sync_all().unwrap();
         assert!(matches!(
             open(&path, 1),
@@ -1814,6 +2061,46 @@ mod tests {
         builder.build().to_der().unwrap()
     }
     #[cfg(feature = "openssl-backend")]
+    fn csr_with_ed25519_pop(
+        ml_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+        ed_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+        oid: &str,
+    ) -> Vec<u8> {
+        use openssl::asn1::{Asn1Object, Asn1OctetString};
+        use openssl::hash::MessageDigest;
+        use openssl::sign::Signer;
+        use openssl::stack::Stack;
+        use openssl::x509::{X509Extension, X509NameBuilder, X509ReqBuilder};
+        let ml_public = ml_key.raw_public_key().unwrap();
+        let ed_public = ed_key.raw_public_key().unwrap();
+        let mut pop_message = Vec::new();
+        pop_message.extend_from_slice(ED25519_POP_DOMAIN);
+        pop_message.extend_from_slice(&ed_public);
+        pop_message.extend_from_slice(&ml_public);
+        let mut signer = Signer::new_without_digest(ed_key).unwrap();
+        let ed_signature = signer.sign_oneshot_to_vec(&pop_message).unwrap();
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&ed_public);
+        payload.extend_from_slice(&ed_signature);
+        let oid_object = Asn1Object::from_str(oid).unwrap();
+        let octets = Asn1OctetString::new_from_bytes(&payload).unwrap();
+        let extension =
+            X509Extension::new_from_der(oid_object.as_ref(), true, octets.as_ref()).unwrap();
+        let mut extensions = Stack::new().unwrap();
+        extensions.push(extension).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "boreas-enrollment-test")
+            .unwrap();
+        let name = name.build();
+        let mut builder = X509ReqBuilder::new().unwrap();
+        builder.set_version(0).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_pubkey(ml_key).unwrap();
+        builder.add_extensions(&extensions).unwrap();
+        builder.sign(ml_key, MessageDigest::null()).unwrap();
+        builder.build().to_der().unwrap()
+    }
+    #[cfg(feature = "openssl-backend")]
     fn ml_dsa_key(seed: u8) -> openssl::pkey::PKey<openssl::pkey::Private> {
         openssl::pkey::PKey::private_key_from_seed(
             None,
@@ -1828,8 +2115,20 @@ mod tests {
     fn real_csr_admission_and_identity_signing_vertical_path() {
         use crate::management::{IdentityAuthority, ManagementTrust, verify_signed_identity};
         let path = temp_path();
+        let policy =
+            CsrPolicy::with_ed25519_pop_oid(EXPERIMENTAL_ED25519_CSR_POP_OID).unwrap();
         let csr_key = ml_dsa_key(11);
-        let csr = csr_from_key(&csr_key);
+        let node_ed_key = openssl::pkey::PKey::generate_ed25519().unwrap();
+        let node_ed_public: [u8; 32] = node_ed_key
+            .raw_public_key()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let csr = csr_with_ed25519_pop(
+            &csr_key,
+            &node_ed_key,
+            EXPERIMENTAL_ED25519_CSR_POP_OID,
+        );
         let expected_identity_public = csr_key.raw_public_key().unwrap();
         let ed_key = openssl::pkey::PKey::generate_ed25519().unwrap();
         let authority_key = ml_dsa_key(12);
@@ -1851,7 +2150,7 @@ mod tests {
             ),
             Err(crate::management::Error::InvalidIssuerKey)
         ));
-        let mut store = setup(&path);
+        let mut store = setup_with_policy(&path, policy.clone());
         let request = store
             .verify_csr_request([1; 16], [9; 16], &[7; 32], &csr, 1)
             .unwrap();
@@ -1896,13 +2195,14 @@ mod tests {
                     body.identity_pub_mldsa.as_slice(),
                     expected_identity_public.as_slice()
                 );
+                assert_eq!(body.identity_pub_ed25519, node_ed_public);
                 assert_eq!(body.scope.as_slice(), &[1, 2, 3]);
             }
             _ => panic!("expected a NodeIdentity object"),
         }
         // Retry after restart must return the exact persisted signed result and the same slot.
         drop(store);
-        let mut store = setup(&path);
+        let mut store = setup_with_policy(&path, policy.clone());
         let retry = store
             .verify_csr_request([1; 16], [9; 16], &[7; 32], &csr, 2)
             .unwrap();
@@ -1923,19 +2223,17 @@ mod tests {
         // A tampered CSR must fail the actual PKCS#10 proof/parsing on a fresh store,
         // not merely hit the already-bound cheap rejection path.
         let tamper_path = temp_path();
-        let tamper_store = setup(&tamper_path);
+        let tamper_store = setup_with_policy(&tamper_path, policy.clone());
         let mut tampered = csr.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(
-            tamper_store
-                .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
-                .is_err()
-        );
+        assert!(tamper_store
+            .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
+            .is_err());
         cleanup(&tamper_path);
         // A valid CSR for the wrong algorithm is rejected, not silently downgraded.
         let ed_path = temp_path();
-        let ed_store = setup(&ed_path);
+        let ed_store = setup_with_policy(&ed_path, policy.clone());
         let ed_csr_key = openssl::pkey::PKey::generate_ed25519().unwrap();
         let ed_csr = csr_from_key(&ed_csr_key);
         assert!(matches!(

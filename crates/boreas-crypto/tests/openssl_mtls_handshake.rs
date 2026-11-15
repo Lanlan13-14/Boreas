@@ -1662,14 +1662,10 @@ fn openssl_s_client_interop_with_boreas_acceptor() {
             &cnf,
             "TLS 1.2-only client",
             &s_client_tls12_args(dir, addr.port()),
-            &[
-                "protocol version",
-                "unsupported protocol",
-                "no protocols available",
-                "handshake failure",
-                "sslv3 alert",
-                "tlsv1 alert",
-            ],
+            // A TLS 1.3-only acceptor must emit a protocol_version alert. Do
+            // not accept generic "handshake failure" here: that would also pass
+            // when the client failed locally before sending a valid ClientHello.
+            &["protocol version"],
         );
     });
 }
@@ -1765,20 +1761,34 @@ fn s_client_args(
 /// A structurally valid `s_client` invocation restricted to TLS 1.2.  The
 /// acceptor must reject it on protocol version, so the "TLS 1.3 only" gate is
 /// exercised at the wire level instead of being inferred from configuration.
+///
+/// This is deliberately constructed from scratch instead of rewriting the TLS
+/// 1.3 arguments: `-ciphersuites` is TLS-1.3-only and a rewritten `-cipher
+/// DEFAULT` produced an empty TLS 1.2 cipher list on OpenSSL 3.6.1, failing the
+/// client locally before it sent a ClientHello. A concrete legacy cipher plus
+/// `-tls1_2` makes the probe reach the Boreas acceptor; no client certificate
+/// is needed because the version must be rejected before a CertificateRequest
+/// can be answered, and no Boreas suite policy is relaxed.
 fn s_client_tls12_args(dir: &TempDir, port: u16) -> Vec<String> {
-    let mut args = s_client_args(dir, port, "TLS_AES_256_GCM_SHA384", "X25519MLKEM768", true);
-    let version = args
-        .iter()
-        .position(|arg| arg == "-tls1_3")
-        .expect("s_client arguments carry -tls1_3");
-    args[version] = "-tls1_2".into();
-    let ciphersuites = args
-        .iter()
-        .position(|arg| arg == "-ciphersuites")
-        .expect("s_client arguments carry -ciphersuites");
-    args[ciphersuites] = "-cipher".into();
-    args[ciphersuites + 1] = "DEFAULT".into();
-    args
+    vec![
+        "s_client".into(),
+        "-connect".into(),
+        format!("127.0.0.1:{port}"),
+        "-servername".into(),
+        "net.boreas.internal".into(),
+        "-verify_return_error".into(),
+        "-CAfile".into(),
+        dir.arg("root.pem"),
+        "-tls1_2".into(),
+        "-cipher".into(),
+        "ECDHE-RSA-AES256-GCM-SHA384".into(),
+        "-groups".into(),
+        "X25519".into(),
+        "-no_ticket".into(),
+        "-ign_eof".into(),
+        "-brief".into(),
+        "-state".into(),
+    ]
 }
 
 /// Run `s_client`, feed it stdin, and enforce an overall deadline by

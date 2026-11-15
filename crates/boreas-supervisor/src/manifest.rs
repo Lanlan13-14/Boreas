@@ -998,11 +998,11 @@ fn parse_timestamp(s: &str) -> Option<u64> {
         return None;
     }
     let year = digits(b, 0, 4)? as i64;
-    let month = digits(b, 5, 2)? as u32;
-    let day = digits(b, 8, 2)? as u32;
-    let hour = digits(b, 11, 2)? as u32;
-    let minute = digits(b, 14, 2)? as u32;
-    let second = digits(b, 17, 2)? as u32;
+    let month = digits(b, 5, 2)?;
+    let day = digits(b, 8, 2)?;
+    let hour = digits(b, 11, 2)?;
+    let minute = digits(b, 14, 2)?;
+    let second = digits(b, 17, 2)?;
     if month == 0
         || month > 12
         || day == 0
@@ -1447,7 +1447,9 @@ mod tests {
             parse(&format!("{GOOD} {{}}")),
             Err(ManifestError::InvalidJson)
         );
-        assert_eq!(parse(&format!("{GOOD}\n\n")), Ok(parse(GOOD).unwrap()));
+        // Trailing *whitespace* is allowed by JSON; the exact bytes are kept.
+        let padded = parse(&format!("{GOOD}\n\n"));
+        assert!(padded.is_ok(), "trailing whitespace must not be a parse error");
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(GOOD.as_bytes());
         assert!(parse_unsigned(&bom).is_err());
@@ -1792,8 +1794,15 @@ mod tests {
         let a = verified(GOOD.as_bytes());
         let b = verified(GOOD.replace("\"sequence\":4", "\"sequence\":5").as_bytes());
         let equiv = verified(GOOD.replace("\"size\":42", "\"size\":43").as_bytes());
+        // A genuinely *new*, lower-numbered manifest, for the rollback case.
+        let older = verified(
+            GOOD.replace("\"sequence\":4", "\"sequence\":3")
+                .replace("\"size\":42", "\"size\":43")
+                .as_bytes(),
+        );
         let mut ledger = SequenceLedger::default();
         ledger.observe(&a).unwrap();
+        // Re-observing the same bytes is idempotent, not a rollback.
         ledger.observe(&a).unwrap();
         assert_eq!(
             ledger.observe(&equiv),
@@ -1802,12 +1811,14 @@ mod tests {
         ledger.observe(&b).unwrap();
         assert_eq!(ledger.highest_sequence(), Some(5));
         assert_eq!(
-            ledger.observe(&a),
+            ledger.observe(&older),
             Err(ManifestError::SequenceRollback {
                 previous: 5,
-                candidate: 4
+                candidate: 3
             })
         );
+        // The already-recorded manifest is still just a duplicate.
+        assert_eq!(ledger.observe(&a), Ok(()));
     }
 
     /// Parse one JSON string literal through the real reader, so escape and
