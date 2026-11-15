@@ -151,6 +151,18 @@ def evaluate_text(
         for line in lines
         if (match := TEST_OK_RE.match(line))
     }
+    # Windows `--nocapture` wraps after `...`, so the evidence and `ok`
+    # land on the following lines. Pair a bare start with the next `ok`
+    # before another test starts.
+    pending = None
+    for line in lines:
+        if line.startswith("test ") and line.endswith(" ..."):
+            pending = line[len("test ") : -len(" ...")]
+        elif line == "ok" and pending is not None:
+            ok_tests.add(pending)
+            pending = None
+        elif line.startswith("test "):
+            pending = None
     for name in require_tests:
         present = name in ok_tests
         report["required_tests"][name] = present

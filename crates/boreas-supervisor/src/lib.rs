@@ -1109,13 +1109,15 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
+            let thread = std::thread::current().id();
             let p = std::env::temp_dir().join(format!(
-                "boreas-supervisor-test-{}-{}",
+                "boreas-supervisor-test-{}-{}-{:?}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                thread
             ));
             fs::create_dir(&p).unwrap();
             // The store rejects symlinked path components, and macOS keeps
