@@ -1,0 +1,195 @@
+name: Rust OpenSSL hybrid TLS backend
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/boreas-crypto/**'
+      - 'crates/boreas-pki/**'
+      - 'crates/boreas-proto/**'
+      - 'crates/boreas-supervisor/**'
+      - 'crates/boreas-tunnel/**'
+      - '.github/workflows/rust-tls.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/boreas-crypto/**'
+      - 'crates/boreas-pki/**'
+      - 'crates/boreas-proto/**'
+      - 'crates/boreas-supervisor/**'
+      - 'crates/boreas-tunnel/**'
+      - '.github/workflows/rust-tls.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-tls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openssl-rust-mtls:
+    name: OpenSSL 3.6.1 + rust-openssl 0.10.82 pq768 mTLS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      OPENSSL_VERSION: 3.6.1
+      OPENSSL_SHA256: b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e
+      OPENSSL_PREFIX: ${{ github.workspace }}/.rust-tls-openssl
+      OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
+      OPENSSL_NO_VENDOR: '1'
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential perl curl ca-certificates pkg-config binutils
+      - name: Build pinned static OpenSSL
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o openssl.tar.gz
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum --check --strict
+          mkdir openssl-src
+          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-src
+          source openssl-src/VERSION.dat
+          test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}"
+          cd openssl-src
+          ./Configure linux-x86_64 no-shared no-tests \
+            --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          make -j2
+          make install_sw
+          mkdir -p "${OPENSSL_PREFIX}/ssl"
+          # install_sw does not install openssl.cnf.  Write an explicit minimal
+          # config (built-in default provider only) without YAML indentation.
+          printf '%s\n' \
+            'openssl_conf = openssl_init' \
+            '' \
+            '[openssl_init]' \
+            'providers = provider_sect' \
+            '' \
+            '[provider_sect]' \
+            'default = default_sect' \
+            '' \
+            '[default_sect]' \
+            'activate = 1' \
+            > "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          test -s "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          "${OPENSSL_PREFIX}/bin/openssl" version -a \
+            | tee "${GITHUB_WORKSPACE}/openssl-runtime.txt"
+          readelf -d "${OPENSSL_PREFIX}/bin/openssl" \
+            | tee "${GITHUB_WORKSPACE}/openssl-linkage.txt"
+          if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' \
+              "${GITHUB_WORKSPACE}/openssl-linkage.txt"; then
+            echo 'OpenSSL CLI unexpectedly links shared libssl/libcrypto' >&2
+            exit 1
+          fi
+      - name: Refuse accidental vendored OpenSSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R --include='Cargo.toml' -n 'vendored' crates/boreas-crypto; then
+            echo 'crates/boreas-crypto must not enable the vendored OpenSSL feature' >&2
+            exit 1
+          fi
+      - name: Format crypto-related crates in CI and record patch
+        # Formatting is intentionally applied before tests, not used as a
+        # blocking `--check` gate: this repository formats only in Actions, and
+        # an unformatted branch must not hide real compile/test evidence.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt -p boreas-crypto -p boreas-pki -p boreas-tunnel -p boreas-supervisor
+          git diff --binary > rust-tls-format.patch || true
+          if [ -s rust-tls-format.patch ]; then
+            echo '::warning title=Formatting patch produced::Review rust-tls-format.patch; this job did not commit it.'
+          fi
+      - name: Format check (non-blocking lint, after formatting)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Policy-only tests (no OpenSSL linkage)
+        if: always()
+        run: cargo test --locked -p boreas-crypto
+      - name: Compile backend and all test targets
+        if: always()
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: cargo check --locked -p boreas-crypto --features openssl-backend --all-targets
+      - name: Real pq768 mTLS, payload-queue byte stream, and fail-closed cases
+        if: always()
+        timeout-minutes: 15
+        shell: bash
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -o pipefail
+          cargo test --locked -p boreas-crypto --features openssl-backend \
+            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-tests.log
+      - name: PKI management, CSR, and signing tests with real OpenSSL
+        if: always()
+        timeout-minutes: 15
+        shell: bash
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -o pipefail
+          cargo test --locked -p boreas-pki --all-features \
+            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-pki-tests.log
+      - name: Transport inner-TLS seam tests with backend feature
+        if: always()
+        timeout-minutes: 15
+        shell: bash
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          # The transport crate's feature-gated module is owned by the
+          # transport-runtime slice.  Fail explicitly instead of silently
+          # skipping the seam test if that module has not landed yet.
+          test -f crates/boreas-tunnel/src/openssl_inner_tls.rs
+          set -o pipefail
+          cargo test --locked -p boreas-tunnel --all-features \
+            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-tunnel-tests.log
+      - name: Supervisor release-manifest dual-signature tests with real OpenSSL
+        if: always()
+        timeout-minutes: 15
+        shell: bash
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -o pipefail
+          cargo test --locked -p boreas-supervisor --features openssl-backend \
+            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
+      - name: Upload non-secret CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-tls-${{ github.run_id }}
+          path: |
+            openssl-runtime.txt
+            openssl-linkage.txt
+            rust-tls-format.patch
+            rust-tls-tests.log
+            rust-tls-pki-tests.log
+            rust-tls-tunnel-tests.log
+            rust-tls-supervisor-tests.log
+          if-no-files-found: warn
+          retention-days: 14
