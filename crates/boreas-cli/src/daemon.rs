@@ -17,10 +17,10 @@
 //! - Step 5: Serves an owner-only (`0600`) Unix control socket (`state_dir/control.sock`)
 //!   with `SO_PEERCRED` caller UID verification.
 
-#[cfg(unix)]
-use crate::render::{DaemonState, SecurityMode as RenderSecurityMode, StatusSnapshot};
 #[cfg(not(unix))]
 use crate::render::StatusSnapshot;
+#[cfg(unix)]
+use crate::render::{DaemonState, SecurityMode as RenderSecurityMode, StatusSnapshot};
 use std::path::Path;
 
 #[cfg(not(feature = "openssl-inner-tls"))]
