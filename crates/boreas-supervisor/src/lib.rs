@@ -61,6 +61,11 @@ mod macos;
 // `docs/upgrade/README.md` for the exact remaining gate.
 
 pub mod manifest;
+pub mod sandbox;
+pub mod preflight;
+pub mod install;
+pub mod control_auth;
+pub mod drain;
 
 /// Real Ed25519 + ML-DSA-65 verification and artifact SHA-256. Compiled only
 /// with the `openssl-backend` feature (OpenSSL 3.5+); `manifest::verify_release`

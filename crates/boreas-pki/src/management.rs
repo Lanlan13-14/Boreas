@@ -906,8 +906,8 @@ mod tests {
         MAX_SIGNED_OBJECT_LEN, SignedObject, SignerRole, SignerSignatures,
     };
     use boreas_proto::objects::{
-        AttachmentLease, CoreLsa, Endpoint, NodeIdentity, NodeRole as ObjectNodeRole, ObjectType,
-        RouteGrant, StatusSnapshot,
+        AttachmentLease, CoreLsa, DirectGrant, Endpoint, NodeIdentity, NodeRole as ObjectNodeRole,
+        ObjectType, RouteGrant, StatusSnapshot,
     };
     use openssl::pkey::{KeyType, PKey, Private};
     use openssl::sign::Signer;

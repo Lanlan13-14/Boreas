@@ -5,6 +5,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod icmp;
+pub mod queue;
+pub mod route_audit;
+pub mod virtio;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -498,14 +501,49 @@ impl PacketIo for VirtualTun {
     }
 }
 
-/// Four-dimensional fragment accounting. This tracker observes ranges only: L3 authorization must
-/// independently validate src/dst on every fragment and does not require reassembly.
+/// Four-dimensional bounded fragment reassembly.
+///
+/// L3 source check does not need reassembly; this tracker exists only for a
+/// destination-node L4 ACL after decrypt. A forwarding core must not call it.
+/// There is no API that says "core_may_reassemble".
+///
+/// This tracker does not parse IPv6 extension headers and does not look at
+/// ports. [`FragmentTracker::try_for_role`] selects the cap: `1` is Edge
+/// (512 sets, 4 MiB) and `2` is Core (2048 sets, 16 MiB). Role `0` is rejected.
+/// A new set past the concurrency cap is rejected and no existing set is evicted.
+///
+/// One set holds at most 65,535 bytes. A fragment that would push it over drops
+/// the whole set and counts the drop. A fragment that would push the global
+/// buffer over the role cap is rejected and does not enter any set. A set whose
+/// age is at least 5,000 monotonic milliseconds is dropped whole on the next
+/// [`FragmentTracker::insert`] or [`FragmentTracker::poll`], counted as expired,
+/// and cannot be completed later.
+///
+/// Overlapping ranges drop the whole set. A duplicate exact fragment (same
+/// offset and same bytes) is an overlap in this slice, not a harmless
+/// retransmit.
+///
+/// Reassembly returns the payload only when the fragment that clears
+/// more-fragments has defined the datagram end and the accepted ranges cover
+/// `0..end` with no holes. The set is then freed and its bytes leave the
+/// global counter.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FragmentKey {
     pub src: IpAddr,
     pub dst: IpAddr,
     pub protocol: u8,
     pub identification: u32,
+}
+/// Destination-node role. This is not a forwarding permission.
+///
+/// Discriminant `0` is not a role. [`FragmentTracker::try_for_role`] rejects it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FragmentRole {
+    /// 512 concurrent sets and a 4 MiB global buffer.
+    Edge = 1,
+    /// 2048 concurrent sets and a 16 MiB global buffer.
+    Core = 2,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct FragmentLimits {
@@ -528,19 +566,43 @@ impl FragmentLimits {
         timeout: Duration::from_secs(5),
     };
 }
+struct Chunk {
+    offset: u32,
+    end: u32,
+    data: Vec<u8>,
+}
 struct Flow {
-    ranges: Vec<(u32, u32)>,
+    chunks: Vec<Chunk>,
     bytes: usize,
-    created: Instant,
+    created_ms: u64,
     final_end: Option<u32>,
 }
 pub struct FragmentTracker {
     limits: FragmentLimits,
     flows: HashMap<FragmentKey, Flow>,
-    tombstones: HashMap<FragmentKey, Instant>,
+    tombstones: HashMap<FragmentKey, u64>,
     bytes: usize,
+    dropped: u64,
+    expired: u64,
+    instant_origin: Option<Instant>,
+}
+/// `true` when `global_used + add` fits in `cap` without wrapping.
+fn try_reserve(global_used: usize, cap: usize, add: usize) -> bool {
+    global_used.checked_add(add).is_some_and(|sum| sum <= cap)
 }
 impl FragmentTracker {
+    /// Hardcoded production caps. `1` is Edge (4 MiB, 512 sets). `2` is Core
+    /// (16 MiB, 2048 sets). `0` and any other discriminant are rejected.
+    pub fn try_for_role(role: u8) -> Result<Self, Error> {
+        let limits = match role {
+            1 => FragmentLimits::EDGE,
+            2 => FragmentLimits::CORE,
+            _ => return Err(Error::InvalidConfiguration),
+        };
+        Ok(Self::from_limits(limits))
+    }
+    /// Compatibility constructor. The public fields cannot exceed the production
+    /// ceilings, and `0` is rejected. Prefer [`Self::try_for_role`].
     pub fn try_new(limits: FragmentLimits) -> Result<Self, Error> {
         if limits.streams == 0
             || limits.streams > 2048
@@ -553,15 +615,21 @@ impl FragmentTracker {
         {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self {
+        Ok(Self::from_limits(limits))
+    }
+    pub fn new(limits: FragmentLimits) -> Self {
+        Self::try_new(limits).expect("FragmentTracker requires protocol-bounded limits")
+    }
+    fn from_limits(limits: FragmentLimits) -> Self {
+        Self {
             limits,
             flows: HashMap::new(),
             tombstones: HashMap::new(),
             bytes: 0,
-        })
-    }
-    pub fn new(limits: FragmentLimits) -> Self {
-        Self::try_new(limits).expect("FragmentTracker requires protocol-bounded limits")
+            dropped: 0,
+            expired: 0,
+            instant_origin: None,
+        }
     }
     pub fn tracked_streams(&self) -> usize {
         self.flows.len()
@@ -569,7 +637,15 @@ impl FragmentTracker {
     pub fn buffered_bytes(&self) -> usize {
         self.bytes
     }
-    fn tombstone(&mut self, key: FragmentKey, until: Instant) {
+    /// Whole sets discarded because a fragment overlapped or exceeded 65,535 bytes.
+    pub fn dropped_sets(&self) -> u64 {
+        self.dropped
+    }
+    /// Whole sets discarded because their age reached 5,000 monotonic milliseconds.
+    pub fn expired_sets(&self) -> u64 {
+        self.expired
+    }
+    fn tombstone(&mut self, key: FragmentKey, until_ms: u64) {
         let cap = self.limits.streams.saturating_mul(2).max(1);
         if self.tombstones.len() >= cap
             && !self.tombstones.contains_key(&key)
@@ -581,110 +657,365 @@ impl FragmentTracker {
         {
             self.tombstones.remove(&old);
         }
-        self.tombstones.insert(key, until);
+        self.tombstones.insert(key, until_ms);
     }
-    fn discard(&mut self, key: FragmentKey, now: Instant) {
+    fn drop_set(&mut self, key: FragmentKey, now_ms: u64) {
         if let Some(f) = self.flows.remove(&key) {
-            self.bytes -= f.bytes
+            self.bytes -= f.bytes;
         }
-        self.tombstone(key, now + self.limits.timeout);
+        self.dropped += 1;
+        self.tombstone(
+            key,
+            now_ms.saturating_add(self.limits.timeout.as_millis() as u64),
+        );
     }
-    pub fn expire(&mut self, now: Instant) -> usize {
+    fn sweep_expired(&mut self, now_ms: u64) -> usize {
+        let lifetime = self.limits.timeout.as_millis() as u64;
         let old: Vec<_> = self
             .flows
             .iter()
-            .filter_map(|(k, v)| {
-                (now.saturating_duration_since(v.created) >= self.limits.timeout).then_some(*k)
-            })
+            .filter_map(|(k, v)| (now_ms.saturating_sub(v.created_ms) >= lifetime).then_some(*k))
             .collect();
         for k in &old {
-            self.discard(*k, now)
+            if let Some(f) = self.flows.remove(k) {
+                self.bytes -= f.bytes;
+            }
+            self.expired += 1;
+            self.tombstone(*k, now_ms.saturating_add(lifetime));
         }
-        self.tombstones.retain(|_, until| *until > now);
+        self.tombstones.retain(|_, until| *until > now_ms);
         old.len()
     }
-    /// Observe one IP fragment and reject overlaps. `now` is injectable for deterministic timeout tests.
+    fn now_ms(&mut self, now: Instant) -> u64 {
+        match self.instant_origin {
+            Some(origin) => now.saturating_duration_since(origin).as_millis() as u64,
+            None => {
+                self.instant_origin = Some(now);
+                0
+            }
+        }
+    }
+    /// Observe one fragment and return the reassembled payload once, if this
+    /// fragment completed `0..end`. `now` is an injectable monotonic instant.
     pub fn observe(
         &mut self,
         key: FragmentKey,
         offset: u32,
-        len: usize,
+        payload: &[u8],
         more: bool,
         now: Instant,
-    ) -> Result<(), Error> {
-        self.expire(now);
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let now_ms = self.now_ms(now);
+        self.insert(key, offset, payload, more, now_ms)
+    }
+    /// Drop sets whose age is at least the lifetime. Returns how many were expired.
+    pub fn expire(&mut self, now: Instant) -> usize {
+        let now_ms = self.now_ms(now);
+        self.sweep_expired(now_ms)
+    }
+    /// Insert one fragment. `now_ms` is caller-supplied monotonic milliseconds.
+    ///
+    /// The returned bytes are the payload only, and only when the fragment that
+    /// cleared more-fragments has defined the end and the ranges cover `0..end`
+    /// with no holes. The set is freed before the return, so its bytes leave
+    /// the global counter.
+    pub fn insert(
+        &mut self,
+        key: FragmentKey,
+        offset: u32,
+        payload: &[u8],
+        more: bool,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.sweep_expired(now_ms);
         if self.tombstones.contains_key(&key) {
             return Err(Error::FragmentTimeout);
         }
-        let end = offset
-            .checked_add(u32::try_from(len).map_err(|_| Error::FragmentMalformed)?)
-            .ok_or(Error::FragmentMalformed)?;
+        let len = payload.len();
+        let len_u32 = u32::try_from(len).map_err(|_| Error::FragmentMalformed)?;
+        let Some(end) = offset.checked_add(len_u32) else {
+            self.drop_set(key, now_ms);
+            return Err(Error::FragmentLimit);
+        };
         if len == 0
-            || end > 65_535
             || (offset != 0 && !offset.is_multiple_of(8))
             || (more && !len.is_multiple_of(8))
         {
             return Err(Error::FragmentMalformed);
         }
+        if end > 65_535 {
+            self.drop_set(key, now_ms);
+            return Err(Error::FragmentLimit);
+        }
         if !self.flows.contains_key(&key) && self.flows.len() >= self.limits.streams {
             return Err(Error::FragmentLimit);
         }
         let current = self.flows.get(&key);
-        let oldbytes = current.map_or(0, |f| f.bytes);
-        let total = oldbytes.checked_add(len).ok_or(Error::FragmentLimit)?;
-        if total > self.limits.per_stream_bytes
-            || self.bytes - oldbytes + total > self.limits.global_bytes
-        {
-            self.discard(key, now);
+        let old_bytes = current.map_or(0, |f| f.bytes);
+        let total = old_bytes.checked_add(len).ok_or(Error::FragmentLimit)?;
+        if total > self.limits.per_stream_bytes {
+            self.drop_set(key, now_ms);
+            return Err(Error::FragmentLimit);
+        }
+        let used_without = self.bytes - old_bytes;
+        if !try_reserve(used_without, self.limits.global_bytes, total) {
             return Err(Error::FragmentLimit);
         }
         if let Some(f) = self.flows.get(&key)
-            && (f.ranges.iter().any(|(a, b)| offset < *b && *a < end)
+            && (f.chunks.iter().any(|c| offset < c.end && c.offset < end)
                 || f.final_end
                     .is_some_and(|x| end > x || (!more && end != x) || (more && end >= x))
-                || (!more && f.ranges.iter().any(|(_, b)| *b > end)))
+                || (!more && f.chunks.iter().any(|c| c.end > end)))
         {
-            self.discard(key, now);
+            self.drop_set(key, now_ms);
             return Err(Error::FragmentOverlap);
         }
-        let f = self.flows.entry(key).or_insert_with(|| Flow {
-            ranges: Vec::new(),
+        let flow = self.flows.entry(key).or_insert_with(|| Flow {
+            chunks: Vec::new(),
             bytes: 0,
-            created: now,
+            created_ms: now_ms,
             final_end: None,
         });
-        f.ranges.push((offset, end));
-        f.bytes += len;
+        flow.chunks.push(Chunk {
+            offset,
+            end,
+            data: payload.to_vec(),
+        });
+        flow.bytes += len;
         if !more {
-            f.final_end = Some(end)
+            flow.final_end = Some(end);
         }
         self.bytes += len;
-        let _ = f;
-        let complete = if let Some(flow) = self.flows.get(&key) {
-            if let Some(final_end) = flow.final_end {
-                let mut ranges = flow.ranges.clone();
-                ranges.sort_unstable();
-                let mut cursor = 0;
-                let mut contiguous = true;
-                for (a, b) in ranges {
-                    if a != cursor {
-                        contiguous = false;
-                        break;
-                    }
-                    cursor = b
-                }
-                contiguous && cursor == final_end
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if complete {
-            self.flows.remove(&key);
-            self.bytes -= total;
-            self.tombstones.insert(key, now + self.limits.timeout);
+        if !Self::is_complete(self.flows.get(&key).expect("flow just inserted")) {
+            return Ok(None);
         }
-        Ok(())
+        let flow = self.flows.remove(&key).expect("complete flow exists");
+        self.bytes -= flow.bytes;
+        self.tombstone(
+            key,
+            now_ms.saturating_add(self.limits.timeout.as_millis() as u64),
+        );
+        Ok(Some(Self::assemble(flow)))
+    }
+    /// Drop expired sets and return how many expired. Does not complete a set.
+    pub fn poll(&mut self, now_ms: u64) -> usize {
+        self.sweep_expired(now_ms)
+    }
+    fn is_complete(flow: &Flow) -> bool {
+        let Some(final_end) = flow.final_end else {
+            return false;
+        };
+        let mut ranges: Vec<(u32, u32)> = flow.chunks.iter().map(|c| (c.offset, c.end)).collect();
+        ranges.sort_unstable();
+        let mut cursor = 0u32;
+        for (start, end) in ranges {
+            if start != cursor {
+                return false;
+            }
+            cursor = end;
+        }
+        cursor == final_end
+    }
+    fn assemble(flow: Flow) -> Vec<u8> {
+        let end = flow.final_end.expect("complete flow has an end");
+        let mut out = vec![0u8; end as usize];
+        let mut chunks = flow.chunks;
+        chunks.sort_by_key(|c| c.offset);
+        for chunk in chunks {
+            let start = chunk.offset as usize;
+            out[start..start + chunk.data.len()].copy_from_slice(&chunk.data);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod fragment_bounds {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn key(id: u32) -> FragmentKey {
+        FragmentKey {
+            src: IpAddr::V4(Ipv4Addr::new(10, 20, 0, 2)),
+            dst: IpAddr::V4(Ipv4Addr::new(10, 20, 1, 1)),
+            protocol: 17,
+            identification: id,
+        }
+    }
+
+    fn fill_edge(tracker: &mut FragmentTracker, n: usize) {
+        let payload = [0u8; 8];
+        for id in 0..n {
+            assert_eq!(
+                tracker.insert(key(id as u32), 0, &payload, true, 0),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn role_zero_is_rejected_and_caps_are_hardcoded() {
+        assert!(matches!(
+            FragmentTracker::try_for_role(0),
+            Err(Error::InvalidConfiguration)
+        ));
+        let edge = FragmentTracker::try_for_role(1).unwrap();
+        assert_eq!(edge.limits.streams, 512);
+        assert_eq!(edge.limits.global_bytes, 4 * 1024 * 1024);
+        let core = FragmentTracker::try_for_role(2).unwrap();
+        assert_eq!(core.limits.streams, 2048);
+        assert_eq!(core.limits.global_bytes, 16 * 1024 * 1024);
+        assert!(FragmentTracker::try_for_role(3).is_err());
+    }
+
+    #[test]
+    fn edge_accepts_512_and_rejects_513_without_evicting() {
+        let mut tracker = FragmentTracker::try_for_role(1).unwrap();
+        fill_edge(&mut tracker, 512);
+        assert_eq!(tracker.tracked_streams(), 512);
+        assert_eq!(
+            tracker.insert(key(512), 0, &[0u8; 8], true, 0),
+            Err(Error::FragmentLimit)
+        );
+        assert_eq!(tracker.tracked_streams(), 512);
+        assert_eq!(tracker.buffered_bytes(), 512 * 8);
+        let tail = [1u8; 8];
+        let done = tracker.insert(key(0), 8, &tail, false, 1).unwrap();
+        assert_eq!(done, Some(vec![0u8; 8].into_iter().chain(tail).collect()));
+        assert_eq!(tracker.tracked_streams(), 511);
+        assert_eq!(tracker.buffered_bytes(), 511 * 8);
+    }
+
+    #[test]
+    fn core_accepts_2048_and_rejects_2049() {
+        let mut tracker = FragmentTracker::try_for_role(2).unwrap();
+        let payload = [0u8; 8];
+        for id in 0..2048u32 {
+            tracker.insert(key(id), 0, &payload, true, 0).unwrap();
+        }
+        assert_eq!(tracker.tracked_streams(), 2048);
+        assert_eq!(
+            tracker.insert(key(2048), 0, &payload, true, 0),
+            Err(Error::FragmentLimit)
+        );
+        assert_eq!(tracker.tracked_streams(), 2048);
+        assert_eq!(tracker.buffered_bytes(), 2048 * 8);
+    }
+
+    #[test]
+    fn overlap_drops_the_set_and_a_later_fragment_does_not_resurrect_it() {
+        let mut tracker = FragmentTracker::try_for_role(1).unwrap();
+        tracker.insert(key(1), 0, &[1u8; 8], true, 0).unwrap();
+        assert_eq!(
+            tracker.insert(key(1), 0, &[2u8; 8], true, 1),
+            Err(Error::FragmentOverlap)
+        );
+        assert_eq!(tracker.tracked_streams(), 0);
+        assert_eq!(tracker.buffered_bytes(), 0);
+        assert_eq!(tracker.dropped_sets(), 1);
+        assert_eq!(
+            tracker.insert(key(1), 8, &[3u8; 8], false, 2),
+            Err(Error::FragmentTimeout)
+        );
+        assert_eq!(tracker.tracked_streams(), 0);
+        assert_eq!(tracker.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn exact_duplicate_is_an_overlap() {
+        let mut tracker = FragmentTracker::try_for_role(1).unwrap();
+        let payload = [9u8; 8];
+        tracker.insert(key(1), 0, &payload, true, 0).unwrap();
+        assert_eq!(
+            tracker.insert(key(1), 0, &payload, true, 1),
+            Err(Error::FragmentOverlap)
+        );
+        assert_eq!(tracker.dropped_sets(), 1);
+        assert_eq!(tracker.tracked_streams(), 0);
+    }
+
+    #[test]
+    fn byte_65536_drops_the_whole_set() {
+        let mut tracker = FragmentTracker::try_for_role(1).unwrap();
+        tracker.insert(key(1), 0, &[0u8; 8], true, 0).unwrap();
+        assert_eq!(
+            tracker.insert(key(1), 65528, &[0u8; 8], true, 1),
+            Err(Error::FragmentLimit)
+        );
+        assert_eq!(tracker.tracked_streams(), 0);
+        assert_eq!(tracker.buffered_bytes(), 0);
+        assert_eq!(tracker.dropped_sets(), 1);
+        assert_eq!(
+            tracker.insert(key(1), 8, &[0u8; 8], false, 3),
+            Err(Error::FragmentTimeout)
+        );
+    }
+
+    #[test]
+    fn global_reserve_boundary_and_real_insert_reject() {
+        assert!(!try_reserve(4 * 1024 * 1024 - 1, 4 * 1024 * 1024, 2));
+        assert!(try_reserve(16 * 1024 * 1024, 16 * 1024 * 1024, 0));
+        assert!(try_reserve(16 * 1024 * 1024 - 8, 16 * 1024 * 1024, 8));
+        assert!(!try_reserve(16 * 1024 * 1024 - 8, 16 * 1024 * 1024, 9));
+        assert!(!try_reserve(usize::MAX, 16 * 1024 * 1024, 1));
+
+        let mut tracker = FragmentTracker::try_new(FragmentLimits {
+            streams: 4,
+            per_stream_bytes: 65_535,
+            global_bytes: 24,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        tracker.insert(key(1), 0, &[1u8; 16], true, 0).unwrap();
+        assert_eq!(tracker.buffered_bytes(), 16);
+        assert_eq!(
+            tracker.insert(key(2), 0, &[2u8; 16], true, 1),
+            Err(Error::FragmentLimit)
+        );
+        assert_eq!(tracker.tracked_streams(), 1);
+        assert_eq!(tracker.buffered_bytes(), 16);
+        assert_eq!(tracker.dropped_sets(), 0);
+        tracker.insert(key(2), 0, &[2u8; 8], true, 2).unwrap();
+        assert_eq!(tracker.buffered_bytes(), 24);
+        assert_eq!(tracker.tracked_streams(), 2);
+    }
+
+    #[test]
+    fn expiry_at_5000_drops_and_4999_still_completes() {
+        let mut dead = FragmentTracker::try_for_role(1).unwrap();
+        dead.insert(key(1), 0, &[7u8; 8], true, 0).unwrap();
+        assert_eq!(dead.poll(4999), 0);
+        assert_eq!(dead.tracked_streams(), 1);
+        assert_eq!(dead.poll(5000), 1);
+        assert_eq!(dead.expired_sets(), 1);
+        assert_eq!(dead.tracked_streams(), 0);
+        assert_eq!(dead.buffered_bytes(), 0);
+        assert_eq!(
+            dead.insert(key(1), 8, &[8u8; 8], false, 5001),
+            Err(Error::FragmentTimeout)
+        );
+
+        let mut live = FragmentTracker::try_for_role(1).unwrap();
+        live.insert(key(2), 0, &[4u8; 8], true, 10).unwrap();
+        let done = live.insert(key(2), 8, &[5u8; 8], false, 10 + 4999).unwrap();
+        assert_eq!(
+            done.unwrap(),
+            vec![4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5]
+        );
+        assert_eq!(live.tracked_streams(), 0);
+        assert_eq!(live.buffered_bytes(), 0);
+        assert_eq!(live.expired_sets(), 0);
+    }
+
+    #[test]
+    fn holes_wait_and_completion_frees_the_global_counter() {
+        let mut tracker = FragmentTracker::try_for_role(1).unwrap();
+        assert_eq!(tracker.insert(key(9), 8, &[2u8; 8], false, 0), Ok(None));
+        assert_eq!(
+            tracker.insert(key(9), 0, &[1u8; 8], true, 1),
+            Ok(Some(vec![1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2]))
+        );
+        assert_eq!(tracker.buffered_bytes(), 0);
+        assert_eq!(tracker.tracked_streams(), 0);
     }
 }

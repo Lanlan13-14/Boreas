@@ -12,6 +12,10 @@ pub mod backend;
 #[cfg(feature = "openssl-backend")]
 pub mod ws_stream;
 
+pub mod ws_frame;
+
+pub mod key_store;
+
 #[cfg(feature = "openssl-backend")]
 pub use ws_stream::WsByteStream;
 

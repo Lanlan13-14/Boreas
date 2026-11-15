@@ -8,3 +8,11 @@ description = "Pure routing policy and deterministic route arbitration primitive
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+# Links the reviewed strict pq768 inner TLS. Default builds stay backend-free.
+openssl-inner-tls = ["dep:boreas-crypto", "boreas-crypto/openssl-backend"]
+
+[dependencies]
+boreas-crypto = { path = "../boreas-crypto", optional = true }

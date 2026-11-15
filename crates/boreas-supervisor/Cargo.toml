@@ -28,10 +28,11 @@ openssl-backend = ["dep:openssl"]
 # default workspace build, which keeps the musl static artifacts crypto-free.
 openssl = { version = "=0.10.82", optional = true }
 
-# macOS only. The store's `F_FULLFSYNC` and directory-fsync backend uses the
-# generated bindings of the same pinned `libc` release the rest of the
+# Linux: classic seccomp-BPF install in `sandbox` (`PR_SET_NO_NEW_PRIVS` then
+# `seccomp(SECCOMP_SET_MODE_FILTER, TSYNC)`). macOS: the store's `F_FULLFSYNC`
+# and directory-fsync backend. Both use the same pinned `libc` the rest of the
 # workspace already locks (`boreas-tun`), so no new package enters
 # `Cargo.lock`. Windows needs `windows-sys`, which is *not* locked, so its
 # adapter stays unwired and the store keeps failing closed there.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "=0.2.191"

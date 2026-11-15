@@ -1742,10 +1742,13 @@ fn s_client_args(
         "-CAfile".into(),
         dir.arg("root.pem"),
         "-tls1_3".into(),
-        "-groups".into(),
+        // OpenSSL 3.6 `-groups` restricts both key-exchange groups and
+        // signature groups. Combining it with `-sigalgs mldsa65` leaves the
+        // client with no enabled TLS 1.3 ciphersuite (`no ciphers available`).
+        // `-curves` sets only the key-exchange group; the ML-DSA certificate
+        // still supplies the signature algorithm.
+        "-curves".into(),
         group.into(),
-        "-sigalgs".into(),
-        "mldsa65".into(),
         "-ciphersuites".into(),
         cipher.into(),
         "-no_ticket".into(),

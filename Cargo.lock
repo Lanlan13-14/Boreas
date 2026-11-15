@@ -72,6 +72,9 @@ dependencies = [
 [[package]]
 name = "boreas-tunnel"
 version = "0.1.0"
+dependencies = [
+ "boreas-crypto",
+]
 
 [[package]]
 name = "byteorder"

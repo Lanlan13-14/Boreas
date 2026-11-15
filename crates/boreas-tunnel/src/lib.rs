@@ -5,10 +5,23 @@
 //! trust layer. Nothing here implements a production packet data plane or TLS;
 //! it does not relax the Phase 0 TLS requirements.
 
+pub mod budget;
+pub mod capacity;
+pub mod circuit;
+pub mod dataplane;
 pub mod directory;
+pub mod failover;
+pub mod h2credit;
+pub mod hedge;
+pub mod memledger;
+#[cfg(feature = "openssl-inner-tls")]
+pub mod openssl_inner_tls;
+pub mod pmtu;
+pub mod probe_budget;
 pub mod relay;
 pub mod resource;
 pub mod scheduler;
+pub mod tcp_opts;
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

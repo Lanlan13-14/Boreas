@@ -2616,6 +2616,7 @@ mod tests {
     const VECTORS: &str =
         include_str!("../../../docs/protocol/vectors/control-messages-candidate-v1.json");
 
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn decode_hex(text: &str) -> Vec<u8> {
         assert_eq!(text.len() % 2, 0, "odd-length hex");
         text.as_bytes()
@@ -2635,24 +2636,49 @@ mod tests {
         let section = &VECTORS[..VECTORS.find("\"session_pairs\"").unwrap_or(VECTORS.len())];
         let mut ids = Vec::new();
         let mut offset = 0;
-        while let Some(found) = section[offset..].find("\"id\": \"") {
-            let start = offset + found + "\"id\": \"".len();
-            let end = start
-                + section[start..]
-                    .find('"')
-                    .unwrap_or_else(|| panic!("unterminated vector id"));
-            assert!(end > start, "empty vector id");
-            ids.push(&section[start..end]);
-            offset = end;
+        while let Some((value, next)) = json_string_field(section, offset, "id") {
+            assert!(!value.is_empty(), "empty vector id");
+            ids.push(value);
+            offset = next;
         }
         ids
     }
 
+    /// Locate `"field"` then its JSON string value, skipping whitespace that
+    /// rustfmt or a generator may insert around the colon.
+    fn json_string_field<'a>(text: &'a str, from: usize, field: &str) -> Option<(&'a str, usize)> {
+        let key = format!("\"{field}\"");
+        let found = text[from..].find(&key)?;
+        let mut cursor = from + found + key.len();
+        let bytes = text.as_bytes();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'"') {
+            return None;
+        }
+        let start = cursor + 1;
+        let end = start + text[start..].find('"')?;
+        Some((&text[start..end], end + 1))
+    }
+
     fn vector_object(id: &str) -> &'static str {
-        let marker = format!("\"id\": \"{id}\"");
-        let at = VECTORS
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing vector {id}"));
+        let mut from = 0;
+        let at = loop {
+            let (value, next) = json_string_field(VECTORS, from, "id")
+                .unwrap_or_else(|| panic!("missing vector {id}"));
+            if value == id {
+                break next;
+            }
+            from = next;
+        };
         let start = VECTORS[..at]
             .rfind('{')
             .unwrap_or_else(|| panic!("vector {id} has no object start"));

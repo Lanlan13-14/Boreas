@@ -199,6 +199,10 @@ pub struct SignedIdentityResult {
     raw_signed_bytes: Vec<u8>,
 }
 impl SignedIdentityResult {
+    // The enrollment journal cannot call the feature-gated signer yet. Keep the
+    // constructor so the signing slice can wire it without a dead_code failure
+    // on the default (backend-free) workspace build.
+    #[allow(dead_code)]
     fn from_identity_authority(raw_signed_bytes: Vec<u8>) -> Result<Self, EnrollmentError> {
         // The master plan caps one signed management object at 16 KiB total, including
         // signatures and container headers, not 16 KiB of TBS plus signatures.

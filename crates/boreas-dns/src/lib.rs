@@ -6,13 +6,23 @@
 //! Negative answers omit SOA authority records, so negative-cache TTL behavior
 //! is not implemented. Caller must provide an authenticated source-IP mapping;
 //! [`SourceAuthorization`] alone is an allowlist, not peer authentication.
+//!
+//! A response that would exceed the caller byte cap is
+//! [`DnsError::TruncatedWouldExceed`]. [`AuthoritativeDns::respond_udp`] and
+//! [`AuthoritativeDns::respond_tcp`] never set TC and never return a partial
+//! RRset. Only [`AuthoritativeDns::udp_truncate`] emits a header-and-question
+//! message with TC and an empty answer section. RD is echoed and is not
+//! recursion: RA stays clear. QCLASS other than IN is
+//! [`DnsError::InvalidQuestion`] (FORMERR); no REFUSED message is built.
+//! [`Zone::refuse_name`] is an exact-match REFUSED list and wins over addresses.
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod packet;
 pub mod tcp;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 /// Hard limit applied before parsing any incoming DNS payload.
@@ -33,8 +43,16 @@ const CLASS_IN: u16 = 1;
 pub enum DnsError {
     MessageTooLarge,
     Truncated,
+    /// The only honest response would exceed the caller byte cap. No partial
+    /// answer is returned. UDP TC, when wanted, must be requested explicitly
+    /// via [`AuthoritativeDns::udp_truncate`].
+    TruncatedWouldExceed,
     InvalidHeader,
     UnsupportedOpcode,
+    /// FORMERR: QCLASS was not IN, the question was cut short, or bytes
+    /// trailed a single question. No response message is produced. This is not
+    /// REFUSED (rcode 5), which is reserved for names outside the zone and for
+    /// names listed by [`Zone::refuse_name`].
     InvalidQuestion,
     InvalidName,
     InvalidEdns,
@@ -50,6 +68,9 @@ pub enum DnsError {
 pub struct Zone {
     origin: String,
     records: BTreeMap<String, Vec<IpAddr>>,
+    /// Exact-match names that are answered REFUSED even though they are inside
+    /// the zone. This is not a policy engine and does not match wildcards.
+    refused: BTreeSet<String>,
 }
 
 impl Zone {
@@ -62,7 +83,19 @@ impl Zone {
         Ok(Self {
             origin,
             records: BTreeMap::new(),
+            refused: BTreeSet::new(),
         })
+    }
+
+    /// Refuse this exact owner on every QTYPE. The name must be inside the zone.
+    /// Addresses already stored for it are ignored while it remains refused.
+    pub fn refuse_name(&mut self, owner: &str) -> Result<(), DnsError> {
+        let name = normalize_name(owner).ok_or(DnsError::InvalidConfiguration)?;
+        if !is_in_zone(&name, &self.origin) {
+            return Err(DnsError::InvalidConfiguration);
+        }
+        self.refused.insert(name);
+        Ok(())
     }
 
     /// Add an address to an owner name within this zone. Duplicate addresses
@@ -189,10 +222,11 @@ impl AuthoritativeDns {
         };
         let mut answer = None;
         let authoritative = is_in_zone(&question.name, &self.zone.origin);
+        let refused = self.zone.refused.contains(&question.name);
         let exists = authoritative && self.name_exists(&question.name);
         let rcode;
-        if !authoritative {
-            rcode = 5; // REFUSED
+        if !authoritative || refused {
+            rcode = 5; // REFUSED: outside the zone, or an exact refused-name hit.
         } else if exists {
             rcode = 0; // Existing owner/empty non-terminal with no requested RRset is NODATA.
             if let Some(addresses) = self.zone.records.get(&question.name) {
@@ -212,8 +246,37 @@ impl AuthoritativeDns {
             answer,
             limit,
             question.edns_size.is_some(),
-            authoritative,
+            authoritative && !refused,
         )?))
+    }
+
+    /// UDP TC indication only. Copies the query id, echoes RD (never sets RA),
+    /// keeps the whole question, sets TC, and leaves the answer section empty.
+    /// This does not invent a shortened RRset. If the header plus question
+    /// cannot fit in `max`, returns [`DnsError::TruncatedWouldExceed`] instead
+    /// of dropping the question. `max` must be between 12 and 4096.
+    pub fn udp_truncate(&self, query: &[u8], max: usize) -> Result<Vec<u8>, DnsError> {
+        if !(12..=MAX_RESPONSE_BYTES).contains(&max) {
+            return Err(DnsError::InvalidConfiguration);
+        }
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(DnsError::MessageTooLarge);
+        }
+        let question = parse_query(query)?;
+        if question.end > max {
+            return Err(DnsError::TruncatedWouldExceed);
+        }
+        let mut out = Vec::with_capacity(question.end);
+        out.extend_from_slice(&question.id.to_be_bytes());
+        // QR | TC | echoed RD. AA and RA stay clear: this is not an answer.
+        let flags = 0x8200 | (question.flags & 0x0100);
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&query[12..question.end]);
+        Ok(out)
     }
 }
 
@@ -370,21 +433,16 @@ fn build_response(
         flags |= 0x0010;
     } // CD
     out.extend_from_slice(&flags.to_be_bytes());
-    // If the question itself cannot fit, return a bounded TC header rather
-    // than exceeding the caller's advertised response ceiling.
-    let question_fits = q.end <= limit;
-    out.extend_from_slice(&(if question_fits { 1u16 } else { 0u16 }).to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-    if question_fits {
-        out.extend_from_slice(&query[12..q.end]);
+    // A question or OPT that cannot fit is not a TC answer. Callers that want
+    // the UDP TC bit use AuthoritativeDns::udp_truncate.
+    if q.end > limit {
+        return Err(DnsError::TruncatedWouldExceed);
     }
-    if !question_fits {
-        let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200;
-        out[2..4].copy_from_slice(&flags.to_be_bytes());
-        return Ok(out);
-    }
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&query[12..q.end]);
     let opt_size = if include_opt { 11 } else { 0 };
     if include_opt
         && out
@@ -393,9 +451,7 @@ fn build_response(
             .filter(|size| *size <= limit)
             .is_none()
     {
-        let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200;
-        out[2..4].copy_from_slice(&flags.to_be_bytes());
-        return Ok(out);
+        return Err(DnsError::TruncatedWouldExceed);
     }
     if let Some((rrtype, bytes)) = answer {
         let required = 2 + 2 + 2 + 4 + 2 + bytes.len();
@@ -414,8 +470,7 @@ fn build_response(
             out.extend_from_slice(&bytes);
             out[6..8].copy_from_slice(&1u16.to_be_bytes());
         } else {
-            let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200;
-            out[2..4].copy_from_slice(&flags.to_be_bytes());
+            return Err(DnsError::TruncatedWouldExceed);
         }
     }
     if include_opt {
@@ -699,14 +754,23 @@ mod tests {
             32,
         )
         .unwrap();
-        let r = small.respond_udp(CLIENT, &q).unwrap().unwrap();
-        assert!(r.len() <= 32);
-        assert_eq!(u16_at(&r, 6).unwrap(), 0);
-        assert_ne!(r[2] & 2, 0);
+        assert_eq!(
+            small.respond_udp(CLIENT, &q),
+            Err(DnsError::TruncatedWouldExceed)
+        );
+        // 32 cannot hold this question, so truncation must fail closed
+        // instead of emitting a header that drops the question.
+        assert_eq!(small.udp_truncate(&q, 32), Err(DnsError::TruncatedWouldExceed));
+        let tc = small.udp_truncate(&q, q.len()).unwrap();
+        assert_eq!(tc.len(), q.len());
+        assert_eq!(u16_at(&tc, 6).unwrap(), 0);
+        assert_ne!(tc[2] & 2, 0);
+        assert_eq!(tc[3] & 0x80, 0);
         q[11] = 1;
         q.extend_from_slice(&[0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0]);
         let r = fixture().respond_udp(CLIENT, &q).unwrap().unwrap();
         assert!(r.len() <= 512);
+        assert_eq!(r[2] & 2, 0);
     }
     #[test]
     fn tcp_response_uses_configured_cap_without_udp_datagram_clamp() {
