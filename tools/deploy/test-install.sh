@@ -6,7 +6,7 @@
 # It is deliberately *not* proof that a real deployment works: see
 # docs/deployment/ONE_CLICK.md section 5 for what still needs a real device.
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)
 DEPLOY=$ROOT/tools/deploy
 INSTALL=$DEPLOY/install.sh
 WRAPPER=$DEPLOY/boreas-run
@@ -19,7 +19,7 @@ PROCD=$DEPLOY/boreas.openwrt
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/boreas-deploy-test.XXXXXX")
 trap 'rm -rf "$T"' EXIT HUP INT TERM
-T=$(CDPATH= cd -- "$T" && pwd -P)
+T=$(CDPATH='' cd -- "$T" && pwd -P)
 FAKE=$T/fake
 mkdir -p "$FAKE" "$T/bindir"
 REAL_SHA=$(command -v sha256sum) || { echo 'sha256sum is required for the harness' >&2; exit 1; }
@@ -537,7 +537,7 @@ printf '%s\n' 'test.1' > "$P/active"
 
 expect_ok 're-entry with an identical bundle is idempotent' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
-[ "$(ls -1 "$P/releases" | wc -l)" -eq 1 ] || bail 're-entry created a second release'
+[ "$(find "$P/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] || bail 're-entry created a second release'
 pass 're-entry created no second release'
 
 printf 'version = 1\n# different\n' > "$T/config.toml"

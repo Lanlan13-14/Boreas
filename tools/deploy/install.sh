@@ -9,7 +9,7 @@
 set -eu
 umask 077
 
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 PREFIX=/opt/boreas
 BINDIR=/usr/local/bin
 LOCAL_BIN=
