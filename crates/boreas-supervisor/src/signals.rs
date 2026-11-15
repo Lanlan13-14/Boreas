@@ -25,7 +25,12 @@ pub fn install() -> std::io::Result<()> {
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: `handler` has the C signal-handler signature, performs only an
         // atomic store, and is never uninstalled, so the pointer stays valid.
-        let previous = unsafe { libc::signal(signal, handler as libc::sighandler_t) };
+        let previous = unsafe {
+            libc::signal(
+                signal,
+                handler as *const () as libc::sighandler_t,
+            )
+        };
         if previous == libc::SIG_ERR {
             return Err(std::io::Error::last_os_error());
         }

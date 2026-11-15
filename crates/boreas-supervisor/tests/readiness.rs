@@ -13,7 +13,8 @@
 
 use boreas_supervisor::{Candidate, Phase, UpgradeStore};
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +23,40 @@ const BIN: &str = env!("CARGO_BIN_EXE_boreas-supervisor");
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+fn short_test_dir(prefix: &str) -> PathBuf {
+    use std::io::Read;
+
+    let base = Path::new("/tmp").canonicalize().expect("canonical /tmp");
+    let uid = unsafe { libc::geteuid() };
+    for _ in 0..32 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut random = [0u8; 8];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut random))
+            .expect("read fixture randomness");
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let root = base.join(format!("{prefix}-{}-{seq}-{suffix}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&root) {
+            Ok(()) => {
+                let metadata = fs::symlink_metadata(&root).expect("fixture metadata");
+                assert!(metadata.file_type().is_dir(), "fixture root must be a directory");
+                assert_eq!(metadata.uid(), uid, "fixture root must be owned by this user");
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .expect("restrict fixture root permissions");
+                return root.canonicalize().expect("canonical fixture root");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot create short fixture root: {error}"),
+        }
+    }
+    panic!("could not allocate unique short fixture root")
+}
+
 struct Fixture {
     root: PathBuf,
     store: UpgradeStore,
@@ -29,20 +64,9 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "boreas-readiness-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            seq
-        ));
-        fs::create_dir_all(root.join("store")).unwrap();
-        fs::create_dir_all(root.join("artifact")).unwrap();
-        // The store rejects symlinked components; macOS keeps temp under /var.
-        let root = root.canonicalize().unwrap();
+        let root = short_test_dir("br");
+        fs::create_dir(root.join("store")).unwrap();
+        fs::create_dir(root.join("artifact")).unwrap();
         let store = UpgradeStore::open(root.join("store")).unwrap();
         // Retained old version, so a failed trial has something to roll back to.
         fs::create_dir(store.version_dir("1.0.0").unwrap()).unwrap();

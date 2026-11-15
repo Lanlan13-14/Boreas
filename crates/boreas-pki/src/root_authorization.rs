@@ -98,12 +98,8 @@ pub struct NetworkRootPin {
     mldsa_public_key_der: Vec<u8>,
 }
 impl NetworkRootPin {
-    /// Construct the network-purpose pin from independently provisioned public key DER.
-    /// The caller must source/fingerprint these bytes out of band under the NetworkRoot
-    /// provisioning procedure. The type prevents accidental API substitution but cannot
-    /// cryptographically distinguish copied ReleaseRoot DER; independent provenance is required.
-    /// SHA-256 identifier for correlating the externally provisioned pin. This only fingerprints
-    /// public configuration; it does not establish the pin's provenance or trustworthiness.
+    /// SHA-256 identifier for correlating the externally provisioned pin. This fingerprints
+    /// public configuration only; it does not establish the pin's provenance or trustworthiness.
     pub fn fingerprint(&self) -> Result<[u8; 32], Error> {
         let mut input = b"BOREAS-NETWORK-ROOT-PIN-FINGERPRINT\0".to_vec();
         input.extend_from_slice(&(self.net_id.len() as u32).to_be_bytes());
@@ -125,6 +121,9 @@ impl NetworkRootPin {
         self.net_id
     }
 
+    /// Construct a network-purpose pin from independently provisioned public key DER.
+    /// The type prevents accidental API substitution but cannot cryptographically distinguish
+    /// copied ReleaseRoot DER; independent provenance is required.
     pub fn provisioned(
         net_id: [u8; 16],
         ed25519_public_key_der: Vec<u8>,
@@ -816,6 +815,21 @@ mod tests {
             root_pq.public_key_to_der().unwrap(),
         )
         .unwrap();
+        assert_eq!(pin.fingerprint().unwrap(), pin.fingerprint().unwrap());
+        let other_network = NetworkRootPin::provisioned(
+            [4; 16],
+            root_ed.public_key_to_der().unwrap(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            root_pq.public_key_to_der().unwrap(),
+        ).unwrap();
+        assert_ne!(pin.fingerprint().unwrap(), other_network.fingerprint().unwrap());
+        let (other_root_ed, other_root_pq) = pair(12);
+        let other_keys = NetworkRootPin::provisioned(
+            [3; 16], other_root_ed.public_key_to_der().unwrap(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            other_root_pq.public_key_to_der().unwrap(),
+        ).unwrap();
+        assert_ne!(pin.fingerprint().unwrap(), other_keys.fingerprint().unwrap());
         assert_eq!(
             RootAuthorizationCandidate::decode_candidate(&raw).unwrap(),
             c

@@ -283,62 +283,60 @@ impl<'a> CircuitStream<'a> {
     }
 
     fn fill_inbound(&mut self) -> Result<(), TunnelError> {
-        loop {
-            let frame = self.session.recv_frame()?;
-            match frame.header.kind {
-                Kind::RelayCircuit => {
-                    let fragment = RelayFragment::decode(&frame.body)?;
-                    if fragment.circuit_id != self.circuit_id {
+        let frame = self.session.recv_frame()?;
+        match frame.header.kind {
+            Kind::RelayCircuit => {
+                let fragment = RelayFragment::decode(&frame.body)?;
+                if fragment.circuit_id != self.circuit_id {
+                    return Err(CircuitReject::UnknownCircuit.into());
+                }
+                if fragment.direction != self.role.inbound() {
+                    return Err(CircuitReject::DirectionMismatch.into());
+                }
+                if fragment.hops_remaining == 0 || fragment.hops_remaining > self.path_hops {
+                    return Err(CircuitReject::HopsMismatch.into());
+                }
+                if fragment.payload.is_empty() {
+                    return Err(CircuitReject::BadBody.into());
+                }
+                if fragment.byte_offset != self.recv_offset {
+                    self.reset_best_effort();
+                    return Err(CircuitReject::OffsetMismatch.into());
+                }
+                let advance = u64::try_from(fragment.payload.len())
+                    .map_err(|_| TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
+                self.recv_offset = self
+                    .recv_offset
+                    .checked_add(advance)
+                    .ok_or(TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
+                self.inbound.extend(fragment.payload);
+                Ok(())
+            }
+            Kind::Control => {
+                let subtype = frame.body.first().copied().ok_or(CircuitReject::BadBody)?;
+                if subtype == ControlType::CircuitReset as u8 {
+                    // The subtype is not enough: a reset for a different
+                    // circuit must never tear this stream down.
+                    let circuit_id = decode_control_id(&frame.body, ControlType::CircuitReset)?;
+                    if circuit_id != self.circuit_id {
+                        self.closed = true;
                         return Err(CircuitReject::UnknownCircuit.into());
                     }
-                    if fragment.direction != self.role.inbound() {
-                        return Err(CircuitReject::DirectionMismatch.into());
+                    self.closed = true;
+                    return Err(CircuitReject::ResetReceived.into());
+                }
+                if subtype == ControlType::CircuitClose as u8 {
+                    let circuit_id = decode_control_id(&frame.body, ControlType::CircuitClose)?;
+                    if circuit_id != self.circuit_id {
+                        self.closed = true;
+                        return Err(CircuitReject::UnknownCircuit.into());
                     }
-                    if fragment.hops_remaining == 0 || fragment.hops_remaining > self.path_hops {
-                        return Err(CircuitReject::HopsMismatch.into());
-                    }
-                    if fragment.payload.is_empty() {
-                        return Err(CircuitReject::BadBody.into());
-                    }
-                    if fragment.byte_offset != self.recv_offset {
-                        self.reset_best_effort();
-                        return Err(CircuitReject::OffsetMismatch.into());
-                    }
-                    let advance = u64::try_from(fragment.payload.len())
-                        .map_err(|_| TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
-                    self.recv_offset = self
-                        .recv_offset
-                        .checked_add(advance)
-                        .ok_or(TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
-                    self.inbound.extend(fragment.payload);
+                    self.closed = true;
                     return Ok(());
                 }
-                Kind::Control => {
-                    let subtype = frame.body.first().copied().ok_or(CircuitReject::BadBody)?;
-                    if subtype == ControlType::CircuitReset as u8 {
-                        // The subtype is not enough: a reset for a different
-                        // circuit must never tear this stream down.
-                        let circuit_id = decode_control_id(&frame.body, ControlType::CircuitReset)?;
-                        if circuit_id != self.circuit_id {
-                            self.closed = true;
-                            return Err(CircuitReject::UnknownCircuit.into());
-                        }
-                        self.closed = true;
-                        return Err(CircuitReject::ResetReceived.into());
-                    }
-                    if subtype == ControlType::CircuitClose as u8 {
-                        let circuit_id = decode_control_id(&frame.body, ControlType::CircuitClose)?;
-                        if circuit_id != self.circuit_id {
-                            self.closed = true;
-                            return Err(CircuitReject::UnknownCircuit.into());
-                        }
-                        self.closed = true;
-                        return Ok(());
-                    }
-                    return Err(CircuitReject::UnexpectedFrame.into());
-                }
-                Kind::HopIpBatch => return Err(CircuitReject::UnexpectedFrame.into()),
+                Err(CircuitReject::UnexpectedFrame.into())
             }
+            Kind::HopIpBatch => Err(CircuitReject::UnexpectedFrame.into()),
         }
     }
 
@@ -484,6 +482,7 @@ pub struct E2eEstablished<'a> {
 }
 
 impl<'a> E2eEstablished<'a> {
+    #[cfg(any(feature = "openssl-inner-tls", test))]
     pub(crate) fn new(stream: Box<dyn Duplex + 'a>, session: InnerTlsSession) -> Self {
         Self { stream, session }
     }

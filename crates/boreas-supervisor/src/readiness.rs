@@ -501,7 +501,48 @@ pub fn serve_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn short_test_dir() -> PathBuf {
+        let base = Path::new("/tmp").canonicalize().expect("canonical /tmp");
+        // Keep the socket pathname short enough for macOS sockaddr_un.sun_path.
+        // Include process-local sequence and OS randomness; create_dir is
+        // exclusive, so collisions never reuse another test's directory.
+        let uid = unsafe { libc::geteuid() };
+        for _ in 0..32 {
+            let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut random = [0u8; 8];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut source| source.read_exact(&mut random))
+                .expect("read fixture randomness");
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let root = base.join(format!("br-{}-{seq}-{suffix}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&root) {
+                Ok(()) => {
+                    let metadata = std::fs::symlink_metadata(&root).expect("fixture metadata");
+                    assert!(metadata.file_type().is_dir(), "fixture root must be a directory");
+                    assert_eq!(metadata.uid(), uid, "fixture root must be owned by this user");
+                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                        .expect("restrict fixture root permissions");
+                    return root.canonicalize().expect("canonical fixture root");
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create short fixture root: {error}"),
+            }
+        }
+        panic!("could not allocate unique short fixture root")
+    }
 
     const NONCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -603,15 +644,7 @@ mod tests {
 
     #[test]
     fn end_to_end_handshake_is_bounded_and_non_blocking() {
-        let dir = std::env::temp_dir().join(format!(
-            "boreas-ready-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = short_test_dir();
         let socket = dir.join("ready.sock");
         let listener = bind(&socket).expect("bind");
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
@@ -660,15 +693,7 @@ mod tests {
 
     #[test]
     fn a_slow_drip_peer_cannot_extend_the_absolute_deadline() {
-        let dir = std::env::temp_dir().join(format!(
-            "boreas-ready-drip-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = short_test_dir();
         let socket = dir.join("ready.sock");
         let listener = bind(&socket).expect("bind");
 

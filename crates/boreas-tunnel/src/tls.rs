@@ -74,6 +74,7 @@ impl InnerTlsSession {
     /// Callers must pass a certificate-derived [`PeerIdentity`]; the adapter is
     /// the only code path that holds a verified leaf certificate. Test code uses
     /// a `#[cfg(test)]` constructor instead.
+    #[cfg(any(feature = "openssl-inner-tls", test))]
     pub(crate) fn from_verified_certificate(
         peer: PeerIdentity,
         negotiated: NegotiatedParameters,
@@ -107,6 +108,7 @@ pub struct EstablishedInner {
 
 impl EstablishedInner {
     /// Constructor for the in-tree backend adapters only.
+    #[cfg(any(feature = "openssl-inner-tls", test))]
     pub(crate) fn new(stream: Box<dyn Duplex>, session: InnerTlsSession) -> Self {
         Self { stream, session }
     }

@@ -48,3 +48,20 @@ Exact SHA `0afc4526162f07f92346a41c104319159173d444`：Rust CI [43680115164](htt
 ## 当前不可推断事项
 
 CI 报告只对应上述 Actions `head_sha`。当前尚未推送的 `runtime.rs` 和 `tests/wss_e2e_openssl.rs` 变更不在这些 SHA 中，因此本报告中的运行时/WSS failures 不能作为其已测试或修复的证据。CLI smoke 不是 production 验证；development packaging 明确 unsigned / production blocked。`root_authorization` 和之后的提交也未以本报告的 97d5530 run 代替验证。
+
+
+## Later completed SHA: Clippy diagnostic supplement (2026-11-15)
+
+Read only completed runs newer than 97d5530. Latest completed non-green/green full Rust CI found was exact SHA `757227d781bb2d4c46cd0853feb5a9da712173ef`, Rust CI run [43681050699](https://github.com/Lanlan13-14/Boreas/actions/runs/43681050699), conclusion failure. (Later SHA `712a94f` Rust CI/TLS/platform runs were still in progress at query time; no waits/polling. Its TUN run was completed, but that says nothing about Clippy.) Rust jobs: Ubuntu [132711538868](https://github.com/Lanlan13-14/Boreas/actions/runs/43681050699/job/132711538868), Windows [132711538931](https://github.com/Lanlan13-14/Boreas/actions/runs/43681050699/job/132711538931); each reported Clippy and Test failed. The following error diagnostics appeared in both Clippy logs under `cargo clippy --workspace --all-targets --locked -- -D warnings` (Clippy 1.100.0); they are not claims about later `712a94f` or unpushed bool/root-auth/runtime/WSS/fixture changes.
+
+- Rust lint `function-casts-as-integer`: `crates/boreas-supervisor/src/signals.rs:28:62`, “direct cast of function item into an integer”.
+- dead code: `crates/boreas-tunnel/src/e2e.rs:487:19`, associated function `new` never used; `crates/boreas-tunnel/src/tls.rs:77:19`, `from_verified_certificate` never used; and `crates/boreas-tunnel/src/tls.rs:110:19`, associated function `new` never used.
+- Clippy `never_loop`: `crates/boreas-tunnel/src/e2e.rs:286:9`, “this loop never actually loops”.
+- Clippy `chunks_exact_to_as_chunks`: `crates/boreas-tunnel/src/sha1.rs:20:27`, “using `chunks_exact` with a constant chunk size”.
+- Clippy `manual_is_multiple_of`: `crates/boreas-tunnel/src/ws.rs:778:27`, “manual implementation of `.is_multiple_of()`”.
+- Clippy `unused_mut`: `crates/boreas-tunnel/src/ws.rs:1042:13`, variable does not need to be mutable (test target).
+- Clippy `same_item_push`: `crates/boreas-tunnel/src/ws.rs:1240:13`, “it looks like the same item is being pushed into this `Vec`” (test target).
+
+Compiler summary for tunnel library: six previous errors; tunnel lib-test: seven previous errors. These findings reflect precisely 757227d, not the later WSS fix in 712a94f. The job log also had `warning: unused dependency boreas-proto` from `crates/boreas-pki/Cargo.toml:21:1`; this was a warning, not one of the `-D warnings` compiler errors reported in the captured excerpt.
+
+Evidence handling: `.local/ci-clippy-132711538868.json` and `.local/ci-clippy-132711538931.json` are ignored local diagnostic captures. The helper emitted a JSON-escaped log string, which was decoded with PowerShell `ConvertFrom-Json`; grep-like extraction was run over the decoded log, not the serialized one-line JSON. No source/ledger changed, and no local compilation, test, Python, or formatting command was run.

@@ -17,14 +17,13 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     ];
     let bit_len = (data.len() as u64).wrapping_mul(8);
 
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
+    let (blocks, remainder) = data.as_chunks::<64>();
+    for block in blocks {
         compress(&mut state, block);
     }
 
     // Padding: 0x80, zeros, then the 64-bit big-endian message length. The
     // final chunk is one or two blocks depending on the remainder length.
-    let remainder = blocks.remainder();
     let mut tail = [0u8; 128];
     tail[..remainder.len()].copy_from_slice(remainder);
     tail[remainder.len()] = 0x80;
