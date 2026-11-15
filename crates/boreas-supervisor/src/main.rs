@@ -1,14 +1,14 @@
 //! `boreas-supervisor` — the external upgrade-supervision process
 //! (master plan §1.1, §10.3, §10.5).
 //!
-//! This binary is deliberately a *skeleton with real process semantics*, not
-//! a release system. It never downloads, installs, or authenticates
-//! anything: `prepare`/`activate` are intentionally absent so no operator
-//! can stage an unverified artifact through this entry point. Manifest
-//! verification (Ed25519 + ML-DSA dual signature, TUF-style roles, SBOM,
-//! anti-rollback — master plan §10.1–§10.2, `G-SUPPLY`) is NOT implemented
-//! anywhere in this crate and must land in an independent verification
-//! layer before `prepare` is reachable in production.
+//! This binary is the real supervision boundary, not a release system. It never
+//! downloads, installs, or authenticates anything: `prepare`/`activate` are
+//! intentionally absent so no operator can stage an unverified artifact through
+//! this entry point. Manifest verification (Ed25519 + ML-DSA dual signature,
+//! TUF-style roles, SBOM, anti-rollback — master plan §10.1–§10.2, `G-SUPPLY`)
+//! lives in `manifest.rs` as strict structure/policy only; the signature
+//! provider is not implemented, so `manifest::verify_release` fails closed and
+//! `prepare` stays unreachable in production.
 //!
 //! # Boot protocol
 //!
@@ -27,15 +27,15 @@
 //!    * no journal / consistent `Confirmed` → run `<argv...>` as the steady
 //!      program and propagate its exit status (128+signal when killed);
 //!    * `Prepared` → activate the candidate for one trial launch, run
-//!      `<argv...>`; zero exit ⇒ `confirm()`, anything else (non-zero exit,
-//!      death by signal, spawn/wait failure) ⇒ `recover()` rollback, with
-//!      the old version directory retained in both cases;
+//!      `<argv...>`, and confirm only after the liveness soak (see below); an
+//!      early exit with any status, a spawn/wait failure or a failed `confirm()`
+//!      ⇒ `recover()` rollback, with the old version directory retained;
 //!    * `Activated` (a previous trial never confirmed, e.g. this supervisor
 //!      or the candidate was `SIGKILL`ed before the outcome was recorded)
 //!      → the `recover()` inside `begin_activation` has already restored
 //!      the old pointer; run `<argv...>` as the *old* program and
 //!      propagate its status. The candidate is not auto-retried by this
-//!      invocation.
+//!      invocation, and the dead trial is recorded as a failed attempt.
 //!    * inconsistent `Confirmed` → refuse (non-zero, nothing launched).
 //!
 //!    The caller resolves `<argv...>` against the store: `supervise`
@@ -47,76 +47,148 @@
 //!
 //! In production the pair is driven as `recover` once at service start,
 //! then one `supervise` per OS-service restart; the first restart after an
-//! upgrade runs the candidate once, a crash before `confirm()` leaves the
-//! journal `Activated`, and the next `supervise` boots the rolled-back
-//! version instead of retrying the candidate. Across further restarts the
-//! journal sits at `Prepared` again, so a *fresh* `supervise` would trial
-//! the candidate again — this minimal slice carries no cross-lifetime
-//! "already failed" ledger. Breaking such a loop (trial budget, cooldown,
-//! operator acknowledgement) is service policy that must be designed with
-//! the §10.5 systemd/OS integration, **not** papered over here by silently
-//! weakening `recover()`. Until that policy exists, wrap `supervise` with
-//! bounded restart counts from the service manager and treat repeated
-//! trial failures as an operator-visible condition.
+//! upgrade runs the candidate once, and a crash before the soak deadline leaves
+//! the journal `Activated`, so the next `supervise` boots the rolled-back
+//! version instead of retrying the candidate. A candidate that keeps failing
+//! early is bounded by the durable trial budget
+//! (`--max-trial-attempts`, default 3) rather than retried forever; after the
+//! budget is spent the supervisor refuses to activate it and the operator must
+//! inspect the store and run `reset-trial`.
 //!
-//! # Known gaps (explicit, not silently claimed)
+//! # Liveness soak, store lock and durable trial budget
 //!
-//! * **No signal forwarding.** If this process receives `SIGTERM`/etc. with
-//!   a child running, the child is not signalled today; wiring that safely
-//!   without a `libc` dependency is an open design item, listed as such in
-//!   `docs/upgrade/README.md`.
-//! * **No health gate beyond exit status.** A zero exit at *any* time is
-//!   confirmed; "exit 0 because the administrator stopped it after a
-//!   healthy run versus exit 0 immediately" cannot be distinguished
-//!   without the §10.3/§10.5 health channel (`sd_notify` / control socket)
-//!   that does not exist yet. The pointer is at least never confirmed on
-//!   failure.
-//! * **No store locking.** A second concurrent supervisor against the same
-//!   store is not serialised (the library already requires single-writer
-//!   access); lock policy is part of OS integration.
-//! * **Durability** inherits the library audit: Linux directory `fsync`
-//!   only, Windows/macOS fail closed, and the power-cut / fault-injection
-//!   matrix behind `G-UPGRADE` remains unproven. Nothing in this slice
-//!   claims `G-UPGRADE` (or `G-SUPPLY`) completion.
+//! **This is a liveness gate, not a health/readiness gate.** A trial launch is
+//! confirmed only after the candidate process has stayed *alive* for
+//! `--trial-soak-ms` (default 30 000 ms); the pointer is committed while the
+//! child is still running. A candidate that stops before the deadline — with
+//! *any* status, including 0 — is a failed attempt and is rolled back. After
+//! confirmation a later exit is an ordinary runtime stop: its status is
+//! propagated and the committed upgrade is not rolled back.
+//!
+//! What it cannot detect: a process that is alive but deadlocked, wedged before
+//! binding its TUN device, missing its workers, or serving a stale state
+//! schema. "Survived the soak" is **not** application readiness. The real gate
+//! is the next round's authorized `AF_UNIX` health endpoint with peer
+//! credentials, where the supervisor sends a random challenge bound to the
+//! candidate SHA, state schema, worker count and TUN status, and only a
+//! correct, freshly signed response confirms. Until that exists, every message
+//! here says "liveness", never "healthy".
+//!
+//! Every mutating subcommand (`supervise`, `recover`, `reset-trial`) holds the
+//! store's exclusive OS file lock for its whole run, so two supervisors cannot
+//! race the journal or the active pointer. The lock is released by the kernel
+//! when the process dies, so a crash cannot leave a stale lock behind.
+//!
+//! Failed trials are durable. The attempt is written to `trial.state` *before*
+//! the launch, so a supervisor that is killed mid-trial still consumes budget
+//! on the next boot; `--max-trial-attempts` (default 3) bounds the restart loop
+//! across process lifetimes. Only the operator-only `reset-trial` clears it.
+//! The ledger can only ever *restrict* launches, so tampering with it causes a
+//! denial of upgrades, never an unauthorised one.
+//!
+//! # Signals: the contract, stated precisely
+//!
+//! This process installs **no** signal handler, and that is a contract rather
+//! than an omission:
+//!
+//! * the child is spawned into this process's group/console, so a
+//!   group-directed `SIGTERM`/`SIGINT` — systemd's default cgroup-wide stop, or
+//!   Ctrl+C in the same terminal — reaches the child directly;
+//! * if this supervisor dies mid-trial, the durable `Activated` journal plus the
+//!   `in-flight` trial reservation make the next `supervise` roll back and
+//!   count the attempt, so no `trap` is ever relied upon (§10.3);
+//! * the service unit must therefore use the default cgroup-wide kill
+//!   (`KillMode=control-group`) and a bounded `Restart=`.
+//!
+//! What is *not* provided, and must not be claimed: forwarding a signal that is
+//! delivered only to the supervisor, a graceful stop window, or per-signal exit
+//! mapping beyond the `128+n` convention. Those need reviewed
+//! `sigaction`/console-handler code per platform and remain an external gate.
+//!
+//! # Still missing (explicit, not silently claimed)
+//!
+//! * **No health channel beyond survival + exit status.** `sd_notify`/control
+//!   socket readiness, timeouts and liveness probes do not exist; "alive for
+//!   the soak" is a floor, not a readiness proof.
+//! * **No release verification.** Nothing here downloads, authenticates or
+//!   stages a release; `prepare`/`activate` are deliberately absent from the
+//!   CLI so no unverified artifact can be executed through it.
+//! * **Durability** inherits the library audit: Linux directory `fsync`, macOS
+//!   `F_FULLFSYNC` + directory `fsync`, Windows fail-closed, and the power-cut /
+//!   fault-injection matrix behind `G-UPGRADE` remains unproven. Nothing in this
+//!   slice claims `G-UPGRADE` or `G-SUPPLY` completion.
 //!
 //! Exit codes: `0` success/confirm/child exit 0; `1` any supervisor-side
-//! error (usage, store open/recovery failure, spawn failure, rollback
-//! after a failed trial — the exact cause is on stderr); `<n>` for steady
-//! or rolled-back launches it is the child's own exit code, and `128+n`
-//! when the child was killed by signal `n` (shell convention).
+//! error (usage, store open/lock/recovery failure, spawn failure, failed liveness
+//! gate, rollback after a failed trial — the exact cause is on stderr); `<n>`
+//! for steady launches, confirmed launches that later exit, and rolled-back
+//! launches it is the child's own exit code, and `128+n` when the child was
+//! killed by signal `n` (shell convention).
 
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io;
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use boreas_supervisor::{Activation, Journal, Phase, Recovery, Result, UpgradeStore};
+use boreas_supervisor::{Activation, Journal, Phase, Recovery, Result, StoreLock, UpgradeStore};
 
 const EXIT_ERROR: u8 = 1;
+
+/// Poll interval while watching a trial child and its liveness-soak deadline.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A trial candidate must stay alive this long before its launch counts as
+/// alive. Overridable with `--trial-soak-ms` (tests use short values).
+const DEFAULT_TRIAL_SOAK_MS: u64 = 30_000;
+
+/// Durable per-candidate trial budget. Overridable with
+/// `--max-trial-attempts`; only the operator-only `reset-trial` clears it.
+const DEFAULT_MAX_TRIAL_ATTEMPTS: u32 = 3;
 
 /// Placeholder substituted (as a prefix) in `supervise`'s `argv[0]` with
 /// the store's absolute active-version directory after recovery/activation.
 const VERSION_PLACEHOLDER: &str = "{version}";
 
 const USAGE: &str = "\
-boreas-supervisor — external Boreas upgrade supervisor (minimal process slice)
+boreas-supervisor — external Boreas upgrade supervisor
 USAGE:
-    boreas-supervisor supervise --store <DIR> -- <argv...>
+    boreas-supervisor supervise --store <DIR> [--trial-soak-ms <MS>]
+                                [--max-trial-attempts <N>] -- <argv...>
     boreas-supervisor recover --store <DIR> [--json]
     boreas-supervisor status --store <DIR> [--json]
+    boreas-supervisor reset-trial --store <DIR>
     boreas-supervisor --help
 
 subcommands:
-    supervise   recover the store first, then run <argv...> as a child process
-                (stdio inherited). A leading {version} in argv[0] is replaced
-                with the resolved active-version directory; fail-closed when
-                no version is active. A candidate activated for its trial
-                launch is confirmed only on a zero exit and rolled back via
-                recover() on any other outcome. Steady launches propagate the
-                child's exit status (128+signal when killed).
-    recover     run UpgradeStore::recover() without launching anything
-    status      report the store's real journal/active-pointer state
+    supervise   lock the store, recover it, then run <argv...> as a child
+                process (stdio inherited). A leading {version} in argv[0] is
+                replaced with the resolved active-version directory;
+                fail-closed when no version is active.
+                A prepared candidate gets one trial launch. It is confirmed
+                only after a liveness soak (--trial-soak-ms, default 30000):
+                the process must still be alive, and exiting 0 *before* the
+                soak is a failed attempt and is rolled back. This is liveness,
+                NOT application readiness — a deadlocked or unready process
+                passes it. The attempt is written to the store before the
+                launch, so a killed supervisor still consumes budget;
+                --max-trial-attempts (default 3) bounds the retry loop across
+                restarts. Once confirmed, a later exit is an ordinary runtime
+                stop and is propagated.
+                Steady launches propagate the child's exit status
+                (128+signal when killed).
+    recover     run UpgradeStore::recover() under the store lock; launches
+                nothing
+    status      report the store's real journal/active-pointer/trial state
+    reset-trial clear the durable failed-trial ledger after an operator has
+                inspected the candidate that exhausted its budget
+
+Every mutating subcommand takes an OS file lock on the store, so concurrent
+supervisors cannot race the journal. The lock dies with the process and never
+goes stale. No signal handler is installed: see the module documentation for
+the process-group contract this relies on.
 
 This binary never downloads, installs, or authenticates a release.
 prepare/activate are deliberately not exposed: staging artifacts requires
@@ -165,8 +237,13 @@ enum CliOutcome {
 struct SupervisePlan {
     store_root: String,
     argv: Vec<OsString>,
-    /// Version that must be confirmed on zero exit (trial launches only).
+    /// Candidate whose trial launch is in flight (trial launches only).
     trial_candidate: Option<String>,
+    /// How long the candidate must stay alive before the upgrade is committed.
+    soak: Duration,
+    /// Exclusive store lock, held from before recovery until the child exits.
+    /// Dropping the plan releases it.
+    store_lock: StoreLock,
 }
 
 /// What a launch decided before any process is spawned. Refusals return
@@ -219,6 +296,7 @@ fn run_cli(args: &[OsString]) -> CliOutcome {
         "supervise" => cmd_supervise(&args[1..]),
         "recover" => cmd_recover(&args[1..]),
         "status" => cmd_status(&args[1..]),
+        "reset-trial" => cmd_reset_trial(&args[1..]),
         other => usage_err(&format!("unknown subcommand: {other}")),
     }
 }
@@ -273,11 +351,15 @@ fn parse_store_args(args: &[OsString], subcommand: &str) -> std::result::Result<
 
 struct SuperviseArgs {
     store: String,
+    soak: Duration,
+    max_trial_attempts: u32,
     child_argv: Vec<OsString>,
 }
 
 fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs, String> {
     let mut store: Option<String> = None;
+    let mut soak: Option<Duration> = None;
+    let mut max_trial_attempts: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i]
@@ -298,6 +380,43 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                         .to_owned(),
                 );
             }
+            "--trial-soak-ms" => {
+                if soak.is_some() {
+                    return Err("supervise: duplicate --trial-soak-ms".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "supervise: --trial-soak-ms requires a value".to_string())?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --trial-soak-ms value is not valid UTF-8".to_string()
+                    })?;
+                let ms: u64 = raw.parse().map_err(|_| {
+                    "supervise: --trial-soak-ms must be a whole number of milliseconds".to_string()
+                })?;
+                soak = Some(Duration::from_millis(ms));
+            }
+            "--max-trial-attempts" => {
+                if max_trial_attempts.is_some() {
+                    return Err("supervise: duplicate --max-trial-attempts".to_string());
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "supervise: --max-trial-attempts requires a value".to_string())?
+                    .to_str()
+                    .ok_or_else(|| {
+                        "supervise: --max-trial-attempts value is not valid UTF-8".to_string()
+                    })?;
+                let attempts: u32 = raw.parse().map_err(|_| {
+                    "supervise: --max-trial-attempts must be a positive integer".to_string()
+                })?;
+                if attempts == 0 {
+                    return Err("supervise: --max-trial-attempts must be at least 1".to_string());
+                }
+                max_trial_attempts = Some(attempts);
+            }
             "--" => {
                 let store =
                     store.ok_or_else(|| "supervise: missing required --store <DIR>".to_string())?;
@@ -307,7 +426,12 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                         "supervise: missing child argv after -- (nothing to run)".to_string()
                     );
                 }
-                return Ok(SuperviseArgs { store, child_argv });
+                return Ok(SuperviseArgs {
+                    store,
+                    soak: soak.unwrap_or_else(|| Duration::from_millis(DEFAULT_TRIAL_SOAK_MS)),
+                    max_trial_attempts: max_trial_attempts.unwrap_or(DEFAULT_MAX_TRIAL_ATTEMPTS),
+                    child_argv,
+                });
             }
             other => {
                 return Err(format!(
@@ -336,6 +460,12 @@ fn cmd_recover(args: &[OsString]) -> CliOutcome {
     let store = match open_store(&parsed.store) {
         Ok(s) => s,
         Err(o) => return o,
+    };
+    // Recovery rewrites the journal and pointer, so it must be serialised
+    // against a running supervisor exactly like `supervise` is.
+    let _lock = match store.lock_exclusive() {
+        Ok(lock) => lock,
+        Err(e) => return err_out(&format!("cannot recover store {}: {e}", parsed.store)),
     };
     match recover_and_report(&store, parsed.json) {
         Ok(out) => done(0, out, String::new()),
@@ -403,6 +533,7 @@ fn status_report(store: &UpgradeStore, json: bool) -> Result<String> {
     let recorded = store.recorded_active_version()?;
     let pointer_ok = store.active_version().is_ok();
     let stored = store.stored_version_count()?;
+    let trial = store.trial_state()?;
     if json {
         let journal_json = match &journal {
             None => "null".to_string(),
@@ -413,12 +544,23 @@ fn status_report(store: &UpgradeStore, json: bool) -> Result<String> {
                 json_str(phase_name(&j.phase)),
             ),
         };
+        let trial_json = match &trial {
+            None => "null".to_string(),
+            Some(t) => format!(
+                "{{\"version\":{},\"attempts\":{},\"in_flight\":{}}}",
+                json_str(&t.version),
+                t.attempts,
+                t.in_flight,
+            ),
+        };
         Ok(format!(
-            "{{\"journal\":{},\"active_version\":{},\"pointer_ok\":{},\"stored_versions\":{}}}\n",
+            "{{\"journal\":{},\"active_version\":{},\"pointer_ok\":{},\
+             \"stored_versions\":{},\"trial\":{}}}\n",
             journal_json,
             json_opt(recorded.as_deref()),
             pointer_ok,
             stored,
+            trial_json,
         ))
     } else {
         let mut out = String::new();
@@ -441,6 +583,16 @@ fn status_report(store: &UpgradeStore, json: bool) -> Result<String> {
             pointer_ok,
             stored,
         );
+        match &trial {
+            None => out.push_str("trial: none\n"),
+            Some(t) => {
+                let _ = writeln!(
+                    out,
+                    "trial: version={} attempts={} in_flight={}",
+                    t.version, t.attempts, t.in_flight,
+                );
+            }
+        }
         Ok(out)
     }
 }
@@ -454,7 +606,50 @@ fn phase_name(phase: &Phase) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Subcommand: supervise (recover -> spawn -> wait -> confirm / roll back)
+// Subcommand: reset-trial (operator acknowledgement of a spent trial budget)
+// ---------------------------------------------------------------------------
+
+fn cmd_reset_trial(args: &[OsString]) -> CliOutcome {
+    let parsed = match parse_store_args(args, "reset-trial") {
+        Ok(p) => p,
+        Err(e) => return usage_err(&e),
+    };
+    if parsed.json {
+        return usage_err("reset-trial: --json is not supported");
+    }
+    let store = match open_store(&parsed.store) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let _lock = match store.lock_exclusive() {
+        Ok(lock) => lock,
+        Err(e) => return err_out(&format!("cannot reset trial in {}: {e}", parsed.store)),
+    };
+    match reset_trial_report(&store) {
+        Ok(out) => done(0, out, String::new()),
+        Err(e) => err_out(&format!("reset-trial failed: {e}")),
+    }
+}
+
+/// Clear the durable trial ledger. Deliberately an explicit operator action:
+/// the supervisor never clears a spent budget by itself, so a crash loop cannot
+/// silently re-enable unlimited candidate trials.
+fn reset_trial_report(store: &UpgradeStore) -> Result<String> {
+    match store.trial_state()? {
+        Some(state) => {
+            store.clear_trial()?;
+            Ok(format!(
+                "reset-trial: cleared {} attempt(s) for candidate {}; \
+                 the next `supervise` may trial it again\n",
+                state.attempts, state.version
+            ))
+        }
+        None => Ok("reset-trial: no trial record to clear\n".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: supervise (lock -> recover -> spawn -> liveness gate -> confirm)
 // ---------------------------------------------------------------------------
 
 fn cmd_supervise(args: &[OsString]) -> CliOutcome {
@@ -466,10 +661,26 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
         Ok(s) => s,
         Err(o) => return o,
     };
+    // Single writer: recovery, activation, the trial ledger and the child's
+    // whole lifetime happen under one OS lock, so a second supervisor fails
+    // fast instead of racing the journal.
+    let store_lock = match store.lock_exclusive() {
+        Ok(lock) => lock,
+        Err(e) => return err_out(&format!("cannot supervise store {}: {e}", parsed.store)),
+    };
+    let mut notes: Vec<String> = Vec::new();
+
+    // Refuse an exhausted candidate *before* `begin_activation` can move the
+    // active pointer: a spent budget must not even be briefly activated.
+    match trial_budget_spent(&store, parsed.max_trial_attempts) {
+        Ok(Some(reason)) => return err_out(&reason),
+        Ok(None) => {}
+        Err(e) => return err_out(&format!("cannot read the trial ledger: {e}")),
+    }
+
     // Recovery happens before anything is launched (master plan Sec.10.3).
     // `begin_activation` starts from `recover()` and only permits the one
     // trial launch of a `Prepared` candidate afterwards.
-    let mut notes: Vec<String> = Vec::new();
     let launch = match store.begin_activation() {
         Ok(Activation::Steady { active }) => {
             if let Some(v) = &active {
@@ -481,14 +692,40 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             candidate,
             previous,
         }) => {
-            notes.push(format!(
-                "trial launch of candidate {candidate} (previous: {}); \
-                 confirmed only on a zero exit",
-                previous.as_deref().unwrap_or("(none)")
-            ));
+            // Durable reservation *before* the launch: a supervisor killed
+            // mid-trial still consumes this attempt on the next boot.
+            match store.reserve_trial(&candidate, parsed.max_trial_attempts) {
+                Ok(state) => notes.push(format!(
+                    "trial launch {}/{} of candidate {candidate} (previous: {}); \
+                     confirmed only after {} ms of liveness window",
+                    state.attempts,
+                    parsed.max_trial_attempts,
+                    previous.as_deref().unwrap_or("(none)"),
+                    parsed.soak.as_millis(),
+                )),
+                Err(e) => {
+                    // `begin_activation` already moved the pointer, so restore
+                    // the retained version before refusing.
+                    if store.recover().is_err() {
+                        return err_out(&format!(
+                            "{e}; rollback of the activated candidate ALSO failed — \
+                             store may still point at the unconfirmed candidate"
+                        ));
+                    }
+                    return err_out(&format!("{e}"));
+                }
+            }
             Launch::Trial { candidate }
         }
         Ok(Activation::RolledBack { active, candidate }) => {
+            // A previous trial never confirmed (its supervisor died before the
+            // outcome). That attempt is already reserved durably; flip it to
+            // `failed` so the record is accurate even if this process dies now.
+            if let Err(e) = store.mark_trial_failed() {
+                notes.push(format!(
+                    "warning: could not record the failed trial of {candidate}: {e}"
+                ));
+            }
             notes.push(format!(
                 "candidate {candidate} was never confirmed; rolled back \
                  before launch, active={}",
@@ -519,11 +756,14 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             // Fail-closed: a trial whose argv cannot even be resolved must
             // not linger in `Activated`. Restore the retained version now
             // instead of relying on a future boot to notice.
-            if trial_candidate.is_some() && store.recover().is_err() {
-                return err_out(&format!(
-                    "{e}; rollback of the activated candidate ALSO failed — \
-                     store may still point at the unconfirmed candidate"
-                ));
+            if trial_candidate.is_some() {
+                let _ = store.mark_trial_failed();
+                if store.recover().is_err() {
+                    return err_out(&format!(
+                        "{e}; rollback of the activated candidate ALSO failed — \
+                         store may still point at the unconfirmed candidate"
+                    ));
+                }
             }
             return err_out(&e);
         }
@@ -533,9 +773,40 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             store_root: parsed.store,
             argv,
             trial_candidate,
+            soak: parsed.soak,
+            store_lock,
         },
         notes,
     }
+}
+
+/// Is the durable trial budget for the journal's `Prepared` candidate spent?
+///
+/// Returns the operator-facing reason when it is. This runs *before*
+/// `begin_activation`, so an exhausted candidate is never activated; the
+/// durable increment in [`UpgradeStore::reserve_trial`] remains the
+/// authoritative check.
+fn trial_budget_spent(
+    store: &UpgradeStore,
+    max_attempts: u32,
+) -> Result<Option<String>> {
+    let Some(journal) = store.journal()? else {
+        return Ok(None);
+    };
+    if journal.phase != Phase::Prepared {
+        return Ok(None);
+    }
+    let Some(state) = store.trial_state()? else {
+        return Ok(None);
+    };
+    if state.version != journal.new_version || state.attempts < max_attempts {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "trial budget for candidate {} is spent ({} of {} attempts); refusing to \
+         activate it again — inspect the store with `status`, then run `reset-trial`",
+        state.version, state.attempts, max_attempts
+    )))
 }
 
 /// Resolve `{version}` (prefix of `argv[0]` only) against the version that
@@ -592,18 +863,28 @@ fn resolve_child_argv(
     Ok(argv)
 }
 
-/// Spawn the child with inherited stdio, wait for it, and close the
-/// journal transaction according to how it died. Returns this process's
-/// exit code. Never panics: every failure path keeps the store consistent
-/// (trial candidates are rolled back, never left silently `Activated` —
-/// and even if that rollback itself fails, the `Activated` journal makes
-/// the *next* supervisor invocation roll back before launching).
+/// Run the planned child and close the journal transaction according to its
+/// real outcome. Returns this process's exit code.
 ///
-/// Known gap: signals delivered to *this* process are not forwarded to the
-/// child (see module docs). If this process is `SIGKILL`ed mid-trial, the
-/// durable `Activated` journal is exactly what the next boot's
-/// `recover()` uses to roll back — no `trap` is relied upon (§10.3).
+/// Two quite different contracts apply:
+///
+/// * **steady launch** — the pointer is not ours to change; spawn, wait and
+///   propagate the child's status.
+/// * **trial launch** — the upgrade is committed only once the candidate has
+///   proved it stays alive for the configured soak. Exiting 0 earlier is *not*
+///   *not* readiness: it is recorded as a failed attempt and rolled back. Once the soak
+///   deadline passes, `confirm()` is written while the child is still running,
+///   so a later crash is an ordinary runtime stop instead of a silent upgrade
+///   failure.
+///
+/// Never panics, and every failure path keeps the store consistent: trial
+/// candidates are rolled back and their attempt is already durable, never left
+/// silently `Activated` — and even if a rollback itself fails, the `Activated`
+/// journal makes the *next* supervisor invocation roll back before launching.
 fn execute_supervise(plan: SupervisePlan) -> u8 {
+    // Hold the exclusive store lock for the entire child lifetime: it is
+    // dropped only when this function returns.
+    let _store_lock = plan.store_lock;
     let store = match UpgradeStore::open(&plan.store_root) {
         Ok(s) => s,
         Err(e) => {
@@ -615,54 +896,105 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
         eprintln!("boreas-supervisor: error: empty child argv");
         return EXIT_ERROR;
     };
-    match run_child_once(program, rest) {
-        Ok(status) if status.success() => {
-            if plan.trial_candidate.is_some() {
-                match store.confirm() {
-                    Ok(()) => {
-                        eprintln!(
-                            "boreas-supervisor: candidate confirmed after clean exit; \
-                             previous version directory retained"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "boreas-supervisor: error: child exited 0 but confirm \
-                             failed: {e}"
-                        );
-                        // Leave `Activated` untouched: the next supervisor
-                        // invocation recovers before launching anything.
-                        EXIT_ERROR
-                    }
-                }
-            } else {
-                0
-            }
-        }
-        Ok(status) => {
-            if plan.trial_candidate.is_some() {
-                eprintln!(
-                    "boreas-supervisor: trial child failed ({}); rolling back",
-                    describe_status(status)
-                );
-                rollback_trial(&store)
-            } else {
-                exit_code_of(status)
-            }
-        }
+    if plan.trial_candidate.is_some() {
+        run_trial(&store, program, rest, plan.soak)
+    } else {
+        run_steady(program, rest)
+    }
+}
+
+/// Steady launch: the store already points at a confirmed version.
+fn run_steady(program: &OsString, args: &[OsString]) -> u8 {
+    match run_child_once(program, args) {
+        Ok(status) => exit_code_of(status),
         Err(e) => {
             eprintln!(
                 "boreas-supervisor: error: cannot run {}: {e}",
                 program.to_string_lossy()
             );
-            if plan.trial_candidate.is_some() {
-                rollback_trial(&store)
-            } else {
-                EXIT_ERROR
+            EXIT_ERROR
+        }
+    }
+}
+
+/// Trial launch with the liveness soak.
+fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], soak: Duration) -> u8 {
+    let mut child = match spawn_child(program, args) {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!(
+                "boreas-supervisor: error: cannot run {}: {e}",
+                program.to_string_lossy()
+            );
+            return fail_trial(store);
+        }
+    };
+    let started = Instant::now();
+    let mut confirmed = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if confirmed {
+                    // The upgrade was committed at the soak deadline; this is
+                    // an ordinary runtime stop of an already-accepted version.
+                    return exit_code_of(status);
+                }
+                eprintln!(
+                    "boreas-supervisor: trial child stopped after {} ms, before the \
+                     {} ms liveness soak ({}); rolling back",
+                    started.elapsed().as_millis(),
+                    soak.as_millis(),
+                    describe_status(status),
+                );
+                return fail_trial(store);
+            }
+            Ok(None) => {
+                if !confirmed && started.elapsed() >= soak {
+                    match store.confirm() {
+                        Ok(()) => {
+                            confirmed = true;
+                            if let Err(e) = store.clear_trial() {
+                                eprintln!(
+                                    "boreas-supervisor: warning: upgrade confirmed, but the \
+                                     trial ledger could not be cleared: {e}"
+                                );
+                            }
+                            eprintln!(
+                                "boreas-supervisor: candidate stayed up for {} ms (liveness \
+                                 soak); upgrade confirmed, previous version directory retained",
+                                started.elapsed().as_millis(),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "boreas-supervisor: error: liveness soak passed but confirm \
+                                 failed: {e}; stopping the candidate and rolling back"
+                            );
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return fail_trial(store);
+                        }
+                    }
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                eprintln!("boreas-supervisor: error: cannot wait for the trial child: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail_trial(store);
             }
         }
     }
+}
+
+/// Record the consumed attempt durably (the reservation was written before the
+/// launch) and restore the retained version.
+fn fail_trial(store: &UpgradeStore) -> u8 {
+    if let Err(e) = store.mark_trial_failed() {
+        eprintln!("boreas-supervisor: error: cannot record the failed trial attempt: {e}");
+    }
+    rollback_trial(store)
 }
 
 fn rollback_trial(store: &UpgradeStore) -> u8 {
@@ -691,13 +1023,24 @@ fn rollback_trial(store: &UpgradeStore) -> u8 {
     EXIT_ERROR
 }
 
-fn run_child_once(program: &OsString, args: &[OsString]) -> io::Result<ExitStatus> {
-    let mut child = Command::new(program)
+/// Spawn one child with inherited stdio.
+///
+/// No new process group/console is created, deliberately: the child stays in
+/// this process's group, so a group-directed stop (systemd's default
+/// cgroup-wide kill, or Ctrl+C in the same terminal) reaches the child even
+/// though this supervisor installs no signal handler. See the module docs for
+/// the full contract.
+fn spawn_child(program: &OsString, args: &[OsString]) -> io::Result<Child> {
+    Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn()
+}
+
+fn run_child_once(program: &OsString, args: &[OsString]) -> io::Result<ExitStatus> {
+    let mut child = spawn_child(program, args)?;
     child.wait()
 }
 
@@ -769,10 +1112,11 @@ fn json_opt(s: Option<&str>) -> String {
 fn _journal_shape(_: &Journal) {}
 
 // ---------------------------------------------------------------------------
-// Tests. Pure parsing/reporting runs everywhere; store/process behaviour is
-// Linux-only because the library's durability contract is (Windows/macOS
-// fail closed). Child processes are tiny test scripts in tempdirs — no
-// network, no model, no installed Boreas binary involved.
+// Tests. Pure parsing/reporting runs everywhere; store/process behaviour runs
+// on the platforms with an integrated transaction backend (Linux, macOS).
+// Windows keeps failing closed inside `UpgradeStore::open`, so its supervisor
+// tests stay limited to the pure paths. Child processes are tiny scripts under
+// a tempdir — no network, no model, no installed Boreas binary involved.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -862,19 +1206,46 @@ mod tests {
         assert_eq!(json_opt(Some("x")), "\"x\"");
     }
 
+    /// Start a real OS child process that terminates with `code` and does
+    /// nothing else. The platform shell is only a launcher: the assertion is
+    /// about a genuine `ExitStatus` returned by this operating system, never a
+    /// synthesised value. `/bin/sh` is POSIX-guaranteed on Unix; `%COMSPEC%`
+    /// (`cmd.exe`) is always present on Windows, so this test runs on every
+    /// supported CI target instead of assuming a Unix shell exists.
+    #[cfg(unix)]
+    fn exit_with(code: i32) -> ExitStatus {
+        let script = format!("exit {code}");
+        Command::new("/bin/sh")
+            .args(["-c", script.as_str()])
+            .status()
+            .expect("cannot launch a real /bin/sh child process")
+    }
+
+    #[cfg(windows)]
+    fn exit_with(code: i32) -> ExitStatus {
+        let script = format!("exit {code}");
+        let shell = env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+        Command::new(shell)
+            .args(["/C", script.as_str()])
+            .status()
+            .expect("cannot launch a real cmd.exe child process")
+    }
+
     #[test]
     fn exit_code_of_matches_real_child_statuses() {
-        let ok = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .status()
-            .unwrap();
+        let ok = exit_with(0);
+        assert!(ok.success());
         assert_eq!(exit_code_of(ok), 0);
-        let three = Command::new("/bin/sh")
-            .args(["-c", "exit 3"])
-            .status()
-            .unwrap();
+
+        let three = exit_with(3);
+        assert!(!three.success());
         assert_eq!(exit_code_of(three), 3);
         assert_eq!(describe_status(three), "exit code 3");
+
+        // A second non-trivial code proves the mapping is not a 0/1 special
+        // case (cmd.exe relabels some failures as 1, so keep 42 off that path).
+        assert_eq!(exit_code_of(exit_with(42)), 42);
+
         #[cfg(unix)]
         {
             let killed = Command::new("/bin/sh")
@@ -885,13 +1256,25 @@ mod tests {
             assert_eq!(exit_code_of(killed), 137);
             assert_eq!(describe_status(killed), "killed by signal 9");
         }
+        #[cfg(windows)]
+        {
+            // Windows has no POSIX signal disposition to report: a terminated
+            // process carries an exit code, so `terminating_signal` must never
+            // invent one and `describe_status` must stay on the code branch.
+            assert_eq!(terminating_signal(three), None);
+            assert_eq!(describe_status(three), "exit code 3");
+        }
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod linux_tests {
+/// End-to-end `supervise`/`recover`/`status` coverage. Gated to the platforms
+/// whose transaction backend is integrated today (Linux, macOS): Windows still
+/// fails closed in `UpgradeStore::open`, so only the pure parsing/reporting
+/// tests run there.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod unix_tests {
     use super::*;
-    use boreas_supervisor::Candidate;
+    use boreas_supervisor::{Candidate, UpgradeError};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -922,10 +1305,15 @@ mod linux_tests {
                     .as_nanos(),
                 seq
             ));
+            fs::create_dir_all(root.join("store")).unwrap();
+            fs::create_dir_all(root.join("src")).unwrap();
+            // `temp_dir()` may itself contain symlinked components (macOS
+            // `/var` -> `/private/var`), which the store's symlink-component
+            // policy rejects by design. Canonicalising keeps the fixture
+            // absolute and symlink-free on every Unix CI target.
+            let root = root.canonicalize().unwrap();
             let store_dir = root.join("store");
             let src_dir = root.join("src");
-            fs::create_dir_all(&store_dir).unwrap();
-            fs::create_dir_all(&src_dir).unwrap();
             Self {
                 root,
                 store_dir,
@@ -997,7 +1385,26 @@ mod linux_tests {
     /// (recovery/activation + argv resolution) happens in `run_cli`, the
     /// real child runs in `execute_supervise`.
     fn supervise(f: &Fixture, child: &[&str]) -> (u8, Vec<String>) {
-        let mut args = vec![os("supervise"), os("--store"), os(&f.store_str()), os("--")];
+        supervise_with(f, child, 250, DEFAULT_MAX_TRIAL_ATTEMPTS)
+    }
+
+    /// Same, with an explicit liveness soak and trial budget.
+    fn supervise_with(
+        f: &Fixture,
+        child: &[&str],
+        soak_ms: u64,
+        max_attempts: u32,
+    ) -> (u8, Vec<String>) {
+        let mut args = vec![
+            os("supervise"),
+            os("--store"),
+            os(&f.store_str()),
+            os("--trial-soak-ms"),
+            os(&soak_ms.to_string()),
+            os("--max-trial-attempts"),
+            os(&max_attempts.to_string()),
+            os("--"),
+        ];
         args.extend(child.iter().map(|c| os(c)));
         match run_cli(&args) {
             CliOutcome::RunChild { plan, notes } => (execute_supervise(plan), notes),
@@ -1008,6 +1415,25 @@ mod linux_tests {
             } => {
                 panic!("supervise planning failed: code={code} stdout={stdout:?} stderr={stderr:?}")
             }
+        }
+    }
+
+    /// Planning-only variant: never spawns, so refusals can be asserted.
+    fn supervise_plan(f: &Fixture, child: &[&str], soak_ms: u64, max: u32) -> (u8, String) {
+        let mut args = vec![
+            os("supervise"),
+            os("--store"),
+            os(&f.store_str()),
+            os("--trial-soak-ms"),
+            os(&soak_ms.to_string()),
+            os("--max-trial-attempts"),
+            os(&max.to_string()),
+            os("--"),
+        ];
+        args.extend(child.iter().map(|c| os(c)));
+        match run_cli(&args) {
+            CliOutcome::Done { code, stderr, .. } => (code, stderr),
+            CliOutcome::RunChild { .. } => (0, "unexpected launch".to_string()),
         }
     }
 
@@ -1113,7 +1539,7 @@ mod linux_tests {
         assert_eq!(code, 0);
         assert_eq!(
             out.trim(),
-            r#"{"journal":null,"active_version":null,"pointer_ok":true,"stored_versions":0}"#
+            r#"{"journal":null,"active_version":null,"pointer_ok":true,"stored_versions":0,"trial":null}"#
         );
     }
 
@@ -1178,7 +1604,8 @@ mod linux_tests {
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains("trial launch of candidate 2.0.0"))
+                .any(|n| n.contains("trial launch 1/3 of candidate 2.0.0")),
+            "{notes:?}"
         );
         let store = f.store();
         assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
@@ -1210,11 +1637,15 @@ mod linux_tests {
     }
 
     #[test]
-    fn trial_child_zero_exit_confirms_and_keeps_old_dir() {
+    fn trial_zero_exit_before_soak_is_a_failure_not_a_confirmation() {
+        // The exact hole this gate closes: a candidate that exits 0
+        // immediately (bad config, no-op build, operator stop) must not be
+        // confirmed just because its status was 0.
         let f = Fixture::new();
         let old_dir = f.seed_active("1.0.0", "exit 0");
         let art = f.artifact("cand", "exit 0");
-        f.store()
+        let store = f.store();
+        store
             .prepare(
                 &Candidate {
                     version: "2.0.0".into(),
@@ -1222,19 +1653,76 @@ mod linux_tests {
                 &art,
             )
             .unwrap();
-        let (code, _) = supervise(&f, &["{version}/prog.sh"]);
-        assert_eq!(code, 0);
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 5_000, 3);
+        assert_eq!(code, EXIT_ERROR, "early clean exit must not confirm");
+        assert_eq!(
+            store.active_version().unwrap().as_deref(),
+            Some("1.0.0"),
+            "pointer must be rolled back"
+        );
+        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
+        assert!(old_dir.join("prog.sh").is_file(), "old dir retained");
+        let trial = store.trial_state().unwrap().unwrap();
+        assert_eq!(trial.version, "2.0.0");
+        assert_eq!(trial.attempts, 1);
+        assert!(!trial.in_flight, "outcome must be recorded, not left pending");
+    }
+
+    #[test]
+    fn trial_that_survives_soak_is_confirmed_while_running_and_keeps_old_dir() {
+        let f = Fixture::new();
+        let old_dir = f.seed_active("1.0.0", "exit 0");
+        let art = f.artifact("cand", "sleep 1\nexit 0");
         let store = f.store();
+        store
+            .prepare(
+                &Candidate {
+                    version: "2.0.0".into(),
+                },
+                &art,
+            )
+            .unwrap();
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 150, 3);
+        assert_eq!(code, 0);
         assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
         assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
         assert!(
             old_dir.join("prog.sh").is_file(),
             "old version dir must be retained"
         );
+        assert_eq!(
+            store.trial_state().unwrap(),
+            None,
+            "a confirmed candidate must not leave a failed-trial record"
+        );
         // A later supervise is a steady launch of the confirmed version.
+        let prog = store.version_dir("2.0.0").unwrap().join("prog.sh");
+        Fixture::write_prog(&prog, "exit 0");
         let (code, _) = supervise(&f, &["{version}/prog.sh"]);
         assert_eq!(code, 0);
         assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn confirmed_candidate_crashing_later_is_not_rolled_back() {
+        // After the soak the upgrade is committed. A later crash is an
+        // ordinary runtime outage: the status propagates, the pointer stays.
+        let f = Fixture::new();
+        f.seed_active("1.0.0", "exit 0");
+        let art = f.artifact("cand", "sleep 1\nexit 7");
+        let store = f.store();
+        store
+            .prepare(
+                &Candidate {
+                    version: "2.0.0".into(),
+                },
+                &art,
+            )
+            .unwrap();
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 150, 3);
+        assert_eq!(code, 7, "post-soak exit status is propagated");
+        assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
+        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
     }
 
     #[test]
@@ -1331,16 +1819,20 @@ mod linux_tests {
     }
 
     #[test]
-    fn failed_trial_then_repeated_supervise_pointer_stays_consistent() {
-        // After a failed trial the journal is `Prepared` again, so each
-        // further supervise re-trials and re-rolls-back (documented; the
-        // trial budget is outstanding service policy). The invariant under
-        // test: the pointer ends at the retained old version after every
-        // cycle and the candidate is never confirmed.
+    fn failed_trial_is_bounded_by_the_durable_budget() {
+        // After a failed trial the journal returns to `Prepared`, which is
+        // indistinguishable from "never launched" by journal alone. The
+        // durable trial ledger is what stops the restart loop: three attempts
+        // are allowed, the fourth is refused without activating anything.
         let f = Fixture::new();
         f.seed_active("1.0.0", "exit 0");
-        let art = f.artifact("cand", "exit 3");
-        f.store()
+        let cand_marker = f.marker("cand-ran");
+        let art = f.artifact(
+            "cand",
+            &format!("echo run >> {}; exit 3", cand_marker.display()),
+        );
+        let store = f.store();
+        store
             .prepare(
                 &Candidate {
                     version: "2.0.0".into(),
@@ -1348,23 +1840,50 @@ mod linux_tests {
                 &art,
             )
             .unwrap();
-        for _ in 0..3 {
-            let (code, _) = supervise(&f, &["{version}/prog.sh"]);
-            assert_eq!(code, EXIT_ERROR);
-            let store = f.store();
+        for attempt in 1..=3 {
+            let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
+            assert_eq!(code, EXIT_ERROR, "attempt {attempt}");
             assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
             assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
+            assert_eq!(store.trial_state().unwrap().unwrap().attempts, attempt);
         }
+        let runs_before = fs::read_to_string(&cand_marker).unwrap().lines().count();
+        assert_eq!(runs_before, 3);
+
+        // Fourth attempt: refused during planning, nothing is activated or
+        // launched, and the operator is pointed at `reset-trial`.
+        let (code, stderr) = supervise_plan(&f, &["{version}/prog.sh"], 100, 3);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(stderr.contains("trial budget"), "{stderr}");
+        assert!(stderr.contains("reset-trial"), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(&cand_marker).unwrap().lines().count(),
+            3,
+            "a refused candidate must not run"
+        );
+        assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
+        assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
+
+        // Operator acknowledgement clears the ledger and permits one more try.
+        let (code, out, _) = store_cmd(&f, "reset-trial", false);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("cleared 3 attempt(s)"), "{out}");
+        assert_eq!(store.trial_state().unwrap(), None);
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
     }
 
     #[test]
     fn explicit_argv_runs_without_placeholder_and_may_carry_arguments() {
-        // Operator-chosen argv (no {version}) still goes through recovery
-        // and trial semantics: success here confirms the candidate.
+        // Operator-chosen argv (no {version}) still goes through recovery,
+        // the trial ledger and the liveness soak: surviving the soak confirms
+        // the candidate.
         let f = Fixture::new();
         f.seed_active("1.0.0", "exit 0");
         let art = f.artifact("cand", "exit 0");
-        f.store()
+        let store = f.store();
+        store
             .prepare(
                 &Candidate {
                     version: "2.0.0".into(),
@@ -1373,11 +1892,10 @@ mod linux_tests {
             )
             .unwrap();
         let script = f.src_dir.join("check.sh");
-        Fixture::write_prog(&script, "test \"$1\" = expected-arg");
+        Fixture::write_prog(&script, "test \"$1\" = expected-arg || exit 9\nsleep 1");
         let script = script.to_string_lossy().into_owned();
-        let (code, _) = supervise(&f, &[&script, "expected-arg"]);
+        let (code, _) = supervise_with(&f, &[&script, "expected-arg"], 150, 3);
         assert_eq!(code, 0);
-        let store = f.store();
         assert_eq!(store.active_version().unwrap().as_deref(), Some("2.0.0"));
         assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Confirmed);
     }
@@ -1490,6 +2008,82 @@ mod linux_tests {
         assert_eq!(
             f.store().recorded_active_version().unwrap().as_deref(),
             Some("9.9.9")
+        );
+    }
+
+    // -- store lock & trial ledger reporting --------------------------------
+
+    #[test]
+    fn store_lock_is_exclusive_across_handles() {
+        let f = Fixture::new();
+        let store = f.store();
+        let first = store.lock_exclusive().expect("first lock");
+        // A second open of the same lock file is a second open file
+        // description, so it conflicts exactly as another process would.
+        match store.lock_exclusive() {
+            Ok(_) => panic!("second lock must not be granted"),
+            Err(e) => assert!(matches!(e, UpgradeError::Locked(_)), "{e}"),
+        }
+        drop(first);
+        store
+            .lock_exclusive()
+            .expect("lock must be re-acquirable once dropped");
+    }
+
+    #[test]
+    fn supervise_and_recover_refuse_while_the_store_is_locked() {
+        let f = Fixture::new();
+        f.seed_active("1.0.0", "exit 0");
+        let store = f.store();
+        let held = store.lock_exclusive().expect("hold the store lock");
+
+        let (code, stderr) = supervise_plan(&f, &["{version}/prog.sh"], 100, 3);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(stderr.contains("locked"), "{stderr}");
+
+        let (code, _, stderr) = store_cmd(&f, "recover", false);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(stderr.contains("locked"), "{stderr}");
+
+        // `status` is read-only and deliberately still available for
+        // diagnosis while a supervisor holds the store.
+        let (code, out, _) = store_cmd(&f, "status", false);
+        assert_eq!(code, 0);
+        assert!(out.contains("active: 1.0.0"), "{out}");
+
+        drop(held);
+        let (code, _) = supervise(&f, &["{version}/prog.sh"]);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn status_reports_durable_trial_state() {
+        let f = Fixture::new();
+        f.seed_active("1.0.0", "exit 0");
+        let art = f.artifact("cand", "exit 3");
+        let store = f.store();
+        store
+            .prepare(
+                &Candidate {
+                    version: "2.0.0".into(),
+                },
+                &art,
+            )
+            .unwrap();
+        let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
+        assert_eq!(code, EXIT_ERROR);
+
+        let (code, out, _) = store_cmd(&f, "status", false);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("trial: version=2.0.0 attempts=1 in_flight=false"),
+            "{out}"
+        );
+        let (code, out, _) = store_cmd(&f, "status", true);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains(r#""trial":{"version":"2.0.0","attempts":1,"in_flight":false}"#),
+            "{out}"
         );
     }
 }

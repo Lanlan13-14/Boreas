@@ -7,19 +7,29 @@
 //! calling [`UpgradeStore::prepare`]. There is no `bool`/"verified" escape
 //! hatch here.
 //!
-//! The bundled `boreas-supervisor` binary is the minimal real process
-//! boundary for those primitives: it recovers the store before launching
-//! anything, launches the selected program as a real child process, confirms
-//! a newly activated candidate only after a zero exit, and rolls back via
-//! [`UpgradeStore::recover`] on any other outcome. It never downloads,
-//! installs, or authenticates anything.
+//! The bundled `boreas-supervisor` binary is the real process boundary for
+//! those primitives: it takes an exclusive store lock, recovers the store
+//! before launching anything, launches the selected program as a real child,
+//! confirms a trial candidate only after a health soak (survival, not merely
+//! exit status 0), and rolls back via [`UpgradeStore::recover`] on any other
+//! outcome. Failed trials are bounded by a durable per-candidate budget in
+//! `trial.state`, so a crash loop cannot retry a candidate forever.
+//!
+//! Strict release-metadata parsing, deployment policy and the single
+//! signature-verification choke point live in [`manifest`]. With the
+//! `openssl-backend` feature that choke point performs real Ed25519 **and**
+//! ML-DSA-65 verification (SPKI DER key parsing + `KeyType` checks + SHA-256
+//! asset hashes) through [`release_crypto`]; the default build compiles no
+//! crypto and fails verification closed, so [`UpgradeStore::prepare`] stays
+//! unreachable from any user-facing path either way.
 //!
 //! Hash/signature/manifest verification (master plan §10.1–§10.2), preflight
-//! (ELF/architecture/state-schema/seccomp/disk checks), signal forwarding,
-//! health checks and launch timeouts, OS service integration (systemd et
-//! al.), and the fault-injection / power-cut matrix remain NOT IMPLEMENTED.
-//! This crate makes no production-readiness or release-authenticity claim,
-//! and nothing here satisfies the master plan's `G-UPGRADE` gate on its own.
+//! (ELF/architecture/state-schema/seccomp/disk checks), signal forwarding and
+//! graceful stop handling, health channels and launch timeouts, OS service
+//! integration (systemd et al.), and the fault-injection / power-cut matrix
+//! remain NOT IMPLEMENTED. This crate makes no production-readiness or
+//! release-authenticity claim, and nothing here satisfies the master plan's
+//! `G-UPGRADE` or `G-SUPPLY` gate on its own.
 //!
 //! Transactions use a durable journal and one atomically replaced active
 //! pointer. Unconfirmed activations are rolled back by
@@ -35,11 +45,36 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+/// macOS `F_FULLFSYNC` flush plus directory-fsync ordering. Compiled only on
+/// macOS; every symbol comes from the pinned `libc` binding in `Cargo.toml`.
+#[cfg(target_os = "macos")]
+mod macos;
+
+// `src/windows.rs` is intentionally not declared here: it needs
+// `windows-sys` (absent from `Cargo.lock`) and the store still has no
+// explicit-DACL verification or documented parent-directory durability, so
+// `UpgradeStore::open` must keep failing closed on Windows. See
+// `docs/upgrade/README.md` for the exact remaining gate.
+
+pub mod manifest;
+
+/// Real Ed25519 + ML-DSA-65 verification and artifact SHA-256. Compiled only
+/// with the `openssl-backend` feature (OpenSSL 3.5+); `manifest::verify_release`
+/// delegates to it and stays fail-closed in the default build.
+#[cfg(feature = "openssl-backend")]
+mod release_crypto;
+
 const JOURNAL_FILE: &str = "upgrade.journal";
 const ACTIVE_FILE: &str = "active.version";
+const LOCK_FILE: &str = "store.lock";
+const TRIAL_FILE: &str = "trial.state";
+const AUDIT_FILE: &str = "trial.audit";
 const FORMAT: &str = "BOREAS-UPGRADE-1";
+const TRIAL_FORMAT: &str = "BOREAS-TRIAL-1";
 const MAX_JOURNAL_BYTES: u64 = 512;
 const MAX_ACTIVE_BYTES: u64 = 129;
+const MAX_TRIAL_BYTES: u64 = 256;
+const MAX_AUDIT_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 64;
 const MAX_TREE_ENTRIES: usize = 100_000;
@@ -49,8 +84,16 @@ pub enum UpgradeError {
     Io(io::Error),
     Invalid(&'static str),
     CorruptJournal,
+    /// The durable trial ledger is unreadable or corrupt. A spent trial budget
+    /// must never be silently treated as "no attempts yet".
+    CorruptTrial,
     NoTransaction,
     WrongState,
+    /// Another process already holds the store's exclusive supervisor lock.
+    Locked(String),
+    /// The durable trial ledger shows every permitted launch of this candidate
+    /// was consumed. Only an operator (`reset-trial`) may clear it.
+    TrialExhausted { version: String, attempts: u32 },
     UnsupportedPlatform(&'static str),
 }
 impl fmt::Display for UpgradeError {
@@ -59,8 +102,18 @@ impl fmt::Display for UpgradeError {
             Self::Io(e) => write!(f, "upgrade I/O error: {e}"),
             Self::Invalid(s) => write!(f, "invalid upgrade input: {s}"),
             Self::CorruptJournal => f.write_str("upgrade journal is corrupt or unsupported"),
+            Self::CorruptTrial => f.write_str("trial ledger is corrupt or unsupported"),
             Self::NoTransaction => f.write_str("no upgrade transaction exists"),
             Self::WrongState => f.write_str("operation is invalid in the current state"),
+            Self::Locked(detail) => write!(
+                f,
+                "store is locked by another supervisor process ({detail})"
+            ),
+            Self::TrialExhausted { version, attempts } => write!(
+                f,
+                "trial budget exhausted for candidate {version} after {attempts} attempt(s); \
+                 inspect the store, then run `reset-trial` to allow another trial"
+            ),
             Self::UnsupportedPlatform(s) => write!(f, "unsupported durability operation: {s}"),
         }
     }
@@ -103,9 +156,11 @@ pub struct Candidate {
 
 /// Filesystem-backed transaction store rooted in an administrator-chosen directory.
 /// The root and all its parents must be trusted and not writable by attackers.
-/// Linux is the only platform with the documented directory-fsync durability
-/// contract. Windows currently fails closed rather than claiming equivalent
-/// parent-directory durability. No paths outside `root` are accepted.
+/// Linux flushes file data with `fsync` and orders namespace changes with
+/// directory `fsync`; macOS asks for `F_FULLFSYNC` on file data and then syncs
+/// the directory. Windows still fails closed rather than claiming equivalent
+/// parent-directory durability. No platform's power-loss behaviour is proven
+/// by this crate's tests, and no paths outside `root` are accepted.
 pub struct UpgradeStore {
     root: PathBuf,
     versions: PathBuf,
@@ -355,6 +410,203 @@ impl UpgradeStore {
         Ok(count)
     }
 
+    /// Take the store's exclusive single-writer lock.
+    ///
+    /// The lock is an OS advisory lock on `store.lock` (see [`StoreLock`]), so
+    /// it disappears with the process instead of leaving a stale pidfile that
+    /// would block every later upgrade. A second supervisor — or a concurrent
+    /// `recover`, which mutates the journal — fails fast instead of racing the
+    /// durable state.
+    ///
+    /// The lock file is untrusted input: its content is never read and never
+    /// echoed into an error, so a hostile file cannot inject terminal escapes or
+    /// log lines. Only the OS error text (which this crate does not control but
+    /// also does not obtain from the file) is reported.
+    pub fn lock_exclusive(&self) -> Result<StoreLock> {
+        let path = self.root.join(LOCK_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
+                return Err(UpgradeError::Invalid(
+                    "lock file is not a regular, non-symlink file",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if let Err(error) = file.try_lock() {
+            return Err(UpgradeError::Locked(error.to_string()));
+        }
+        Ok(StoreLock { _file: file })
+    }
+
+    /// The durable trial record, if any. Strictly parsed: a corrupt ledger is an
+    /// error, never "this candidate has no attempts yet".
+    pub fn trial_state(&self) -> Result<Option<TrialState>> {
+        self.read_trial()
+    }
+
+    /// Durably reserve one more trial launch of `version`, enforcing
+    /// `max_attempts`.
+    ///
+    /// The reservation is written *before* the candidate is launched, so a
+    /// supervisor killed mid-trial still consumes its attempt when the next one
+    /// starts. The ledger only ever *restricts* launches: an attacker who can
+    /// write it can cause a denial of upgrades, never authorise one.
+    pub fn reserve_trial(&self, version: &str, max_attempts: u32) -> Result<TrialState> {
+        validate_version(version)?;
+        if max_attempts == 0 {
+            return Err(UpgradeError::Invalid("trial budget must be at least one"));
+        }
+        let current = self.read_trial()?;
+        let previous = current
+            .as_ref()
+            .filter(|state| state.version == version)
+            .map_or(0, |state| state.attempts);
+        // `checked_add`, never saturating: at `u32::MAX` a saturating counter
+        // would pin attempts at MAX and a caller passing `max_attempts = MAX`
+        // would then grant unlimited trials. An overflow is a corrupt/absurd
+        // ledger and fails closed instead.
+        let attempts = previous
+            .checked_add(1)
+            .ok_or(UpgradeError::Invalid("trial attempt counter overflow"))?;
+        if attempts > max_attempts {
+            return Err(UpgradeError::TrialExhausted {
+                version: version.to_owned(),
+                attempts: previous,
+            });
+        }
+        let state = TrialState {
+            version: version.to_owned(),
+            attempts,
+            in_flight: true,
+        };
+        self.write_trial(&state)?;
+        Ok(state)
+    }
+
+    /// Record that the reserved trial failed, or that its supervisor died while
+    /// it ran. The attempt count is kept, so the budget is never reset by a
+    /// crash or a failed launch.
+    pub fn mark_trial_failed(&self) -> Result<()> {
+        match self.read_trial()? {
+            Some(mut state) => {
+                if !state.in_flight {
+                    return Ok(());
+                }
+                state.in_flight = false;
+                self.write_trial(&state)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Forget the trial record: called after a confirmed upgrade, and by the
+    /// operator-only `reset-trial` acknowledgement.
+    pub fn clear_trial(&self) -> Result<()> {
+        let path = self.root.join(TRIAL_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => sync_dir(&self.root),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Append one bounded audit record for an operator trial reset.
+    ///
+    /// The log is append-only and capped at `MAX_AUDIT_BYTES`. It is never
+    /// truncated or rotated implicitly: silently discarding the history of a
+    /// high-risk action is worse than refusing to write. Operator identity is
+    /// deliberately not invented here — it comes from the OS audit trail
+    /// (systemd journal / Windows event log) that invokes this command.
+    pub fn record_trial_reset(&self, version: &str, attempts: u32) -> Result<()> {
+        validate_version(version)?;
+        let path = self.root.join(AUDIT_FILE);
+        let existing_len = match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
+                return Err(UpgradeError::Invalid(
+                    "trial audit log is not a regular, non-symlink file",
+                ));
+            }
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        let line = format!("reset-trial version={version} attempts={attempts}\n");
+        if existing_len > MAX_AUDIT_BYTES
+            || existing_len.saturating_add(line.len() as u64) > MAX_AUDIT_BYTES
+        {
+            return Err(UpgradeError::Invalid(
+                "trial audit log is full; archive it before resetting again",
+            ));
+        }
+        let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        sync_dir(&self.root)
+    }
+
+    fn read_trial(&self) -> Result<Option<TrialState>> {
+        let path = self.root.join(TRIAL_FILE);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_TRIAL_BYTES {
+            return Err(UpgradeError::CorruptTrial);
+        }
+        let mut s = String::new();
+        File::open(&path)
+            .take(MAX_TRIAL_BYTES + 1)
+            .read_to_string(&mut s)?;
+        if s.len() as u64 > MAX_TRIAL_BYTES {
+            return Err(UpgradeError::CorruptTrial);
+        }
+        let mut lines = s.lines();
+        if lines.next() != Some(TRIAL_FORMAT) {
+            return Err(UpgradeError::CorruptTrial);
+        }
+        let version = lines.next().ok_or(UpgradeError::CorruptTrial)?.to_owned();
+        validate_version(&version).map_err(|_| UpgradeError::CorruptTrial)?;
+        let attempts: u32 = lines
+            .next()
+            .ok_or(UpgradeError::CorruptTrial)?
+            .parse()
+            .map_err(|_| UpgradeError::CorruptTrial)?;
+        if attempts == 0 {
+            return Err(UpgradeError::CorruptTrial);
+        }
+        let in_flight = match lines.next() {
+            Some("in-flight") => true,
+            Some("failed") => false,
+            _ => return Err(UpgradeError::CorruptTrial),
+        };
+        if lines.next().is_some() {
+            return Err(UpgradeError::CorruptTrial);
+        }
+        Ok(Some(TrialState {
+            version,
+            attempts,
+            in_flight,
+        }))
+    }
+
+    fn write_trial(&self, state: &TrialState) -> Result<()> {
+        let outcome = if state.in_flight { "in-flight" } else { "failed" };
+        let data = format!(
+            "{TRIAL_FORMAT}\n{}\n{}\n{outcome}\n",
+            state.version, state.attempts
+        );
+        atomic_write(&self.root, TRIAL_FILE, data.as_bytes())
+    }
+
     /// Compose "recover before launch" with the single permitted first launch
     /// of a `Prepared` candidate, for the external supervisor process.
     ///
@@ -500,6 +752,28 @@ impl UpgradeStore {
         }
         atomic_write(&self.root, ACTIVE_FILE, v.unwrap_or("").as_bytes())
     }
+}
+
+/// Exclusive single-writer guard returned by [`UpgradeStore::lock_exclusive`].
+///
+/// Backed by the operating system's advisory file lock, so it cannot go stale:
+/// the kernel releases it when the process exits, however it exits. Keep the
+/// value alive for the whole recover → activate → launch sequence; dropping it
+/// releases the lock.
+pub struct StoreLock {
+    _file: File,
+}
+
+/// Durable record of trial launches for one candidate version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialState {
+    pub version: String,
+    /// 1-based number of trial launches reserved for `version`.
+    pub attempts: u32,
+    /// A reservation whose outcome was never recorded. Because only one
+    /// supervisor can hold the store lock, an `in_flight` record seen by a new
+    /// supervisor always belongs to a previous one that died mid-trial.
+    pub in_flight: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -665,7 +939,7 @@ fn copy_tree_no_symlinks(
                 .bytes
                 .checked_add(copied)
                 .ok_or(UpgradeError::Invalid("artifact size overflow"))?;
-            o.sync_all()?;
+            flush_file(&o)?;
         } else {
             return Err(UpgradeError::Invalid("artifact contains special file"));
         }
@@ -704,7 +978,10 @@ fn sync_tree(path: &Path) -> Result<()> {
         if e.file_type()?.is_dir() {
             sync_tree(&e.path())?;
         } else {
-            File::open(e.path())?.sync_all()?;
+            // Open writable: macOS `F_FULLFSYNC` is a flush request on the
+            // descriptor, and staged files are always owner-writable here.
+            let f = OpenOptions::new().write(true).open(e.path())?;
+            flush_file(&f)?;
         }
     }
     sync_dir(path)
@@ -736,14 +1013,37 @@ fn atomic_write(root: &Path, name: &str, data: &[u8]) -> Result<()> {
     }
     let mut f = builder.open(&tmp)?;
     f.write_all(data)?;
-    f.sync_all()?;
+    flush_file(&f)?;
     drop(f);
     fs::rename(&tmp, root.join(name))?;
     sync_dir(root)
 }
+
+/// Push staged file data to stable storage before the namespace rename.
+///
+/// Linux and Windows use the standard `fsync`/`FlushFileBuffers` path; macOS
+/// asks for `F_FULLFSYNC` so a drive firmware cache is not silently trusted.
+/// A failure is returned, never downgraded to a weaker `fsync` that would make
+/// the durability claim false.
+#[cfg(target_os = "macos")]
+fn flush_file(file: &File) -> Result<()> {
+    macos::flush_file(file)?;
+    Ok(())
+}
+#[cfg(not(target_os = "macos"))]
+fn flush_file(file: &File) -> Result<()> {
+    file.sync_all()?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn sync_dir(p: &Path) -> Result<()> {
     File::open(p)?.sync_all()?;
+    Ok(())
+}
+#[cfg(target_os = "macos")]
+fn sync_dir(p: &Path) -> Result<()> {
+    macos::sync_directory(p)?;
     Ok(())
 }
 #[cfg(windows)]
@@ -752,10 +1052,10 @@ fn sync_dir(_p: &Path) -> Result<()> {
         "Windows directory fsync semantics are not implemented",
     ))
 }
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn sync_dir(_p: &Path) -> Result<()> {
     Err(UpgradeError::UnsupportedPlatform(
-        "only Linux directory fsync is supported",
+        "only Linux and macOS directory fsync is supported",
     ))
 }
 #[cfg(unix)]
@@ -781,7 +1081,12 @@ mod windows_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+/// Transaction-store coverage for the platforms with an integrated backend.
+/// macOS runs the same suite as Linux, which is exactly what turns the macOS
+/// adapter from an unreviewed draft into a tested backend (namespace ordering,
+/// F_FULLFSYNC failure propagation, symlink/hardlink rejection). Windows has
+/// no backend, so only `windows_tests` applies there.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -797,6 +1102,10 @@ mod tests {
                     .as_nanos()
             ));
             fs::create_dir(&p).unwrap();
+            // The store rejects symlinked path components, and macOS keeps
+            // `temp_dir()` under `/var` (a symlink to `/private/var`), so the
+            // fixture canonicalises before use on every Unix target.
+            let p = p.canonicalize().unwrap();
             Self(p)
         }
         fn path(&self) -> &Path {

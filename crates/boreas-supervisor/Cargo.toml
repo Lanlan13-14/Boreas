@@ -13,4 +13,25 @@ path = "src/lib.rs"
 name = "boreas-supervisor"
 path = "src/main.rs"
 
+[features]
+default = []
+# Real Ed25519 + ML-DSA-65 release verification and artifact SHA-256, backed by
+# the maintained `openssl` crate (same provider and pin as boreas-pki /
+# boreas-crypto). ML-DSA key types require OpenSSL 3.5+; on older system
+# libraries key parsing fails and verification reports an error. The default
+# build compiles no crypto code and `manifest::verify_release` fails closed with
+# `ManifestError::VerificationUnavailable`.
+openssl-backend = ["dep:openssl"]
+
 [dependencies]
+# Optional: only pulled in by the `openssl-backend` feature. Never enabled by the
+# default workspace build, which keeps the musl static artifacts crypto-free.
+openssl = { version = "=0.10.82", optional = true }
+
+# macOS only. The store's `F_FULLFSYNC` and directory-fsync backend uses the
+# generated bindings of the same pinned `libc` release the rest of the
+# workspace already locks (`boreas-tun`), so no new package enters
+# `Cargo.lock`. Windows needs `windows-sys`, which is *not* locked, so its
+# adapter stays unwired and the store keeps failing closed there.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.191"
