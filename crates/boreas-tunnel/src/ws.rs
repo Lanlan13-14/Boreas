@@ -806,8 +806,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
         // Padding is only valid in the final quantum and only at its tail;
         // RFC 4648 also requires unused pad bits to be zero.
-        if (padding == 2
-            && (chunk[0] == b'=' || chunk[1] == b'=' || values[1] & 0x0f != 0))
+        if (padding == 2 && (chunk[0] == b'=' || chunk[1] == b'=' || values[1] & 0x0f != 0))
             || (padding == 1
                 && (chunk[0] == b'='
                     || chunk[1] == b'='
