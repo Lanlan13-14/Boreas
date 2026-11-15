@@ -4,9 +4,13 @@
 //! screen, no Emoji, no ANSI, `NO_COLOR` honored by never emitting color,
 //! and a 77-column x 18-line box only when the caller says the terminal is
 //! wide enough. A narrow terminal gets a plain list and is never claimed to
-//! be 77 columns. There is no stdin, no raw mode, no DSR probe and no
-//! control socket here: [`render_menu`] only formats a [`MenuModel`] the
-//! caller already built.
+//! be 77 columns.
+//!
+//! `render_menu` only formats a [`MenuModel`] the caller already built, and
+//! [`render_detail`] only formats rows the caller already gathered. The
+//! line-mode console state machine ([`ConsoleState`]) is pure: it reads no
+//! stdin, opens no socket and spawns no process. There is still no raw mode
+//! and no DSR probe anywhere in this crate.
 //!
 //! [`confirm_dangerous`] compares a typed phrase and returns. It does not
 //! change the security mode, revoke a node, uninstall anything, or talk to
@@ -559,6 +563,421 @@ pub fn confirm_dangerous(action: &DangerAction, typed: &str) -> Result<(), Confi
     }
 }
 
+// ---------------------------------------------------------------------------
+// Line-mode console (the `boreas-easy` entry of §10.5)
+// ---------------------------------------------------------------------------
+//
+// This slice is deliberately line-oriented: it reads one line from stdin per
+// screen and prints a prompt. There is no raw mode, so an abnormal exit cannot
+// leave a terminal in a half-configured state (§10.4 is explicit that `Drop`
+// cannot be guaranteed under `SIGKILL`; not entering raw mode avoids the
+// claim entirely). Everything here is pure data plus pure functions; the
+// driver in `main.rs` performs all I/O.
+
+/// Content rows a detail/notice screen can show. The frame stays 18 lines:
+/// title, four status rows, rule, heading, these rows, rule, hint, bottom.
+pub const DETAIL_ROWS: usize = 8;
+
+/// Which screen the line-mode console is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleView {
+    /// The nine-entry §10.4.1 menu.
+    Menu,
+    /// Entry 8: service status / start / stop / config check.
+    Service,
+    /// Typed-phrase confirmation before a mutating service action.
+    Confirm,
+    /// Read-only result screen (telemetry, config check, command output).
+    Notice,
+}
+
+/// A mutating service action. Neither variant is performed by this module;
+/// [`ServiceAction::phrase`] is what the operator must type first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+}
+
+impl ServiceAction {
+    /// Exact phrase required before the driver runs the action. Compared
+    /// byte-for-byte: no trimming, no case folding, same rule as
+    /// [`confirm_dangerous`].
+    pub fn phrase(self) -> &'static str {
+        match self {
+            ServiceAction::Start => "START",
+            ServiceAction::Stop => "STOP",
+        }
+    }
+
+    fn label(self, lang: Lang) -> &'static str {
+        match self {
+            ServiceAction::Start => text(lang, Msg::SvcStart),
+            ServiceAction::Stop => text(lang, Msg::SvcStop),
+        }
+    }
+}
+
+/// Work the driver must perform outside the reducer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleEffect {
+    None,
+    /// Re-query the control socket; stays on the menu.
+    RefreshStatus,
+    /// Query the control socket and open the telemetry result screen.
+    Telemetry,
+    ServiceStatus,
+    ServiceStart,
+    ServiceStop,
+    CheckConfig,
+    Quit,
+}
+
+/// Console state. Every field is plain data, so transitions are testable
+/// without a socket, a process or a terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleState {
+    pub lang: Lang,
+    pub view: ConsoleView,
+    /// Menu selection, always `1..=9`.
+    pub selected: u8,
+    /// Action awaiting a typed phrase; `Some` only in [`ConsoleView::Confirm`].
+    pub pending: Option<ServiceAction>,
+    /// `true` when the last control-socket query succeeded.
+    pub live: bool,
+    pub node_name: String,
+    /// Unit name shown on the confirm screen; empty when it could not be
+    /// resolved, which the screen reports rather than inventing a name.
+    pub service_name: String,
+    pub narrow: bool,
+    pub no_color: bool,
+    pub notice_rows: Vec<String>,
+}
+
+impl ConsoleState {
+    /// A menu on entry 1. `live` records the result of the startup probe.
+    pub fn new(lang: Lang, live: bool) -> ConsoleState {
+        ConsoleState {
+            lang,
+            view: ConsoleView::Menu,
+            selected: 1,
+            pending: None,
+            live,
+            node_name: String::new(),
+            service_name: String::new(),
+            narrow: false,
+            no_color: false,
+            notice_rows: Vec::new(),
+        }
+    }
+
+    /// Apply one input line and report the work the driver must do.
+    ///
+    /// The menu and service screens trim surrounding whitespace; the
+    /// confirmation screen does not, so `" START"` is a mismatch.
+    pub fn apply(&mut self, line: &str) -> ConsoleEffect {
+        match self.view {
+            ConsoleView::Menu => self.apply_menu(line.trim()),
+            ConsoleView::Service => self.apply_service(line.trim()),
+            ConsoleView::Confirm => self.apply_confirm(line),
+            ConsoleView::Notice => self.apply_notice(line.trim()),
+        }
+    }
+
+    fn apply_menu(&mut self, cmd: &str) -> ConsoleEffect {
+        match cmd {
+            "" => self.open_selected(),
+            "q" | "quit" => ConsoleEffect::Quit,
+            "j" | "down" => {
+                self.selected = self.selected.saturating_add(1).min(9);
+                ConsoleEffect::None
+            }
+            "k" | "up" => {
+                self.selected = self.selected.saturating_sub(1).max(1);
+                ConsoleEffect::None
+            }
+            "r" => ConsoleEffect::RefreshStatus,
+            "L" | "l" => {
+                self.cycle_lang();
+                ConsoleEffect::None
+            }
+            other => match other.parse::<u8>() {
+                Ok(value) if (1..=9).contains(&value) => {
+                    self.selected = value;
+                    ConsoleEffect::None
+                }
+                _ => self.notice(vec![text(self.lang, Msg::NoticeUnknownCommand).to_string()]),
+            },
+        }
+    }
+
+    /// Entry dispatch. Only 1 (telemetry) and 8 (service) have a backend; 6
+    /// and 9 are refused because this build must not change the security mode,
+    /// revoke, or uninstall.
+    fn open_selected(&mut self) -> ConsoleEffect {
+        match self.selected {
+            1 => ConsoleEffect::Telemetry,
+            6 | 9 => self.notice(vec![text(self.lang, Msg::NoticeRefused).to_string()]),
+            8 => {
+                self.view = ConsoleView::Service;
+                ConsoleEffect::None
+            }
+            _ => self.notice(vec![text(self.lang, Msg::NoticeNotImplemented).to_string()]),
+        }
+    }
+
+    fn apply_service(&mut self, cmd: &str) -> ConsoleEffect {
+        match cmd {
+            "1" => ConsoleEffect::ServiceStatus,
+            "2" => {
+                self.pending = Some(ServiceAction::Start);
+                self.view = ConsoleView::Confirm;
+                ConsoleEffect::None
+            }
+            "3" => {
+                self.pending = Some(ServiceAction::Stop);
+                self.view = ConsoleView::Confirm;
+                ConsoleEffect::None
+            }
+            "4" => ConsoleEffect::CheckConfig,
+            "5" | "b" | "" => {
+                self.view = ConsoleView::Menu;
+                ConsoleEffect::None
+            }
+            "q" | "quit" => ConsoleEffect::Quit,
+            _ => self.notice(vec![text(self.lang, Msg::NoticeUnknownCommand).to_string()]),
+        }
+    }
+
+    fn apply_confirm(&mut self, line: &str) -> ConsoleEffect {
+        let Some(action) = self.pending else {
+            self.view = ConsoleView::Menu;
+            return ConsoleEffect::None;
+        };
+        if line == action.phrase() {
+            self.pending = None;
+            match action {
+                ServiceAction::Start => ConsoleEffect::ServiceStart,
+                ServiceAction::Stop => ConsoleEffect::ServiceStop,
+            }
+        } else {
+            self.pending = None;
+            self.notice(vec![text(self.lang, Msg::NoticeCancelled).to_string()])
+        }
+    }
+
+    fn apply_notice(&mut self, cmd: &str) -> ConsoleEffect {
+        match cmd {
+            "q" | "quit" => ConsoleEffect::Quit,
+            _ => {
+                self.view = ConsoleView::Menu;
+                ConsoleEffect::None
+            }
+        }
+    }
+
+    fn notice(&mut self, rows: Vec<String>) -> ConsoleEffect {
+        self.notice_rows = rows;
+        self.pending = None;
+        self.view = ConsoleView::Notice;
+        ConsoleEffect::None
+    }
+
+    fn cycle_lang(&mut self) {
+        self.lang = match self.lang {
+            Lang::ZhCn => Lang::ZhTw,
+            Lang::ZhTw => Lang::En,
+            Lang::En => Lang::ZhCn,
+        };
+    }
+
+    /// Header model. The mesh cell carries the snapshot source (`live` /
+    /// `offline`), which is where [`MenuModel::offline`] already puts
+    /// `offline`; `auth` is `n/a` because this build never inspects the
+    /// negotiated algorithms and must not imply one.
+    pub fn menu_model(&self, version: &str) -> MenuModel {
+        let mut model = MenuModel::offline(version, self.lang);
+        model.node_name = self.node_name.clone();
+        model.selected = self.selected;
+        model.narrow = self.narrow;
+        model.no_color = self.no_color;
+        model.mesh_label = text(
+            self.lang,
+            if self.live {
+                Msg::SrcLive
+            } else {
+                Msg::SrcOffline
+            },
+        )
+        .to_string();
+        model.auth_label = "n/a".to_string();
+        model
+    }
+
+    /// Render the current screen. Boxed output is exactly 18 lines of exactly
+    /// 77 display columns; narrow output is a plain list.
+    pub fn screen(&self, version: &str) -> Result<String, MenuError> {
+        let base = self.menu_model(version);
+        match self.view {
+            ConsoleView::Menu => render_menu(&base),
+            ConsoleView::Service => render_detail(
+                &base,
+                text(self.lang, Msg::HeadingService),
+                &self.service_rows(),
+                text(self.lang, Msg::HintService),
+            ),
+            ConsoleView::Confirm => render_detail(
+                &base,
+                text(self.lang, Msg::HeadingConfirm),
+                &self.confirm_rows(),
+                text(self.lang, Msg::HintConfirm),
+            ),
+            ConsoleView::Notice => render_detail(
+                &base,
+                text(self.lang, Msg::HeadingNotice),
+                &self.notice_rows,
+                text(self.lang, Msg::HintNotice),
+            ),
+        }
+    }
+
+    fn service_rows(&self) -> Vec<String> {
+        vec![
+            format!("[1] {}", text(self.lang, Msg::SvcStatus)),
+            format!("[2] {}", text(self.lang, Msg::SvcStart)),
+            format!("[3] {}", text(self.lang, Msg::SvcStop)),
+            format!("[4] {}", text(self.lang, Msg::SvcConfig)),
+            format!("[5] {}", text(self.lang, Msg::SvcBack)),
+        ]
+    }
+
+    fn confirm_rows(&self) -> Vec<String> {
+        let Some(action) = self.pending else {
+            return vec![text(self.lang, Msg::NoticeCancelled).to_string()];
+        };
+        let target = if self.service_name.is_empty() {
+            text(self.lang, Msg::UnknownNode)
+        } else {
+            self.service_name.as_str()
+        };
+        let warning = match action {
+            ServiceAction::Start => String::new(),
+            ServiceAction::Stop => stop_warning(self.lang).to_string(),
+        };
+        vec![
+            format!("{}: {target}", action.label(self.lang)),
+            warning,
+            format!("{}{}", text(self.lang, Msg::ConfirmPrompt), action.phrase()),
+            text(self.lang, Msg::CancelHint).to_string(),
+        ]
+    }
+}
+
+/// Warning shown before a stop: stopping the daemon drops the tunnel, and
+/// §10.4 requires the screen to say so instead of implying a graceful pause.
+fn stop_warning(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "警告: 停止后本机隧道立即中断",
+        Lang::ZhTw => "警告: 停止後本機隧道立即中斷",
+        Lang::En => "Warning: stopping drops this tunnel immediately",
+    }
+}
+
+/// Replace control characters so externally sourced text (command output,
+/// socket fields) can never reach a terminal as an escape or an extra line.
+pub fn sanitize_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// Render a detail/notice screen in the same 18-line frame as the menu.
+///
+/// Rejects a control character in `heading`, `rows` or `hint` — including a
+/// CSI introduced by `ESC` — so a hostile service-manager line cannot inject a
+/// terminal escape or an extra row (§10.4).
+pub fn render_detail(
+    base: &MenuModel,
+    heading: &str,
+    rows: &[String],
+    hint: &str,
+) -> Result<String, MenuError> {
+    if contains_injection(heading) || contains_injection(hint) {
+        return Err(MenuError::Injection);
+    }
+    if rows
+        .iter()
+        .take(DETAIL_ROWS)
+        .any(|row_text| contains_injection(row_text))
+    {
+        return Err(MenuError::Injection);
+    }
+    for field in free_text_fields(base) {
+        if contains_injection(field) {
+            return Err(MenuError::Injection);
+        }
+    }
+    if base.narrow {
+        Ok(render_narrow_detail(base, heading, rows, hint))
+    } else {
+        Ok(render_boxed_detail(base, heading, rows, hint))
+    }
+}
+
+fn render_boxed_detail(base: &MenuModel, heading: &str, rows: &[String], hint: &str) -> String {
+    let mut lines = Vec::with_capacity(MENU_LINES);
+    lines.push(title_line(base));
+    let (row_tun_right, row_mesh_left, row_mesh_right) = status_keys(base.lang);
+    lines.push(field_row(
+        text(base.lang, Msg::NodeLabel),
+        &node_value(base),
+        text(base.lang, Msg::ModeLabel),
+        &base.mode_label,
+    ));
+    lines.push(field_row(
+        "TUN",
+        &base.tun_label,
+        row_tun_right,
+        &base.inbound_label,
+    ));
+    lines.push(field_row(
+        row_mesh_left,
+        &base.mesh_label,
+        row_mesh_right,
+        &base.auth_label,
+    ));
+    lines.push(field_row("MEM", &base.mem_label, "GUARD", &base.guard_label));
+    lines.push(rule('├', '┤'));
+    lines.push(row(heading));
+    for index in 0..DETAIL_ROWS {
+        let content = rows.get(index).map(String::as_str).unwrap_or("");
+        lines.push(row(content));
+    }
+    lines.push(rule('├', '┤'));
+    lines.push(row(hint));
+    lines.push(rule('└', '┘'));
+    lines.join("\n")
+}
+
+fn render_narrow_detail(base: &MenuModel, heading: &str, rows: &[String], hint: &str) -> String {
+    let mut lines = Vec::with_capacity(DETAIL_ROWS + 4);
+    lines.push(format!(
+        "{} {} {} {} {}",
+        text(base.lang, Msg::ConsoleTitle),
+        base.version,
+        node_value(base),
+        base.mode_label,
+        base.mesh_label
+    ));
+    lines.push(heading.to_string());
+    for row_text in rows.iter().take(DETAIL_ROWS) {
+        lines.push(row_text.clone());
+    }
+    lines.push(hint.to_string());
+    lines.join("\n")
+}
+
 /// Box-drawing used by the wide screen. Narrow output must contain none.
 #[cfg(test)]
 const BOX_DRAWING: &[char] = &['┌', '┐', '└', '┘', '├', '┤', '─', '│'];
@@ -607,6 +1026,10 @@ mod tests {
     use super::{
         BOX_DRAWING, BOX_WIDTH, DangerAction, MENU_LINES, MenuError, MenuModel, ZH_CN_ORACLE,
         confirm_dangerous, display_width, is_emoji, render_menu,
+    };
+    use super::{
+        ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, ServiceAction, render_detail,
+        sanitize_line,
     };
     use crate::i18n::Lang;
 
@@ -867,5 +1290,279 @@ mod tests {
                 assert!(!is_emoji(c as u32), "{lang:?} U+{:04X}", c as u32);
             }
         }
+    }
+
+    // --- line-mode console ---
+
+    #[test]
+    fn console_starts_on_the_menu_with_entry_one() {
+        let state = ConsoleState::new(Lang::En, false);
+        assert_eq!(state.view, ConsoleView::Menu);
+        assert_eq!(state.selected, 1);
+        assert!(!state.live);
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn console_jk_and_digits_move_the_selection_without_running() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        assert_eq!(state.apply("j"), ConsoleEffect::None);
+        assert_eq!(state.selected, 2);
+        state.apply("j");
+        assert_eq!(state.selected, 3);
+        state.apply("k");
+        assert_eq!(state.selected, 2);
+        for _ in 0..20 {
+            state.apply("k");
+        }
+        assert_eq!(state.selected, 1, "selection clamps at 1");
+        for _ in 0..20 {
+            state.apply("j");
+        }
+        assert_eq!(state.selected, 9, "selection clamps at 9");
+
+        assert_eq!(state.apply("6"), ConsoleEffect::None);
+        assert_eq!(state.selected, 6);
+        assert_eq!(state.view, ConsoleView::Menu, "a digit only jumps");
+    }
+
+    #[test]
+    fn console_only_telemetry_and_service_have_a_backend() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 1;
+        assert_eq!(state.apply(""), ConsoleEffect::Telemetry);
+
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        assert_eq!(state.apply(""), ConsoleEffect::None);
+        assert_eq!(state.view, ConsoleView::Service);
+
+        for entry in [2u8, 3, 4, 5, 7] {
+            let mut state = ConsoleState::new(Lang::En, false);
+            state.selected = entry;
+            assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
+            assert_eq!(state.view, ConsoleView::Notice, "entry {entry}");
+            assert!(
+                state.notice_rows[0].contains("Not implemented"),
+                "entry {entry}: {:?}",
+                state.notice_rows
+            );
+        }
+    }
+
+    #[test]
+    fn console_refuses_mode_change_and_uninstall() {
+        for entry in [6u8, 9] {
+            let mut state = ConsoleState::new(Lang::En, false);
+            state.selected = entry;
+            assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
+            assert_eq!(state.view, ConsoleView::Notice, "entry {entry}");
+            assert!(
+                state.notice_rows[0].contains("Refused"),
+                "entry {entry}: {:?}",
+                state.notice_rows
+            );
+            // Leaving the notice never runs the entry either.
+            assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
+            assert_eq!(state.view, ConsoleView::Menu, "entry {entry}");
+        }
+    }
+
+    #[test]
+    fn console_service_start_needs_the_exact_phrase() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        state.apply("");
+        assert_eq!(state.apply("2"), ConsoleEffect::None);
+        assert_eq!(state.view, ConsoleView::Confirm);
+        assert_eq!(state.pending, Some(ServiceAction::Start));
+        assert_eq!(state.apply("START"), ConsoleEffect::ServiceStart);
+        assert!(state.pending.is_none());
+
+        for wrong in ["start", " START", "START ", "STAR", "STOP"] {
+            let mut state = ConsoleState::new(Lang::En, false);
+            state.selected = 8;
+            state.apply("");
+            state.apply("2");
+            assert_eq!(state.apply(wrong), ConsoleEffect::None, "{wrong:?}");
+            assert_eq!(state.view, ConsoleView::Notice, "{wrong:?}");
+            assert!(
+                state.notice_rows[0].contains("Cancelled"),
+                "{wrong:?}: {:?}",
+                state.notice_rows
+            );
+            assert!(state.pending.is_none(), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn console_service_stop_needs_the_exact_phrase() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        state.apply("");
+        assert_eq!(state.apply("3"), ConsoleEffect::None);
+        assert_eq!(state.pending, Some(ServiceAction::Stop));
+        assert_eq!(state.apply("START"), ConsoleEffect::None, "START is not STOP");
+        assert_eq!(state.view, ConsoleView::Notice);
+
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        state.apply("");
+        state.apply("3");
+        assert_eq!(state.apply("STOP"), ConsoleEffect::ServiceStop);
+    }
+
+    #[test]
+    fn console_confirm_screen_names_the_target_and_the_stop_risk() {
+        let mut state = ConsoleState::new(Lang::ZhCn, true);
+        state.selected = 8;
+        state.service_name = "boreas-core".to_string();
+        state.apply("");
+        state.apply("3");
+
+        let rows = state.confirm_rows();
+        assert!(rows[0].contains("停止守护进程"), "{:?}", rows[0]);
+        assert!(rows[0].contains("boreas-core"), "{:?}", rows[0]);
+        assert!(rows[1].contains("中断"), "stop must warn: {:?}", rows[1]);
+        assert!(rows[2].contains("STOP"), "{:?}", rows[2]);
+        assert!(rows[3].contains("取消"), "{:?}", rows[3]);
+
+        state.pending = Some(ServiceAction::Start);
+        assert!(state.confirm_rows()[1].is_empty(), "a start has no such risk");
+    }
+
+    #[test]
+    fn console_without_a_known_unit_says_so() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        state.apply("");
+        state.apply("3");
+        let rows = state.confirm_rows();
+        assert!(rows[0].contains("(unknown)"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn console_quit_works_from_every_view() {
+        for view in [
+            ConsoleView::Menu,
+            ConsoleView::Service,
+            ConsoleView::Confirm,
+            ConsoleView::Notice,
+        ] {
+            let mut state = ConsoleState::new(Lang::En, false);
+            state.view = view;
+            assert_eq!(state.apply("q"), ConsoleEffect::Quit, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn console_language_cycle_wraps_through_three() {
+        let mut state = ConsoleState::new(Lang::ZhCn, false);
+        state.apply("L");
+        assert_eq!(state.lang, Lang::ZhTw);
+        state.apply("L");
+        assert_eq!(state.lang, Lang::En);
+        state.apply("L");
+        assert_eq!(state.lang, Lang::ZhCn);
+    }
+
+    #[test]
+    fn console_source_is_visible_on_the_menu() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        let offline = state.screen("1.11.0").expect("offline screen");
+        assert!(offline.contains("offline"));
+
+        state.live = true;
+        state.node_name = "hub-us-c".to_string();
+        let live = state.screen("1.11.0").expect("live screen");
+        assert!(live.contains("hub-us-c"), "{live}");
+        assert!(live.contains("live"), "{live}");
+        for line in live.split('\n') {
+            assert_eq!(display_width(line), BOX_WIDTH, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn detail_screens_stay_18_by_77_in_every_language() {
+        for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
+            for view in [
+                ConsoleView::Service,
+                ConsoleView::Confirm,
+                ConsoleView::Notice,
+            ] {
+                let mut state = ConsoleState::new(lang, true);
+                state.view = view;
+                state.selected = 8;
+                state.service_name = "boreas-core".to_string();
+                state.pending = Some(ServiceAction::Stop);
+                state.notice_rows = vec!["a".to_string(); DETAIL_ROWS];
+
+                let rendered = state.screen("v-test").expect("screen");
+                let lines: Vec<&str> = rendered.split('\n').collect();
+                assert_eq!(lines.len(), MENU_LINES, "{lang:?}/{view:?}");
+                for line in &lines {
+                    assert_eq!(
+                        display_width(line),
+                        BOX_WIDTH,
+                        "{lang:?}/{view:?}: {line:?}"
+                    );
+                    assert!(!line.as_bytes().contains(&0x1B), "{lang:?}/{view:?}");
+                    for c in line.chars() {
+                        assert!(!is_emoji(c as u32), "{lang:?} U+{:04X}", c as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_detail_has_no_box_and_no_77_claim() {
+        let mut state = ConsoleState::new(Lang::En, true);
+        state.narrow = true;
+        state.view = ConsoleView::Notice;
+        state.notice_rows = vec!["row-one".to_string()];
+
+        let rendered = state.screen("1.11.0").expect("narrow screen");
+        for glyph in BOX_DRAWING {
+            assert!(!rendered.contains(*glyph), "box glyph {glyph}");
+        }
+        assert!(rendered.contains("row-one"));
+        assert!(rendered.lines().count() < MENU_LINES);
+    }
+
+    #[test]
+    fn detail_rejects_injected_rows_headings_and_hints() {
+        let base = MenuModel::offline("1.11.0", Lang::En);
+        for hostile in [
+            "line\nbreak".to_string(),
+            "esc\u{1b}[31m".to_string(),
+            "bell\u{07}".to_string(),
+            "c1\u{9b}31m".to_string(),
+        ] {
+            assert_eq!(
+                render_detail(&base, "ok", std::slice::from_ref(&hostile), "ok"),
+                Err(MenuError::Injection),
+                "{hostile:?}"
+            );
+            assert_eq!(
+                render_detail(&base, &hostile, &[], "ok"),
+                Err(MenuError::Injection),
+                "{hostile:?}"
+            );
+            assert_eq!(
+                render_detail(&base, "ok", &[], &hostile),
+                Err(MenuError::Injection),
+                "{hostile:?}"
+            );
+        }
+        // Ordinary text (including brackets) still renders.
+        assert!(render_detail(&base, "ok", &["a[b]".to_string()], "hint").is_ok());
+    }
+
+    #[test]
+    fn sanitize_line_removes_every_control_character() {
+        assert_eq!(sanitize_line("a\nb"), "a?b");
+        assert_eq!(sanitize_line("a\u{1b}[0m"), "a?[0m");
+        assert_eq!(sanitize_line("boreas-core"), "boreas-core");
     }
 }

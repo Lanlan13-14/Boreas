@@ -1,0 +1,179 @@
+name: '[Test] OpenWrt rootfs and static pq768 daemon'
+
+# Native x86_64/aarch64 builds plus an official OpenWrt userland. The netns
+# test uses the runner kernel; it is not represented as an OpenWrt-kernel or
+# physical-router acceptance test.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'tools/release/**'
+      - 'tools/deploy/**'
+      - '.github/workflows/openwrt.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'tools/release/**'
+      - 'tools/deploy/**'
+      - '.github/workflows/openwrt.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-netns:
+    name: OpenWrt 24.10.0 ${{ matrix.arch }} rootfs + pq768 netns
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            openssl_target: linux-x86_64
+            rootfs_url: https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-24.10.0-x86-64-rootfs.tar.gz
+            rootfs_sha256: 25c1e8682bd3c4950be6480d859257bb5c86d5be36589824d43141986fe64d93
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            openssl_target: linux-aarch64
+            rootfs_url: https://downloads.openwrt.org/releases/24.10.0/targets/armsr/armv8/openwrt-24.10.0-armsr-armv8-rootfs.tar.gz
+            rootfs_sha256: ae9619d2f74d22779655e12764cbfa26625bd81614364197785a1ed3d3bedb36
+    env:
+      OPENSSL_VERSION: 3.6.5
+      OPENSSL_SHA256: a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98
+      OPENSSL_NO_VENDOR: '1'
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.openwrt-openssl/bin/openssl
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Verify native architecture and install build tools
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential perl curl ca-certificates pkg-config binutils \
+            musl-tools linux-libc-dev file iproute2 iputils-ping
+      - name: Build pinned static OpenSSL for native musl
+        timeout-minutes: 35
+        env:
+          OPENSSL_PREFIX: ${{ github.workspace }}/.openwrt-openssl
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o openssl.tar.gz
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum --check --strict
+          mkdir openssl-src
+          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-src
+          source openssl-src/VERSION.dat
+          test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}"
+          cd openssl-src
+          MUSL_UAPI="${GITHUB_WORKSPACE}/.musl-kernel-headers"
+          mkdir -p "$MUSL_UAPI"
+          ln -s /usr/include/linux "$MUSL_UAPI/linux"
+          ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
+          case '${{ matrix.arch }}' in
+            x86_64) ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
+            aarch64) ln -s /usr/include/aarch64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
+          esac
+          CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-shared no-tests no-async \
+            -isystem "$MUSL_UAPI" \
+            --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          make -j2
+          make install_sw
+          mkdir -p "${OPENSSL_PREFIX}/ssl"
+          printf '%s\n' \
+            'openssl_conf = openssl_init' '' '[openssl_init]' \
+            'providers = provider_sect' '' '[provider_sect]' \
+            'default = default_sect' '' '[default_sect]' 'activate = 1' \
+            > "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+      - name: Build fully static pq768 daemon
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.openwrt-openssl
+          OPENSSL_STATIC: '1'
+          OPENSSL_CONF: ${{ github.workspace }}/.openwrt-openssl/ssl/openssl.cnf
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo test --locked -p boreas-tunnel -p boreas-cli \
+            --target '${{ matrix.target }}' --features boreas-cli/openssl-inner-tls
+          cargo build --locked --release -p boreas-cli \
+            --target '${{ matrix.target }}' --features openssl-inner-tls
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/boreas" \
+            "dist/boreas-linux-${{ matrix.arch }}-musl-pq768"
+      - name: Verify static ELF and record toolchain
+        run: |
+          set -euo pipefail
+          python tools/release/verify_static_linux.py \
+            --binary "dist/boreas-linux-${{ matrix.arch }}-musl-pq768" \
+            --target '${{ matrix.target }}' --out dist/static-linkage.json
+          rustc -Vv | tee dist/toolchain.txt
+          cargo -V | tee -a dist/toolchain.txt
+          sha256sum Cargo.lock > dist/cargo-lock.sha256
+      - name: Install official OpenWrt rootfs and run daemon doctor
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            '${{ matrix.rootfs_url }}' -o openwrt-rootfs.tar.gz
+          echo '${{ matrix.rootfs_sha256 }}  openwrt-rootfs.tar.gz' \
+            | sha256sum --check --strict
+          mkdir openwrt-rootfs
+          tar -xzf openwrt-rootfs.tar.gz -C openwrt-rootfs
+          test -f openwrt-rootfs/etc/openwrt_release
+          grep -F "DISTRIB_RELEASE='24.10.0'" openwrt-rootfs/etc/openwrt_release
+          install -d -m 0755 openwrt-rootfs/usr/local/bin
+          install -m 0755 "dist/boreas-linux-${{ matrix.arch }}-musl-pq768" \
+            openwrt-rootfs/usr/local/bin/boreas
+          ln -s boreas openwrt-rootfs/usr/local/bin/boreas-easy
+          chroot openwrt-rootfs /usr/local/bin/boreas doctor | tee dist/openwrt-doctor.json
+          grep -F '"daemon":true' dist/openwrt-doctor.json
+          grep -F '"tls_backend":true' dist/openwrt-doctor.json
+          test "$(readlink openwrt-rootfs/usr/local/bin/boreas-easy)" = boreas
+      - name: Run pq768 netns inside official OpenWrt userland
+        run: |
+          set -euo pipefail
+          sudo modprobe tun || true
+          sudo -E env BOREAS_ROOTFS="$PWD/openwrt-rootfs" \
+            bash tools/release/netns_daemon_smoke.sh \
+            "$PWD/dist/boreas-linux-${{ matrix.arch }}-musl-pq768" \
+            2>&1 | tee dist/openwrt-netns.log
+      - name: Record exact support boundary
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'OpenWrt userland: official 24.10.0 rootfs, pinned SHA-256' \
+            'Architecture: ${{ matrix.arch }} (native GitHub runner)' \
+            'Kernel: GitHub runner Linux kernel in isolated network namespaces' \
+            'Not tested: OpenWrt kernel, physical router, procd, reboot, flash and resource endurance' \
+            'Development evidence only; production gates remain open.' \
+            > dist/SUPPORT-BOUNDARY.txt
+          (cd dist && sha256sum "boreas-linux-${{ matrix.arch }}-musl-pq768" > SHA256SUMS)
+      - name: Upload OpenWrt development binary and evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boreas-openwrt-${{ matrix.arch }}-${{ github.run_id }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14

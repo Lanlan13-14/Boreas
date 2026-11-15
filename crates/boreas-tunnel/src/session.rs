@@ -241,8 +241,13 @@ impl FrameIo {
             body_len: u32::try_from(body.len()).map_err(|_| TunnelError::FrameTooLarge)?,
         };
         let encoded = header.encode()?;
-        self.stream.write_all(&encoded)?;
-        self.stream.write_all(body)?;
+        let mut frame = Vec::with_capacity(encoded.len() + body.len());
+        frame.extend_from_slice(&encoded);
+        frame.extend_from_slice(body);
+        // One application frame is one TLS write. TLS record boundaries remain
+        // independent of AppHeader framing, but avoiding separate header/body
+        // records halves avoidable encryption and WebSocket overhead.
+        self.stream.write_all(&frame)?;
         self.stream.flush()?;
         Ok(())
     }

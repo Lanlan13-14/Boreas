@@ -7,22 +7,25 @@ library sockets are used; no host sysctl, route, or TLS setting is changed.
 
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
 
 CHUNK = bytes((index % 251 for index in range(64 * 1024)))
-TOTAL_BYTES = 8 * 1024 * 1024
+TOTAL_BYTES = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
+if TOTAL_BYTES <= 0 or TOTAL_BYTES > 64 * 1024 * 1024:
+    raise ValueError("BOREAS_PERF_BYTES must be in 1..=67108864")
 PORT = 18080
 TIMEOUT_SECONDS = 30
 
 
-def receiver() -> None:
+def receiver(local_ip: str) -> None:
     digest = hashlib.sha256()
     received = 0
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("10.20.1.1", PORT))
+        listener.bind((local_ip, PORT))
         listener.listen(1)
         listener.settimeout(TIMEOUT_SECONDS)
         connection, _ = listener.accept()
@@ -39,10 +42,12 @@ def receiver() -> None:
         raise SystemExit(f"receiver got {received} bytes, expected {TOTAL_BYTES}")
 
 
-def sender() -> None:
+def sender(local_ip: str, peer_ip: str) -> None:
     digest = hashlib.sha256()
     started = time.monotonic()
-    with socket.create_connection(("10.20.1.1", PORT), timeout=TIMEOUT_SECONDS) as connection:
+    with socket.create_connection(
+        (peer_ip, PORT), timeout=TIMEOUT_SECONDS, source_address=(local_ip, 0)
+    ) as connection:
         connection.settimeout(TIMEOUT_SECONDS)
         sent = 0
         while sent < TOTAL_BYTES:
@@ -73,9 +78,9 @@ def sender() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in {"receive", "send"}:
-        raise SystemExit("usage: netns_overlay_perf.py receive|send")
+    if len(sys.argv) != 4 or sys.argv[1] not in {"receive", "send"}:
+        raise SystemExit("usage: netns_overlay_perf.py receive|send LOCAL_IP PEER_IP")
     if sys.argv[1] == "receive":
-        receiver()
+        receiver(sys.argv[2])
     else:
-        sender()
+        sender(sys.argv[2], sys.argv[3])

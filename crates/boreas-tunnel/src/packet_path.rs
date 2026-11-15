@@ -581,7 +581,7 @@ fn read_prefix<C: Read + ?Sized>(
     let mut filled = 0;
     let mut interrupts = 0u8;
     while filled < FRAME_PREFIX_LEN {
-        let target = &mut prefix[filled..filled + 1];
+        let target = &mut prefix[filled..FRAME_PREFIX_LEN];
         match circuit.read(target) {
             Ok(0) => {
                 return if filled == 0 {

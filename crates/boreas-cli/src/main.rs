@@ -5,8 +5,9 @@
 //! This slice contains the policy/config/console foundation plus an optional
 //! hop-node process:
 //!
-//! - a trilingual (`zh-CN` / `zh-TW` / `en`) one-shot rendering layer for the
-//!   status screen (`status`, and `boreas-easy` with no arguments);
+//! - a trilingual (`zh-CN` / `zh-TW` / `en`) rendering layer for the status
+//!   screen (`status`), the one-shot 9-entry screen (`menu`) and the
+//!   line-mode console (`console`, also reached as `boreas-easy`);
 //! - a typed, fail-closed TOML configuration model with `config-check <path>`
 //!   static policy validation and `config-migrate <path>` schema migration
 //!   (stdout only; no file is rewritten);
@@ -18,9 +19,16 @@
 //!   plus one hop inner TLS session. That is not a production daemon, not
 //!   E2E relay, and not a passed gate.
 //!
-//! `status` keeps saying `daemon: not connected` unless a live control socket
-//! exists; none does. `menu` renders the §10.4.1 screen from an offline model
-//! only: no raw mode, no DSR probe and no control socket (G-UI is not met).
+//! `boreas-easy` / `boreas console` is a **line-oriented** console: it prints
+//! the §10.4.1 box, prints a prompt, and reads one line per screen. There is no
+//! raw mode and no key-level input, so an abnormal exit cannot leave a terminal
+//! in a raw state (§10.4: `SIGKILL` cannot be made to run `Drop`). Non-TTY
+//! output stays JSON. Live status comes from the authorized Unix control
+//! socket; when that fails the screen says `offline` and shows the reason
+//! instead of inventing a mesh. Service start/stop run `systemctl` or
+//! `/etc/init.d/boreas` with an argument vector (no shell) and only after an
+//! exact typed phrase; security-mode changes, revocation and uninstall are
+//! refused. **G-UI is still not passed.**
 
 mod config;
 mod daemon;
@@ -31,13 +39,17 @@ mod render;
 mod tui;
 
 use std::env;
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use config::RuntimeCapabilities;
-use i18n::{Lang, lang_from_env, parse_lang};
-use render::{StatusSnapshot, render_status};
-use tui::{DangerAction, MenuModel, confirm_dangerous, render_menu};
+use config::{Config, NodeRole, RuntimeCapabilities};
+use i18n::{Lang, Msg, lang_from_env, parse_lang, text};
+use render::{DaemonState, StatusSnapshot, render_status};
+use tui::{
+    ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction, MenuModel,
+    confirm_dangerous, render_menu, sanitize_line,
+};
 
 const IMPLEMENTATION_SCOPE: &str = "Phase 0 policy/config/console-rendering foundation only";
 
@@ -87,9 +99,8 @@ fn runtime_capabilities() -> RuntimeCapabilities {
 /// Testable entry point: resolves the `boreas-easy` argv[0] alias, strips
 /// the global `--lang` option, then hands off to [`run`].
 ///
-/// When invoked as `boreas-easy` with no subcommand this is equivalent to
-/// `status` (see the crate docs: the interactive raw-mode TUI is a future
-/// slice, not implemented here).
+/// `boreas-easy` with no subcommand enters the line-mode console, which is
+/// interactive on a TTY and JSON otherwise (see [`run_console`]).
 fn dispatch(
     argv0: &str,
     raw_args: &[String],
@@ -102,7 +113,7 @@ fn dispatch(
     };
     let lang = lang_probe(cli_lang.as_deref());
     if is_easy_entrypoint(argv0) && args.is_empty() {
-        return run(&["status".to_string()], lang, stdout_tty);
+        return run(&["console".to_string()], lang, stdout_tty);
     }
     run(&args, lang, stdout_tty)
 }
@@ -157,6 +168,7 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         ),
         Some("status") => run_status(&args[1..], lang, stdout_tty),
         Some("menu") => run_menu(&args[1..], lang, stdout_tty),
+        Some("console") => run_console(&args[1..], lang, stdout_tty),
         Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
@@ -283,12 +295,541 @@ fn run_menu(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Strin
     }
 }
 
-/// `NO_COLOR` is set when the variable exists and is non-empty. Read only by
-/// [`run_menu`]; other commands ignore it.
+/// `NO_COLOR` is set when the variable exists and is non-empty. Read by the
+/// screen builders (`menu` and `console`); it never enables color, it only
+/// records that the caller does not want any.
 fn no_color_set() -> bool {
     match std::env::var("NO_COLOR") {
         Ok(value) => !value.is_empty(),
         Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line-mode console (`boreas-easy` / `boreas console`)
+// ---------------------------------------------------------------------------
+
+/// Authorized control socket from master plan §10.5. The daemon currently
+/// binds `state_dir/control.sock`; `--socket` overrides this default.
+const DEFAULT_CONTROL_SOCKET: &str = "/run/boreas/control.sock";
+
+/// Configuration path from master plan §5.5.
+const DEFAULT_CONFIG_PATH: &str = "/etc/boreas/config.toml";
+
+/// Parsed `console` options.
+struct ConsoleOptions {
+    socket: PathBuf,
+    config: PathBuf,
+    service: Option<String>,
+    narrow: bool,
+    json: bool,
+}
+
+/// One value for a flag that requires it. Missing values are exit-2 errors,
+/// never a silent default.
+fn take_flag_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    args.get(index + 1).cloned().ok_or_else(|| {
+        format!("error: {flag} requires a value; run `boreas help`")
+    })
+}
+
+/// `console [--json] [--narrow] [--socket <PATH>] [--config <FILE>]
+/// [--service <UNIT>]`: the line-mode management console.
+///
+/// On a TTY this reads one line per screen from stdin; otherwise (`--json` or
+/// no TTY) it prints one JSON object and returns, so scripts and pipes never
+/// hang waiting for input.
+fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+    let mut options = ConsoleOptions {
+        socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
+        config: PathBuf::from(DEFAULT_CONFIG_PATH),
+        service: None,
+        narrow: false,
+        json: false,
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                options.json = true;
+                i += 1;
+            }
+            "--narrow" => {
+                options.narrow = true;
+                i += 1;
+            }
+            "--socket" | "--config" | "--service" => {
+                let flag = args[i].clone();
+                let value = match take_flag_value(args, i, &flag) {
+                    Ok(value) => value,
+                    Err(message) => return (2, String::new(), message),
+                };
+                match flag.as_str() {
+                    "--socket" => options.socket = PathBuf::from(&value),
+                    "--config" => options.config = PathBuf::from(&value),
+                    _ => options.service = Some(value),
+                }
+                i += 2;
+            }
+            other => {
+                return (
+                    2,
+                    String::new(),
+                    format!("error: unexpected argument `{other}`; run `boreas help`"),
+                );
+            }
+        }
+    }
+
+    let (live, snapshot, error) = probe_status(&options.socket);
+
+    if options.json || !stdout_tty {
+        let body = console_json(
+            live,
+            &snapshot,
+            error.as_deref(),
+            &options.socket,
+            options.service.as_deref(),
+            lang,
+        );
+        return (0, body, String::new());
+    }
+
+    let mut state = ConsoleState::new(lang, live);
+    state.node_name = sanitize_line(&snapshot.node_name);
+    state.narrow = options.narrow;
+    state.no_color = no_color_set();
+    state.service_name = sanitize_line(&preview_unit(&options));
+
+    let mut io = ConsoleIo {
+        socket: options.socket,
+        config: options.config,
+        service: options.service,
+    };
+
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    let outcome = drive_console(&mut state, &mut reader, &mut writer, |effect, effect_lang| {
+        io.perform(effect, effect_lang)
+    });
+    // Leave the shell prompt on a fresh line; no terminal mode was changed.
+    let _ = writeln!(&mut writer);
+
+    match outcome {
+        Ok(()) => (0, String::new(), String::new()),
+        Err(message) => (2, String::new(), format!("error: {message}")),
+    }
+}
+
+/// Best-effort unit name for the confirmation screen. An explicit `--service`
+/// wins; otherwise the name is derived from the config role. Nothing is
+/// guessed: an unreadable config yields an empty name and the screen says so.
+fn preview_unit(options: &ConsoleOptions) -> String {
+    if let Some(name) = &options.service {
+        return name.clone();
+    }
+    derive_unit(&options.config).unwrap_or_default()
+}
+
+fn derive_unit(config: &Path) -> Result<String, String> {
+    let parsed = Config::read_file(config, RuntimeCapabilities::NO_RUNTIME)
+        .map_err(|error| format!("cannot read {} to derive the unit: {error}", config.display()))?;
+    Ok(match parsed.identity.role {
+        NodeRole::Core => "boreas-core".to_string(),
+        NodeRole::Edge => "boreas-edge".to_string(),
+        NodeRole::EnrollmentService => String::new(),
+    })
+}
+
+/// Query the control socket once. A failure is not downgraded to "no daemon":
+/// the reason is returned so the screen can print it.
+fn probe_status(socket: &Path) -> (bool, StatusSnapshot, Option<String>) {
+    match daemon::query_control_socket(socket) {
+        Ok((snapshot, _raw)) => (true, snapshot, None),
+        Err(error) => (
+            false,
+            StatusSnapshot::offline(env!("CARGO_PKG_VERSION")),
+            Some(error),
+        ),
+    }
+}
+
+/// Minimal JSON string escaping for console fields (this crate has no serde
+/// dependency and deliberately has not added one).
+fn esc(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Non-TTY snapshot. `source` is the honest live/offline token; `error` carries
+/// the query failure so a caller can tell "daemon absent" from "permission
+/// denied" instead of guessing.
+fn console_json(
+    live: bool,
+    snapshot: &StatusSnapshot,
+    error: Option<&str>,
+    socket: &Path,
+    service: Option<&str>,
+    lang: Lang,
+) -> String {
+    let daemon = match snapshot.daemon {
+        DaemonState::Connected => "connected",
+        DaemonState::NotConnected => "not_connected",
+    };
+    let error_field = match error {
+        Some(value) => format!("\"{}\"", esc(value)),
+        None => "null".to_string(),
+    };
+    let service_field = match service {
+        Some(value) => format!("\"{}\"", esc(value)),
+        None => "null".to_string(),
+    };
+    format!(
+        concat!(
+            "{{\"command\":\"console\",\"lang\":\"{}\",\"version\":\"{}\",",
+            "\"source\":\"{}\",\"daemon\":\"{}\",\"node_name\":\"{}\",",
+            "\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},",
+            "\"security_mode\":\"{}\",\"socket\":\"{}\",\"service\":{},\"error\":{}}}"
+        ),
+        lang.code(),
+        esc(&snapshot.version),
+        if live { "live" } else { "offline" },
+        daemon,
+        esc(&sanitize_line(&snapshot.node_name)),
+        snapshot.inbound_on,
+        snapshot.inbound_connections,
+        snapshot.outbound_upstreams,
+        snapshot.security_mode.as_str(),
+        esc(&socket.display().to_string()),
+        service_field,
+        error_field,
+    )
+}
+
+/// Result of one driver-performed effect.
+struct ConsoleOutcome {
+    rows: Vec<String>,
+    live: Option<bool>,
+    node: Option<String>,
+}
+
+impl ConsoleOutcome {
+    fn rows(rows: Vec<String>) -> ConsoleOutcome {
+        ConsoleOutcome {
+            rows,
+            live: None,
+            node: None,
+        }
+    }
+
+    fn none() -> ConsoleOutcome {
+        ConsoleOutcome {
+            rows: Vec::new(),
+            live: None,
+            node: None,
+        }
+    }
+}
+
+/// Performs the effects the pure reducer asked for.
+struct ConsoleIo {
+    socket: PathBuf,
+    config: PathBuf,
+    service: Option<String>,
+}
+
+impl ConsoleIo {
+    fn perform(&mut self, effect: ConsoleEffect, lang: Lang) -> ConsoleOutcome {
+        match effect {
+            ConsoleEffect::RefreshStatus => {
+                let (live, _snapshot, _error) = probe_status(&self.socket);
+                ConsoleOutcome {
+                    rows: Vec::new(),
+                    live: Some(live),
+                    node: None,
+                }
+            }
+            ConsoleEffect::Telemetry => self.telemetry(lang),
+            ConsoleEffect::ServiceStatus => self.service("status"),
+            ConsoleEffect::ServiceStart => self.service("start"),
+            ConsoleEffect::ServiceStop => self.service("stop"),
+            ConsoleEffect::CheckConfig => self.config_check(),
+            ConsoleEffect::None | ConsoleEffect::Quit => ConsoleOutcome::none(),
+        }
+    }
+
+    fn telemetry(&self, lang: Lang) -> ConsoleOutcome {
+        let (live, snapshot, error) = probe_status(&self.socket);
+        let name = if snapshot.node_name.is_empty() {
+            text(lang, Msg::UnknownNode).to_string()
+        } else {
+            sanitize_line(&snapshot.node_name)
+        };
+        let mut rows = Vec::with_capacity(DETAIL_ROWS);
+        rows.push(format!(
+            "{}: {}",
+            text(lang, Msg::SrcLabel),
+            if live {
+                text(lang, Msg::SrcLive)
+            } else {
+                text(lang, Msg::SrcOffline)
+            }
+        ));
+        rows.push(format!("{}: {name}", text(lang, Msg::NodeLabel)));
+        rows.push(format!(
+            "{}: {} / {} {}",
+            text(lang, Msg::InboundLabel),
+            if snapshot.inbound_on {
+                text(lang, Msg::On)
+            } else {
+                text(lang, Msg::Off)
+            },
+            snapshot.inbound_connections,
+            text(lang, Msg::ConnectionsUnit)
+        ));
+        rows.push(format!(
+            "{}: {} {}",
+            text(lang, Msg::OutboundLabel),
+            snapshot.outbound_upstreams,
+            text(lang, Msg::UpstreamsUnit)
+        ));
+        rows.push(format!(
+            "{}: {}",
+            text(lang, Msg::ModeLabel),
+            snapshot.security_mode.as_str()
+        ));
+        rows.push(
+            text(
+                lang,
+                match snapshot.daemon {
+                    DaemonState::Connected => Msg::DaemonConnected,
+                    DaemonState::NotConnected => Msg::DaemonNotConnected,
+                },
+            )
+            .to_string(),
+        );
+        if let Some(error) = error {
+            rows.push(sanitize_line(&error));
+        }
+        rows.truncate(DETAIL_ROWS);
+        ConsoleOutcome {
+            rows,
+            live: Some(live),
+            node: Some(snapshot.node_name),
+        }
+    }
+
+    /// Read-only static validation. Prints identifiers and policy switches but
+    /// never key references, trust-anchor paths or state paths (§10.4).
+    fn config_check(&self) -> ConsoleOutcome {
+        let file = sanitize_line(&self.config.display().to_string());
+        match Config::read_file(&self.config, RuntimeCapabilities::NO_RUNTIME) {
+            Ok(parsed) => {
+                let mut rows = vec![
+                    format!("file: {file}"),
+                    "config-check: valid".to_string(),
+                    format!(
+                        "schema: v{} ({})",
+                        parsed.schema.as_u32(),
+                        parsed.schema.label()
+                    ),
+                    format!(
+                        "role: {} / node_id: {} / home_core: {} / vip_octet: {}",
+                        parsed.identity.role.as_str(),
+                        parsed.identity.node_id,
+                        parsed.identity.home_core_id,
+                        parsed.identity.vip_octet
+                    ),
+                    format!(
+                        "mode: {} / suite: {}",
+                        parsed.security.mode.as_str(),
+                        parsed.security.suite.as_str()
+                    ),
+                    format!(
+                        "uplink paths: {} / probe: {}",
+                        parsed.uplinks.paths, parsed.uplinks.probe_paths
+                    ),
+                    "paths: [REDACTED] / state_dir: [REDACTED]".to_string(),
+                ];
+                rows.truncate(DETAIL_ROWS);
+                ConsoleOutcome::rows(rows)
+            }
+            Err(error) => {
+                let mut rows = vec![
+                    format!("file: {file}"),
+                    "config-check: rejected".to_string(),
+                ];
+                for line in error.to_string().lines().take(DETAIL_ROWS - 2) {
+                    rows.push(sanitize_line(line));
+                }
+                ConsoleOutcome::rows(rows)
+            }
+        }
+    }
+
+    fn service(&self, verb: &str) -> ConsoleOutcome {
+        let unit = match self.unit() {
+            Ok(unit) => unit,
+            Err(error) => return ConsoleOutcome::rows(vec![sanitize_line(&error)]),
+        };
+        if unit.is_empty() {
+            return ConsoleOutcome::rows(vec![
+                "no service unit: pass --service <UNIT> (boreas-core or boreas-edge)".to_string(),
+            ]);
+        }
+        match service_invoke(&unit, verb) {
+            Ok(rows) => ConsoleOutcome::rows(rows),
+            Err(error) => ConsoleOutcome::rows(vec![sanitize_line(&error)]),
+        }
+    }
+
+    /// Lazy: a missing config blocks only the service actions, never the
+    /// status screen.
+    fn unit(&self) -> Result<String, String> {
+        match &self.service {
+            Some(name) => Ok(name.clone()),
+            None => derive_unit(&self.config),
+        }
+    }
+}
+
+/// True when an OpenWrt/procd init script owns the service and systemd is not
+/// running. Checked by path so no shell is involved and no unit guess is made.
+#[cfg(unix)]
+fn manages_with_procd() -> bool {
+    Path::new("/etc/init.d/boreas").is_file() && !Path::new("/run/systemd/system").is_dir()
+}
+
+/// Run one service verb with an argument vector. There is no `sh -c` anywhere:
+/// the program and every argument are separate, and stdin is null so a
+/// privilege prompt cannot block the console. `--no-ask-password` makes a
+/// missing authorization fail instead of prompting.
+#[cfg(unix)]
+fn service_invoke(unit: &str, verb: &str) -> Result<Vec<String>, String> {
+    use std::process::{Command, Stdio};
+
+    let (program, arguments): (&str, Vec<&str>) = if manages_with_procd() {
+        ("/etc/init.d/boreas", vec![verb])
+    } else {
+        let action = if verb == "status" { "is-active" } else { verb };
+        (
+            "systemctl",
+            vec!["--no-pager", "--no-ask-password", action, unit],
+        )
+    };
+
+    let output = Command::new(program)
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("cannot run {program}: {error}"))?;
+
+    let mut rows: Vec<String> = Vec::with_capacity(DETAIL_ROWS);
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let cleaned = sanitize_line(line).trim().to_string();
+        if !cleaned.is_empty() {
+            rows.push(cleaned);
+        }
+        if rows.len() >= DETAIL_ROWS {
+            break;
+        }
+    }
+    if !output.status.success() {
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            let cleaned = sanitize_line(line).trim().to_string();
+            if !cleaned.is_empty() {
+                rows.push(cleaned);
+            }
+            if rows.len() >= DETAIL_ROWS {
+                break;
+            }
+        }
+        // Keep one row for the exit code so a failure is never silently
+        // truncated away by the bounded screen height.
+        rows.truncate(DETAIL_ROWS - 1);
+        rows.push(format!("exit: {}", output.status.code().unwrap_or(-1)));
+    }
+    if rows.is_empty() {
+        rows.push("ok".to_string());
+    }
+    rows.truncate(DETAIL_ROWS);
+    Ok(rows)
+}
+
+#[cfg(not(unix))]
+fn service_invoke(_unit: &str, _verb: &str) -> Result<Vec<String>, String> {
+    Err("service control is implemented for Linux targets only (systemd or OpenWrt procd)"
+        .to_string())
+}
+
+/// Drive the line-mode console: paint, read one line, reduce, perform.
+///
+/// Generic over the reader/writer and over an effect handler so the whole loop
+/// is testable with a byte cursor and a fake performer — no terminal, no
+/// socket, no child process.
+fn drive_console<R, W, F>(
+    state: &mut ConsoleState,
+    reader: &mut R,
+    out: &mut W,
+    mut perform: F,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+    F: FnMut(ConsoleEffect, Lang) -> ConsoleOutcome,
+{
+    loop {
+        let screen = state
+            .screen(env!("CARGO_PKG_VERSION"))
+            .map_err(|error| format!("console render failed: {error}"))?;
+        writeln!(out, "{screen}").map_err(|_| "console write failed".to_string())?;
+        write!(out, "{}", text(state.lang, Msg::PromptLabel))
+            .map_err(|_| "console write failed".to_string())?;
+        out.flush().map_err(|_| "console flush failed".to_string())?;
+
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|_| "console read failed".to_string())?;
+        if read == 0 {
+            // EOF is a clean exit, not an error: a closed pipe must not hang.
+            return Ok(());
+        }
+
+        let step = state.apply(line.trim_end_matches(['\r', '\n']));
+        if step == ConsoleEffect::Quit {
+            return Ok(());
+        }
+        if step == ConsoleEffect::None {
+            continue;
+        }
+
+        let outcome = perform(step, state.lang);
+        if let Some(live) = outcome.live {
+            state.live = live;
+        }
+        if let Some(node) = outcome.node {
+            state.node_name = sanitize_line(&node);
+        }
+        if step == ConsoleEffect::RefreshStatus {
+            // A refresh updates the header in place; it is not a result screen.
+            continue;
+        }
+        state.notice_rows = outcome.rows;
+        state.view = ConsoleView::Notice;
     }
 }
 
@@ -393,12 +934,17 @@ fn run_config_migrate(args: &[String]) -> (u8, String, String) {
 fn help_text() -> String {
     let mut text = "boreas — Phase 0 policy/config/console foundation\n\n\
      USAGE:\n\
-     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|node serve|node connect|help]\n\
-     \x20 boreas-easy   (one-shot status screen; interactive TUI not implemented)\n\n\
+     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|console [--json] [--socket <p>] [--config <f>] [--service <u>]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|node serve|node connect|help]\n\
+     \x20 boreas-easy   (line-mode console: menu, service status/start/stop)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\
      \x20 boreas menu [--narrow]    offline 9-entry screen (JSON when not a TTY)\n\
+     \x20 boreas console           line-mode console on a TTY; one JSON object otherwise\n\
+     \x20   --socket <PATH>        control socket (default /run/boreas/control.sock)\n\
+     \x20   --config <FILE>        config to validate (default /etc/boreas/config.toml)\n\
+     \x20   --service <UNIT>       override the derived unit (boreas-core/-edge)\n\
+     \x20                          start/stop require typing START / STOP exactly\n\
      \x20 boreas confirm hop-only|revoke:<id>|uninstall <phrase>\n\
      \x20                          records the phrase only; never applies it\n\
      \x20 boreas node serve <config> <listen> <material-dir>\n\
@@ -449,6 +995,9 @@ fn doctor_json() -> String {
 #[cfg(test)]
 mod tests {
     use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
+    use super::{
+        ConsoleEffect, ConsoleOutcome, ConsoleState, drive_console, run_console,
+    };
     use crate::config::RuntimeCapabilities;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -889,10 +1438,10 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     #[test]
-    fn easy_with_no_args_is_status() {
+    fn easy_with_no_args_enters_the_console() {
         let easy = dispatch("/usr/bin/boreas-easy", &[], probe_en, false);
-        let status = run(&args(&["status"]), Lang::En, false);
-        assert_eq!(easy, status);
+        let console = run(&args(&["console"]), Lang::En, false);
+        assert_eq!(easy, console, "both must resolve to the console path");
         assert_eq!(easy.0, 0);
     }
 
@@ -994,5 +1543,237 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(stdout.contains("\"phase0_complete\":false"));
         let (code, _, _) = dispatch("boreas-easy", &args(&["bogus"]), probe_en, false);
         assert_eq!(code, 2);
+    }
+
+    // --- line-mode console ---
+
+    /// Nanosecond component for unique temp-socket names.
+    fn unique_suffix() -> u128 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    }
+
+    #[test]
+    fn console_reports_offline_when_the_socket_is_absent() {
+        let missing = std::env::temp_dir().join(format!(
+            "boreas-console-absent-{}-{}.sock",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let (code, stdout, stderr) = run_console(
+            &args(&["--socket", missing.to_str().expect("utf8 temp path")]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("\"command\":\"console\""));
+        assert!(stdout.contains("\"source\":\"offline\""));
+        assert!(stdout.contains("\"daemon\":\"not_connected\""));
+        assert!(
+            stdout.contains("\"error\":\""),
+            "the query failure must be reported, not hidden: {stdout}"
+        );
+        // Never claim a live mesh.
+        assert!(!stdout.contains("\"source\":\"live\""));
+    }
+
+    #[test]
+    fn console_rejects_unknown_and_valueless_arguments() {
+        let (code, stdout, stderr) = run_console(&args(&["--socket"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("requires a value"), "{stderr}");
+
+        for flag in ["--config", "--service"] {
+            let (code, _, stderr) = run_console(&args(&[flag]), Lang::En, false);
+            assert_eq!(code, 2, "{flag}");
+            assert!(stderr.contains("requires a value"), "{flag}");
+        }
+
+        let (code, stdout, stderr) = run_console(&args(&["--nope"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("unexpected argument"), "{stderr}");
+    }
+
+    #[test]
+    fn console_json_escapes_the_socket_path() {
+        let weird = std::env::temp_dir().join("boreas-console-weird-\"q\".sock");
+        let (code, stdout, _) = run_console(
+            &args(&["--socket", weird.to_str().expect("utf8 temp path")]),
+            Lang::En,
+            false,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            stdout.contains("\\\"q\\\""),
+            "socket path must be JSON-escaped: {stdout}"
+        );
+    }
+
+    #[test]
+    fn console_driver_paints_each_step_and_exits_on_q() {
+        use std::io::BufReader;
+
+        let mut state = ConsoleState::new(Lang::En, false);
+        let mut reader = BufReader::new(&b"j\nq\n"[..]);
+        let mut out: Vec<u8> = Vec::new();
+        let result = drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
+            assert_eq!(effect, ConsoleEffect::None, "navigation has no effect");
+            ConsoleOutcome::none()
+        });
+        assert!(result.is_ok());
+
+        let screen = String::from_utf8(out).expect("utf8");
+        assert_eq!(screen.matches("BOREAS CONSOLE").count(), 2);
+        assert!(screen.contains("> [2] Identity & DIR"));
+        assert!(!screen.as_bytes().contains(&0x1B));
+    }
+
+    #[test]
+    fn console_driver_treats_eof_as_a_clean_exit() {
+        use std::io::BufReader;
+
+        let mut state = ConsoleState::new(Lang::En, false);
+        let mut reader = BufReader::new(&b""[..]);
+        let mut out: Vec<u8> = Vec::new();
+        let result = drive_console(&mut state, &mut reader, &mut out, |_, _| ConsoleOutcome::none());
+        assert!(result.is_ok(), "a closed pipe must not hang or fail");
+    }
+
+    #[test]
+    fn console_driver_refuses_a_trailing_space_on_the_phrase() {
+        use std::cell::RefCell;
+        use std::io::BufReader;
+
+        let performed = RefCell::new(Vec::new());
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.service_name = "boreas-core".to_string();
+        let mut reader = BufReader::new(&b"8\n2\nSTART \nq\n"[..]);
+        let mut out: Vec<u8> = Vec::new();
+        drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
+            performed.borrow_mut().push(effect);
+            ConsoleOutcome::rows(vec!["unexpected".to_string()])
+        })
+        .expect("driver");
+
+        assert!(
+            performed.borrow().is_empty(),
+            "`START ` must not start the daemon: {:?}",
+            performed.borrow()
+        );
+    }
+
+    #[test]
+    fn console_driver_starts_only_after_the_exact_phrase() {
+        use std::cell::RefCell;
+        use std::io::BufReader;
+
+        let performed = RefCell::new(Vec::new());
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.service_name = "boreas-core".to_string();
+        let mut reader = BufReader::new(&b"8\n2\nSTART\nq\n"[..]);
+        let mut out: Vec<u8> = Vec::new();
+        drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
+            performed.borrow_mut().push(effect);
+            ConsoleOutcome::rows(vec!["active".to_string()])
+        })
+        .expect("driver");
+
+        assert_eq!(*performed.borrow(), vec![ConsoleEffect::ServiceStart]);
+        assert!(String::from_utf8(out).expect("utf8").contains("active"));
+    }
+
+    #[test]
+    fn console_driver_never_runs_a_dangerous_entry() {
+        use std::cell::RefCell;
+        use std::io::BufReader;
+
+        // Entry 6 (security mode / revoke) and entry 9 (uninstall) must both
+        // stop at a refusal screen and never reach the effect handler.
+        for entry in ["6", "9"] {
+            let performed = RefCell::new(Vec::new());
+            let mut state = ConsoleState::new(Lang::En, false);
+            let input = format!("{entry}\n\nq\n");
+            let mut reader = BufReader::new(input.as_bytes());
+            let mut out: Vec<u8> = Vec::new();
+            drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
+                performed.borrow_mut().push(effect);
+                ConsoleOutcome::none()
+            })
+            .expect("driver");
+
+            assert!(
+                performed.borrow().is_empty(),
+                "entry {entry} must not perform anything: {:?}",
+                performed.borrow()
+            );
+            let screen = String::from_utf8(out).expect("utf8");
+            assert!(screen.contains("Refused"), "entry {entry}: {screen}");
+        }
+    }
+
+    /// Live status is read from a real AF_UNIX socket in a temp directory. The
+    /// listener is nonblocking so a failing assert can never hang the suite.
+    #[cfg(unix)]
+    #[test]
+    fn console_reports_live_when_the_socket_answers() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "boreas-console-live-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let socket_path = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let body = concat!(
+                            "{\"command\":\"ctl.status\",\"node\":\"core-1\",",
+                            "\"daemon_connected\":true,\"inbound_on\":true,",
+                            "\"inbound_connections\":1,\"outbound_upstreams\":0,",
+                            "\"security_mode\":\"e2e-required\"}\n"
+                        );
+                        let _ = stream.write_all(body.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let (code, stdout, stderr) = run_console(
+            &args(&["--socket", socket_path.to_str().expect("utf8 socket")]),
+            Lang::En,
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = handle.join();
+
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("\"source\":\"live\""), "{stdout}");
+        assert!(stdout.contains("\"daemon\":\"connected\""), "{stdout}");
+        assert!(stdout.contains("\"node_name\":\"core-1\""), "{stdout}");
+        assert!(stdout.contains("\"error\":null"), "{stdout}");
     }
 }

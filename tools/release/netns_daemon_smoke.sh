@@ -23,9 +23,9 @@ EDGE_NS="boreas-edge-$$"
 
 cleanup() {
   set +e
-  if [[ -f "$WORK/perf-receiver.pid" ]]; then kill "$(cat "$WORK/perf-receiver.pid")" 2>/dev/null || true; fi
-  if [[ -f "$WORK/core.pid" ]]; then kill "$(cat "$WORK/core.pid")" 2>/dev/null || true; fi
-  if [[ -f "$WORK/edge.pid" ]]; then kill "$(cat "$WORK/edge.pid")" 2>/dev/null || true; fi
+  for pidfile in "$WORK"/*.pid; do
+    if [[ -f "$pidfile" ]]; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi
+  done
   ip netns del "$CORE_NS" 2>/dev/null || true
   ip netns del "$EDGE_NS" 2>/dev/null || true
   rm -rf "$WORK"
@@ -35,9 +35,18 @@ trap 'echo "ERROR: netns smoke failed at line $LINENO" >&2; for log in "$WORK/co
 
 # LinuxTunDevice sets MTU through sysfs. A network namespace alone retains
 # the host sysfs view; remount it in a private mount namespace after setns.
+# BOREAS_ROOTFS optionally runs the same static binary inside an unpacked
+# OpenWrt userland. The host kernel is still explicitly outside that claim.
 run_node() {
   local ns="$1"
   shift
+  if [[ -n "${BOREAS_ROOTFS:-}" ]]; then
+    mkdir -p "${BOREAS_ROOTFS}/sys" "${BOREAS_ROOTFS}/dev" "${BOREAS_ROOTFS}${WORK}"
+    touch "${BOREAS_ROOTFS}/dev/net/tun"
+    exec ip netns exec "$ns" unshare --mount --propagation private \
+      bash -e -c 'mount --make-rprivate /; mount -t sysfs sysfs "$1/sys"; mount --bind /dev/net/tun "$1/dev/net/tun"; mount --bind "$2" "$1$2"; exec chroot "$1" /usr/local/bin/boreas "${@:3}"' \
+      boreas-node "$BOREAS_ROOTFS" "$WORK" "$@"
+  fi
   exec ip netns exec "$ns" unshare --mount --propagation private \
     bash -e -c 'mount --make-rprivate /; umount -l /sys; mount -t sysfs sysfs /sys; exec "$@"' boreas-node "$@"
 }
@@ -207,38 +216,57 @@ fi
 ip netns exec "$EDGE_NS" ping -c 10 -i 0.1 -W 2 -I 10.20.1.2 10.20.1.1 | tee "$WORK/ping.log"
 grep -q " 0% packet loss" "$WORK/ping.log"
 python3 - "$WORK/ping.log" <<'PY'
+import os
 import re
 import sys
 
+limit = float(os.environ.get("BOREAS_MAX_PING_MS", "15.0"))
+
 text = open(sys.argv[1], encoding="utf-8").read()
-match = re.search(r"= [0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+ ms", text)
+match = re.search(r"= ([0-9.]+)/([0-9.]+)/([0-9.]+)/[0-9.]+ ms", text)
 if match is None:
-    raise SystemExit("could not parse ping average RTT")
-average = float(match.group(1))
+    raise SystemExit("could not parse ping RTT statistics")
+minimum, average, maximum = map(float, match.groups())
 print(f"overlay_ping_average_ms={average:.3f}")
-if average > 15.0:
-    raise SystemExit(f"overlay average RTT {average:.3f} ms exceeds 15 ms regression bound")
+print(f"overlay_ping_max_ms={maximum:.3f}")
+if average > limit or maximum > limit:
+    raise SystemExit(
+        f"overlay RTT avg={average:.3f} ms max={maximum:.3f} ms exceeds {limit:.3f} ms regression bound"
+    )
 PY
 
-# Send 8 MiB through real inner TCP over the overlay and authenticate the test
-# payload by comparing independent SHA-256 digests. The modest regression floor
-# rejects the former ~1 Mbps path without claiming a public-network guarantee.
-ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" receive > "$WORK/perf-receiver.log" 2>&1 &
-echo $! > "$WORK/perf-receiver.pid"
+# Send 8 MiB in each direction at the same time and authenticate both payloads
+# with independent SHA-256 digests. This exercises full-duplex progress rather
+# than only a one-way throughput happy path; it is not a public-network SLA.
+ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" receive 10.20.1.1 10.20.1.2 > "$WORK/perf-receiver-core.log" 2>&1 &
+echo $! > "$WORK/perf-receiver-core.pid"
+ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" receive 10.20.1.2 10.20.1.1 > "$WORK/perf-receiver-edge.log" 2>&1 &
+echo $! > "$WORK/perf-receiver-edge.pid"
 sleep 0.1
-ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" send | tee "$WORK/perf-sender.log"
-wait "$(cat "$WORK/perf-receiver.pid")"
-python3 - "$WORK/perf-sender.log" <<'PY'
+ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" send 10.20.1.2 10.20.1.1 > "$WORK/perf-sender-edge.log" 2>&1 &
+echo $! > "$WORK/perf-sender-edge.pid"
+ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" send 10.20.1.1 10.20.1.2 > "$WORK/perf-sender-core.log" 2>&1 &
+echo $! > "$WORK/perf-sender-core.pid"
+wait "$(cat "$WORK/perf-sender-edge.pid")"
+wait "$(cat "$WORK/perf-sender-core.pid")"
+wait "$(cat "$WORK/perf-receiver-core.pid")"
+wait "$(cat "$WORK/perf-receiver-edge.pid")"
+python3 - "$WORK/perf-sender-edge.log" "$WORK/perf-sender-core.log" <<'PY'
 import json
+import os
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as source:
-    result = json.load(source)
-if result["bytes"] != 8 * 1024 * 1024:
-    raise SystemExit("throughput probe transferred an unexpected byte count")
-if result["throughput_mbps"] < 3.0:
-    raise SystemExit(f"overlay throughput {result['throughput_mbps']} Mbps is below 3 Mbps regression bound")
-print(f"overlay_throughput_mbps={result['throughput_mbps']:.3f}")
+minimum = float(os.environ.get("BOREAS_MIN_THROUGHPUT_MBPS", "3.0"))
+expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
+
+for label, path in zip(("edge_to_core", "core_to_edge"), sys.argv[1:]):
+    with open(path, encoding="utf-8") as source:
+        result = json.load(source)
+    if result["bytes"] != expected_bytes:
+        raise SystemExit(f"{label} transferred an unexpected byte count")
+    if result["throughput_mbps"] < minimum:
+        raise SystemExit(f"{label} throughput {result['throughput_mbps']} Mbps is below {minimum} Mbps regression bound")
+    print(f"overlay_throughput_{label}_mbps={result['throughput_mbps']:.3f}")
 PY
 
 CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock")"

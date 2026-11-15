@@ -35,8 +35,8 @@ impl Lang {
     }
 }
 
-/// Dictionary keys: every string the status screen can print. Some keys
-/// are reserved for the next console slice (interactive menu / help).
+/// Dictionary keys: every string the status screen and the line-mode console
+/// can print. The console is line-oriented (no raw mode); see `crate::tui`.
 #[allow(
     dead_code,
     reason = "dictionary is intentionally complete ahead of later console screens"
@@ -61,12 +61,35 @@ pub enum Msg {
     LiveNote,
     UsageLabel,
     UnknownNode,
+    // --- line-mode console (boreas-easy) ---
+    SrcLabel,
+    SrcLive,
+    SrcOffline,
+    HeadingTelemetry,
+    HeadingService,
+    HeadingConfirm,
+    HeadingNotice,
+    HintService,
+    HintConfirm,
+    HintNotice,
+    PromptLabel,
+    NoticeUnknownCommand,
+    NoticeNotImplemented,
+    NoticeRefused,
+    NoticeCancelled,
+    SvcStatus,
+    SvcStart,
+    SvcStop,
+    SvcConfig,
+    SvcBack,
+    ConfirmPrompt,
+    CancelHint,
 }
 
 impl Msg {
     /// Every key, for the dictionary-completeness test.
     #[cfg(test)]
-    pub(crate) const ALL: [Msg; 18] = [
+    pub(crate) const ALL: [Msg; 40] = [
         Msg::ConsoleTitle,
         Msg::LangLabel,
         Msg::NodeLabel,
@@ -85,6 +108,28 @@ impl Msg {
         Msg::LiveNote,
         Msg::UsageLabel,
         Msg::UnknownNode,
+        Msg::SrcLabel,
+        Msg::SrcLive,
+        Msg::SrcOffline,
+        Msg::HeadingTelemetry,
+        Msg::HeadingService,
+        Msg::HeadingConfirm,
+        Msg::HeadingNotice,
+        Msg::HintService,
+        Msg::HintConfirm,
+        Msg::HintNotice,
+        Msg::PromptLabel,
+        Msg::NoticeUnknownCommand,
+        Msg::NoticeNotImplemented,
+        Msg::NoticeRefused,
+        Msg::NoticeCancelled,
+        Msg::SvcStatus,
+        Msg::SvcStart,
+        Msg::SvcStop,
+        Msg::SvcConfig,
+        Msg::SvcBack,
+        Msg::ConfirmPrompt,
+        Msg::CancelHint,
     ];
 }
 
@@ -150,6 +195,81 @@ pub fn text(lang: Lang, msg: Msg) -> &'static str {
         (Lang::ZhCn, Msg::UnknownNode) => "(未知)",
         (Lang::ZhTw, Msg::UnknownNode) => "(未知)",
         (Lang::En, Msg::UnknownNode) => "(unknown)",
+        // --- line-mode console. `live` / `offline` are machine state tokens and
+        // are never translated, the same way `e2e-required` and `hop-only` are
+        // kept verbatim (§1.3, §10.4). ---
+        (_, Msg::SrcLabel) => "SRC",
+        (_, Msg::SrcLive) => "live",
+        (_, Msg::SrcOffline) => "offline",
+        (Lang::ZhCn, Msg::HeadingTelemetry) => "实时链路遥测",
+        (Lang::ZhTw, Msg::HeadingTelemetry) => "即時鏈路遙測",
+        (Lang::En, Msg::HeadingTelemetry) => "Live Telemetry",
+        (Lang::ZhCn, Msg::HeadingService) => "服务与脱敏诊断",
+        (Lang::ZhTw, Msg::HeadingService) => "服務與脫敏診斷",
+        (Lang::En, Msg::HeadingService) => "Service & Diag",
+        (Lang::ZhCn, Msg::HeadingConfirm) => "危险操作确认",
+        (Lang::ZhTw, Msg::HeadingConfirm) => "危險操作確認",
+        (Lang::En, Msg::HeadingConfirm) => "Confirm action",
+        (Lang::ZhCn, Msg::HeadingNotice) => "结果",
+        (Lang::ZhTw, Msg::HeadingNotice) => "結果",
+        (Lang::En, Msg::HeadingNotice) => "Result",
+        (Lang::ZhCn, Msg::HintService) => " [1] 状态 [2] 启动 [3] 停止 [4] 配置 [5] 返回 [q] 退出",
+        (Lang::ZhTw, Msg::HintService) => " [1] 狀態 [2] 啟動 [3] 停止 [4] 配置 [5] 返回 [q] 離開",
+        (Lang::En, Msg::HintService) => {
+            " [1] Status [2] Start [3] Stop [4] Config [5] Back [q] Quit"
+        }
+        (Lang::ZhCn, Msg::HintConfirm) => " 输入确认词后回车; 直接回车取消",
+        (Lang::ZhTw, Msg::HintConfirm) => " 輸入確認詞後回車; 直接回車取消",
+        (Lang::En, Msg::HintConfirm) => {
+            " Type the phrase above; bare Enter cancels"
+        }
+        (Lang::ZhCn, Msg::HintNotice) => " [Enter] 返回主菜单 [q] 退出",
+        (Lang::ZhTw, Msg::HintNotice) => " [Enter] 返回主選單 [q] 離開",
+        (Lang::En, Msg::HintNotice) => " [Enter] Back to menu [q] Quit",
+        (_, Msg::PromptLabel) => "> ",
+        (Lang::ZhCn, Msg::NoticeUnknownCommand) => {
+            "未知命令; 用 j/k 或 1-9 选择, Enter 执行, q 退出"
+        }
+        (Lang::ZhTw, Msg::NoticeUnknownCommand) => {
+            "未知命令; 用 j/k 或 1-9 選擇, Enter 執行, q 離開"
+        }
+        (Lang::En, Msg::NoticeUnknownCommand) => {
+            "Unknown command; use j/k or 1-9, Enter to run, q to quit"
+        }
+        (Lang::ZhCn, Msg::NoticeNotImplemented) => "未实现: 本版仅提供状态、配置检查与服务状态",
+        (Lang::ZhTw, Msg::NoticeNotImplemented) => "未實現: 本版僅提供狀態、配置檢查與服務狀態",
+        (Lang::En, Msg::NoticeNotImplemented) => {
+            "Not implemented: this build offers status, config check and service state only"
+        }
+        (Lang::ZhCn, Msg::NoticeRefused) => "已拒绝: 本版不切换安全模式、不吊销、不卸载",
+        (Lang::ZhTw, Msg::NoticeRefused) => "已拒絕: 本版不切換安全模式、不吊銷、不解除安裝",
+        (Lang::En, Msg::NoticeRefused) => {
+            "Refused: this build does not switch security mode, revoke, or uninstall"
+        }
+        (Lang::ZhCn, Msg::NoticeCancelled) => "已取消; 未执行任何动作",
+        (Lang::ZhTw, Msg::NoticeCancelled) => "已取消; 未執行任何動作",
+        (Lang::En, Msg::NoticeCancelled) => "Cancelled; nothing was executed",
+        (Lang::ZhCn, Msg::SvcStatus) => "查询守护进程状态",
+        (Lang::ZhTw, Msg::SvcStatus) => "查詢守護行程狀態",
+        (Lang::En, Msg::SvcStatus) => "Query daemon status",
+        (Lang::ZhCn, Msg::SvcStart) => "启动守护进程",
+        (Lang::ZhTw, Msg::SvcStart) => "啟動守護行程",
+        (Lang::En, Msg::SvcStart) => "Start daemon",
+        (Lang::ZhCn, Msg::SvcStop) => "停止守护进程",
+        (Lang::ZhTw, Msg::SvcStop) => "停止守護行程",
+        (Lang::En, Msg::SvcStop) => "Stop daemon",
+        (Lang::ZhCn, Msg::SvcConfig) => "检查配置文件",
+        (Lang::ZhTw, Msg::SvcConfig) => "檢查配置檔案",
+        (Lang::En, Msg::SvcConfig) => "Check config file",
+        (Lang::ZhCn, Msg::SvcBack) => "返回主菜单",
+        (Lang::ZhTw, Msg::SvcBack) => "返回主選單",
+        (Lang::En, Msg::SvcBack) => "Back to menu",
+        (Lang::ZhCn, Msg::ConfirmPrompt) => "请输入确认词: ",
+        (Lang::ZhTw, Msg::ConfirmPrompt) => "請輸入確認詞: ",
+        (Lang::En, Msg::ConfirmPrompt) => "Type this phrase: ",
+        (Lang::ZhCn, Msg::CancelHint) => "直接回车取消",
+        (Lang::ZhTw, Msg::CancelHint) => "直接回車取消",
+        (Lang::En, Msg::CancelHint) => "Bare Enter cancels",
     }
 }
 
