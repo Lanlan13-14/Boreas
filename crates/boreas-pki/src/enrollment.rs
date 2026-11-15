@@ -1415,8 +1415,7 @@ fn verify_ml_dsa_csr(
     let ml_dsa_public = public_key
         .raw_public_key()
         .map_err(|_| EnrollmentError::InvalidCsr)?;
-    let ed25519_public =
-        verify_csr_ed25519_extension(&request, ed25519_pop_oid, &ml_dsa_public)?;
+    let ed25519_public = verify_csr_ed25519_extension(&request, ed25519_pop_oid, &ml_dsa_public)?;
     let digest = hash(MessageDigest::sha256(), csr_der).map_err(|_| EnrollmentError::InvalidCsr)?;
     let digest_bytes: &[u8] = digest.as_ref();
     let mut csr_hash = [0u8; 32];
@@ -1463,11 +1462,9 @@ fn verify_csr_ed25519_extension(
     message.extend_from_slice(ED25519_POP_DOMAIN);
     message.extend_from_slice(&ed25519_public);
     message.extend_from_slice(ml_dsa_public);
-    let ed_key = openssl::pkey::PKey::public_key_from_raw_bytes(
-        &ed25519_public,
-        openssl::pkey::Id::ED25519,
-    )
-    .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
+    let ed_key =
+        openssl::pkey::PKey::public_key_from_raw_bytes(&ed25519_public, openssl::pkey::Id::ED25519)
+            .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
     let mut verifier = openssl::sign::Verifier::new_without_digest(&ed_key)
         .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
     if !verifier
@@ -1516,10 +1513,7 @@ fn parse_extension_der(der: &[u8]) -> Result<(Vec<u8>, bool, Vec<u8>), Enrollmen
 }
 
 #[cfg(feature = "openssl-backend")]
-fn der_take(
-    der: &[u8],
-    position: &mut usize,
-) -> Result<(u8, usize, usize), EnrollmentError> {
+fn der_take(der: &[u8], position: &mut usize) -> Result<(u8, usize, usize), EnrollmentError> {
     let tag = *der
         .get(*position)
         .ok_or(EnrollmentError::InvalidCsrExtension)?;
@@ -1538,8 +1532,7 @@ fn der_take(
         }
         let mut length = 0usize;
         for offset in 0..count {
-            length = (length << 8)
-                | usize::from(der[*position + 2 + offset]);
+            length = (length << 8) | usize::from(der[*position + 2 + offset]);
         }
         (length, 2 + count)
     };
@@ -2119,20 +2112,11 @@ mod tests {
     fn real_csr_admission_and_identity_signing_vertical_path() {
         use crate::management::{IdentityAuthority, ManagementTrust, verify_signed_identity};
         let path = temp_path();
-        let policy =
-            CsrPolicy::with_ed25519_pop_oid(EXPERIMENTAL_ED25519_CSR_POP_OID).unwrap();
+        let policy = CsrPolicy::with_ed25519_pop_oid(EXPERIMENTAL_ED25519_CSR_POP_OID).unwrap();
         let csr_key = ml_dsa_key(11);
         let node_ed_key = openssl::pkey::PKey::generate_ed25519().unwrap();
-        let node_ed_public: [u8; 32] = node_ed_key
-            .raw_public_key()
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let csr = csr_with_ed25519_pop(
-            &csr_key,
-            &node_ed_key,
-            EXPERIMENTAL_ED25519_CSR_POP_OID,
-        );
+        let node_ed_public: [u8; 32] = node_ed_key.raw_public_key().unwrap().try_into().unwrap();
+        let csr = csr_with_ed25519_pop(&csr_key, &node_ed_key, EXPERIMENTAL_ED25519_CSR_POP_OID);
         let expected_identity_public = csr_key.raw_public_key().unwrap();
         let ed_key = openssl::pkey::PKey::generate_ed25519().unwrap();
         let authority_key = ml_dsa_key(12);
@@ -2231,9 +2215,11 @@ mod tests {
         let mut tampered = csr.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(tamper_store
-            .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
-            .is_err());
+        assert!(
+            tamper_store
+                .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
+                .is_err()
+        );
         cleanup(&tamper_path);
         // A valid CSR for the wrong algorithm is rejected, not silently downgraded.
         let ed_path = temp_path();

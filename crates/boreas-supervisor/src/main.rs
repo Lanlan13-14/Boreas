@@ -557,7 +557,7 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                     || raw.starts_with('.')
                 {
                     return Err(
-                        "supervise: --ready-expected-schema is not a valid identifier".to_string()
+                        "supervise: --ready-expected-schema is not a valid identifier".to_string(),
                     );
                 }
                 ready_expected_schema = Some(raw.to_owned());
@@ -1342,9 +1342,7 @@ fn trial_loop(
             if confirmed {
                 stop.get_or_insert((signal, Instant::now() + plan.stop_grace));
             } else {
-                eprintln!(
-                    "boreas-supervisor: stop signal {signal} before readiness; rolling back"
-                );
+                eprintln!("boreas-supervisor: stop signal {signal} before readiness; rolling back");
                 let _ = child.kill();
                 let _ = child.wait();
                 return fail_trial(store);
@@ -1900,7 +1898,12 @@ mod unix_tests {
     }
 
     /// Planning-only variant: never spawns, so refusals can be asserted.
-    fn supervise_plan(f: &Fixture, child: &[&str], ready_timeout_ms: u64, max: u32) -> (u8, String) {
+    fn supervise_plan(
+        f: &Fixture,
+        child: &[&str],
+        ready_timeout_ms: u64,
+        max: u32,
+    ) -> (u8, String) {
         let mut args = vec![
             os("supervise"),
             os("--store"),

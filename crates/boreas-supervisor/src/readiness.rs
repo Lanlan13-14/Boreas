@@ -252,7 +252,9 @@ fn parse_response(
 ) -> Result<ReadyReport, ReadinessError> {
     let mut fields = line.split(' ');
     if fields.next() != Some(RESPONSE_MAGIC) {
-        return Err(ReadinessError::Protocol("unexpected readiness answer magic"));
+        return Err(ReadinessError::Protocol(
+            "unexpected readiness answer magic",
+        ));
     }
     let echo = fields
         .next()
@@ -266,7 +268,9 @@ fn parse_response(
         .next()
         .ok_or(ReadinessError::Protocol("missing state schema"))?;
     if !valid_schema(schema) {
-        return Err(ReadinessError::Protocol("state schema identifier is invalid"));
+        return Err(ReadinessError::Protocol(
+            "state schema identifier is invalid",
+        ));
     }
     if schema != policy.expected_schema {
         return Err(ReadinessError::NotReady(

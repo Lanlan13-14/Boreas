@@ -144,10 +144,7 @@ fn readiness_answer_confirms_the_trial_and_retains_old_version() {
         err.contains("readiness accepted"),
         "the answer must come from the readiness handshake, not liveness: {err}"
     );
-    assert_eq!(
-        f.store.active_version().unwrap().as_deref(),
-        Some("2.0.0")
-    );
+    assert_eq!(f.store.active_version().unwrap().as_deref(), Some("2.0.0"));
     assert_eq!(f.store.journal().unwrap().unwrap().phase, Phase::Confirmed);
     assert_eq!(f.store.trial_state().unwrap(), None);
     assert!(
@@ -181,7 +178,10 @@ fn tun_absent_is_refused_by_policy_and_rolled_back() {
         stderr(&output)
     );
     let err = stderr(&output);
-    assert!(err.contains("not ready") || err.contains("readiness failed"), "{err}");
+    assert!(
+        err.contains("not ready") || err.contains("readiness failed"),
+        "{err}"
+    );
     assert_eq!(
         f.store.active_version().unwrap().as_deref(),
         Some("1.0.0"),
