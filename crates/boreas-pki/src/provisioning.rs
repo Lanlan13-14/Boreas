@@ -53,7 +53,6 @@ const ROOT_AUTH_DOMAIN: &[u8] = b"BOREAS-ROOT-AUTHORIZATION-CANDIDATE\0";
 const MAX_ROOTS_BUNDLE_BYTES: usize = 128 * 1024;
 const MAX_BUNDLE_AUTH_RECORDS: usize = 16;
 const MAX_MATERIAL_FILE_BYTES: usize = 64 * 1024;
-const ED25519_SIG_LEN: usize = 64;
 const MLDSA65_SIG_LEN: usize = 3309;
 const IA_KEY_ID: &[u8] = b"identity-authority-v1";
 const STATUS_KEY_ID: &[u8] = b"status-signer-v1";
@@ -1586,7 +1585,13 @@ mod tests {
         let ca = TempDir::new("ca");
         let core_dir = TempDir::new("core");
         let edge_dir = TempDir::new("edge");
-        let now_us = 1_760_000_000_000_000u64;
+        let now_us = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap();
         let net_id = [0x42; 16];
 
         let ca_summary = init_ca_dir(

@@ -373,47 +373,48 @@ impl StatusStore {
         // Structural pre-check for a same-sequence conflict. We do not trust
         // this decode for acceptance; it only selects the evidence path.
         let candidate = decode_conflict_candidate(raw_signed, self.net).ok();
-        if let (Some(old), Some(candidate)) = (old.as_ref(), candidate.as_ref()) {
-            if candidate.seq == old.seq && candidate.object_id != old.object_id {
-                if candidate.issuer.as_slice() != old.issuer.as_slice()
-                    || candidate.generation != old.generation
-                {
-                    // A different StatusSigner identity at the same sequence is
-                    // not attributed as equivocation. The master plan's
-                    // StatusSigner rotation/global-sequence semantics are not
-                    // frozen here, and `ManagementTrust` currently keys the
-                    // StatusSnapshot replay slot globally. Reject without
-                    // touching that replay slot so a valid signer rotation
-                    // cannot freeze this store by mistake. A higher sequence
-                    // from another authorized signer follows the verifier's
-                    // normal global-slot path.
-                    return Err(Error::BadStatus);
+        if let (Some(old), Some(candidate)) = (old.as_ref(), candidate.as_ref())
+            && candidate.seq == old.seq
+            && candidate.object_id != old.object_id
+        {
+            if candidate.issuer.as_slice() != old.issuer.as_slice()
+                || candidate.generation != old.generation
+            {
+                // A different StatusSigner identity at the same sequence is
+                // not attributed as equivocation. The master plan's
+                // StatusSigner rotation/global-sequence semantics are not
+                // frozen here, and `ManagementTrust` currently keys the
+                // StatusSnapshot replay slot globally. Reject without
+                // touching that replay slot so a valid signer rotation
+                // cannot freeze this store by mistake. A higher sequence
+                // from another authorized signer follows the verifier's
+                // normal global-slot path.
+                return Err(Error::BadStatus);
+            }
+            // `verify_and_authorize` verifies issuer authority, network,
+            // object type, the signed validity window and both Ed25519 +
+            // ML-DSA signatures before `record_replay` can return
+            // `Equivocation`. Therefore this error is evidence of a valid
+            // dual-signed, authorized conflicting object, not arbitrary
+            // bad bytes. We retain the older envelope ourselves; the
+            // verifier's single `conflict_evidence` slot is not used as
+            // storage.
+            match self
+                .trust
+                .verify_and_authorize(raw_signed, candidate.issued)
+            {
+                Err(management::Error::Equivocation) => {
+                    self.persist_equivocation(raw_signed, old.seq)?;
+                    return Err(Error::Policy(PolicyError::SnapshotEquivocation));
                 }
-                // `verify_and_authorize` verifies issuer authority, network,
-                // object type, the signed validity window and both Ed25519 +
-                // ML-DSA signatures before `record_replay` can return
-                // `Equivocation`. Therefore this error is evidence of a valid
-                // dual-signed, authorized conflicting object, not arbitrary
-                // bad bytes. We retain the older envelope ourselves; the
-                // verifier's single `conflict_evidence` slot is not used as
-                // storage.
-                match self
-                    .trust
-                    .verify_and_authorize(raw_signed, candidate.issued)
-                {
-                    Err(management::Error::Equivocation) => {
-                        self.persist_equivocation(raw_signed, old.seq)?;
-                        return Err(Error::Policy(PolicyError::SnapshotEquivocation));
-                    }
-                    Err(error) => return Err(map_management_error(error)),
-                    Ok(_) => {
-                        // The owned verifier had no replay slot for our
-                        // persisted snapshot, so a conflict cannot be
-                        // attributed. Fail closed without freezing.
-                        self.poisoned = true;
-                        self.runtime_deadline = None;
-                        return Err(Error::BadStatus);
-                    }
+                Err(error) => return Err(map_management_error(error)),
+                Ok(_) => {
+                    // The owned verifier had no replay slot for our
+                    // persisted snapshot, so a conflict cannot be
+                    // attributed. Fail closed without freezing.
+                    self.poisoned = true;
+                    self.runtime_deadline = None;
+                    return Err(Error::BadStatus);
                 }
             }
         }
@@ -958,10 +959,10 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
     if reader.position != bytes.len() {
         return Err(Error::Corrupt);
     }
-    if let Some(snapshot) = &snapshot {
-        if utc_floor < snapshot.issued {
-            return Err(Error::Corrupt);
-        }
+    if let Some(snapshot) = &snapshot
+        && utc_floor < snapshot.issued
+    {
+        return Err(Error::Corrupt);
     }
     Ok(State {
         net,
@@ -1364,7 +1365,6 @@ mod tests {
                 fresh.check(1_500_000, start + Duration::from_millis(600)),
                 Err(Error::NotFresh)
             ));
-            drop(fresh);
             // UTC 1.6 s is still inside the signed window (next_update 2.0 s),
             // but the process-local deadline from the original accept is
             // start + 500 ms. A duplicate at mono `start + 1000 ms` must not
@@ -1384,7 +1384,6 @@ mod tests {
             assert_eq!(store.sequence(), Some(1));
             let fresh = store.current_fresh(1_700_000, Instant::now()).unwrap();
             assert_eq!(fresh.sequence(), 1);
-            drop(fresh);
             assert!(matches!(
                 store.current_fresh(2_000_000, Instant::now()),
                 Err(Error::NotFresh)
@@ -1602,14 +1601,12 @@ mod tests {
             fresh.check(ACCEPTED - CLOCK_ROLLBACK_TOLERANCE_US - 1, start),
             Err(Error::ClockRollback)
         ));
-        drop(fresh);
 
         // A tolerated rollback is evaluated at the persisted floor, exactly as
         // `current_fresh` does: the same (UTC, mono) pair must both succeed.
         let tolerated = ACCEPTED - CLOCK_ROLLBACK_TOLERANCE_US;
         let fresh = store.current_fresh(tolerated, start).unwrap();
         assert!(fresh.check(tolerated, start).is_ok());
-        drop(fresh);
 
         assert!(matches!(
             store.accept_signed_snapshot(&raw2, BASE + 600_000, start),
@@ -1617,7 +1614,6 @@ mod tests {
         ));
         let fresh = store.current_fresh(BASE + 600_000, start).unwrap();
         assert!(fresh.check(BASE + 600_000, start).is_ok());
-        drop(fresh);
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -591,7 +591,7 @@ fn value_uint(v: &Value<'_>) -> Result<u64, Error> {
         Err(Error::InvalidCandidate)
     }
 }
-fn value_bytes<'v, 'a>(v: &'v Value<'a>) -> Result<&'a [u8], Error> {
+fn value_bytes<'a>(v: &Value<'a>) -> Result<&'a [u8], Error> {
     if let Value::Bytes(b) = v {
         Ok(b)
     } else {

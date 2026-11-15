@@ -536,17 +536,14 @@ fn validate_file(p: &Path, f: &File, owner: u32) -> Result<(), Error> {
     Ok(())
 }
 #[cfg(target_os = "linux")]
-fn decode(
-    b: &[u8],
-) -> Result<
-    (
-        [u8; 16],
-        [u8; 32],
-        BTreeMap<Vec<u8>, Entry>,
-        BTreeMap<Vec<u8>, Conflict>,
-    ),
-    Error,
-> {
+type DecodedTrustStore = (
+    [u8; 16],
+    [u8; 32],
+    BTreeMap<Vec<u8>, Entry>,
+    BTreeMap<Vec<u8>, Conflict>,
+);
+#[cfg(target_os = "linux")]
+fn decode(b: &[u8]) -> Result<DecodedTrustStore, Error> {
     if b.len() < 56 || &b[..8] != MAGIC {
         return Err(Error::Corrupt);
     }

@@ -720,10 +720,10 @@ impl EnrollmentStore {
         }
         // Cheap rejection before the expensive ML-DSA proof-of-possession check:
         // an invitation already bound to another enrollment cannot be rescued by a new CSR.
-        if let Some((bound_enrollment_id, _)) = self.invite_bindings.get(&invite_id) {
-            if *bound_enrollment_id != enrollment_id {
-                return Err(EnrollmentError::InviteBoundToDifferentRequest);
-            }
+        if let Some((bound_enrollment_id, _)) = self.invite_bindings.get(&invite_id)
+            && *bound_enrollment_id != enrollment_id
+        {
+            return Err(EnrollmentError::InviteBoundToDifferentRequest);
         }
         let pair = (invite_id, enrollment_id);
         if let Some(tx) = self.transactions.get(&pair) {

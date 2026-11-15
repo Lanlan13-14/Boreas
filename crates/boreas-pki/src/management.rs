@@ -333,10 +333,10 @@ impl ManagementTrust {
         if self.issuers.len() >= MAX_TRUSTED_ISSUERS {
             return Err(Error::TrustFull);
         }
-        if let Authority::CoreOperationalKey { core_id } = issuer.authority {
-            if !(1..=16).contains(&core_id) {
-                return Err(Error::InvalidIssuerRecord);
-            }
+        if let Authority::CoreOperationalKey { core_id } = issuer.authority
+            && !(1..=16).contains(&core_id)
+        {
+            return Err(Error::InvalidIssuerRecord);
         }
         if !key_matches(&issuer.ed25519_public_key_der, KeyType::ED25519) {
             return Err(Error::InvalidIssuerKey);
@@ -399,12 +399,11 @@ impl ManagementTrust {
             return Err(Error::UnauthorizedObjectType);
         }
         authorize_scope(&issuer, &object)?;
-        if let ObjectBody::NodeIdentity(node) = &object.body {
-            if !self.node_identities.contains_key(&node.node_id)
-                && self.node_identities.len() >= MAX_NODE_IDENTITIES
-            {
-                return Err(Error::ReplayFull);
-            }
+        if let ObjectBody::NodeIdentity(node) = &object.body
+            && !self.node_identities.contains_key(&node.node_id)
+            && self.node_identities.len() >= MAX_NODE_IDENTITIES
+        {
+            return Err(Error::ReplayFull);
         }
         let message = objects::signature_input(
             &raw_tbs,
