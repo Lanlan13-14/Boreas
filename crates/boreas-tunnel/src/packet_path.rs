@@ -1482,14 +1482,3 @@ mod tests {
         assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
     }
 }
-xpect("bound path");
-        path.close();
-        path.close();
-        assert!(dropped.get());
-        assert_eq!(path.first_error(), None);
-        assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
-    }
-}
-.step_inbound(), Err(PacketPathError::Closed));
-    }
-}
