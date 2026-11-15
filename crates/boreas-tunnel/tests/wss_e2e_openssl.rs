@@ -224,8 +224,7 @@ fn sanitize_cli_stderr(bytes: &[u8], dir: &str) -> String {
         if budget == 0 {
             // Fewer bytes are left than the marker itself needs: shrink the
             // retained text (never mid code point) so the marker still fits.
-            let cut =
-                truncate_utf8(&kept, STDERR_TEXT_LIMIT - STDERR_TRUNCATION.len()).len();
+            let cut = truncate_utf8(&kept, STDERR_TEXT_LIMIT - STDERR_TRUNCATION.len()).len();
             kept.truncate(cut);
             kept.push_str(STDERR_TRUNCATION);
             break;
@@ -333,10 +332,7 @@ fn genpkey(t: &Temp, out: &str, algorithm: KeyAlg) {
                 &out,
             ],
         ),
-        KeyAlg::MlDsa65 => openssl(
-            t,
-            &["genpkey", "-algorithm", "ML-DSA-65", "-out", &out],
-        ),
+        KeyAlg::MlDsa65 => openssl(t, &["genpkey", "-algorithm", "ML-DSA-65", "-out", &out]),
     }
 }
 
@@ -459,7 +455,12 @@ fn setup(t: &Temp) {
             serial: "203",
         },
     );
-    make_ca(t, "rogue", KeyAlg::MlDsa65, "/CN=Untrusted Boreas Test Root");
+    make_ca(
+        t,
+        "rogue",
+        KeyAlg::MlDsa65,
+        "/CN=Untrusted Boreas Test Root",
+    );
 }
 fn read(t: &Temp, name: &str) -> Vec<u8> {
     std::fs::read(t.path(name)).expect("read generated fixture")
