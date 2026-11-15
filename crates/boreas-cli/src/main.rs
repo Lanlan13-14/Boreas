@@ -454,7 +454,11 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(stdout.is_empty());
         assert!(stderr.contains("requires exactly one config path"));
 
-        let (code, stdout, stderr) = run(&args(&["config-check", "a.toml", "b.toml"]), Lang::En, false);
+        let (code, stdout, stderr) = run(
+            &args(&["config-check", "a.toml", "b.toml"]),
+            Lang::En,
+            false,
+        );
         assert_eq!(code, 2);
         assert!(stdout.is_empty());
         assert!(stderr.contains("requires exactly one config path"));
