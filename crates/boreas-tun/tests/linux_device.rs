@@ -231,7 +231,8 @@ fn real_l3_write_and_kernel_routed_reply() {
     let p = reply.unwrap_or_else(|| {
         panic!("kernel should route the echo reply out through the TUN (ignored {ignored} other packets)")
     });
-    let reply_info = boreas_tun::inspect_packet(&p).expect("filtered reply must be a valid IP packet");
+    let reply_info =
+        boreas_tun::inspect_packet(&p).expect("filtered reply must be a valid IP packet");
     assert_eq!(reply_info.version, IpVersion::V4);
     assert_eq!(reply_info.protocol, 1);
     assert_eq!(p[reply_info.header_len], 0, "ICMP echo reply");
