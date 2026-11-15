@@ -45,7 +45,9 @@ RESULT_RE = re.compile(
     r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;"
 )
 RUNNING_RE = re.compile(r"^running (\d+) tests?$")
-TEST_OK_RE = re.compile(r"^test ([^ ]+) \.\.\. ok$")
+# `--nocapture` lets the test print its evidence marker between `...` and
+# `ok`. The marker is still required separately; this only recovers the name.
+TEST_OK_RE = re.compile(r"^test ([^ ]+) \.\.\.(?: .*)? ok$")
 
 DRIVER = {"windows": "wintun", "macos": "utun", "linux": "tun"}
 
