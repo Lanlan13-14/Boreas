@@ -59,7 +59,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential perl curl ca-certificates pkg-config binutils \
-            musl-tools iproute2 iputils-ping
+            musl-tools linux-libc-dev file iproute2 iputils-ping
       - name: Build pinned static OpenSSL
         timeout-minutes: 35
         shell: bash
@@ -258,8 +258,16 @@ jobs:
           OPENSSL_MUSL_PREFIX="${GITHUB_WORKSPACE}/.rust-tls-openssl-musl"
           mkdir -p openssl-musl-src
           tar -xzf openssl.tar.gz --strip-components=1 -C openssl-musl-src
+          # Expose kernel UAPI headers without adding glibc's include root to
+          # musl-gcc. OpenSSL's secure-memory code includes linux/mman.h.
+          MUSL_UAPI="${GITHUB_WORKSPACE}/.musl-kernel-headers"
+          mkdir -p "$MUSL_UAPI"
+          ln -s /usr/include/linux "$MUSL_UAPI/linux"
+          ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
+          ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm"
           pushd openssl-musl-src
           CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests no-async \
+            -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_MUSL_PREFIX}" --openssldir="${OPENSSL_MUSL_PREFIX}/ssl"
           make -j2
           make install_sw
@@ -268,7 +276,10 @@ jobs:
             cargo build --locked --release --target x86_64-unknown-linux-musl \
               -p boreas-cli --features openssl-inner-tls
           cp target/x86_64-unknown-linux-musl/release/boreas hop-node-linux/boreas-linux-x86_64-musl-pq768
-          readelf -l hop-node-linux/boreas-linux-x86_64-musl-pq768 | grep -v 'Requesting program interpreter'
+          python tools/release/verify_static_linux.py \
+            --binary hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            --target x86_64-unknown-linux-musl \
+            --out hop-node-linux/static-linkage-pq768.json
           sudo -E bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee -a rust-tls-netns-e2e.log
 
