@@ -6,6 +6,11 @@
 //! production enrollment cannot be completed through this module.
 //! The journal protects transaction consistency/torn writes, not against a malicious local
 //! filesystem administrator or arbitrary journal rewriting.
+//!
+//! Durability is platform-scoped: Unix fsyncs the parent directory after creating/removing
+//! journal and lock entries. Windows currently syncs file data only and does not flush
+//! directory entries, so [`EnrollmentStore::directory_entry_durability_guaranteed`] reports
+//! `false` there and the Windows crash-durability gate remains open.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +21,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use subtle::ConstantTimeEq;
+
+#[cfg(feature = "openssl-backend")]
+use openssl::hash::{MessageDigest, hash};
+#[cfg(feature = "openssl-backend")]
+use openssl::pkey::KeyType;
+#[cfg(feature = "openssl-backend")]
+use openssl::x509::X509Req;
 
 const MAGIC: &[u8; 4] = b"BENR";
 const VERSION: u8 = 1;
@@ -70,22 +84,33 @@ pub struct InviteSpec {
     pub bearer_secret: [u8; 32],
 }
 
-/// Monotonically increasing writer epoch delivered by a durable external fencing authority.
-/// Do not manufacture one from wall time, PID, or local state. Public integration should
-/// provide it only after establishing single-writer ownership in the deployment control plane.
+/// A caller-asserted monotonic writer epoch.
+///
+/// This is an assertion, not proof of exclusive ownership. The journal can reject an
+/// epoch lower than the highest one it has durably observed, but it cannot authenticate
+/// who issued the epoch or prevent two writers that were both given epoch N from running.
+/// Deployments **must** obtain the epoch from a durable external fencing authority
+/// (for example a control-plane lease service) after partitioning every older writer.
+/// It must never be derived from wall time, a PID, a random nonce, or local configuration:
+/// inventing a locally larger number defeats the only protection this type can offer.
+///
+/// The public constructor exists because an external integration must be able to pass the
+/// authority-issued value in; it deliberately does not validate the source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriterFence {
     epoch: u64,
 }
 impl WriterFence {
-    /// Internal constructor for trusted integration and unit tests. Not exposed to callers
-    /// outside this crate; current module is intentionally not yet exported from lib.rs.
-    /// Wraps an epoch issued by an independent durable fencing authority.
-    /// This constructor does not authenticate or validate its source: choosing a number
-    /// locally does not establish exclusive ownership. Deployments must obtain this value
-    /// from a monotonic authority that fences every older writer.
+    /// Wraps an epoch obtained from an independent, durable fencing authority.
+    ///
+    /// The caller is responsible for exclusive ownership; this constructor does not
+    /// authenticate the authority or validate that older writers have been fenced.
     pub const fn from_external_authority(epoch: u64) -> Self {
         Self { epoch }
+    }
+    /// The externally issued epoch, for diagnostics and journal correlation.
+    pub const fn epoch(self) -> u64 {
+        self.epoch
     }
     #[cfg(test)]
     const fn from_authority(epoch: u64) -> Self {
@@ -174,12 +199,18 @@ pub struct SignedIdentityResult {
     raw_signed_bytes: Vec<u8>,
 }
 impl SignedIdentityResult {
-    #[allow(dead_code)] // Called when the IdentityAuthority signer integration is added.
     fn from_identity_authority(raw_signed_bytes: Vec<u8>) -> Result<Self, EnrollmentError> {
+        // The master plan caps one signed management object at 16 KiB total, including
+        // signatures and container headers, not 16 KiB of TBS plus signatures.
         if raw_signed_bytes.is_empty() || raw_signed_bytes.len() > 16 * 1024 {
             return Err(EnrollmentError::InvalidSignedResult);
         }
         Ok(Self { raw_signed_bytes })
+    }
+    /// The exact signed object bytes persisted by the journal. Decode them with the
+    /// management-object parser before treating any embedded field as authoritative.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw_signed_bytes
     }
 }
 
@@ -198,6 +229,16 @@ pub struct EnrollmentResult {
     pub signed_identity: Option<Vec<u8>>,
     pub recovery_until_us: u64,
 }
+/// Validity and role-scope material supplied by the enrolling deployment.
+/// The IdentityAuthority signs these exact values into the NodeIdentity object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityValidity {
+    pub not_before_us: u64,
+    pub expires_us: u64,
+    /// Role/prefix authorization scope bytes, at most 1024 bytes.
+    pub scope: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 struct Tx {
     result: EnrollmentResult,
@@ -225,6 +266,11 @@ pub enum EnrollmentError {
     WrongPhase,
     InvalidSignedResult,
     CsrTooLarge,
+    InvalidCsr,
+    UnsupportedCsrKey,
+    CsrProofOfPossession,
+    IdentityAuthorityRejected,
+    InvalidIdentityValidity,
     StoreFull,
     CorruptJournal,
     UnsupportedVersion,
@@ -236,19 +282,20 @@ impl From<io::Error> for EnrollmentError {
     }
 }
 
-/// Store is single-process mutable and guarded by an exclusive create_new sidecar lock.
-/// A crash leaves the lock behind; operators must inspect and explicitly remove it after
-/// fencing the old writer. No automatic stale-lock stealing is attempted.
+/// Store is single-process mutable and guarded by an OS advisory exclusive lock on a
+/// sidecar file. The kernel releases the lock when the holding process exits or is killed,
+/// so a `SIGKILL` does not permanently wedge recovery. The lock file itself is intentionally
+/// left in place: unlinking a still-locked inode can let a new writer create a different
+/// inode while an old writer holds the old one. The lock does not replace the independent
+/// fencing epoch, which still rejects a restored stale writer after an old process dies.
 pub struct EnrollmentStore {
     path: PathBuf,
-    lock_path: PathBuf,
     journal: File,
     _lock: Option<File>,
     fence: u64,
     provided_fence: u64,
     poisoned: bool,
     record_count: usize,
-    remove_lock_on_drop: bool,
     #[cfg(test)]
     fail_next_write: bool,
     invites: BTreeMap<[u8; 16], InviteSpec>,
@@ -257,6 +304,9 @@ pub struct EnrollmentStore {
     generations: BTreeMap<u16, u64>,
     transactions: BTreeMap<([u8; 16], [u8; 16]), Tx>,
     invite_bindings: BTreeMap<[u8; 16], ([u8; 16], [u8; 32])>,
+    /// Durable per-home-core allocation watermark. It only moves forward and is
+    /// recovered from the journal before any new allocation is attempted.
+    allocation_watermarks: BTreeMap<u8, u64>,
 }
 impl fmt::Debug for EnrollmentStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -267,6 +317,7 @@ impl fmt::Debug for EnrollmentStore {
             .field("invite_count", &self.invites.len())
             .field("slot_count", &self.slots.len())
             .field("transaction_count", &self.transactions.len())
+            .field("allocation_watermarks", &self.allocation_watermarks)
             .finish()
     }
 }
@@ -280,31 +331,29 @@ impl EnrollmentStore {
         if fence.epoch == 0 {
             return Err(EnrollmentError::StaleFence);
         }
-        let path = path.as_ref().to_path_buf();
-        validate_storage_path(&path)?;
+        let path = canonical_storage_path(path.as_ref())?;
         let lock_path = suffix_path(&path, ".writer-lock");
         let mut lock_options = OpenOptions::new();
-        lock_options.write(true).create_new(true);
+        // read+write is required by Windows LockFileEx. create(true) reuses an existing
+        // lock file, which is intentionally persistent and not a crash sentinel.
+        lock_options.read(true).write(true).create(true);
         #[cfg(unix)]
         lock_options.mode(0o600);
-        let lock = lock_options.open(&lock_path).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                EnrollmentError::BusyLock
-            } else {
-                EnrollmentError::Io(e)
+        let lock = lock_options.open(&lock_path)?;
+        validate_open_file(&lock_path, &lock)?;
+        match lock.try_lock() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                drop(lock);
+                return Err(EnrollmentError::BusyLock);
             }
-        })?;
-        if let Err(error) = validate_open_file(&lock_path, &lock) {
-            drop(lock);
-            let _ = fs::remove_file(&lock_path);
-            return Err(error);
+            Err(std::fs::TryLockError::Error(error)) => {
+                drop(lock);
+                return Err(EnrollmentError::Io(error));
+            }
         }
-        if let Err(error) = sync_parent_dir(&lock_path) {
-            drop(lock);
-            let _ = fs::remove_file(&lock_path);
-            return Err(error);
-        }
-        match Self::open_locked(path, lock_path.clone(), lock, fence, invites, slots) {
+        sync_parent_dir(&lock_path)?;
+        match Self::open_locked(path, lock, fence, invites, slots) {
             Ok(mut store) => {
                 if store.provided_fence < store.fence {
                     drop(store);
@@ -316,13 +365,11 @@ impl EnrollmentStore {
                     store.append_event(Event::Fence { epoch })?;
                     sync_parent_dir(&store.path)?;
                 }
-                store.remove_lock_on_drop = true;
                 Ok(store)
             }
             Err(error) => {
-                // A recovery/open failure leaves the sentinel for explicit operator review;
-                // it is not automatically stolen or removed.
-                let _ = lock_path;
+                // The OS lock is released when `lock`/store drops; the lock file stays so a
+                // retry opens the same inode instead of racing an unlink.
                 Err(error)
             }
         }
@@ -330,7 +377,6 @@ impl EnrollmentStore {
 
     fn open_locked(
         path: PathBuf,
-        lock_path: PathBuf,
         lock: File,
         fence: WriterFence,
         invites: Vec<InviteSpec>,
@@ -360,14 +406,12 @@ impl EnrollmentStore {
         validate_open_file(&path, &journal)?;
         let mut store = Self {
             path,
-            lock_path,
             journal,
             _lock: Some(lock),
             fence: 0,
             provided_fence: fence.epoch,
             poisoned: false,
             record_count: 0,
-            remove_lock_on_drop: false,
             #[cfg(test)]
             fail_next_write: false,
             invites: invite_map,
@@ -376,6 +420,7 @@ impl EnrollmentStore {
             generations: BTreeMap::new(),
             transactions: BTreeMap::new(),
             invite_bindings: BTreeMap::new(),
+            allocation_watermarks: BTreeMap::new(),
         };
         store.recover()?;
         Ok(store)
@@ -442,6 +487,16 @@ impl EnrollmentStore {
             signed_identity: None,
             recovery_until_us: invite.expires_at_us.saturating_add(RECOVERY_WINDOW_US),
         };
+        if self.record_count >= MAX_RECORDS.saturating_sub(1) {
+            return Err(EnrollmentError::StoreFull);
+        }
+        let watermark = self
+            .allocation_watermarks
+            .get(&invite.home_core_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(EnrollmentError::StoreFull)?;
         let tx = Tx {
             result: result.clone(),
             invite_id: req.invite_id,
@@ -449,12 +504,52 @@ impl EnrollmentStore {
             csr_hash: req.raw_csr_sha256,
             csr_der: req.raw_csr_der.clone(),
         };
+        // The watermark is a separate durable record written before the binding.
+        // A crash after this write may skip a number, but can never move backwards.
+        self.append_event(Event::AllocationWatermark {
+            fence: self.fence,
+            home_core_id: invite.home_core_id,
+            watermark,
+        })?;
+        self.allocation_watermarks
+            .insert(invite.home_core_id, watermark);
         self.append_event(Event::Prepared {
             fence: self.fence,
             tx: tx.clone(),
         })?;
         self.apply_prepared(tx);
         Ok(result)
+    }
+
+    /// Durable, monotonically increasing allocation watermark for one home-core block.
+    /// It survives torn writes and restart; a restored stale disk that cannot present a
+    /// watermark at least this high must be fenced off rather than allowed to allocate.
+    pub fn allocation_watermark(&self, home_core_id: u8) -> Result<u64, EnrollmentError> {
+        if !(1..=16).contains(&home_core_id) {
+            return Err(EnrollmentError::InvalidSlot);
+        }
+        Ok(self
+            .allocation_watermarks
+            .get(&home_core_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    /// Whether this platform implements the parent-directory fsync required for
+    /// crash-durable rename/create of a new journal or lock entry.
+    ///
+    /// This is `true` only on Unix. On Windows the implementation currently syncs file
+    /// data but returns without a directory-entry flush; that platform gate is **not**
+    /// passed, and a production deployment must not claim crash durability for a newly
+    /// created journal there. A future implementation may use a documented Windows
+    /// directory-handle flush strategy, but it must not be inferred from file `sync_all`.
+    pub const fn directory_entry_durability_guaranteed() -> bool {
+        cfg!(unix)
+    }
+
+    /// Canonical journal path selected after resolving the storage directory.
+    pub fn journal_path(&self) -> &Path {
+        &self.path
     }
 
     pub fn mark_issued(
@@ -519,6 +614,139 @@ impl EnrollmentStore {
             return Err(EnrollmentError::InviteRecoveryExpired);
         }
         Ok(tx.csr_der.clone())
+    }
+
+    /// Production CSR admission boundary.
+    ///
+    /// The ML-DSA PKCS#10 signature is verified against the public key carried in the
+    /// exact DER request, and the exact DER bytes are hashed and retained. The returned
+    /// token is the only way to enter [`Self::claim`] from outside this crate's tests.
+    /// The invitation determines the role and home core; the caller cannot supply them.
+    #[cfg(feature = "openssl-backend")]
+    pub fn verify_csr_request(
+        &self,
+        invite_id: [u8; 16],
+        enrollment_id: [u8; 16],
+        bearer_secret: &[u8; 32],
+        csr_der: &[u8],
+        now_us: u64,
+    ) -> Result<VerifiedEnrollmentRequest, EnrollmentError> {
+        self.ensure_healthy()?;
+        let invite = *self
+            .invites
+            .get(&invite_id)
+            .ok_or(EnrollmentError::InvalidInvite)?;
+        if !secret_bytes_equal(&invite.bearer_secret, bearer_secret) {
+            return Err(EnrollmentError::InvalidBearerSecret);
+        }
+        if csr_der.is_empty() || csr_der.len() > MAX_CSR_BYTES {
+            return Err(EnrollmentError::CsrTooLarge);
+        }
+        // Cheap rejection before the expensive ML-DSA proof-of-possession check:
+        // an invitation already bound to another enrollment cannot be rescued by a new CSR.
+        if let Some((bound_enrollment_id, _)) = self.invite_bindings.get(&invite_id) {
+            if *bound_enrollment_id != enrollment_id {
+                return Err(EnrollmentError::InviteBoundToDifferentRequest);
+            }
+        }
+        let pair = (invite_id, enrollment_id);
+        if let Some(tx) = self.transactions.get(&pair) {
+            if now_us > tx.result.recovery_until_us {
+                return Err(EnrollmentError::InviteRecoveryExpired);
+            }
+            if tx.csr_der.as_slice() == csr_der {
+                // The exact DER was already verified when first admitted. Recovery retries
+                // reuse that decision instead of paying for a second ML-DSA verification.
+                return VerifiedEnrollmentRequest::from_verified_csr(
+                    invite_id,
+                    enrollment_id,
+                    *bearer_secret,
+                    tx.csr_der.clone(),
+                    tx.csr_hash,
+                    invite.role,
+                    invite.home_core_id,
+                );
+            }
+            // A bound transaction cannot be rebound to different bytes; reject cheaply.
+            return Err(EnrollmentError::InviteBoundToDifferentRequest);
+        }
+        if self.invite_bindings.contains_key(&invite_id) {
+            return Err(EnrollmentError::InviteBoundToDifferentRequest);
+        }
+        if now_us >= invite.expires_at_us {
+            return Err(EnrollmentError::InviteExpired);
+        }
+        let csr_hash = verify_ml_dsa_csr(csr_der)?;
+        VerifiedEnrollmentRequest::from_verified_csr(
+            invite_id,
+            enrollment_id,
+            *bearer_secret,
+            csr_der.to_vec(),
+            csr_hash,
+            invite.role,
+            invite.home_core_id,
+        )
+    }
+
+    /// Complete the recoverable enrollment and signing path in one call.
+    ///
+    /// A fresh transaction moves `PREPARED -> ISSUED`; a retry after a crash or lost
+    /// response returns the already-persisted signed identity and never reallocates the
+    /// slot. The CSR is read back from the journal, not reconstructed from the bare
+    /// enrollment id.
+    #[cfg(feature = "openssl-backend")]
+    pub fn claim_and_issue(
+        &mut self,
+        req: VerifiedEnrollmentRequest,
+        now_us: u64,
+        authority: &crate::management::IdentityAuthority,
+        validity: IdentityValidity,
+    ) -> Result<EnrollmentResult, EnrollmentError> {
+        if validity.not_before_us >= validity.expires_us
+            || validity.not_before_us > now_us
+            || validity.expires_us <= now_us
+            || validity.scope.len() > 1024
+        {
+            return Err(EnrollmentError::InvalidIdentityValidity);
+        }
+        let invite_id = req.invite_id;
+        let enrollment_id = req.enrollment_id;
+        let bearer_secret = req.bearer_secret;
+        let claimed = self.claim(req, now_us)?;
+        if claimed.phase != EnrollmentPhase::Prepared {
+            return Ok(claimed);
+        }
+        let csr_der = self.raw_csr_for_signing(invite_id, enrollment_id, &bearer_secret, now_us)?;
+        let role = match claimed.slot.role {
+            NodeRole::Edge => crate::NodeRole::Edge,
+            NodeRole::Core => crate::NodeRole::Core,
+            NodeRole::EnrollmentService => crate::NodeRole::EnrollmentService,
+        };
+        let template = crate::management::IdentityTemplate {
+            node_id: claimed.node_id,
+            home_core_id: claimed.slot.home_core_id,
+            vip_octet: claimed.slot.vip_octet,
+            role,
+            identity_generation: claimed.identity_generation,
+            not_before_us: validity.not_before_us,
+            expires_us: validity.expires_us,
+            scope: validity.scope,
+        };
+        let body = authority
+            .node_identity_from_csr(template, &csr_der)
+            .map_err(|_| EnrollmentError::IdentityAuthorityRejected)?;
+        let signed = authority
+            .sign_node_identity(body)
+            .map_err(|_| EnrollmentError::IdentityAuthorityRejected)?;
+        let signed_bytes = signed
+            .encode()
+            .map_err(|_| EnrollmentError::IdentityAuthorityRejected)?;
+        self.mark_issued(
+            invite_id,
+            enrollment_id,
+            now_us,
+            SignedIdentityResult::from_identity_authority(signed_bytes)?,
+        )
     }
 
     pub fn mark_delivered(
@@ -733,9 +961,15 @@ impl EnrollmentStore {
                     .get(&key)
                     .ok_or(EnrollmentError::CorruptJournal)?;
                 if old.csr_hash != tx.csr_hash
+                    || old.csr_der != tx.csr_der
+                    || tx.result.node_id != old.result.node_id
+                    || tx.result.slot != old.result.slot
+                    || tx.result.identity_generation != old.result.identity_generation
+                    || tx.result.recovery_until_us != old.result.recovery_until_us
                     || tx.result.phase != EnrollmentPhase::Issued
                     || tx.result.signed_identity.is_none()
                     || old.result.phase != EnrollmentPhase::Prepared
+                    || old.result.signed_identity.is_some()
                 {
                     return Err(EnrollmentError::CorruptJournal);
                 }
@@ -749,12 +983,34 @@ impl EnrollmentStore {
                     .get(&key)
                     .ok_or(EnrollmentError::CorruptJournal)?;
                 if old.csr_hash != tx.csr_hash
+                    || old.csr_der != tx.csr_der
+                    || tx.result.node_id != old.result.node_id
+                    || tx.result.slot != old.result.slot
+                    || tx.result.identity_generation != old.result.identity_generation
+                    || tx.result.recovery_until_us != old.result.recovery_until_us
+                    || tx.result.signed_identity != old.result.signed_identity
                     || tx.result.phase != EnrollmentPhase::Delivered
                     || old.result.phase != EnrollmentPhase::Issued
                 {
                     return Err(EnrollmentError::CorruptJournal);
                 }
                 self.transactions.insert(key, tx);
+            }
+            Event::AllocationWatermark {
+                fence,
+                home_core_id,
+                watermark,
+            } => {
+                self.check_fence(fence)?;
+                let previous = self
+                    .allocation_watermarks
+                    .get(&home_core_id)
+                    .copied()
+                    .unwrap_or(0);
+                if !(1..=16).contains(&home_core_id) || watermark == 0 || watermark <= previous {
+                    return Err(EnrollmentError::CorruptJournal);
+                }
+                self.allocation_watermarks.insert(home_core_id, watermark);
             }
             Event::Tombstone {
                 fence,
@@ -782,16 +1038,13 @@ impl EnrollmentStore {
 }
 impl Drop for EnrollmentStore {
     fn drop(&mut self) {
-        // Open stores release their owned lock on orderly shutdown. A process crash skips
-        // Drop and leaves the sentinel for operator-reviewed recovery.
+        // The OS releases the advisory lock on close, and also on process death/SIGKILL.
+        // The lock file is not unlinked: unlinking while another waiter holds the old inode
+        // would allow a second writer on a newly created inode.
         if let Some(lock) = self._lock.take() {
-            let _ = lock.sync_all();
+            let _ = lock.unlock();
             drop(lock);
-            if self.remove_lock_on_drop {
-                let _ = fs::remove_file(&self.lock_path);
-            }
         }
-        let _ = &self.path;
     }
 }
 
@@ -816,6 +1069,11 @@ enum Event {
         fence: u64,
         node_id: u16,
         generation: u64,
+    },
+    AllocationWatermark {
+        fence: u64,
+        home_core_id: u8,
+        watermark: u64,
     },
 }
 impl Event {
@@ -851,6 +1109,16 @@ impl Event {
                 w.extend_from_slice(&node_id.to_be_bytes());
                 w.extend_from_slice(&generation.to_be_bytes());
             }
+            Event::AllocationWatermark {
+                fence,
+                home_core_id,
+                watermark,
+            } => {
+                w.push(6);
+                w.extend_from_slice(&fence.to_be_bytes());
+                w.push(*home_core_id);
+                w.extend_from_slice(&watermark.to_be_bytes());
+            }
         }
         w
     }
@@ -877,6 +1145,11 @@ impl Event {
                 generation: r.u64()?,
             },
             5 => Self::Fence { epoch: fence },
+            6 => Self::AllocationWatermark {
+                fence,
+                home_core_id: r.u8()?,
+                watermark: r.u64()?,
+            },
             _ => return Err(EnrollmentError::CorruptJournal),
         };
         if r.p != b.len() {
@@ -1006,6 +1279,43 @@ impl<'a> Reader<'a> {
             .map_err(|_| EnrollmentError::CorruptJournal)
     }
 }
+/// Verify a standard PKCS#10 DER request carrying an ML-DSA-65 key.
+///
+/// `X509Req::verify` performs the actual proof-of-possession check. Re-encoding and
+/// comparing the whole DER rejects trailing bytes that some decoders would ignore.
+/// The returned digest is over the exact bytes persisted by the journal.
+#[cfg(feature = "openssl-backend")]
+fn verify_ml_dsa_csr(csr_der: &[u8]) -> Result<[u8; 32], EnrollmentError> {
+    if csr_der.is_empty() || csr_der.len() > MAX_CSR_BYTES {
+        return Err(EnrollmentError::CsrTooLarge);
+    }
+    let request = X509Req::from_der(csr_der).map_err(|_| EnrollmentError::InvalidCsr)?;
+    if request.version() != 0 {
+        return Err(EnrollmentError::InvalidCsr);
+    }
+    let canonical_der = request.to_der().map_err(|_| EnrollmentError::InvalidCsr)?;
+    if canonical_der != csr_der {
+        return Err(EnrollmentError::InvalidCsr);
+    }
+    let public_key = request
+        .public_key()
+        .map_err(|_| EnrollmentError::InvalidCsr)?;
+    if !public_key.is_a(KeyType::ML_DSA_65) {
+        return Err(EnrollmentError::UnsupportedCsrKey);
+    }
+    let proof_of_possession = request
+        .verify(&public_key)
+        .map_err(|_| EnrollmentError::InvalidCsr)?;
+    if !proof_of_possession {
+        return Err(EnrollmentError::CsrProofOfPossession);
+    }
+    let digest = hash(MessageDigest::sha256(), csr_der).map_err(|_| EnrollmentError::InvalidCsr)?;
+    let digest_bytes: &[u8] = digest.as_ref();
+    let mut csr_hash = [0u8; 32];
+    csr_hash.copy_from_slice(digest_bytes);
+    Ok(csr_hash)
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
     for &b in bytes {
@@ -1026,26 +1336,21 @@ fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn validate_storage_path(path: &Path) -> Result<(), EnrollmentError> {
+/// Resolve the storage directory before creating any file.
+///
+/// macOS exposes `/tmp` and `/var/folders/...` through the system `/var` symlink, so a
+/// blanket "no symlink in any textual ancestor" check rejects a safe, standard temporary
+/// directory. Canonicalizing the parent resolves every component first; the final directory
+/// is then re-checked as a real directory with private permissions. The final file name is
+/// checked before and after open, including hard-link count, so a symlinked journal or lock
+/// file is still rejected. This is not a proof against a malicious local administrator racing
+/// the path, which is outside this journal's threat model.
+fn canonical_storage_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
+    let file_name = path.file_name().ok_or(EnrollmentError::UnsafeStoragePath)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    // Refuse symlinks at every component, not just the final directory.
-    for ancestor in parent.ancestors() {
-        let meta = fs::symlink_metadata(ancestor)?;
-        if meta.file_type().is_symlink() {
-            return Err(EnrollmentError::UnsafeStoragePath);
-        }
-    }
-    let parent_meta = fs::symlink_metadata(parent)?;
-    if !parent_meta.is_dir() {
-        return Err(EnrollmentError::UnsafeStoragePath);
-    }
-    #[cfg(unix)]
-    if parent_meta.permissions().mode() & 0o077 != 0 {
-        return Err(EnrollmentError::UnsafeStoragePath);
-    }
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.is_file() {
@@ -1059,7 +1364,16 @@ fn validate_storage_path(path: &Path) -> Result<(), EnrollmentError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(EnrollmentError::Io(e)),
     }
-    Ok(())
+    let canonical_parent = fs::canonicalize(parent)?;
+    let parent_meta = fs::symlink_metadata(&canonical_parent)?;
+    if !parent_meta.is_dir() || parent_meta.file_type().is_symlink() {
+        return Err(EnrollmentError::UnsafeStoragePath);
+    }
+    #[cfg(unix)]
+    if parent_meta.permissions().mode() & 0o077 != 0 {
+        return Err(EnrollmentError::UnsafeStoragePath);
+    }
+    Ok(canonical_parent.join(file_name))
 }
 fn validate_open_file(path: &Path, file: &File) -> Result<(), EnrollmentError> {
     let meta = fs::symlink_metadata(path)?;
@@ -1076,6 +1390,8 @@ fn validate_open_file(path: &Path, file: &File) -> Result<(), EnrollmentError> {
             return Err(EnrollmentError::UnsafeStoragePath);
         }
     }
+    #[cfg(not(unix))]
+    let _ = file;
     Ok(())
 }
 #[cfg(unix)]
@@ -1089,20 +1405,17 @@ fn sync_parent_dir(path: &Path) -> Result<(), EnrollmentError> {
 }
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> Result<(), EnrollmentError> {
-    // std has no portable directory-handle fsync API. File sync still occurs; crash-safe
-    // directory-entry durability is not asserted on these platforms in this draft.
+    // std has no portable directory-handle fsync API and this crate forbids unsafe FFI.
+    // File data is still synced by append_event, but a newly created directory entry is
+    // not crash-durable here. EnrollmentStore::directory_entry_durability_guaranteed()
+    // returns false so the deployment gate cannot mistake this for Unix behavior.
     Ok(())
 }
-/// Byte-wise equality helper only; this is not claimed to have constant-time behavior.
+/// Constant-time equality for the fixed-size bearer secret.
+///
+/// The length check is not secret-dependent because every valid secret is exactly 32 bytes.
 fn secret_bytes_equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 #[cfg(test)]
 mod tests {
@@ -1135,6 +1448,29 @@ mod tests {
             role: NodeRole::Edge,
         }]
     }
+    fn two_slots() -> Vec<Slot> {
+        vec![
+            Slot {
+                home_core_id: 1,
+                vip_octet: 2,
+                role: NodeRole::Edge,
+            },
+            Slot {
+                home_core_id: 1,
+                vip_octet: 3,
+                role: NodeRole::Edge,
+            },
+        ]
+    }
+    fn second_invite() -> InviteSpec {
+        InviteSpec {
+            invite_id: [2; 16],
+            expires_at_us: 10_000_000,
+            role: NodeRole::Edge,
+            home_core_id: 1,
+            bearer_secret: [7; 32],
+        }
+    }
     fn setup(path: &Path) -> EnrollmentStore {
         EnrollmentStore::open(
             path,
@@ -1152,11 +1488,22 @@ mod tests {
             slots(),
         )
     }
+    fn open_two(path: &Path, fence: u64) -> Result<EnrollmentStore, EnrollmentError> {
+        EnrollmentStore::open(
+            path,
+            WriterFence::from_authority(fence),
+            vec![invite(), second_invite()],
+            two_slots(),
+        )
+    }
     fn request(enroll: u8, fill: u8) -> VerifiedEnrollmentRequest {
+        request_with([1; 16], enroll, fill)
+    }
+    fn request_with(invite_id: [u8; 16], enroll: u8, fill: u8) -> VerifiedEnrollmentRequest {
         let csr = vec![fill; 256];
         let digest = [fill; 32];
         VerifiedEnrollmentRequest::test_request(
-            [1; 16],
+            invite_id,
             [enroll; 16],
             [7; 32],
             csr,
@@ -1252,15 +1599,39 @@ mod tests {
         for i in 0..16u8 {
             let s = store.clone();
             joins.push(thread::spawn(move || {
-                s.lock().unwrap().claim(request(i + 1, i + 1), 1).is_ok()
+                s.lock().unwrap().claim(request(i + 1, i + 1), 1)
             }));
         }
-        let wins = joins
-            .into_iter()
-            .map(|j| j.join().unwrap())
-            .filter(|won| *won)
-            .count();
-        assert_eq!(wins, 1);
+        let results: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        for result in &results {
+            if let Err(error) = result {
+                assert!(matches!(
+                    error,
+                    EnrollmentError::InviteBoundToDifferentRequest
+                ));
+            }
+        }
+        let winner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .cloned()
+            .unwrap();
+        // The exact winning enrollment is idempotent; every other enrollment id is still
+        // rejected without a second slot allocation or invite rebinding.
+        let mut store = store.lock().unwrap();
+        let mut retried_winner = false;
+        for i in 0..16u8 {
+            match store.claim(request(i + 1, i + 1), 1) {
+                Ok(result) => {
+                    assert_eq!(result, winner);
+                    retried_winner = true;
+                }
+                Err(EnrollmentError::InviteBoundToDifferentRequest) => {}
+                Err(error) => panic!("unexpected retry error: {error:?}"),
+            }
+        }
+        assert!(retried_winner);
         drop(store);
         cleanup(&path);
     }
@@ -1333,6 +1704,246 @@ mod tests {
             Some(&(r.identity_generation + 1))
         );
         drop(s);
+        cleanup(&path);
+    }
+    #[test]
+    fn failed_authentication_does_not_burn_invite_or_watermark() {
+        let path = temp_path();
+        let mut store = setup(&path);
+        let mut bad_secret = request(2, 3);
+        bad_secret.bearer_secret = [9; 32];
+        assert!(matches!(
+            store.claim(bad_secret, 1),
+            Err(EnrollmentError::InvalidBearerSecret)
+        ));
+        assert_eq!(store.allocation_watermark(1).unwrap(), 0);
+        let mut bad_scope = request(2, 3);
+        bad_scope.home_core_id = 2;
+        assert!(matches!(
+            store.claim(bad_scope, 1),
+            Err(EnrollmentError::InviteScopeMismatch)
+        ));
+        assert_eq!(store.allocation_watermark(1).unwrap(), 0);
+        let result = store.claim(request(2, 3), 1).unwrap();
+        assert_eq!(result.node_id, 2);
+        assert_eq!(store.allocation_watermark(1).unwrap(), 1);
+        drop(store);
+        cleanup(&path);
+    }
+    #[test]
+    fn torn_prepared_record_preserves_watermark_and_does_not_burn_invite() {
+        let path = temp_path();
+        {
+            let mut store = setup(&path);
+            let first = store.claim(request(2, 3), 1).unwrap();
+            assert_eq!(first.node_id, 2);
+        }
+        let journal_len = fs::metadata(&path).unwrap().len();
+        // Remove the tail of the Prepared record, leaving the durable allocation
+        // watermark intact. Recovery must truncate the torn tail and allow a retry.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(journal_len - 7)
+            .unwrap();
+        let mut store = setup(&path);
+        assert_eq!(store.allocation_watermark(1).unwrap(), 1);
+        let retried = store.claim(request(2, 3), 1).unwrap();
+        assert_eq!(retried.node_id, 2);
+        assert_eq!(store.allocation_watermark(1).unwrap(), 2);
+        drop(store);
+        cleanup(&path);
+    }
+    #[test]
+    fn allocation_watermark_persists_and_never_moves_backwards() {
+        let path = temp_path();
+        {
+            let mut store = open_two(&path, 1).unwrap();
+            assert_eq!(store.allocation_watermark(1).unwrap(), 0);
+            let first = store.claim(request(2, 3), 1).unwrap();
+            assert_eq!(first.node_id, 2);
+            assert_eq!(store.allocation_watermark(1).unwrap(), 1);
+            assert_eq!(store.allocation_watermark(2).unwrap(), 0);
+        }
+        {
+            // A higher external fence is persisted; the old watermark remains and the
+            // next allocation advances it rather than reusing a rolled-back value.
+            let mut store = open_two(&path, 2).unwrap();
+            assert_eq!(store.allocation_watermark(1).unwrap(), 1);
+            let second = store.claim(request_with([2; 16], 4, 4), 2).unwrap();
+            assert_eq!(second.node_id, 3);
+            assert_eq!(store.allocation_watermark(1).unwrap(), 2);
+            assert!(matches!(
+                store.allocation_watermark(0),
+                Err(EnrollmentError::InvalidSlot)
+            ));
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persistent_lock_file_does_not_wedge_recovery() {
+        let path = temp_path();
+        {
+            let mut store = setup(&path);
+            store.claim(request(2, 3), 1).unwrap();
+            // Dropping normally releases the OS advisory lock. The lock file deliberately
+            // remains on disk and must be reusable, not treated as a crash sentinel.
+        }
+        assert!(fs::metadata(suffix_path(&path, ".writer-lock")).is_ok());
+        let store = setup(&path);
+        assert_eq!(store.allocation_watermark(1).unwrap(), 1);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "openssl-backend")]
+    fn csr_from_key(key: &openssl::pkey::PKey<openssl::pkey::Private>) -> Vec<u8> {
+        use openssl::hash::MessageDigest;
+        use openssl::x509::{X509NameBuilder, X509ReqBuilder};
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "boreas-enrollment-test")
+            .unwrap();
+        let name = name.build();
+        let mut builder = X509ReqBuilder::new().unwrap();
+        builder.set_version(0).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_pubkey(key).unwrap();
+        builder.sign(key, MessageDigest::null()).unwrap();
+        builder.build().to_der().unwrap()
+    }
+    #[cfg(feature = "openssl-backend")]
+    fn ml_dsa_key(seed: u8) -> openssl::pkey::PKey<openssl::pkey::Private> {
+        openssl::pkey::PKey::private_key_from_seed(
+            None,
+            openssl::pkey::KeyType::ML_DSA_65,
+            None,
+            &[seed; 32],
+        )
+        .unwrap()
+    }
+    #[cfg(feature = "openssl-backend")]
+    #[test]
+    fn real_csr_admission_and_identity_signing_vertical_path() {
+        use crate::management::{
+            IdentityAuthority, ManagementTrust, verify_signed_identity,
+        };
+        let path = temp_path();
+        let csr_key = ml_dsa_key(11);
+        let csr = csr_from_key(&csr_key);
+        let expected_identity_public = csr_key.raw_public_key().unwrap();
+        let ed_key = openssl::pkey::PKey::generate_ed25519().unwrap();
+        let authority_key = ml_dsa_key(12);
+        let authority = IdentityAuthority::from_pkcs8_der(
+            [0x42; 16],
+            vec![1],
+            1,
+            &ed_key.private_key_to_pkcs8().unwrap(),
+            &authority_key.private_key_to_pkcs8().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            IdentityAuthority::from_pkcs8_der(
+                [0x42; 16],
+                vec![2],
+                1,
+                &ed_key.private_key_to_pkcs8().unwrap(),
+                &ed_key.private_key_to_pkcs8().unwrap(),
+            ),
+            Err(crate::management::Error::InvalidIssuerKey)
+        ));
+        let mut store = setup(&path);
+        let request = store
+            .verify_csr_request([1; 16], [9; 16], &[7; 32], &csr, 1)
+            .unwrap();
+        let issued = store
+            .claim_and_issue(
+                request,
+                1,
+                &authority,
+                IdentityValidity {
+                    not_before_us: 0,
+                    expires_us: 10_000_000,
+                    scope: vec![1, 2, 3],
+                },
+            )
+            .unwrap();
+        assert_eq!(issued.phase, EnrollmentPhase::Issued);
+        assert_eq!(issued.node_id, 2);
+        let signed = issued.signed_identity.clone().unwrap();
+        let mut trust = ManagementTrust::new([0x42; 16]);
+        trust
+            .add_issuer(
+                authority
+                    .issuer_record(
+                        crate::management::IssuerScope::for_identity(
+                            vec![crate::NodeRole::Edge],
+                            vec![1],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let verified = verify_signed_identity(&mut trust, &signed, 1).unwrap();
+        assert!(!verified.is_duplicate());
+        assert_eq!(verified.object().seq, 1);
+        match &verified.object().body {
+            boreas_proto::objects::ObjectBody::NodeIdentity(body) => {
+                assert_eq!(body.node_id, 2);
+                assert_eq!(body.vip, [10, 20, 1, 2]);
+                assert_eq!(body.identity_generation, 1);
+                assert_eq!(
+                    body.identity_pub_mldsa.as_slice(),
+                    expected_identity_public.as_slice()
+                );
+                assert_eq!(body.scope.as_slice(), &[1, 2, 3]);
+            }
+            _ => panic!("expected a NodeIdentity object"),
+        }
+        // Retry after restart must return the exact persisted signed result and the same slot.
+        drop(store);
+        let mut store = setup(&path);
+        let retry = store
+            .verify_csr_request([1; 16], [9; 16], &[7; 32], &csr, 2)
+            .unwrap();
+        let retried = store
+            .claim_and_issue(
+                retry,
+                2,
+                &authority,
+                IdentityValidity {
+                    not_before_us: 0,
+                    expires_us: 10_000_000,
+                    scope: vec![1, 2, 3],
+                },
+            )
+            .unwrap();
+        assert_eq!(retried.phase, EnrollmentPhase::Issued);
+        assert_eq!(retried.signed_identity.as_deref(), Some(signed.as_slice()));
+        // A tampered CSR must fail the actual PKCS#10 proof/parsing on a fresh store,
+        // not merely hit the already-bound cheap rejection path.
+        let tamper_path = temp_path();
+        let tamper_store = setup(&tamper_path);
+        let mut tampered = csr.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(tamper_store
+            .verify_csr_request([1; 16], [9; 16], &[7; 32], &tampered, 1)
+            .is_err());
+        cleanup(&tamper_path);
+        // A valid CSR for the wrong algorithm is rejected, not silently downgraded.
+        let ed_path = temp_path();
+        let ed_store = setup(&ed_path);
+        let ed_csr_key = openssl::pkey::PKey::generate_ed25519().unwrap();
+        let ed_csr = csr_from_key(&ed_csr_key);
+        assert!(matches!(
+            ed_store.verify_csr_request([1; 16], [9; 16], &[7; 32], &ed_csr, 1),
+            Err(EnrollmentError::UnsupportedCsrKey)
+        ));
+        cleanup(&ed_path);
+        drop(store);
         cleanup(&path);
     }
 }
