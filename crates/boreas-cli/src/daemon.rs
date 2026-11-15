@@ -819,9 +819,8 @@ mod linux_daemon {
             }
             return Err("daemon: socket/TUN poll failed".to_string());
         }
-        let ready = |pfd: &libc::pollfd| {
-            pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-        };
+        let ready =
+            |pfd: &libc::pollfd| pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
         Ok((ready(&fds[0]), count == 2 && ready(&fds[1])))
     }
 
