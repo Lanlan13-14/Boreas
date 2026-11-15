@@ -1,0 +1,481 @@
+//! In-tree adapter from the reviewed `boreas-crypto` OpenSSL pq768 backend to
+//! the hop and E2E transport seams.
+//!
+//! Enabled by the `openssl-inner-tls` feature. The adapter deliberately cannot
+//! invent peer identity: the certificate is read from the backend **after**
+//! chain verification, and a [`PeerIdentityExtractor`] supplied by the PKI layer
+//! must map the verified leaf to `net_id` / node id / generation / role. If the
+//! extractor returns `None`, the handshake is rejected.
+//!
+//! This module is compiled only with the feature and needs OpenSSL 3.6+ with
+//! ML-DSA support (the same build the `rust-tls.yml` workflow produces). It is
+//! not exerciseable by the default workspace CI job; the OpenSSL CI job must run
+//! `cargo test -p boreas-tunnel --features openssl-inner-tls` before any claim
+//! about real inner TLS behaviour.
+
+use std::net::TcpStream;
+use std::path::Path;
+use std::sync::Arc;
+
+use boreas_crypto::NodeRole;
+use boreas_crypto::backend::{OpenSslAcceptor, OpenSslConnector};
+use boreas_pki::management::VerifiedObject;
+use boreas_proto::objects::{MldsaParameterSet, NodeRole as ObjectRole, ObjectBody};
+use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use openssl::x509::X509;
+
+use crate::e2e::{CircuitStream, E2eEstablished, E2eTlsBackend};
+use crate::error::TunnelError;
+use crate::stream::Duplex;
+use crate::tls::{
+    EstablishedInner, InnerTlsAcceptor, InnerTlsConnector, InnerTlsSession, OuterTlsAcceptor,
+    OuterTlsConnector, PeerIdentity, PeerIdentityExtractor,
+};
+
+fn peer_identity(
+    extractor: &Arc<dyn PeerIdentityExtractor>,
+    certificate_der: &[u8],
+) -> Result<crate::tls::PeerIdentity, TunnelError> {
+    extractor
+        .extract(certificate_der)
+        .ok_or(TunnelError::InnerTls("peer identity mapping"))
+}
+
+/// Client side of the hop inner TLS handshake.
+pub struct OpenSslInnerConnector {
+    connector: OpenSslConnector,
+    extractor: Arc<dyn PeerIdentityExtractor>,
+}
+
+impl OpenSslInnerConnector {
+    pub fn new(connector: OpenSslConnector, extractor: Arc<dyn PeerIdentityExtractor>) -> Self {
+        Self {
+            connector,
+            extractor,
+        }
+    }
+
+    fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
+        let established = self
+            .connector
+            .connect(transport)
+            .map_err(|_| TunnelError::InnerTls("handshake"))?;
+        let negotiated = established.negotiated();
+        let certificate = established
+            .peer_certificate()
+            .to_der()
+            .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
+        let peer = peer_identity(&self.extractor, &certificate)?;
+        Ok(EstablishedInner::new(
+            Box::new(established),
+            InnerTlsSession::from_verified_certificate(peer, negotiated),
+        ))
+    }
+}
+
+impl InnerTlsConnector for OpenSslInnerConnector {
+    fn connect(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
+        self.establish(transport)
+    }
+}
+
+/// Server side of the hop inner TLS handshake.
+pub struct OpenSslInnerAcceptor {
+    acceptor: OpenSslAcceptor,
+    extractor: Arc<dyn PeerIdentityExtractor>,
+}
+
+impl OpenSslInnerAcceptor {
+    pub fn new(acceptor: OpenSslAcceptor, extractor: Arc<dyn PeerIdentityExtractor>) -> Self {
+        Self {
+            acceptor,
+            extractor,
+        }
+    }
+
+    fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
+        let established = self
+            .acceptor
+            .accept(transport)
+            .map_err(|_| TunnelError::InnerTls("handshake"))?;
+        let negotiated = established.negotiated();
+        let certificate = established
+            .peer_certificate()
+            .to_der()
+            .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
+        let peer = peer_identity(&self.extractor, &certificate)?;
+        Ok(EstablishedInner::new(
+            Box::new(established),
+            InnerTlsSession::from_verified_certificate(peer, negotiated),
+        ))
+    }
+}
+
+impl InnerTlsAcceptor for OpenSslInnerAcceptor {
+    fn accept(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
+        self.establish(transport)
+    }
+}
+
+/// E2E TLS over a circuit byte stream, in both roles.
+///
+/// The role is chosen by the caller from node identities
+/// ([`crate::e2e::e2e_tls_role`]); this adapter only runs the handshake.
+pub struct OpenSslE2eBackend {
+    connector: Arc<OpenSslConnector>,
+    acceptor: Arc<OpenSslAcceptor>,
+    extractor: Arc<dyn PeerIdentityExtractor>,
+}
+
+impl OpenSslE2eBackend {
+    pub fn new(
+        connector: Arc<OpenSslConnector>,
+        acceptor: Arc<OpenSslAcceptor>,
+        extractor: Arc<dyn PeerIdentityExtractor>,
+    ) -> Self {
+        Self {
+            connector,
+            acceptor,
+            extractor,
+        }
+    }
+}
+
+impl E2eTlsBackend for OpenSslE2eBackend {
+    fn connect<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError> {
+        let established = self
+            .connector
+            .connect(transport)
+            .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
+        let negotiated = established.negotiated();
+        let certificate = established
+            .peer_certificate()
+            .to_der()
+            .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
+        let peer = peer_identity(&self.extractor, &certificate)?;
+        Ok(E2eEstablished::new(
+            Box::new(established),
+            InnerTlsSession::from_verified_certificate(peer, negotiated),
+        ))
+    }
+
+    fn accept<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError> {
+        let established = self
+            .acceptor
+            .accept(transport)
+            .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
+        let negotiated = established.negotiated();
+        let certificate = established
+            .peer_certificate()
+            .to_der()
+            .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
+        let peer = peer_identity(&self.extractor, &certificate)?;
+        Ok(E2eEstablished::new(
+            Box::new(established),
+            InnerTlsSession::from_verified_certificate(peer, negotiated),
+        ))
+    }
+}
+
+// --- PKI identity extraction -------------------------------------------------
+
+/// A node identity derived from a `NodeIdentity` management object that
+/// `boreas-pki`'s `ManagementTrust` already verified.
+///
+/// There is deliberately no unchecked constructor: [`Self::from_verified_object`]
+/// accepts only a [`VerifiedObject`], rejects any other object body, and derives
+/// the expected SubjectPublicKeyInfo from the object's ML-DSA public key. An
+/// arbitrary `key + role` pair cannot be labelled "verified" through this API.
+///
+/// `not_before` / `expires` are exposed for the caller: validity, generation and
+/// revocation must be re-checked with a trusted clock for each business action
+/// and recovery, not only once at handshake time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedNodeIdentity {
+    net_id: [u8; 16],
+    node_id: u16,
+    identity_generation: u64,
+    role: NodeRole,
+    not_before: u64,
+    expires: u64,
+    public_key_spki: Vec<u8>,
+}
+
+impl VerifiedNodeIdentity {
+    pub fn from_verified_object(object: &VerifiedObject) -> Result<Self, TunnelError> {
+        let management = object.object();
+        let ObjectBody::NodeIdentity(body) = &management.body else {
+            return Err(TunnelError::Unsupported("not a NodeIdentity object"));
+        };
+        if management.net_id != body.net_id || body.net_id == [0u8; 16] {
+            return Err(TunnelError::Unsupported("identity network mismatch"));
+        }
+        if body.node_id == 0 || body.identity_generation == 0 {
+            return Err(TunnelError::Unsupported("invalid identity fields"));
+        }
+        if body.identity_pub_mldsa.is_empty() {
+            return Err(TunnelError::Unsupported("missing identity key"));
+        }
+        let oid = match body.mldsa_parameter_set {
+            MldsaParameterSet::Mldsa65 => ML_DSA_65_OID,
+            MldsaParameterSet::Mldsa87 => ML_DSA_87_OID,
+        };
+        Ok(Self {
+            net_id: body.net_id,
+            node_id: body.node_id,
+            identity_generation: body.identity_generation,
+            role: map_object_role(body.role),
+            not_before: body.not_before,
+            expires: body.expires,
+            public_key_spki: ml_dsa_spki(oid, &body.identity_pub_mldsa),
+        })
+    }
+
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+
+    pub fn node_id(&self) -> u16 {
+        self.node_id
+    }
+
+    pub fn identity_generation(&self) -> u64 {
+        self.identity_generation
+    }
+
+    pub fn role(&self) -> NodeRole {
+        self.role
+    }
+
+    pub fn not_before(&self) -> u64 {
+        self.not_before
+    }
+
+    pub fn expires(&self) -> u64 {
+        self.expires
+    }
+}
+
+/// RFC 9881 id-ml-dsa-65 OID content (2.16.840.1.101.3.4.3.18).
+const ML_DSA_65_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
+/// RFC 9881 id-ml-dsa-87 OID content (2.16.840.1.101.3.4.3.19).
+const ML_DSA_87_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13];
+
+fn map_object_role(role: ObjectRole) -> NodeRole {
+    match role {
+        ObjectRole::Edge => NodeRole::Edge,
+        ObjectRole::Core => NodeRole::Core,
+        ObjectRole::EnrollmentService => NodeRole::EnrollmentService,
+    }
+}
+
+fn der_length(len: usize) -> Vec<u8> {
+    if len < 128 {
+        return vec![len as u8];
+    }
+    let bytes = len.to_be_bytes();
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let significant = &bytes[first..];
+    let mut out = Vec::with_capacity(1 + significant.len());
+    out.push(0x80 | (significant.len() as u8));
+    out.extend_from_slice(significant);
+    out
+}
+
+/// Build the DER SubjectPublicKeyInfo for a raw ML-DSA public key.
+///
+/// SPKI = SEQUENCE { AlgorithmIdentifier { OID }, BIT STRING { 0x00 || key } }.
+/// The certificate must carry exactly this key; comparing the whole SPKI binds
+/// the certificate to the management object's identity key.
+fn ml_dsa_spki(oid: &[u8], raw_key: &[u8]) -> Vec<u8> {
+    let mut algorithm = Vec::with_capacity(oid.len() + 2);
+    algorithm.push(0x30);
+    algorithm.extend(der_length(oid.len() + 2));
+    algorithm.push(0x06);
+    algorithm.extend(der_length(oid.len()));
+    algorithm.extend_from_slice(oid);
+
+    let mut key = Vec::with_capacity(raw_key.len() + 2);
+    key.push(0x03);
+    key.extend(der_length(raw_key.len() + 1));
+    key.push(0x00);
+    key.extend_from_slice(raw_key);
+
+    let mut spki = Vec::with_capacity(algorithm.len() + key.len() + 2);
+    spki.push(0x30);
+    spki.extend(der_length(algorithm.len() + key.len()));
+    spki.extend(algorithm);
+    spki.extend(key);
+    spki
+}
+
+/// Extracts peer identity by exact SubjectPublicKeyInfo binding against a trust
+/// store of already-validated [`VerifiedNodeIdentity`] values.
+///
+/// The TLS backend has verified the certificate chain to the Boreas identity CA
+/// before this runs. This extractor does not trust a fingerprint: it decodes
+/// the leaf, compares its SPKI byte-for-byte with the identity key recorded in
+/// the management object, and returns the corresponding claims. Zero or more
+/// than one match is rejected. Certificate parsing must not panic on hostile
+/// DER; failures return `None`.
+pub struct PkiIdentityExtractor {
+    trusted: Vec<VerifiedNodeIdentity>,
+}
+
+impl PkiIdentityExtractor {
+    pub fn new(trusted: Vec<VerifiedNodeIdentity>) -> Result<Self, TunnelError> {
+        if trusted.is_empty() {
+            return Err(TunnelError::Unsupported("empty trust store"));
+        }
+        for (index, identity) in trusted.iter().enumerate() {
+            if identity.public_key_spki.is_empty()
+                || identity.net_id == [0u8; 16]
+                || identity.node_id == 0
+                || identity.identity_generation == 0
+            {
+                return Err(TunnelError::Unsupported("invalid trusted identity"));
+            }
+            for other in &trusted[index + 1..] {
+                if other.public_key_spki == identity.public_key_spki {
+                    return Err(TunnelError::Unsupported("duplicate identity key"));
+                }
+            }
+        }
+        Ok(Self { trusted })
+    }
+}
+
+impl PeerIdentityExtractor for PkiIdentityExtractor {
+    fn extract(&self, certificate_der: &[u8]) -> Option<PeerIdentity> {
+        let certificate = X509::from_der(certificate_der).ok()?;
+        let spki = certificate.public_key().ok()?.public_key_to_der().ok()?;
+        let mut matched = None;
+        for identity in &self.trusted {
+            if identity.public_key_spki == spki {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(identity);
+            }
+        }
+        let identity = matched?;
+        Some(PeerIdentity {
+            net_id: identity.net_id,
+            node_id: identity.node_id,
+            identity_generation: identity.identity_generation,
+            role: identity.role,
+        })
+    }
+}
+
+// --- outer HTTPS/WSS TLS -----------------------------------------------------
+
+/// Outer TLS client using the platform web-PKI trust store.
+///
+/// Requires TLS 1.3 (both floor and ceiling) and verifies the chain and server
+/// name. It never offers the Boreas identity CA and never disables verification.
+pub struct OpenSslOuterTlsConnector {
+    connector: SslConnector,
+}
+
+impl OpenSslOuterTlsConnector {
+    pub fn web_pki() -> Result<Self, TunnelError> {
+        let mut builder = SslConnector::builder(SslMethod::tls_client())
+            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder.set_verify(SslVerifyMode::PEER);
+        builder
+            .set_default_verify_paths()
+            .map_err(|_| TunnelError::InnerTls("web pki roots"))?;
+        Ok(Self {
+            connector: builder.build(),
+        })
+    }
+
+    /// Test/private-CA constructor: trusts exactly the supplied PEM roots.
+    pub fn with_root_certificates(root_pem: &[u8]) -> Result<Self, TunnelError> {
+        let mut builder = SslConnector::builder(SslMethod::tls_client())
+            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder.set_verify(SslVerifyMode::PEER);
+        let roots = X509::stack_from_pem(root_pem)
+            .map_err(|_| TunnelError::InnerTls("root certificate"))?;
+        for root in roots {
+            builder
+                .cert_store_mut()
+                .add_cert(root)
+                .map_err(|_| TunnelError::InnerTls("trust root"))?;
+        }
+        Ok(Self {
+            connector: builder.build(),
+        })
+    }
+}
+
+impl OuterTlsConnector for OpenSslOuterTlsConnector {
+    fn connect(&self, tcp: TcpStream, server_name: &str) -> Result<Box<dyn Duplex>, TunnelError> {
+        let stream = self
+            .connector
+            .connect(server_name, tcp)
+            .map_err(|_| TunnelError::InnerTls("outer handshake"))?;
+        Ok(Box::new(stream))
+    }
+}
+
+/// Outer TLS server for the origin leg. Presents the configured certificate and
+/// requires TLS 1.3. Peer (CDN/origin) authentication is a separate concern and
+/// is **not** provided by this channel alone.
+pub struct OpenSslOuterTlsAcceptor {
+    acceptor: SslAcceptor,
+}
+
+impl OpenSslOuterTlsAcceptor {
+    pub fn from_pem_files(
+        certificate_chain: impl AsRef<Path>,
+        private_key: impl AsRef<Path>,
+    ) -> Result<Self, TunnelError> {
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_certificate_chain_file(certificate_chain)
+            .map_err(|_| TunnelError::InnerTls("outer certificate"))?;
+        builder
+            .set_private_key_file(private_key, SslFiletype::PEM)
+            .map_err(|_| TunnelError::InnerTls("outer private key"))?;
+        builder
+            .check_private_key()
+            .map_err(|_| TunnelError::InnerTls("outer key mismatch"))?;
+        Ok(Self {
+            acceptor: builder.build(),
+        })
+    }
+}
+
+impl OuterTlsAcceptor for OpenSslOuterTlsAcceptor {
+    fn accept(&self, tcp: TcpStream) -> Result<Box<dyn Duplex>, TunnelError> {
+        let stream = self
+            .acceptor
+            .accept(tcp)
+            .map_err(|_| TunnelError::InnerTls("outer accept"))?;
+        Ok(Box::new(stream))
+    }
+}

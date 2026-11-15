@@ -1,7 +1,19 @@
 //! RelayCircuit lifecycle and bounded pre-establishment queues only. This is
 //! NOT TLS, key agreement, authentication, or an E2E-active token. Callers must
 //! hold a genuine verified TLS session token before passing application traffic.
+//!
+//! Two distinct capabilities gate this module:
+//!
+//! * [`HopSessionToken`] proves a segment arrived on an already-authorized hop
+//!   session. A blind relay uses it: it never holds E2E secrets.
+//! * [`VerifiedE2eSession`] proves a completed, policy-checked **E2E** TLS
+//!   handshake. Only an endpoint may create it, through
+//!   [`VerifiedE2eSession::from_verified_e2e_tls`], and it gates plaintext
+//!   injection for pre-open queues.
+use crate::error::{SessionReject, TunnelError};
 use crate::resource::{Admission, AdmissionError, ByteCredit};
+use crate::tls::{InnerTlsSession, PeerIdentity, check_inner_tls};
+use boreas_proto::messages::Suite as MessageSuite;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -54,6 +66,8 @@ pub enum RelayError {
     WrongDestination,
     WrongSourceGeneration,
     WrongDestinationGeneration,
+    /// The segment did not arrive from the hop peer that opened the circuit.
+    WrongHop,
     NotEstablished,
     Expired,
     Admission(AdmissionError),
@@ -97,10 +111,63 @@ struct Queued {
 pub struct VerifiedE2eSession {
     _private: (),
 }
+impl VerifiedE2eSession {
+    /// The only production constructor.
+    ///
+    /// It accepts facts reported by a **completed E2E inner-TLS handshake** and
+    /// re-runs the strict policy gate plus an exact peer-identity comparison.
+    /// Network-supplied identifiers, booleans and configuration flags never
+    /// reach this constructor, so a relay cannot mint an E2E token and an
+    /// endpoint cannot mint one before the E2E TLS session exists.
+    pub fn from_verified_e2e_tls(
+        session: &InnerTlsSession,
+        expected_peer: PeerIdentity,
+        suite: MessageSuite,
+        allow_pq1024: bool,
+    ) -> Result<Self, TunnelError> {
+        check_inner_tls(session, suite, allow_pq1024)?;
+        if session.peer() != expected_peer {
+            return Err(SessionReject::PeerIdentityMismatch.into());
+        }
+        Ok(Self { _private: () })
+    }
+}
 #[cfg(test)]
 impl VerifiedE2eSession {
     fn test_only() -> Self {
         Self { _private: () }
+    }
+}
+
+/// Proof that a segment was read from an already-authorized hop session.
+///
+/// This is what a blind relay can hold: the relay authenticated its upstream
+/// peer's hop TLS session, but it does not have (and must not have) the E2E TLS
+/// session that protects the payload. It is deliberately weaker than
+/// [`VerifiedE2eSession`].
+pub struct HopSessionToken {
+    peer: NodeRef,
+    _private: (),
+}
+impl HopSessionToken {
+    /// Created by the runtime from an authorized hop session. The peer values
+    /// come from the verified certificate identity, not from the wire.
+    pub(crate) fn from_established_session(session: &crate::session::EstablishedSession) -> Self {
+        let peer = session.peer();
+        Self {
+            peer: NodeRef {
+                node_id: peer.node_id,
+                identity_generation: peer.identity_generation,
+            },
+            _private: (),
+        }
+    }
+    #[cfg(test)]
+    fn test_only(peer: NodeRef) -> Self {
+        Self { peer, _private: () }
+    }
+    pub fn peer(&self) -> NodeRef {
+        self.peer
     }
 }
 
@@ -346,10 +413,15 @@ impl RelayTable {
 
     /// Any binding, generation, direction, expiry, or offset error locks the
     /// circuit in Reset so a later frame cannot continue the corrupted stream.
+    ///
+    /// The `hop` token binds the segment to the authenticated upstream peer:
+    /// a relay accepts only frames that arrived on the session which opened
+    /// the circuit. It carries no E2E state, because a blind relay must not
+    /// hold any.
     pub fn accept_segment(
         &mut self,
         id: CircuitId,
-        _session: &VerifiedE2eSession,
+        hop: &HopSessionToken,
         segment: Segment<'_>,
     ) -> Result<u64, RelayError> {
         let Segment {
@@ -375,7 +447,9 @@ impl RelayTable {
             Direction::SourceToDestination => (c.src, c.dst, 0),
             Direction::DestinationToSource => (c.dst, c.src, 1),
         };
-        let error = if claimed_source.node_id != src.node_id {
+        let error = if hop.peer != src {
+            Some(RelayError::WrongHop)
+        } else if claimed_source.node_id != src.node_id {
             Some(RelayError::InvalidDirection)
         } else if claimed_source.identity_generation != src.identity_generation {
             Some(RelayError::WrongSourceGeneration)
@@ -577,11 +651,11 @@ mod tests {
         let now = Instant::now();
         t.open(id(1), node(1, 2), node(2, 3), 8, now).unwrap();
         t.mark_established(id(1), now).unwrap();
-        let session = test_session();
+        let hop = HopSessionToken::test_only(node(1, 2));
         assert_eq!(
             t.accept_segment(
                 id(1),
-                &session,
+                &hop,
                 Segment {
                     direction: Direction::SourceToDestination,
                     offset: 0,
@@ -596,7 +670,7 @@ mod tests {
         assert_eq!(
             t.accept_segment(
                 id(1),
-                &session,
+                &hop,
                 Segment {
                     direction: Direction::SourceToDestination,
                     offset: 0,
@@ -621,6 +695,72 @@ mod tests {
         assert_eq!(t.decrement_hop(id(1)).unwrap(), 7);
         assert_eq!(t.reap_expired(now + PREOPEN_TTL), vec![id(1)]);
     }
+    #[test]
+    fn foreign_hop_cannot_feed_a_circuit() {
+        let mut t = table();
+        let now = Instant::now();
+        t.open(id(1), node(1, 1), node(2, 1), 8, now).unwrap();
+        t.mark_established(id(1), now).unwrap();
+        let foreign = HopSessionToken::test_only(node(9, 1));
+        assert_eq!(
+            t.accept_segment(
+                id(1),
+                &foreign,
+                Segment {
+                    direction: Direction::SourceToDestination,
+                    offset: 0,
+                    source: node(1, 1),
+                    destination: node(2, 1),
+                    bytes: b"x",
+                    now
+                },
+            ),
+            Err(RelayError::WrongHop)
+        );
+    }
+
+    #[test]
+    fn e2e_token_requires_strict_tls_and_exact_peer() {
+        use crate::tls::{InnerTlsSession, PeerIdentity, strict_test_negotiated};
+        use boreas_crypto::NodeRole;
+        use boreas_proto::messages::Suite as MessageSuite;
+
+        let peer = PeerIdentity {
+            net_id: [7; 16],
+            node_id: 2,
+            identity_generation: 1,
+            role: NodeRole::Core,
+        };
+        let strict = InnerTlsSession::test_only(peer, strict_test_negotiated());
+        assert!(
+            VerifiedE2eSession::from_verified_e2e_tls(&strict, peer, MessageSuite::Pq768, false)
+                .is_ok()
+        );
+
+        let mut wrong_peer = peer;
+        wrong_peer.identity_generation = 2;
+        assert_eq!(
+            VerifiedE2eSession::from_verified_e2e_tls(
+                &strict,
+                wrong_peer,
+                MessageSuite::Pq768,
+                false
+            )
+            .err(),
+            Some(TunnelError::Session(SessionReject::PeerIdentityMismatch))
+        );
+
+        let mut downgraded = strict_test_negotiated();
+        downgraded.group = boreas_crypto::HybridGroup::ClassicalOnly;
+        let classical = InnerTlsSession::test_only(peer, downgraded);
+        assert!(matches!(
+            VerifiedE2eSession::from_verified_e2e_tls(&classical, peer, MessageSuite::Pq768, false),
+            Err(TunnelError::Policy(
+                boreas_crypto::PolicyError::HybridGroupRequired
+            ))
+        ));
+    }
+
     #[test]
     fn returned_payload_holds_global_credit_until_payload_drop() {
         let mut t = table();

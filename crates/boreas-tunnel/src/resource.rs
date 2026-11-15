@@ -117,6 +117,18 @@ pub struct AuthenticatedPeer {
     _private: (),
 }
 impl AuthenticatedPeer {
+    /// Production construction point for the transport runtime.
+    ///
+    /// The input is a certificate-derived [`crate::tls::PeerIdentity`] reported
+    /// by the TLS adapter, never a peer-supplied id, a claimed `node_id`, or a
+    /// boolean. The `PeerId` itself stays crate-internal.
+    pub(crate) fn from_verified_identity(identity: crate::tls::PeerIdentity) -> Self {
+        Self {
+            id: PeerId(identity.node_id),
+            _private: (),
+        }
+    }
+
     #[cfg(test)]
     fn test_only(id: PeerId) -> Self {
         Self { id, _private: () }

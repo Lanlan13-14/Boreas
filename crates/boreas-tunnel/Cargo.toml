@@ -3,8 +3,24 @@ name = "boreas-tunnel"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-rust-version = "1.97"
-description = "Pure routing policy and deterministic route arbitration primitives"
+rust-version = "1.100"
+description = "Boreas hop-transport runtime (WSS h1 baseline, inner-TLS seam, session authorization, E2E circuit seam) plus pure routing-policy primitives"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+# Links the reviewed OpenSSL pq768 inner-TLS backend from `boreas-crypto`, plus
+# the in-tree outer HTTPS(WSS) adapter and the `boreas-pki` verified-object
+# identity extractor. The default build stays backend-free and therefore cannot
+# negotiate or bind any TLS session.
+openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki"]
+
+[dependencies]
+boreas-crypto = { path = "../boreas-crypto" }
+boreas-pki = { path = "../boreas-pki", optional = true }
+boreas-proto = { path = "../boreas-proto" }
+# Same reviewed release as `boreas-crypto`'s backend; used by the outer TLS
+# adapter and the certificate SPKI binding.
+openssl = { version = "=0.10.82", optional = true }

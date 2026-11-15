@@ -1,14 +1,68 @@
-//! Pure routing-policy primitives for Boreas.
+//! Boreas hop-transport runtime and pure routing-policy primitives.
 //!
-//! This crate does not authenticate signatures, certificates, revocations, leases,
-//! or object IDs. Callers MUST supply inputs already validated by the appropriate
-//! trust layer. Nothing here implements a production packet data plane or TLS;
-//! it does not relax the Phase 0 TLS requirements.
+//! # Layers
+//!
+//! * Pure policy primitives ([`directory`], [`relay`], [`resource`],
+//!   [`scheduler`], prefix classification): no I/O, no cryptography. Callers
+//!   must supply inputs already validated by the appropriate trust layer.
+//! * Blocking hop-transport runtime ([`ws`], [`tls`], [`session`], [`e2e`],
+//!   [`runtime`]): an RFC 6455 HTTP/1.1 WebSocket baseline whose binary payloads
+//!   are concatenated into the hop inner-TLS byte stream, the
+//!   `SessionHello`/`SessionAccept` authorization exchange, bounded
+//!   `AppHeader` framing, and E2E circuits carried over the same hop sessions.
+//!
+//! # Deliberate limits (not production acceptance)
+//!
+//! * This crate contains **no TLS implementation**. [`tls::OuterTlsConnector`]
+//!   / [`tls::OuterTlsAcceptor`] carry the public HTTPS/WSS leg (web PKI);
+//!   [`tls::InnerTlsConnector`] / [`tls::InnerTlsAcceptor`] carry the strict
+//!   pq768 hop session. The default build has no backend and therefore cannot
+//!   establish either. The `openssl-inner-tls` feature links the reviewed
+//!   OpenSSL adapters, including [`tls::PeerIdentityExtractor`]'s in-tree
+//!   certificate-SPKI binding.
+//! * The runtime is blocking, thread-per-connection, HTTP/1.1 WebSocket only.
+//!   HTTP/2 Extended CONNECT ([RFC 8441]), CDN behaviour, async scheduling, h2
+//!   flow control and the full Phase 1 data plane are not implemented here.
+//! * WebSocket message and TLS record boundaries are independent; control
+//!   frames (`Ping`/`Pong`/`Close`) never enter the inner TLS byte stream.
+//! * `/dev/urandom` (Unix) or `BCryptGenRandom` (Windows) supplies masking keys
+//!   and identifiers; entropy failure aborts the connection.
+//! * [`runtime_capabilities`] reports what this build can actually do. It is
+//!   not a substitute for the Phase 0–5 gates, and no gate is claimed complete.
 
+pub mod csprng;
 pub mod directory;
+pub mod e2e;
+pub mod error;
 pub mod relay;
 pub mod resource;
+pub mod runtime;
 pub mod scheduler;
+pub mod session;
+pub mod sha1;
+pub mod stream;
+pub mod tls;
+pub mod ws;
+
+#[cfg(feature = "openssl-inner-tls")]
+pub mod openssl_inner_tls;
+
+pub use error::{CircuitReject, SessionReject, TunnelError};
+#[cfg(feature = "openssl-inner-tls")]
+pub use openssl_inner_tls::{
+    OpenSslE2eBackend, OpenSslInnerAcceptor, OpenSslInnerConnector, OpenSslOuterTlsAcceptor,
+    OpenSslOuterTlsConnector, PkiIdentityExtractor, VerifiedNodeIdentity,
+};
+pub use runtime::{
+    AcceptedSession, ClientTarget, LinkClient, LinkServer, RuntimeCapabilities,
+    runtime_capabilities,
+};
+pub use session::{EstablishedSession, SessionPolicy};
+pub use stream::Duplex;
+pub use tls::{
+    EstablishedInner, InnerTlsAcceptor, InnerTlsConnector, InnerTlsSession, OuterTlsAcceptor,
+    OuterTlsConnector, PeerIdentity, PeerIdentityExtractor,
+};
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
