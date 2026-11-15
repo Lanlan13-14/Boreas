@@ -41,6 +41,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::time::Instant;
 
+use boreas_crypto::NodeRole;
 use boreas_proto::messages::{
     self, CircuitAccept as ProtoCircuitAccept, CircuitClose as ProtoCircuitClose,
     CircuitOpen as ProtoCircuitOpen, CircuitReset as ProtoCircuitReset, RelayFragment,
@@ -68,6 +69,7 @@ pub const CIRCUIT_ACCEPT_BODY_LEN: usize = 1 + CIRCUIT_ID_LEN + 1;
 pub const CIRCUIT_ID_BODY_LEN: usize = 1 + CIRCUIT_ID_LEN;
 /// Largest payload one fragment can carry.
 pub const MAX_FRAGMENT_PAYLOAD: usize = messages::MAX_RELAY_PAYLOAD;
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CircuitRole {
@@ -346,12 +348,25 @@ impl<'a> CircuitStream<'a> {
             return;
         };
         let _ = self.session.send_control(ControlType::CircuitReset, &body);
+        self.closed = true;
     }
 
     /// Close the circuit and give the hop session borrow back.
     pub fn finish(mut self) -> Result<(), TunnelError> {
         let body = encode_close(self.circuit_id)?;
-        self.session.send_control(ControlType::CircuitClose, &body)
+        let result = self.session.send_control(ControlType::CircuitClose, &body);
+        self.closed = true;
+        result
+    }
+}
+
+impl Drop for CircuitStream<'_> {
+    fn drop(&mut self) {
+        // A TLS/backend/confirmation error destroys the underlying byte stream.
+        // Tear down the circuit as well; never reinterpret this as hop-only.
+        if !self.closed {
+            self.reset_best_effort();
+        }
     }
 }
 
@@ -503,6 +518,171 @@ pub struct E2eCircuit<'a> {
     info: E2eInfo,
 }
 
+/// Candidate confirmation body inside E2E TLS. Not a cryptographic handshake.
+/// Field order/version is documented in docs/protocol/e2e-confirmation-candidate-v1.md.
+const E2E_CONFIRM_MAGIC: [u8; 4] = *b"BE2E";
+const E2E_CONFIRM_VERSION: u8 = 1;
+const E2E_CONFIRM_OFFER: u8 = 1;
+const E2E_CONFIRM_ACK: u8 = 2;
+const E2E_CONFIRM_BODY_LEN: usize = 73;
+const E2E_CONFIRM_CAPABILITIES: u64 = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct E2eConfirmation {
+    net_id: [u8; 16],
+    initiator_node_id: u16,
+    initiator_generation: u64,
+    initiator_role: NodeRole,
+    acceptor_node_id: u16,
+    acceptor_generation: u64,
+    acceptor_role: NodeRole,
+    circuit_id: [u8; CIRCUIT_ID_LEN],
+    suite: MessageSuite,
+    opener_node_id: u16,
+    path_hops: u8,
+}
+
+impl E2eConfirmation {
+    fn encode(self, message_type: u8) -> [u8; E2E_CONFIRM_BODY_LEN] {
+        let mut bytes = [0u8; E2E_CONFIRM_BODY_LEN];
+        let mut cursor = 0;
+        bytes[cursor..cursor + 4].copy_from_slice(&E2E_CONFIRM_MAGIC);
+        cursor += 4;
+        bytes[cursor] = E2E_CONFIRM_VERSION;
+        cursor += 1;
+        bytes[cursor] = message_type;
+        cursor += 1;
+        bytes[cursor..cursor + 16].copy_from_slice(&self.net_id);
+        cursor += 16;
+        bytes[cursor..cursor + 2].copy_from_slice(&self.initiator_node_id.to_be_bytes());
+        cursor += 2;
+        bytes[cursor..cursor + 8].copy_from_slice(&self.initiator_generation.to_be_bytes());
+        cursor += 8;
+        bytes[cursor] = node_role_byte(self.initiator_role);
+        cursor += 1;
+        bytes[cursor..cursor + 2].copy_from_slice(&self.acceptor_node_id.to_be_bytes());
+        cursor += 2;
+        bytes[cursor..cursor + 8].copy_from_slice(&self.acceptor_generation.to_be_bytes());
+        cursor += 8;
+        bytes[cursor] = node_role_byte(self.acceptor_role);
+        cursor += 1;
+        bytes[cursor..cursor + CIRCUIT_ID_LEN].copy_from_slice(&self.circuit_id);
+        cursor += CIRCUIT_ID_LEN;
+        // Security-mode byte: 1 is the existing E2E-required enum value.
+        bytes[cursor] = 1;
+        cursor += 1;
+        bytes[cursor] = self.suite as u8;
+        cursor += 1;
+        bytes[cursor..cursor + 2].copy_from_slice(&self.opener_node_id.to_be_bytes());
+        cursor += 2;
+        bytes[cursor] = self.path_hops;
+        cursor += 1;
+        bytes[cursor..cursor + 8].copy_from_slice(&E2E_CONFIRM_CAPABILITIES.to_be_bytes());
+        debug_assert_eq!(cursor + 8, E2E_CONFIRM_BODY_LEN);
+        bytes
+    }
+}
+
+fn node_role_byte(role: NodeRole) -> u8 {
+    match role {
+        NodeRole::Edge => 1,
+        NodeRole::Core => 2,
+        NodeRole::EnrollmentService => 3,
+    }
+}
+
+fn write_confirmation(
+    stream: &mut dyn Duplex,
+    message_type: u8,
+    confirmation: E2eConfirmation,
+) -> Result<(), TunnelError> {
+    let record = confirmation.encode(message_type);
+    let length = u16::try_from(record.len()).map_err(|_| TunnelError::FrameTooLarge)?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(&record)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_confirmation(stream: &mut dyn Duplex) -> Result<[u8; E2E_CONFIRM_BODY_LEN], TunnelError> {
+    let mut length = [0u8; 2];
+    stream.read_exact(&mut length)?;
+    let length = usize::from(u16::from_be_bytes(length));
+    if length != E2E_CONFIRM_BODY_LEN {
+        return Err(CircuitReject::BadBody.into());
+    }
+    let mut record = [0u8; E2E_CONFIRM_BODY_LEN];
+    stream.read_exact(&mut record)?;
+    Ok(record)
+}
+
+fn confirm_e2e_application(
+    stream: &mut dyn Duplex,
+    info: E2eInfo,
+    local: PeerIdentity,
+    peer: PeerIdentity,
+    suite: MessageSuite,
+) -> Result<(), TunnelError> {
+    if local.net_id != peer.net_id || local.net_id == [0; 16]
+        || info.peer != peer
+        || info.circuit_id == [0; CIRCUIT_ID_LEN]
+        || local.node_id == 0
+        || peer.node_id == 0
+        || local.node_id == peer.node_id
+        || local.identity_generation == 0
+        || peer.identity_generation == 0
+        || info.path_hops == 0
+        || info.path_hops > MAX_RELAY_HOPS
+        || suite != MessageSuite::Pq768
+    {
+        return Err(SessionReject::PeerIdentityMismatch.into());
+    }
+    let (initiator, acceptor) = if local.node_id < peer.node_id {
+        (local, peer)
+    } else {
+        (peer, local)
+    };
+    let opener_node_id = match info.role {
+        CircuitRole::Initiator => local.node_id,
+        CircuitRole::Acceptor => peer.node_id,
+    };
+    let expected = E2eConfirmation {
+        net_id: local.net_id,
+        initiator_node_id: initiator.node_id,
+        initiator_generation: initiator.identity_generation,
+        initiator_role: initiator.role,
+        acceptor_node_id: acceptor.node_id,
+        acceptor_generation: acceptor.identity_generation,
+        acceptor_role: acceptor.role,
+        circuit_id: info.circuit_id,
+        suite,
+        opener_node_id,
+        path_hops: info.path_hops,
+    };
+    let (outgoing, incoming) = if info.tls_role == CircuitTlsRole::Client {
+        (E2E_CONFIRM_OFFER, E2E_CONFIRM_ACK)
+    } else {
+        (E2E_CONFIRM_ACK, E2E_CONFIRM_OFFER)
+    };
+    if outgoing == E2E_CONFIRM_OFFER {
+        write_confirmation(stream, E2E_CONFIRM_OFFER, expected)?;
+    }
+    let received = read_confirmation(stream)?;
+    let expected_bytes = expected.encode(incoming);
+    if !constant_time_record_eq(&received, &expected_bytes) {
+        return Err(SessionReject::PeerIdentityMismatch.into());
+    }
+    if outgoing == E2E_CONFIRM_ACK {
+        write_confirmation(stream, E2E_CONFIRM_ACK, expected)?;
+    }
+    Ok(())
+}
+
+fn constant_time_record_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct E2eInfo {
     pub circuit_id: [u8; CIRCUIT_ID_LEN],
@@ -545,14 +725,19 @@ impl Write for E2eCircuit<'_> {
 fn finish_e2e<'a>(
     established: E2eEstablished<'a>,
     info: E2eInfo,
+    local: PeerIdentity,
     expected_peer: PeerIdentity,
     suite: MessageSuite,
     allow_pq1024: bool,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
-    let (stream, tls) = established.into_parts();
+    let (mut stream, tls) = established.into_parts();
     if tls.peer() != expected_peer {
         return Err(SessionReject::PeerIdentityMismatch.into());
     }
+    // Require the registered, strict TLS profile before exchanging even this
+    // encrypted application-layer binding. Confirmation never replaces TLS auth.
+    crate::tls::check_inner_tls(&tls, suite, allow_pq1024)?;
+    confirm_e2e_application(&mut *stream, info, local, expected_peer, suite)?;
     let token =
         VerifiedE2eSession::from_verified_e2e_tls(&tls, expected_peer, suite, allow_pq1024)?;
     Ok(E2eCircuit {
@@ -587,7 +772,8 @@ pub fn open_e2e<'a>(
 ) -> Result<E2eCircuit<'a>, TunnelError> {
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
-    let tls_role = e2e_tls_role(session.local().node_id, expected_peer.node_id);
+    let local = session.local();
+    let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
     let destination = NodeRef {
         node_id: expected_peer.node_id,
         identity_generation: expected_peer.identity_generation,
@@ -601,7 +787,14 @@ pub fn open_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(established, info, expected_peer, suite, allow_pq1024)
+    finish_e2e(
+        established,
+        info,
+        local,
+        expected_peer,
+        suite,
+        allow_pq1024,
+    )
 }
 
 /// Accept a circuit and run the E2E TLS handshake over it in the
@@ -613,7 +806,8 @@ pub fn accept_e2e<'a>(
 ) -> Result<E2eCircuit<'a>, TunnelError> {
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
-    let tls_role = e2e_tls_role(session.local().node_id, expected_peer.node_id);
+    let local = session.local();
+    let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
     let (circuit, circuit_info) = accept_circuit(session)?;
     let established = run_e2e(circuit, backend, tls_role)?;
     let info = E2eInfo {
@@ -623,7 +817,14 @@ pub fn accept_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(established, info, expected_peer, suite, allow_pq1024)
+    finish_e2e(
+        established,
+        info,
+        local,
+        expected_peer,
+        suite,
+        allow_pq1024,
+    )
 }
 
 // --- relay forwarding --------------------------------------------------------
@@ -804,7 +1005,9 @@ mod tests {
     use crate::resource::Limits;
     use crate::runtime::{ClientTarget, LinkClient, LinkServer};
     use crate::session::SessionPolicy;
-    use crate::tls::{TestOnlyPlaintextOuter, TestOnlyPlaintextTls};
+    use crate::tls::{
+        InnerTlsSession, TestOnlyPlaintextOuter, TestOnlyPlaintextTls, strict_test_negotiated,
+    };
     use boreas_crypto::NodeRole;
     use boreas_proto::messages::PathRole;
     use std::net::{SocketAddr, TcpListener};
@@ -812,6 +1015,31 @@ mod tests {
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// No TLS is performed here. This is only an in-memory/test-socket seam for
+    /// exercising confirmation ordering; it is not production crypto evidence.
+    struct TestE2eBackend {
+        peer: PeerIdentity,
+    }
+
+    impl E2eTlsBackend for TestE2eBackend {
+        fn connect<'a>(
+            &self,
+            transport: CircuitStream<'a>,
+        ) -> Result<E2eEstablished<'a>, TunnelError> {
+            Ok(E2eEstablished::new(
+                Box::new(transport),
+                InnerTlsSession::test_only(self.peer, strict_test_negotiated()),
+            ))
+        }
+
+        fn accept<'a>(
+            &self,
+            transport: CircuitStream<'a>,
+        ) -> Result<E2eEstablished<'a>, TunnelError> {
+            self.connect(transport)
+        }
+    }
 
     fn identity(node_id: u16, generation: u64, role: NodeRole) -> PeerIdentity {
         PeerIdentity {
@@ -833,7 +1061,7 @@ mod tests {
             identity_registered: true,
             allow_pq1024: false,
             allow_hop_only: false,
-            allowed_peer_roles: vec![NodeRole::Core],
+            allowed_peer_roles: vec![peer.role],
         }
     }
 
@@ -901,6 +1129,172 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_record_is_fixed_length_and_binds_all_candidate_fields() {
+        let local = identity(0x0101, 4, NodeRole::Edge);
+        let peer = identity(0x0201, 9, NodeRole::Core);
+        let info = E2eInfo {
+            circuit_id: [0x5a; CIRCUIT_ID_LEN],
+            path_hops: 3,
+            role: CircuitRole::Initiator,
+            tls_role: CircuitTlsRole::Client,
+            peer,
+        };
+        let (initiator, acceptor) = (local, peer);
+        let confirmation = E2eConfirmation {
+            net_id: local.net_id,
+            initiator_node_id: initiator.node_id,
+            initiator_generation: initiator.identity_generation,
+            initiator_role: initiator.role,
+            acceptor_node_id: acceptor.node_id,
+            acceptor_generation: acceptor.identity_generation,
+            acceptor_role: acceptor.role,
+            circuit_id: info.circuit_id,
+            suite: MessageSuite::Pq768,
+            opener_node_id: local.node_id,
+            path_hops: info.path_hops,
+        };
+        let encoded = confirmation.encode(E2E_CONFIRM_OFFER);
+        assert_eq!(encoded.len(), E2E_CONFIRM_BODY_LEN);
+        assert_eq!(&encoded[..4], b"BE2E");
+        assert_eq!(encoded[4], E2E_CONFIRM_VERSION);
+        assert_eq!(encoded[5], E2E_CONFIRM_OFFER);
+        assert_eq!(&encoded[6..22], &[7; 16]);
+        assert_eq!(&encoded[22..24], &0x0101u16.to_be_bytes());
+        assert_eq!(&encoded[24..32], &4u64.to_be_bytes());
+        assert_eq!(encoded[32], 1);
+        assert_eq!(&encoded[33..35], &0x0201u16.to_be_bytes());
+        assert_eq!(&encoded[35..43], &9u64.to_be_bytes());
+        assert_eq!(encoded[43], 2);
+        assert_eq!(&encoded[44..60], &[0x5a; 16]);
+        assert_eq!(encoded[60], 1);
+        assert_eq!(encoded[61], MessageSuite::Pq768 as u8);
+        assert_eq!(&encoded[62..64], &0x0101u16.to_be_bytes());
+        assert_eq!(encoded[64], 3);
+        assert_eq!(&encoded[65..73], &[0; 8]);
+        let mut altered = encoded;
+        altered[61] = MessageSuite::Pq1024 as u8;
+        assert!(!constant_time_record_eq(&encoded, &altered));
+        altered[61] = MessageSuite::Pq768 as u8;
+        altered[65] = 1; // Unknown/nonzero capabilities are not accepted.
+        assert!(!constant_time_record_eq(&encoded, &altered));
+        altered[65] = 0;
+        altered[4] = 2; // unknown confirmation version
+        assert!(!constant_time_record_eq(&encoded, &altered));
+    }
+
+    #[test]
+    fn confirmation_rejects_tampered_fields_from_peer() {
+        let local = identity(0x0101, 4, NodeRole::Edge);
+        let peer = identity(0x0201, 9, NodeRole::Core);
+        let info = E2eInfo {
+            circuit_id: [0x5a; CIRCUIT_ID_LEN],
+            path_hops: 3,
+            role: CircuitRole::Initiator,
+            tls_role: CircuitTlsRole::Client,
+            peer,
+        };
+        let base = E2eConfirmation {
+            net_id: local.net_id,
+            initiator_node_id: local.node_id,
+            initiator_generation: local.identity_generation,
+            initiator_role: local.role,
+            acceptor_node_id: peer.node_id,
+            acceptor_generation: peer.identity_generation,
+            acceptor_role: peer.role,
+            circuit_id: info.circuit_id,
+            suite: MessageSuite::Pq768,
+            opener_node_id: local.node_id,
+            path_hops: info.path_hops,
+        };
+        // Header, version, type, network, both endpoint IDs/generations/roles,
+        // circuit, mode, suite, opener, path length, and capabilities are all
+        // compared against the certificate/configuration-derived expected tuple.
+        for offset in [0usize, 4, 5, 6, 22, 24, 32, 33, 35, 43, 44, 60, 61, 62, 64, 65] {
+            let (listener, address) = listener();
+            let responder = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _offer = read_confirmation(&mut stream).expect("offer");
+                let mut ack = base.encode(E2E_CONFIRM_ACK);
+                ack[offset] ^= 1;
+                stream
+                    .write_all(&(E2E_CONFIRM_BODY_LEN as u16).to_be_bytes())
+                    .expect("length");
+                stream.write_all(&ack).expect("tampered ack");
+            });
+            let mut stream = std::net::TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(TIMEOUT))
+                .expect("write timeout");
+            assert!(confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768)
+                .is_err(), "mutation at byte offset {offset} must reject");
+            responder.join().expect("responder");
+        }
+
+        let mut other_network = peer;
+        other_network.net_id = [8; 16];
+        let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(confirm_e2e_application(
+            &mut stream,
+            info,
+            local,
+            other_network,
+            MessageSuite::Pq768
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn confirmation_read_rejects_short_length_and_truncation() {
+        let mut short = std::io::Cursor::new(72u16.to_be_bytes().to_vec());
+        assert_eq!(
+            read_confirmation(&mut short),
+            Err(TunnelError::Circuit(CircuitReject::BadBody))
+        );
+        let mut oversized = std::io::Cursor::new(74u16.to_be_bytes().to_vec());
+        assert_eq!(
+            read_confirmation(&mut oversized),
+            Err(TunnelError::Circuit(CircuitReject::BadBody))
+        );
+        let mut truncated = std::io::Cursor::new(73u16.to_be_bytes().to_vec());
+        assert_eq!(read_confirmation(&mut truncated), Err(TunnelError::Closed));
+    }
+
+    #[test]
+    fn confirmation_read_timeout_fails_closed() {
+        let (listener, address) = listener();
+        let responder = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            // Keep the peer socket open but silent: the local I/O timeout, not
+            // an invented confirmation-level deadline, must terminate the read.
+            thread::sleep(Duration::from_millis(100));
+        });
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(TIMEOUT))
+            .expect("write timeout");
+        let local = identity(0x0101, 1, NodeRole::Edge);
+        let peer = identity(0x0201, 1, NodeRole::Core);
+        let info = E2eInfo {
+            circuit_id: [0x33; CIRCUIT_ID_LEN],
+            path_hops: 1,
+            role: CircuitRole::Initiator,
+            tls_role: CircuitTlsRole::Client,
+            peer,
+        };
+        assert_eq!(
+            confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768),
+            Err(TunnelError::Timeout)
+        );
+        responder.join().expect("responder");
+    }
+
+    #[test]
     fn circuit_stream_carries_bytes_between_two_nodes() {
         let (listener, address) = listener();
         let a = identity(0x0101, 1, NodeRole::Edge);
@@ -961,6 +1355,46 @@ mod tests {
     }
 
     #[test]
+    fn e2e_confirmation_gates_business_stream_when_higher_node_opens() {
+        let (listener, address) = listener();
+        let lower = identity(0x0101, 4, NodeRole::Edge);
+        let higher = identity(0x0201, 9, NodeRole::Core);
+        let server = {
+            let hop_policy = policy(lower, higher);
+            let admission = admission();
+            thread::spawn(move || {
+                let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: higher }));
+                let mut hop = server
+                    .accept(&listener, hop_policy, TIMEOUT, &admission)
+                    .expect("authorized hop")
+                    .session;
+                let backend = TestE2eBackend { peer: higher };
+                let mut e2e = accept_e2e(&mut hop, &backend, higher).expect("confirmed E2E");
+                let mut received = [0u8; 5];
+                e2e.read_exact(&mut received).expect("read business bytes");
+                assert_eq!(&received, b"hello");
+            })
+        };
+
+        let client = LinkClient::new(
+            Box::new(TestOnlyPlaintextOuter),
+            Box::new(TestOnlyPlaintextTls { peer: lower }),
+        );
+        let mut hop = client
+            .connect(&target(address), policy(higher, lower), TIMEOUT)
+            .expect("authorized hop");
+        let backend = TestE2eBackend { peer: lower };
+        // The higher NodeID opens; the lower NodeID is nevertheless the E2E TLS
+        // client. Opener identity is not confused with TLS client/server role.
+        let mut e2e = open_e2e(&mut hop, &backend, lower, 1).expect("confirmed E2E");
+        assert_eq!(e2e.info().tls_role, CircuitTlsRole::Server);
+        assert_eq!(e2e.info().role, CircuitRole::Initiator);
+        e2e.write_all(b"hello").expect("write business bytes");
+        drop(e2e);
+        server.join().expect("server thread");
+    }
+
+    #[test]
     fn duplicate_offset_resets_the_circuit() {
         let (listener, address) = listener();
         let a = identity(0x0101, 1, NodeRole::Edge);
@@ -992,18 +1426,15 @@ mod tests {
         let mut session = client
             .connect(&target(address), policy(a, b), TIMEOUT)
             .expect("client session");
-        let info = {
-            let (_circuit, info) = open_circuit(
-                &mut session,
-                NodeRef {
-                    node_id: b.node_id,
-                    identity_generation: b.identity_generation,
-                },
-                1,
-            )
-            .expect("open");
-            info
-        };
+        let (circuit, info) = open_circuit(
+            &mut session,
+            NodeRef {
+                node_id: b.node_id,
+                identity_generation: b.identity_generation,
+            },
+            1,
+        )
+        .expect("open");
         let fragment = RelayFragment {
             circuit_id: info.circuit_id,
             direction: 0,
@@ -1011,12 +1442,17 @@ mod tests {
             hops_remaining: 1,
             payload: b"abc".to_vec(),
         };
-        session
+        // Keep CircuitStream alive while injecting the malformed duplicate;
+        // its Drop must not reset the circuit before these frames are sent.
+        circuit
+            .session
             .send_frame(Kind::RelayCircuit, &fragment.encode().expect("encode"))
             .expect("first send");
-        session
+        circuit
+            .session
             .send_frame(Kind::RelayCircuit, &fragment.encode().expect("encode"))
             .expect("duplicate send");
+        drop(circuit);
         server.join().expect("server thread");
     }
 
@@ -1033,16 +1469,16 @@ mod tests {
         let relay_thread = {
             let policy_upstream = policy(b, a);
             let policy_downstream = policy(b, c);
-            let admission = admission();
+            let relay_admission = admission();
             thread::spawn(move || {
                 let upstream_server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
                 let mut upstream = upstream_server
-                    .accept(&listener, policy_upstream, TIMEOUT, &admission)
+                    .accept(&listener, policy_upstream, TIMEOUT, &relay_admission)
                     .expect("upstream session")
                     .session;
                 let downstream_server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: c }));
                 let mut downstream = downstream_server
-                    .accept(&listener, policy_downstream, TIMEOUT, &admission)
+                    .accept(&listener, policy_downstream, TIMEOUT, &relay_admission)
                     .expect("downstream session")
                     .session;
                 let mut hop = RelayHop::new(admission(), 8, b).expect("relay");
