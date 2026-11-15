@@ -9,10 +9,10 @@ pub mod enrollment;
 /// It requires OpenSSL 3.5+ for the ML-DSA provider and is therefore feature-gated.
 #[cfg(feature = "openssl-backend")]
 pub mod management;
+pub mod revoke_cleanup;
 /// Bounded NetworkRoot authorization candidate validation; requires the real crypto backend.
 #[cfg(feature = "openssl-backend")]
 pub mod root_authorization;
-pub mod revoke_cleanup;
 
 use core::fmt;
 
