@@ -819,10 +819,7 @@ mod linux_daemon {
             }
             return Err("daemon: socket/TUN poll failed".to_string());
         }
-        if fds
-            .iter()
-            .any(|pfd| pfd.revents & libc::POLLNVAL != 0)
-        {
+        if fds.iter().any(|pfd| pfd.revents & libc::POLLNVAL != 0) {
             return Err("daemon: poll reported an invalid fd".to_string());
         }
         let ready =
