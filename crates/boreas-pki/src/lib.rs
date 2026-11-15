@@ -16,6 +16,9 @@ pub mod root_authorization;
 /// Durable NetworkRoot authorization store; Linux durability only, backend required.
 #[cfg(feature = "openssl-backend")]
 pub mod trust_store;
+/// Durable signed-status freshness store; Linux durability only, backend required.
+#[cfg(feature = "openssl-backend")]
+pub mod status_store;
 
 use core::fmt;
 

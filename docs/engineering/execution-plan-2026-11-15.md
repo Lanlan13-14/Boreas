@@ -173,5 +173,6 @@ P05 + P06 + P07 + P08 + P09 -> P10 规模/故障/外部审计 -> 生产审批
 - 原主计划哈希已核实；逐条审计详表见 [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md)。
 - 发布报告复用修复、故障切换目标/迟滞修复、README/部署/发布规范和发布说明结构检查器已提交推送；代码提交不是测试通过，各自仍需 exact-commit Actions。
 - Refresh-lock `43678497934` 在 `8090fd6` 生成成功，compile validation 暴露 supervisor readiness 接口错误。主代理核对 manifests 未变和 artifact 哈希后恢复锁为 `dc484f6`，不放宽 `--locked`，不将恢复视为编译验收。
-- GPT6 Luna 当前分工：readiness 编译修复；E2E 加密应用绑定确认候选及实际调用；NetworkRoot 授权链验证；最小双节点真实数据面接口合同。已有审查记录只读/有限修复任务完成后不重复计算。
-- 下一门槛：修复 supervisor 和本轮实际编译/测试失败，验证默认及 backend feature 的 exact commit；其后先落地根授权/持久信任输入，再接真正 E2E + PacketIo 纵切，不盲目同时写整个 workspace。
+- 按用户最新偏好，主写已切换 DeepSeek V4.1 Flash；Luna 在途写任务均先停止交接。监督器 fixture/Clippy、WSS 夹具修复已审查提交。`da1b278` 默认 Rust、Linux TUN、OpenSSL TLS、五平台开发打包四个工作流共 21 个 job 全通过，其中实际运行 157 tunnel lib + 15 WSS 集成/净化测试；这不是生产门禁接受。
+- Flash 正完成持久状态新鲜度和真实 E2E→PacketIo 两个分离写范围的切片；独立审查要求修正 tolerated-clock 时间基准、无续期测试敏感性、中断重试界限、协商 MTU 限制和真实 E2E+VirtualTun 构造路径覆盖。未修正代码不纳入已验证基线。
+- 下一门槛：审查上述最终 diff，通过 Actions 刷新新增 PacketIo 依赖锁，验证默认及 backend feature 的 exact commit；再接持久 FreshStatus 和真正 NodeRuntime 纵切。仍无生产 daemon、外部审计或全部门禁验收，不能从当前绿色开发基线外推。
