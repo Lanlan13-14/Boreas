@@ -160,6 +160,7 @@ mod readiness;
 const EXIT_ERROR: u8 = 1;
 
 /// Poll interval for child waits, readiness probes and stop deadlines.
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A trial candidate must answer the readiness challenge within this window.
@@ -270,7 +271,7 @@ fn main() -> ExitCode {
             for note in &notes {
                 eprintln!("boreas-supervisor: {note}");
             }
-            ExitCode::from(execute_supervise(plan))
+            ExitCode::from(execute_supervise(*plan))
         }
     }
 }
@@ -285,7 +286,7 @@ enum CliOutcome {
         stderr: String,
     },
     RunChild {
-        plan: SupervisePlan,
+        plan: Box<SupervisePlan>,
         notes: Vec<String>,
     },
 }
@@ -295,15 +296,17 @@ struct SupervisePlan {
     argv: Vec<OsString>,
     /// Candidate whose trial launch is in flight (trial launches only).
     trial_candidate: Option<String>,
-    /// How long the candidate gets to connect and answer the readiness
-    /// challenge before the trial is failed and rolled back.
+    /// Unix trial-readiness policy. Windows deliberately refuses trial launch
+    /// because its readiness channel is not implemented there.
+    #[cfg(unix)]
     ready_timeout: Duration,
-    /// How long a forwarded stop signal may take before `SIGKILL`.
+    #[cfg(unix)]
     stop_grace: Duration,
-    /// Readiness requirements the answer is validated against.
+    #[cfg(unix)]
     ready_require_tun: bool,
+    #[cfg(unix)]
     ready_min_workers: u32,
-    /// Exact state schema the candidate must report.
+    #[cfg(unix)]
     ready_expected_schema: String,
     /// Exclusive store lock, held from before recovery until the child exits.
     /// Dropping the plan releases it.
@@ -1102,18 +1105,31 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             return err_out(&e);
         }
     };
+    #[cfg(not(unix))]
+    let _unused_unix_readiness_policy = (
+        parsed.ready_timeout,
+        parsed.stop_grace,
+        parsed.ready_require_tun,
+        parsed.ready_min_workers,
+        parsed.ready_expected_schema.as_str(),
+    );
     CliOutcome::RunChild {
-        plan: SupervisePlan {
+        plan: Box::new(SupervisePlan {
             store_root: parsed.store,
             argv,
             trial_candidate,
+            #[cfg(unix)]
             ready_timeout: parsed.ready_timeout,
+            #[cfg(unix)]
             stop_grace: parsed.stop_grace,
+            #[cfg(unix)]
             ready_require_tun: parsed.ready_require_tun,
+            #[cfg(unix)]
             ready_min_workers: parsed.ready_min_workers,
+            #[cfg(unix)]
             ready_expected_schema: parsed.ready_expected_schema,
             store_lock,
-        },
+        }),
         notes,
     }
 }
@@ -1224,7 +1240,7 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
     // Hold the exclusive store lock for the entire child lifetime: it is
     // dropped only when this function returns.
     let _store_lock = plan.store_lock;
-    let store = match UpgradeStore::open(&plan.store_root) {
+    let _store = match UpgradeStore::open(&plan.store_root) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("boreas-supervisor: error: cannot re-open store: {e}");
@@ -1248,7 +1264,7 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
                     min_workers: plan.ready_min_workers,
                 },
             };
-            return run_trial(&store, program, rest, &trial);
+            return run_trial(&_store, program, rest, &trial);
         }
         #[cfg(not(unix))]
         {
@@ -1897,7 +1913,7 @@ mod unix_tests {
         ];
         args.extend(child.iter().map(|c| os(c)));
         match run_cli(&args) {
-            CliOutcome::RunChild { plan, notes } => (execute_supervise(plan), notes),
+            CliOutcome::RunChild { plan, notes } => (execute_supervise(*plan), notes),
             CliOutcome::Done {
                 code,
                 stdout,
