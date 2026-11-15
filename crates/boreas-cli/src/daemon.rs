@@ -1055,12 +1055,14 @@ mod linux_daemon {
                         .store(st.outbound_bytes, Ordering::Relaxed);
                 }
                 Ok(None) => {}
-                Err(PacketPathError::Denied(reason)) => {
-                    // Stable policy code only; never log packet contents.
-                    // Fail-closed per-packet denial already poisoned `path`.
-                    return Err(format!(
-                        "daemon: outbound L3 packet denied by PointToPoint policy: {reason}"
-                    ));
+                Err(PacketPathError::Denied(_)) => {
+                    // `step_outbound` discards ordinary local traffic itself.
+                    // Reaching here means the packet was malformed or the host
+                    // packet interface failed; that remains fatal.
+                    return Err(
+                        "daemon: outbound packet path rejected a malformed host packet"
+                            .to_string(),
+                    );
                 }
                 Err(e) => {
                     return Err(format!("daemon: outbound packet path error: {e:?}"));

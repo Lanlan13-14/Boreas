@@ -662,6 +662,10 @@ pub struct PacketStats {
     pub inbound_packets: u64,
     pub inbound_bytes: u64,
     pub failures: u64,
+    /// Host packets that were structurally readable but not authorized for the
+    /// peer. They are discarded locally; they do not cross the circuit and do
+    /// not close it.
+    pub dropped_outbound: u64,
 }
 
 impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
@@ -1429,10 +1433,10 @@ mod tests {
         let mut path =
             PacketPath::try_new(&device, OutboundSink::new().0, endpoints(local, peer), mtu)
                 .expect("bound path");
-        assert_eq!(
-            path.step_outbound(),
-            Err(PacketPathError::Denied(PacketDeny::Ipv6NotNegotiated))
-        );
+        assert_eq!(path.step_outbound(), Ok(None));
+        assert!(path.is_open());
+        assert_eq!(path.stats().dropped_outbound, 1);
+        assert_eq!(path.stats().outbound_packets, 0);
     }
 
     #[test]
@@ -1454,19 +1458,18 @@ mod tests {
         assert_eq!(path.step_outbound(), Err(PacketPathError::Closed));
         assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
 
-        // A refused packet releases the circuit in the same step that refused it.
+        // Local traffic that is not addressed to the peer is discarded, but the
+        // authenticated circuit stays up for the actual peer flow.
         let (circuit, dropped) = Droppable::new();
         let mut path =
             PacketPath::try_new(&device, circuit, endpoints(local, peer), mtu).expect("bound path");
         device
             .inject(&ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoofed"))
             .expect("structurally valid");
-        assert_eq!(
-            path.step_outbound(),
-            Err(PacketPathError::Denied(PacketDeny::SourceNotLocal))
-        );
-        assert!(dropped.get(), "a refused packet must release the circuit");
-        assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
+        assert_eq!(path.step_outbound(), Ok(None));
+        assert!(!dropped.get(), "local discard must keep the circuit");
+        assert!(path.is_open());
+        assert_eq!(path.stats().dropped_outbound, 1);
 
         // Explicit close is idempotent and releases too.
         let (circuit, dropped) = Droppable::new();
@@ -1477,5 +1480,16 @@ mod tests {
         assert!(dropped.get());
         assert_eq!(path.first_error(), None);
         assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+    }
+}
+xpect("bound path");
+        path.close();
+        path.close();
+        assert!(dropped.get());
+        assert_eq!(path.first_error(), None);
+        assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+    }
+}
+.step_inbound(), Err(PacketPathError::Closed));
     }
 }
