@@ -70,7 +70,6 @@ pub const CIRCUIT_ID_BODY_LEN: usize = 1 + CIRCUIT_ID_LEN;
 /// Largest payload one fragment can carry.
 pub const MAX_FRAGMENT_PAYLOAD: usize = messages::MAX_RELAY_PAYLOAD;
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CircuitRole {
     /// Opened the circuit; writes `direction = 0`.
@@ -623,7 +622,8 @@ fn confirm_e2e_application(
     peer: PeerIdentity,
     suite: MessageSuite,
 ) -> Result<(), TunnelError> {
-    if local.net_id != peer.net_id || local.net_id == [0; 16]
+    if local.net_id != peer.net_id
+        || local.net_id == [0; 16]
         || info.peer != peer
         || info.circuit_id == [0; CIRCUIT_ID_LEN]
         || local.node_id == 0
@@ -680,7 +680,11 @@ fn confirm_e2e_application(
 
 fn constant_time_record_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
-        && left.iter().zip(right).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -787,14 +791,7 @@ pub fn open_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(
-        established,
-        info,
-        local,
-        expected_peer,
-        suite,
-        allow_pq1024,
-    )
+    finish_e2e(established, info, local, expected_peer, suite, allow_pq1024)
 }
 
 /// Accept a circuit and run the E2E TLS handshake over it in the
@@ -817,14 +814,7 @@ pub fn accept_e2e<'a>(
         tls_role,
         peer: expected_peer,
     };
-    finish_e2e(
-        established,
-        info,
-        local,
-        expected_peer,
-        suite,
-        allow_pq1024,
-    )
+    finish_e2e(established, info, local, expected_peer, suite, allow_pq1024)
 }
 
 // --- relay forwarding --------------------------------------------------------
@@ -1209,7 +1199,9 @@ mod tests {
         // Header, version, type, network, both endpoint IDs/generations/roles,
         // circuit, mode, suite, opener, path length, and capabilities are all
         // compared against the certificate/configuration-derived expected tuple.
-        for offset in [0usize, 4, 5, 6, 22, 24, 32, 33, 35, 43, 44, 60, 61, 62, 64, 65] {
+        for offset in [
+            0usize, 4, 5, 6, 22, 24, 32, 33, 35, 43, 44, 60, 61, 62, 64, 65,
+        ] {
             let (listener, address) = listener();
             let responder = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept");
@@ -1228,22 +1220,21 @@ mod tests {
             stream
                 .set_write_timeout(Some(TIMEOUT))
                 .expect("write timeout");
-            assert!(confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768)
-                .is_err(), "mutation at byte offset {offset} must reject");
+            assert!(
+                confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768)
+                    .is_err(),
+                "mutation at byte offset {offset} must reject"
+            );
             responder.join().expect("responder");
         }
 
         let mut other_network = peer;
         other_network.net_id = [8; 16];
         let mut stream = std::io::Cursor::new(Vec::<u8>::new());
-        assert!(confirm_e2e_application(
-            &mut stream,
-            info,
-            local,
-            other_network,
-            MessageSuite::Pq768
-        )
-        .is_err());
+        assert!(
+            confirm_e2e_application(&mut stream, info, local, other_network, MessageSuite::Pq768)
+                .is_err()
+        );
     }
 
     #[test]
