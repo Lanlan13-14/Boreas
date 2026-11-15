@@ -404,7 +404,7 @@ probe_paths = 1
 "#
         )
     }
-}
+    }
 
     fn legacy_source() -> String {
         format!(
@@ -847,5 +847,6 @@ uplinks = ["wss://hub-us-c.example.net"]
         let (code, _, _) = dispatch("boreas-easy", &args(&["bogus"]), probe_en, false);
         assert_eq!(code, 2);
     }
+}
 }
 }
