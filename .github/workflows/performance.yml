@@ -1,0 +1,96 @@
+name: '[Test] pq768 netem RTT, loss, rate and full duplex'
+
+on:
+  workflow_run:
+    workflows: ['[Test] OpenSSL hybrid TLS backend (ML-KEM + ML-DSA)']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: perf-netem-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  netem:
+    # Manual dispatch is a source-only diagnostic unless an artifact run is
+    # explicitly supplied; automatic runs always bind to the triggering SHA.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    name: one-way ${{ matrix.rtt }}ms / loss ${{ matrix.loss }}% / ${{ matrix.rate }}Mbps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rtt: 50
+            loss: 0
+            rate: 10
+            max_ping: 115
+            min_mbps: 3
+          - rtt: 200
+            loss: 0.1
+            rate: 100
+            max_ping: 415
+            min_mbps: 3
+          - rtt: 400
+            loss: 1
+            rate: 1000
+            max_ping: 815
+            min_mbps: 1
+          - rtt: 200
+            loss: 3
+            rate: 1000
+            max_ping: 415
+            min_mbps: 0.5
+    steps:
+      - name: Record triggering source commit
+        run: |
+          set -euo pipefail
+          test -n '${{ github.event.workflow_run.head_sha }}'
+          echo 'source_sha=${{ github.event.workflow_run.head_sha }}' >> "$GITHUB_ENV"
+          echo 'source_run=${{ github.event.workflow_run.id }}' >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Install network-namespace tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
+          test -x artifact/boreas-linux-x86_64-musl-pq768
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Run isolated impaired-path full-duplex test
+        env:
+          BOREAS_NETEM_RTT_MS: ${{ matrix.rtt }}
+          BOREAS_NETEM_LOSS_PERCENT: ${{ matrix.loss }}
+          BOREAS_NETEM_RATE_MBIT: ${{ matrix.rate }}
+          BOREAS_MAX_PING_MS: ${{ matrix.max_ping }}
+          BOREAS_MIN_THROUGHPUT_MBPS: ${{ matrix.min_mbps }}
+          BOREAS_PERF_BYTES: '1048576'
+        run: |
+          set -euo pipefail
+          sudo -E bash tools/release/netns_daemon_smoke.sh \
+            "$PWD/artifact/boreas-linux-x86_64-musl-pq768" \
+            2>&1 | tee "netem-${source_sha}.log"
+      - name: Upload exact-commit performance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: netem-${{ github.event.workflow_run.id }}-${{ matrix.rtt }}ms-${{ matrix.loss }}pct-${{ matrix.rate }}mbps
+          path: netem-*.log
+          if-no-files-found: warn
+          retention-days: 14

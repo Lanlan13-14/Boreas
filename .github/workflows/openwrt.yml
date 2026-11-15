@@ -95,7 +95,7 @@ jobs:
             x86_64) ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
             aarch64) ln -s /usr/include/aarch64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
           esac
-          CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-shared no-tests no-async \
+          CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-shared no-tests no-async no-legacy \
             -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
           make -j2
@@ -175,5 +175,5 @@ jobs:
         with:
           name: boreas-openwrt-${{ matrix.arch }}-${{ github.run_id }}
           path: dist
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14

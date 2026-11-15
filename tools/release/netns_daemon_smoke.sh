@@ -150,6 +150,18 @@ ip netns exec "$EDGE_NS" ip link set lo up
 ip netns exec "$EDGE_NS" ip addr add 192.0.2.2/24 dev veth-edge
 ip netns exec "$EDGE_NS" ip link set veth-edge up
 
+# Optional netem impairment is scoped to the two disposable underlay devices.
+# No host qdisc or global sysctl is touched. RTT is one-way per device.
+if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
+  for spec in "$CORE_NS:veth-core" "$EDGE_NS:veth-edge"; do
+    ns="${spec%%:*}"
+    dev="${spec##*:}"
+    ip netns exec "$ns" tc qdisc add dev "$dev" root netem \
+      delay "${BOREAS_NETEM_RTT_MS}ms" loss "${BOREAS_NETEM_LOSS_PERCENT:-0}%" \
+      rate "${BOREAS_NETEM_RATE_MBIT:-1000}mbit"
+  done
+fi
+
 # Start Core daemon inside CORE_NS (creates real /dev/net/tun `btun0`).
 run_node "$CORE_NS" "$BIN" daemon serve \
   --config "$WORK/core.toml" \

@@ -750,6 +750,10 @@ impl ConsoleState {
     }
 
     fn apply_confirm(&mut self, line: &str) -> ConsoleEffect {
+        if matches!(line, "q" | "quit") {
+            self.pending = None;
+            return ConsoleEffect::Quit;
+        }
         let Some(action) = self.pending else {
             self.view = ConsoleView::Menu;
             return ConsoleEffect::None;

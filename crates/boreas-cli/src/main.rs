@@ -1663,7 +1663,7 @@ uplinks = ["wss://hub-us-c.example.net"]
         let performed = RefCell::new(Vec::new());
         let mut state = ConsoleState::new(Lang::En, false);
         state.service_name = "boreas-core".to_string();
-        let mut reader = BufReader::new(&b"8\n2\nSTART \nq\n"[..]);
+        let mut reader = BufReader::new(&b"8\n\n2\nSTART \nq\n"[..]);
         let mut out: Vec<u8> = Vec::new();
         drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
             performed.borrow_mut().push(effect);
@@ -1686,7 +1686,7 @@ uplinks = ["wss://hub-us-c.example.net"]
         let performed = RefCell::new(Vec::new());
         let mut state = ConsoleState::new(Lang::En, false);
         state.service_name = "boreas-core".to_string();
-        let mut reader = BufReader::new(&b"8\n2\nSTART\nq\n"[..]);
+        let mut reader = BufReader::new(&b"8\n\n2\nSTART\nq\n"[..]);
         let mut out: Vec<u8> = Vec::new();
         drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
             performed.borrow_mut().push(effect);
