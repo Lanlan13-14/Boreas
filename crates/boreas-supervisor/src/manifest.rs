@@ -69,8 +69,13 @@ pub enum ManifestError {
     Invalid(&'static str),
     Expired,
     ClockBeforeEpoch,
-    Equivocation { sequence: u64 },
-    SequenceRollback { previous: u64, candidate: u64 },
+    Equivocation {
+        sequence: u64,
+    },
+    SequenceRollback {
+        previous: u64,
+        candidate: u64,
+    },
     /// The envelope names a key that is not a configured release root.
     UntrustedKey,
     /// Both signatures are required, but this build contains no Ed25519 or
@@ -89,7 +94,10 @@ impl fmt::Display for ManifestError {
             Self::Equivocation { sequence } => {
                 write!(f, "different manifest bytes reuse sequence {sequence}")
             }
-            Self::SequenceRollback { previous, candidate } => {
+            Self::SequenceRollback {
+                previous,
+                candidate,
+            } => {
                 write!(f, "manifest sequence rollback: {candidate} < {previous}")
             }
             Self::UntrustedKey => f.write_str("manifest was signed by an untrusted key id"),
@@ -238,26 +246,35 @@ pub fn parse_unsigned(bytes: &[u8]) -> Result<UnsignedManifest, ManifestError> {
     let published_at = take_string(&mut fields, "published_at")?;
     let issued_at = take_string(&mut fields, "issued_at")?;
     let expires = take_string(&mut fields, "expires")?;
-    let published = parse_timestamp(&published_at)
-        .ok_or(ManifestError::Invalid("published_at must be RFC3339 with an explicit UTC offset"))?;
-    let issued = parse_timestamp(&issued_at)
-        .ok_or(ManifestError::Invalid("issued_at must be RFC3339 with an explicit UTC offset"))?;
-    let expiry = parse_timestamp(&expires)
-        .ok_or(ManifestError::Invalid("expires must be RFC3339 with an explicit UTC offset"))?;
+    let published = parse_timestamp(&published_at).ok_or(ManifestError::Invalid(
+        "published_at must be RFC3339 with an explicit UTC offset",
+    ))?;
+    let issued = parse_timestamp(&issued_at).ok_or(ManifestError::Invalid(
+        "issued_at must be RFC3339 with an explicit UTC offset",
+    ))?;
+    let expiry = parse_timestamp(&expires).ok_or(ManifestError::Invalid(
+        "expires must be RFC3339 with an explicit UTC offset",
+    ))?;
     if published > issued || issued >= expiry {
         return Err(ManifestError::Invalid(
             "published_at <= issued_at < expires is required",
         ));
     }
     let min_compatible_state = take_string(&mut fields, "min_compatible_state")?;
-    validate_identifier(&min_compatible_state, MAX_VERSION_BYTES, "min_compatible_state")?;
+    validate_identifier(
+        &min_compatible_state,
+        MAX_VERSION_BYTES,
+        "min_compatible_state",
+    )?;
     let signing_key_id = take_string(&mut fields, "signing_key_id")?;
     validate_identifier(&signing_key_id, MAX_SIGNING_KEY_ID_BYTES, "signing_key_id")?;
     let assets_value = fields
         .remove("assets")
         .ok_or(ManifestError::Invalid("missing assets"))?;
     if !fields.is_empty() {
-        return Err(ManifestError::Invalid("unknown top-level fields are not accepted"));
+        return Err(ManifestError::Invalid(
+            "unknown top-level fields are not accepted",
+        ));
     }
     let assets = parse_assets(assets_value)?;
     Ok(UnsignedManifest {
@@ -350,7 +367,9 @@ impl SignatureEnvelope {
         let key_id = key_id.into();
         validate_identifier(&key_id, MAX_SIGNING_KEY_ID_BYTES, "envelope key_id")?;
         if ml_dsa_65.len() != ML_DSA_65_SIGNATURE_BYTES {
-            return Err(ManifestError::Invalid("envelope ML-DSA-65 signature length"));
+            return Err(ManifestError::Invalid(
+                "envelope ML-DSA-65 signature length",
+            ));
         }
         Ok(Self {
             key_id,
@@ -629,7 +648,11 @@ impl ReleasePolicy {
     }
 
     /// Freshness, lifetime and anti-rollback checks.
-    pub fn check(&self, manifest: &UnsignedManifest, trusted_now: u64) -> Result<(), ManifestError> {
+    pub fn check(
+        &self,
+        manifest: &UnsignedManifest,
+        trusted_now: u64,
+    ) -> Result<(), ManifestError> {
         manifest.check_expiry(trusted_now)?;
         let lifetime = manifest
             .expires_unix_seconds()
@@ -663,9 +686,9 @@ impl ReleasePolicy {
             ));
         }
         let mut matches = manifest.assets().iter().filter(|asset| asset.arch == arch);
-        let first = matches
-            .next()
-            .ok_or(ManifestError::Invalid("manifest has no asset for this architecture"))?;
+        let first = matches.next().ok_or(ManifestError::Invalid(
+            "manifest has no asset for this architecture",
+        ))?;
         if matches.next().is_some() {
             return Err(ManifestError::Invalid(
                 "manifest has more than one asset for this architecture",
@@ -714,7 +737,9 @@ impl SequenceLedger {
             });
         }
         if self.by_sequence.len() >= MAX_LEDGER_ENTRIES {
-            return Err(ManifestError::Invalid("volatile equivocation ledger is at capacity"));
+            return Err(ManifestError::Invalid(
+                "volatile equivocation ledger is at capacity",
+            ));
         }
         self.by_sequence
             .insert(sequence, manifest.raw_bytes().to_vec());
@@ -758,7 +783,9 @@ fn parse_assets(value: JsonValue) -> Result<Vec<UnsignedAsset>, ManifestError> {
         let url = take_string(&mut fields, "url")?;
         validate_https_url(&url)?;
         if !fields.is_empty() {
-            return Err(ManifestError::Invalid("unknown asset fields are not accepted"));
+            return Err(ManifestError::Invalid(
+                "unknown asset fields are not accepted",
+            ));
         }
         assets.push(UnsignedAsset {
             name,
@@ -834,7 +861,9 @@ fn validate_identifier(value: &str, max: usize, field: &'static str) -> Result<(
 /// `https://host:0/`, `https://host:99999/` and `https:///p` are all rejected.
 fn validate_https_url(url: &str) -> Result<(), ManifestError> {
     if url.len() > MAX_URL_BYTES {
-        return Err(ManifestError::Invalid("asset URL exceeds the configured limit"));
+        return Err(ManifestError::Invalid(
+            "asset URL exceeds the configured limit",
+        ));
     }
     if !url.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ManifestError::Invalid(
@@ -857,7 +886,9 @@ fn validate_https_url(url: &str) -> Result<(), ManifestError> {
 
 fn validate_authority(authority: &str) -> Result<(), ManifestError> {
     if authority.is_empty() || authority.len() > 253 {
-        return Err(ManifestError::Invalid("asset URL host is empty or too long"));
+        return Err(ManifestError::Invalid(
+            "asset URL host is empty or too long",
+        ));
     }
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host, Some(port)),
@@ -886,7 +917,9 @@ fn validate_authority(authority: &str) -> Result<(), ManifestError> {
     }
     if let Some(port) = port {
         if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(ManifestError::Invalid("asset URL port is not a decimal number"));
+            return Err(ManifestError::Invalid(
+                "asset URL port is not a decimal number",
+            ));
         }
         let value: u32 = port
             .parse()
@@ -1014,9 +1047,9 @@ fn digits(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
     if !slice.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    slice
-        .iter()
-        .try_fold(0u32, |n, d| n.checked_mul(10)?.checked_add(u32::from(d - b'0')))
+    slice.iter().try_fold(0u32, |n, d| {
+        n.checked_mul(10)?.checked_add(u32::from(d - b'0'))
+    })
 }
 
 fn days_in_month(year: i64, month: u32) -> u32 {
@@ -1081,7 +1114,9 @@ impl<'a> JsonParser<'a> {
 
     fn parse_value(&mut self, depth: usize) -> Result<JsonValue, ManifestError> {
         if depth > MAX_JSON_DEPTH {
-            return Err(ManifestError::Invalid("manifest JSON nesting exceeds the limit"));
+            return Err(ManifestError::Invalid(
+                "manifest JSON nesting exceeds the limit",
+            ));
         }
         match self.peek().ok_or(ManifestError::InvalidJson)? {
             b'{' => self.parse_object(depth),
@@ -1380,7 +1415,10 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_keys_at_every_depth() {
-        let s = GOOD.replace("\"product\":\"boreas\",", "\"product\":\"boreas\",\"product\":\"boreas\",");
+        let s = GOOD.replace(
+            "\"product\":\"boreas\",",
+            "\"product\":\"boreas\",\"product\":\"boreas\",",
+        );
         assert_eq!(parse(&s), Err(ManifestError::DuplicateKey));
         let s = GOOD.replace(
             "\"name\":\"boreas-linux-x86_64\",",
@@ -1395,23 +1433,26 @@ mod tests {
         assert!(parse(&GOOD.replace("\"sequence\":4", "\"sequence\":4e0")).is_err());
         assert!(parse(&GOOD.replace("\"sequence\":4", "\"sequence\":-4")).is_err());
         assert!(
-            parse(&GOOD.replace("\"product\":\"boreas\",", "\"product\":\"boreas\",\"future\":true,"))
-                .is_err()
+            parse(&GOOD.replace(
+                "\"product\":\"boreas\",",
+                "\"product\":\"boreas\",\"future\":true,"
+            ))
+            .is_err()
         );
     }
 
     #[test]
     fn rejects_trailing_data_bom_and_invalid_utf8() {
-        assert_eq!(parse(&format!("{GOOD} {{}}")), Err(ManifestError::InvalidJson));
+        assert_eq!(
+            parse(&format!("{GOOD} {{}}")),
+            Err(ManifestError::InvalidJson)
+        );
         assert_eq!(parse(&format!("{GOOD}\n\n")), Ok(parse(GOOD).unwrap()));
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(GOOD.as_bytes());
         assert!(parse_unsigned(&bom).is_err());
         let bad_utf8 = [b'{', 0xFF, b'}'];
-        assert_eq!(
-            parse_unsigned(&bad_utf8),
-            Err(ManifestError::InvalidJson)
-        );
+        assert_eq!(parse_unsigned(&bad_utf8), Err(ManifestError::InvalidJson));
     }
 
     #[test]
@@ -1502,12 +1543,9 @@ mod tests {
         let now = m.issued_unix_seconds();
         // GOOD's 31-day lifetime is inside the 90-day ceiling but outside a
         // 7-day policy.
-        let strict = ReleasePolicy::new(
-            vec!["x86_64-unknown-linux-gnu".into()],
-            7 * 24 * 60 * 60,
-            1,
-        )
-        .unwrap();
+        let strict =
+            ReleasePolicy::new(vec!["x86_64-unknown-linux-gnu".into()], 7 * 24 * 60 * 60, 1)
+                .unwrap();
         assert!(strict.check(&m, now).is_err());
         let loose = ReleasePolicy::new(
             vec!["x86_64-unknown-linux-gnu".into()],
@@ -1552,8 +1590,16 @@ mod tests {
         let asset = policy.select_asset(&m, "x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(asset.name(), "boreas-linux-x86_64");
         assert_eq!(asset.size(), 42);
-        assert!(policy.select_asset(&m, "aarch64-unknown-linux-gnu").is_err());
-        assert!(policy.select_asset(&m, "riscv64-unknown-linux-gnu").is_err());
+        assert!(
+            policy
+                .select_asset(&m, "aarch64-unknown-linux-gnu")
+                .is_err()
+        );
+        assert!(
+            policy
+                .select_asset(&m, "riscv64-unknown-linux-gnu")
+                .is_err()
+        );
 
         // Two distinct assets for the same architecture are ambiguous and are
         // refused rather than resolved by position.
@@ -1570,12 +1616,9 @@ mod tests {
     fn verify_release_rejects_untrusted_and_oversized_inputs_before_crypto() {
         let roots = [root()];
         // Unknown key id: refused before any signature is looked at.
-        let other = SignatureEnvelope::new(
-            "root-2",
-            [1u8; 64],
-            vec![2u8; ML_DSA_65_SIGNATURE_BYTES],
-        )
-        .unwrap();
+        let other =
+            SignatureEnvelope::new("root-2", [1u8; 64], vec![2u8; ML_DSA_65_SIGNATURE_BYTES])
+                .unwrap();
         assert_eq!(
             verify_release(GOOD.as_bytes(), &other, &roots),
             Err(ManifestError::UntrustedKey)
@@ -1719,9 +1762,12 @@ mod tests {
         // A sequence floor above the manifest, a foreign architecture and an
         // expired clock are all refused, and each refusal happens before any
         // staging could occur.
-        let floored =
-            ReleasePolicy::new(vec!["x86_64-unknown-linux-gnu".into()], MAX_METADATA_LIFETIME_SECONDS, 5)
-                .expect("policy");
+        let floored = ReleasePolicy::new(
+            vec!["x86_64-unknown-linux-gnu".into()],
+            MAX_METADATA_LIFETIME_SECONDS,
+            5,
+        )
+        .expect("policy");
         assert!(
             verified
                 .clone()
@@ -1774,7 +1820,11 @@ mod tests {
         };
         let value = parser.parse_value(0)?;
         parser.skip_whitespace();
-        assert_eq!(parser.pos, parser.text.len(), "reader must consume the input");
+        assert_eq!(
+            parser.pos,
+            parser.text.len(),
+            "reader must consume the input"
+        );
         match value {
             JsonValue::String(s) => Ok(s),
             other => panic!("expected a string, got {other:?}"),
@@ -1785,8 +1835,17 @@ mod tests {
     fn unicode_escapes_are_decoded_and_lone_surrogates_rejected() {
         assert_eq!(json_string(r#""state\u002dv1""#).unwrap(), "state-v1");
         assert_eq!(json_string(r#""\uD83D\uDE00""#).unwrap(), "😀");
-        assert_eq!(json_string(r#""quote:\" backslash:\\ tab:\t""#).unwrap(), "quote:\" backslash:\\ tab:\t");
-        for bad in [r#""\uD83D""#, r#""\uDE00""#, r#""\uD83Dx""#, r#""\u""#, r#""\q""#] {
+        assert_eq!(
+            json_string(r#""quote:\" backslash:\\ tab:\t""#).unwrap(),
+            "quote:\" backslash:\\ tab:\t"
+        );
+        for bad in [
+            r#""\uD83D""#,
+            r#""\uDE00""#,
+            r#""\uD83Dx""#,
+            r#""\u""#,
+            r#""\q""#,
+        ] {
             assert!(json_string(bad).is_err(), "{bad}");
         }
     }
