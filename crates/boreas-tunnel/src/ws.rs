@@ -775,7 +775,13 @@ fn base64_value(byte: u8) -> Option<u8> {
 }
 
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    if text.is_empty() || text.len() % 4 != 0 {
+    // RFC 4648 encodes the empty octet string as the empty string. This is
+    // distinct from malformed input; handshake keys are separately required
+    // to decode to exactly 16 bytes.
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    if text.len() % 4 != 0 {
         return None;
     }
     let chunks = text.len() / 4;
@@ -796,6 +802,19 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
             }
         }
         if padding > 2 || (!last && padding > 0) {
+            return None;
+        }
+        // Padding is only valid in the final quantum and only at its tail;
+        // RFC 4648 also requires unused pad bits to be zero.
+        if (padding == 2
+            && (chunk[0] == b'=' || chunk[1] == b'=' || values[1] & 0x0f != 0))
+            || (padding == 1
+                && (chunk[0] == b'='
+                    || chunk[1] == b'='
+                    || chunk[2] == b'='
+                    || values[2] & 0x03 != 0))
+            || (padding == 0 && chunk.contains(&b'='))
+        {
             return None;
         }
         let value = (u32::from(values[0]) << 18)
@@ -997,6 +1016,11 @@ mod tests {
         assert_eq!(base64_decode("abc"), None);
         assert_eq!(base64_decode("===="), None);
         assert_eq!(base64_decode("AA=A"), None);
+        assert_eq!(base64_decode("AB=="), None); // non-zero unused pad bits
+        assert_eq!(base64_decode("AAB="), None); // non-zero unused pad bits
+        assert_eq!(base64_decode("AA==").as_deref(), Some(&[0][..]));
+        assert_eq!(base64_decode("AAA=").as_deref(), Some(&[0, 0][..]));
+        assert_eq!(base64_decode("=AAA"), None);
     }
 
     #[test]
@@ -1100,14 +1124,15 @@ mod tests {
         assert_eq!(&out, b"data");
 
         // The pong was written by the client stream, therefore masked.
-        let mut pong = WsStream::new(
-            memory(&stream.io.output),
+        let pong = read_frame(
+            &mut Cursor::new(stream.io.output.clone()),
             WsRole::Server,
-            WsLimits::default(),
-        );
-        let mut echoed = [0u8; 2];
-        pong.read_exact(&mut echoed).expect("pong payload");
-        assert_eq!(&echoed, b"hi");
+            &WsLimits::default(),
+            Instant::now() + WsLimits::default().message_deadline,
+        )
+        .expect("valid masked pong frame");
+        assert_eq!(pong.opcode, OpCode::Pong);
+        assert_eq!(pong.payload, b"hi");
     }
 
     #[test]
@@ -1213,6 +1238,9 @@ mod tests {
         input.extend_from_slice(&encode_frame(false, true, OpCode::Continuation, b"b").unwrap());
         let mut stream = WsStream::new(memory(&input), WsRole::Client, limits);
         let mut out = [0u8; 1];
+        // Read returns already-available payload immediately; the fragment cap
+        // is enforced when the next frame is consumed on the following read.
+        assert_eq!(stream.read(&mut out).expect("first fragment"), 1);
         assert!(stream.read(&mut out).is_err());
     }
 
@@ -1222,8 +1250,10 @@ mod tests {
             max_frame_payload: 16,
             ..WsLimits::default()
         };
-        let mut bytes = vec![0x82, 0xfe, 0x00, 0x20];
-        bytes.extend(std::iter::repeat_n(0u8, 32));
+        // Client-side parser: an oversized server frame must be unmasked so
+        // that the size limit, not the mask-role check, is the first failure.
+        let mut bytes = vec![0x82, 0x7e, 0x00, 0x7e];
+        bytes.extend(std::iter::repeat_n(0u8, 126));
         assert_eq!(
             read_frame(
                 &mut Cursor::new(bytes),
