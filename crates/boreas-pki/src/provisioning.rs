@@ -37,7 +37,7 @@ use openssl::x509::extension::{
     AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
     SubjectKeyIdentifier,
 };
-use openssl::x509::{X509, X509Builder, X509NameBuilder, X509Ref, X509ReqBuilder};
+use openssl::x509::{X509, X509NameBuilder, X509Ref, X509ReqBuilder};
 
 use crate::management::{
     IdentityAuthority, IdentityTemplate, MANAGEMENT_SCHEMA_VERSION, ManagementTrust, VerifiedObject,
@@ -631,7 +631,7 @@ pub fn issue_node_dir(
         private_key_pem: node_ml_pem.clone(),
         trust_anchor_pem: ia_ca_pem.clone(),
     };
-    let _ = OpenSslAcceptor::new(Policy::strict_pq768(params.role), &pem_id)
+    let _ = OpenSslAcceptor::from_pem_identity(&pem_id, Policy::production_default())
         .map_err(|_| ProvisionError::CryptoIdentity)?;
 
     let body = authority.node_identity_from_csr(

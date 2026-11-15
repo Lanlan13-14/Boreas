@@ -1,4 +1,4 @@
-# ADR 0002：Phase 0 内层 TLS 1.3 后端与套件候选（OpenSSL 3.6.1 + rust-openssl）
+# ADR 0002：Phase 0 内层 TLS 1.3 后端与套件候选（OpenSSL 3.6.5 + rust-openssl）
 
 - **状态：Proposed（Candidate）——未 Accepted、未 Frozen。**
 - 日期：2026-11-15
@@ -35,11 +35,11 @@
 
 ## 3. 候选决定（全部待 §7 接受，非冻结线）
 
-### C-1 主后端候选：OpenSSL 3.6.1 + `openssl 0.10.82` / `openssl-sys 0.9.118`
+### C-1 主后端候选：OpenSSL 3.6.5 + `openssl 0.10.82` / `openssl-sys 0.9.118`
 
-- `[设计·候选]` 产品主实现候选为固定 tag `openssl-3.6.1`（release tarball SHA-256 `b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e`，2026-11-14 核查记录）经 Rust `openssl 0.10.82` / `openssl-sys 0.9.118` 绑定集成，策略集中在 `SslContextBuilder` 一层下发。
+- `[设计·候选]` 产品主实现候选为固定 tag `openssl-3.6.5`（release tarball SHA-256 `a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98`，2026-11-14 核查记录）经 Rust `openssl 0.10.82` / `openssl-sys 0.9.118` 绑定集成，策略集中在 `SslContextBuilder` 一层下发。
 - `[事实·调研快照]` 2026-11-15 调研逐个核到该绑定对下列控制点的源码级入口：`set_min/max_proto_version(TLS1_3)`、`set_groups_list`、`set_sigalgs_list`、`set_ciphersuites`、证书链/私钥加载、`SslVerifyMode::PEER | FAIL_IF_NO_PEER_CERT`、`set_verify_callback`、`NO_TICKET`、`set_num_tickets(0)`、`set_session_cache_mode(OFF)`、`set_max_early_data`、`PKey::is_a(KeyType::ML_DSA_65)`（ML-DSA 无经典 `Id`，不得用 `id()` 判算法）。**API 存在不等于握手正确**：全部须以 §7 实测收口。
-- `[待证]` OpenSSL 3.6.1 非 LTS 分支的支持窗口、4.x 存在下继续钉 3.6.1 的支持期与安全通告跟踪、以及每次发布的可复现输入更新流程，须在接受时按主计划 §10.2 写清；钉版是每次发布的输入锁定，不是永久锁死。
+- `[待证]` OpenSSL 3.6.5 非 LTS 分支的支持窗口、4.x 存在下继续钉 3.6.5 的支持期与安全通告跟踪、以及每次发布的可复现输入更新流程，须在接受时按主计划 §10.2 写清；钉版是每次发布的输入锁定，不是永久锁死。
 
 ### C-2 严格内层策略（`pq768`，Fail-Closed）
 
@@ -58,8 +58,8 @@
 
 ### C-4 禁止 `vendored`，走自建 OpenSSL 注入
 
-- `[事实·调研快照]` 当前钉版的 `vendored` 链为 `openssl-sys 0.9.118 → openssl-src 300.2.0 (features=["legacy"])`；据 openssl-src 版本规则与 tag 命名，其内置版本是 OpenSSL **3.2.0**，且附带 legacy provider，与本文候选的 3.6.1 固定 tag、最小 provider 面均不一致（该结论基于 tag/README 级证据，接受时应直接展开该 crate 源码复核一遍后归档）。
-- `[设计·候选]` 因此 `openssl-backend` 启用时**不得叠加 `vendored`**；静态构建改走：先按固定 tag + tarball 哈希自建 OpenSSL 3.6.1 `no-shared`（仅激活内建 default provider 的最小 `openssl.cnf`），再以带 target 前缀的环境变量注入 rust-openssl 的正常发现路径：`<TARGET>_OPENSSL_DIR=<prefix>`、`<TARGET>_OPENSSL_STATIC=1`，并加 `OPENSSL_NO_VENDOR=1` 双保险。CI 须加负断言：仓库 manifests 与最终构建命令中出现 `vendored` 即失败。`[待证]`（尚未在双架构 job 上执行）
+- `[事实·调研快照]` 当前钉版的 `vendored` 链为 `openssl-sys 0.9.118 → openssl-src 300.2.0 (features=["legacy"])`；据 openssl-src 版本规则与 tag 命名，其内置版本是 OpenSSL **3.2.0**，且附带 legacy provider，与本文候选的 3.6.5 固定 tag、最小 provider 面均不一致（该结论基于 tag/README 级证据，接受时应直接展开该 crate 源码复核一遍后归档）。
+- `[设计·候选]` 因此 `openssl-backend` 启用时**不得叠加 `vendored`**；静态构建改走：先按固定 tag + tarball 哈希自建 OpenSSL 3.6.5 `no-shared`（仅激活内建 default provider 的最小 `openssl.cnf`），再以带 target 前缀的环境变量注入 rust-openssl 的正常发现路径：`<TARGET>_OPENSSL_DIR=<prefix>`、`<TARGET>_OPENSSL_STATIC=1`，并加 `OPENSSL_NO_VENDOR=1` 双保险。CI 须加负断言：仓库 manifests 与最终构建命令中出现 `vendored` 即失败。`[待证]`（尚未在双架构 job 上执行）
 - 同理禁止用系统默认 CA 路径（`set_default_verify_paths` 一类）充当内层信任根：内层只认 provisioning 写入的 Boreas 根锚（主计划 §2.4）。
 
 ### C-5 静态双架构候选要求（发行形态未证）
@@ -149,7 +149,7 @@
 
 ## 8. 证据索引
 
-- [phase0-crypto-backend-assessment-2026-11-14.md](../research/phase0-crypto-backend-assessment-2026-11-14.md)：标准状态、OpenSSL 3.6.1 固定 tag/tarball 哈希、CLI PoC 边界与「当前状态：未验收 / G-CRYPTO 未通过（尚未测）」的既有结论（本文延续，不推翻）。
+- [phase0-crypto-backend-assessment-2026-11-14.md](../research/phase0-crypto-backend-assessment-2026-11-14.md)：标准状态、OpenSSL 3.6.5 固定 tag/tarball 哈希、CLI PoC 边界与「当前状态：未验收 / G-CRYPTO 未通过（尚未测）」的既有结论（本文延续，不推翻）。
 - [phase0-tls-backend-interop-2026-11-15.md](../research/phase0-tls-backend-interop-2026-11-15.md)：rust-openssl API 逐项源码定位、协商读数缺口、`vendored` 3.2.0 判定、GnuTLS/wolfSSL/Go/rustls 源码级互操作候选、draft-06 datatracker 实测。
 - [implementation-status.md](../engineering/implementation-status.md)：门禁台账；本文不改动其中任何 Phase/门禁的完成状态。
 - 候选注册表复核与 Phase 0 威胁模型尚未落盘；本文不引用不存在的文件，也不把它们算作已完成产物。

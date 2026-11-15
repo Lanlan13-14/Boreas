@@ -22,12 +22,12 @@ ourselves. The WebSocket Upgrade/framing engine remains outside this crate.
 | [rust-openssl 0.10.82 `SslStream`](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslStream.html) / [source](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl/src/ssl/mod.rs) | `SslStream<S>` wraps any `Read + Write`; `SslStream::new` performs no I/O; `do_handshake`, `ssl_read`, `ssl_write` expose `ErrorCode::{WANT_READ,WANT_WRITE}` for non-blocking drivers. The maintained BIO adapter maps `WouldBlock` to BIO retry and catches panics across FFI. | The BIO adapter does not turn the stream into a WebSocket engine: HTTP Upgrade, frame parsing, control-frame handling, compression rejection, and the transport-wide queue budget remain caller work. |
 | [`SslContextBuilder`](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslContextBuilder.html) | TLS version bounds, `set_groups_list`, `set_sigalgs_list`, `set_ciphersuites`, `set_verify_depth`, certificates, verify stores/modes, tickets/session cache, `set_max_early_data`. | Presence of a setter does not prove the pinned OpenSSL build registered the algorithm. This backend additionally checks the verified chain's SPKI/signature OIDs after every handshake. |
 | [openssl-sys 0.9.118 SSL declarations](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl-sys/src/handwritten/ssl.rs) | `SSL_session_reused` is available for the one post-handshake resumption readout; `ForeignTypeRef::as_ptr` borrows the `SSL` object. | There is no safe negotiated-group or peer-signature-scheme getter in this binding. Those reported values remain constrained-context inference, not wire readout. |
-| [OpenSSL 3.6.1 `ssl/t1_lib.c`](https://github.com/openssl/openssl/blob/openssl-3.6.1/ssl/t1_lib.c), [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html), [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html), [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html), [TLS ML-DSA draft -06](https://www.ietf.org/archive/id/draft-ietf-tls-mldsa-06.txt) | OpenSSL 3.6.1 carries the hybrid group and the ML-DSA TLS/X.509 machinery used by the tests; RFC 10024 defines group `0x11EC`, RFC 9881 defines id-ml-dsa-65 OID `2.16.840.1.101.3.4.3.18`. TLS `mldsa65` is still draft-06 code point `0x0905` at this snapshot. | Source listing is not end-to-end identity authentication. The two test endpoints share the same OpenSSL codebase; no independent implementation has been interop-tested. |
+| [OpenSSL 3.6.5 `ssl/t1_lib.c`](https://github.com/openssl/openssl/blob/openssl-3.6.5/ssl/t1_lib.c), [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html), [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html), [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html), [TLS ML-DSA draft -06](https://www.ietf.org/archive/id/draft-ietf-tls-mldsa-06.txt) | OpenSSL 3.6.5 carries the hybrid group and the ML-DSA TLS/X.509 machinery used by the tests; RFC 10024 defines group `0x11EC`, RFC 9881 defines id-ml-dsa-65 OID `2.16.840.1.101.3.4.3.18`. TLS `mldsa65` is still draft-06 code point `0x0905` at this snapshot. | Source listing is not end-to-end identity authentication. The two test endpoints share the same OpenSSL codebase; no independent implementation has been interop-tested. |
 
 The reviewed binding pins are `openssl = "=0.10.82"`, `openssl-sys =
 "=0.9.118"`, `foreign-types-shared = "=0.1.1"`; this change adds no dependency
 and does not modify `Cargo.lock`. `openssl-src`/`vendored` is deliberately not
-used: it would select OpenSSL 3.2.0 rather than the reviewed 3.6.1 build.
+used: it would select OpenSSL 3.2.0 rather than the reviewed 3.6.5 build.
 
 ## Layering and byte flow
 
@@ -189,7 +189,7 @@ is uploaded. CLI output is sanitized line-by-line before assertions.
 
 `.github/workflows/rust-tls.yml`:
 
-1. Downloads the pinned OpenSSL 3.6.1 tarball, verifies its SHA-256, checks
+1. Downloads the pinned OpenSSL 3.6.5 tarball, verifies its SHA-256, checks
    `VERSION.dat`, builds `no-shared no-tests`, installs it, writes a minimal
    default-provider-only `openssl.cnf`, and records `version -a` plus
    `readelf -d` evidence.
@@ -229,7 +229,7 @@ is uploaded. CLI output is sanitized line-by-line before assertions.
 - [SslRef API](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslRef.html)
 - [Maintained binding BIO adapter source](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl/src/ssl/bio.rs)
 - [OpenSSL binding `openssl-sys` SSL declarations](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl-sys/src/handwritten/ssl.rs)
-- [OpenSSL 3.6.1 TLS group/signature discovery source](https://github.com/openssl/openssl/blob/openssl-3.6.1/ssl/t1_lib.c)
+- [OpenSSL 3.6.5 TLS group/signature discovery source](https://github.com/openssl/openssl/blob/openssl-3.6.5/ssl/t1_lib.c)
 - [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html)
 - [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html)
 - [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html)

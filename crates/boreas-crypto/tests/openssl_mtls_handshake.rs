@@ -3,7 +3,7 @@
 //!
 //! What this proves, against the Boreas master plan (BOREAS-MASTER-PLAN
 //! v1.11.0, section 4.2), with an ephemeral ML-DSA-65 PKI generated at test
-//! runtime by the OpenSSL 3.6.1 CLI:
+//! runtime by the OpenSSL 3.6.5 CLI:
 //!
 //! * both Boreas endpoints (`OpenSslConnector` / `OpenSslAcceptor`) complete
 //!   a real, mutually authenticated TLS 1.3 handshake over a byte stream
@@ -84,7 +84,7 @@
 //! `/tmp/ossl/install/bin/openssl` and then `openssl` on `PATH` are probed
 //! for X25519MLKEM768 + ML-DSA-65 support. If no capable CLI exists the
 //! tests skip loudly on stderr instead of failing unrelated environments;
-//! CI jobs that build OpenSSL 3.6.1 must set `BOREAS_OPENSSL_BIN` so a
+//! CI jobs that build OpenSSL 3.6.5 must set `BOREAS_OPENSSL_BIN` so a
 //! missing binary cannot silently green.
 
 #![cfg(all(unix, feature = "openssl-backend"))]
@@ -318,7 +318,7 @@ impl TestPki {
             eprintln!(
                 "SKIP ({tag}): no openssl CLI with X25519MLKEM768 + ML-DSA-65 support \
                  found (looked at $BOREAS_OPENSSL_BIN, /tmp/ossl/install/bin/openssl, \
-                 PATH). Build OpenSSL 3.6.1 and set BOREAS_OPENSSL_BIN to run these tests."
+                 PATH). Build OpenSSL 3.6.5 and set BOREAS_OPENSSL_BIN to run these tests."
             );
             return None;
         };
@@ -1767,7 +1767,7 @@ fn s_client_args(
 ///
 /// This is deliberately constructed from scratch instead of rewriting the TLS
 /// 1.3 arguments: `-ciphersuites` is TLS-1.3-only and a rewritten `-cipher
-/// DEFAULT` produced an empty TLS 1.2 cipher list on OpenSSL 3.6.1, failing the
+/// DEFAULT` produced an empty TLS 1.2 cipher list on OpenSSL 3.6.5, failing the
 /// client locally before it sent a ClientHello. A concrete legacy cipher plus
 /// `-tls1_2` makes the probe reach the Boreas acceptor; no client certificate
 /// is needed because the version must be rejected before a CertificateRequest

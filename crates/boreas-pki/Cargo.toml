@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [features]
 default = []
 # Real ML-DSA/Ed25519 verification and IdentityAuthority signing. Requires OpenSSL 3.5+
-# (the CI rust-tls workflow pins 3.6.1); the default workspace build stays backend-free.
+# (the CI rust-tls workflow pins 3.6.5); the default workspace build stays backend-free.
 openssl-backend = [
     "dep:openssl",
     "dep:boreas-crypto",

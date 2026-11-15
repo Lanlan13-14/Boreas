@@ -234,7 +234,7 @@ schema 迁移不代表网络状态迁移或在线 reload。安全模式、suite�
 
 ## 8. `v0.1.0-pre.1` 预发布可运行路径（`openssl-inner-tls` Linux 双节点点对点 E2E + TUN）
 
-> **边界声明**：以下路径仅适用于启用了 `--features openssl-inner-tls`（静态链接 OpenSSL 3.6.1 `X25519MLKEM768` + `ML-DSA-65`）的 Linux `boreas` 预发布二进制（如 `v0.1.0-pre.1` 附带的 `boreas-linux-x86_64-musl-pq768`）。五平台未签名离线开发包（`platforms.yml`）仍不含 TLS 后端，对 `pki` / `daemon` 会 fail-closed 返回退出码 `2`。此预发布实现点对点双节点（1 Core ↔ 1 Edge）真实运行，**不代表**多跳网格收敛、DNS、30 分钟资源门禁、双 TLS 栈互操作（`G-CRYPTO`）或外部安全审计（`G-EXTERNAL-REVIEW`）通过；`docs/engineering/gates.json` 全部生产门禁仍保持 `open`。
+> **边界声明**：以下路径仅适用于启用了 `--features openssl-inner-tls`（静态链接 OpenSSL 3.6.5 `X25519MLKEM768` + `ML-DSA-65`）的 Linux `boreas` 预发布二进制（如 `v0.1.0-pre.1` 附带的 `boreas-linux-x86_64-musl-pq768`）。五平台未签名离线开发包（`platforms.yml`）仍不含 TLS 后端，对 `pki` / `daemon` 会 fail-closed 返回退出码 `2`。此预发布实现点对点双节点（1 Core ↔ 1 Edge）真实运行，**不代表**多跳网格收敛、DNS、30 分钟资源门禁、双 TLS 栈互操作（`G-CRYPTO`）或外部安全审计（`G-EXTERNAL-REVIEW`）通过；`docs/engineering/gates.json` 全部生产门禁仍保持 `open`。
 
 ### 8.1 离线生成四权分立 CA 与双节点预配包（无需在线 CA，禁止 TOFU）
 

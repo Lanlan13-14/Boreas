@@ -38,12 +38,12 @@ concurrency:
 
 jobs:
   openssl-rust-mtls:
-    name: OpenSSL 3.6.1 + rust-openssl 0.10.82 pq768 mTLS
+    name: OpenSSL 3.6.5 + rust-openssl 0.10.82 pq768 mTLS
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     env:
-      OPENSSL_VERSION: 3.6.1
-      OPENSSL_SHA256: b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e
+      OPENSSL_VERSION: 3.6.5
+      OPENSSL_SHA256: a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98
       OPENSSL_PREFIX: ${{ github.workspace }}/.rust-tls-openssl
       OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
       OPENSSL_NO_VENDOR: '1'
@@ -253,7 +253,7 @@ jobs:
           cp target/release/boreas hop-node-linux/boreas
 
           # Also build a zero-glibc-dependency static x86_64-unknown-linux-musl binary
-          # linked against musl-compiled OpenSSL 3.6.1 for portable Linux pre-releases.
+          # linked against musl-compiled OpenSSL 3.6.5 for portable Linux pre-releases.
           rustup target add x86_64-unknown-linux-musl
           OPENSSL_MUSL_PREFIX="${GITHUB_WORKSPACE}/.rust-tls-openssl-musl"
           mkdir -p openssl-musl-src
@@ -275,7 +275,7 @@ jobs:
           printf '%s\n' \
             'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
             'Source commit: '"$GITHUB_SHA" \
-            'Feature: openssl-inner-tls (OpenSSL 3.6.1 X25519MLKEM768 + ML-DSA-65)' \
+            'Feature: openssl-inner-tls (OpenSSL 3.6.5 X25519MLKEM768 + ML-DSA-65)' \
             'Included binaries:' \
             '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
             '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
