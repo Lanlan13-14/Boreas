@@ -1055,11 +1055,12 @@ mod linux_daemon {
                         .store(st.outbound_bytes, Ordering::Relaxed);
                 }
                 Ok(None) => {}
-                Err(PacketPathError::Denied(_)) => {
+                Err(PacketPathError::Denied(reason)) => {
+                    // Stable policy code only; never log packet contents.
                     // Fail-closed per-packet denial already poisoned `path`.
-                    return Err(
-                        "daemon: outbound L3 packet denied by PointToPoint policy".to_string()
-                    );
+                    return Err(format!(
+                        "daemon: outbound L3 packet denied by PointToPoint policy: {reason}"
+                    ));
                 }
                 Err(e) => {
                     return Err(format!("daemon: outbound packet path error: {e:?}"));

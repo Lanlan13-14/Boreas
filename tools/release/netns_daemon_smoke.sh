@@ -120,6 +120,12 @@ chmod 0600 "$WORK/edge.toml"
 # Create isolated network namespaces and underlay veth link.
 ip netns add "$CORE_NS"
 ip netns add "$EDGE_NS"
+# This candidate negotiates IPv4 only. Disable automatic IPv6 link-local/DAD
+# traffic in these disposable namespaces before any interfaces are brought up.
+for ns in "$CORE_NS" "$EDGE_NS"; do
+  ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+  ip netns exec "$ns" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+done
 ip link add veth-core type veth peer name veth-edge
 ip link set veth-core netns "$CORE_NS"
 ip link set veth-edge netns "$EDGE_NS"
