@@ -14,6 +14,7 @@ on:
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
       - 'tools/release/netns_daemon_smoke.sh'
+      - 'tools/release/netns_overlay_perf.py'
       - '.github/workflows/rust-tls.yml'
   pull_request:
     paths:
@@ -27,6 +28,7 @@ on:
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
       - 'tools/release/netns_daemon_smoke.sh'
+      - 'tools/release/netns_overlay_perf.py'
       - '.github/workflows/rust-tls.yml'
 
 permissions:
@@ -290,7 +292,7 @@ jobs:
             'Included binaries:' \
             '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
             '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
-            'Verified end-to-end in CI: offline PKI -> mounted roots.cbor -> WSS + pq768 hop + pq768 E2E + real Linux netns /dev/net/tun ICMP ping (0% loss).' \
+            'Verified end-to-end in CI: offline PKI -> mounted roots.cbor -> WSS + pq768 hop + pq768 E2E + real Linux netns /dev/net/tun ICMP latency and 8 MiB integrity/throughput probes.' \
             'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
             > hop-node-linux/README-DEVELOPMENT.txt
           (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)

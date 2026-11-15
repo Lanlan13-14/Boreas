@@ -235,6 +235,11 @@ impl<'a> CircuitStream<'a> {
         self.path_hops
     }
 
+    /// Whether a previous read left bytes above the raw hop socket.
+    pub fn has_buffered_input(&self) -> bool {
+        !self.inbound.is_empty() || self.session.has_buffered_input()
+    }
+
     /// Send up to [`MAX_FRAGMENT_PAYLOAD`] bytes as one fragment.
     pub fn write_bytes(&mut self, data: &[u8]) -> Result<usize, TunnelError> {
         if data.is_empty() {
@@ -723,6 +728,11 @@ pub struct E2eInfo {
 impl<'a> E2eCircuit<'a> {
     pub fn token(&self) -> &VerifiedE2eSession {
         &self.token
+    }
+
+    /// Whether E2E TLS or a lower layer already holds inbound bytes.
+    pub fn has_buffered_input(&self) -> bool {
+        self.stream.has_buffered_input()
     }
 
     pub fn info(&self) -> E2eInfo {

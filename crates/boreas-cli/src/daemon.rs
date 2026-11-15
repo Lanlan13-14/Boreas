@@ -253,7 +253,8 @@ mod linux_daemon {
         SecurityMode as CfgMode,
     };
 
-    const POLL_IO_TIMEOUT: Duration = Duration::from_millis(25);
+    const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+    const VIRTUAL_IDLE_WAIT: Duration = Duration::from_millis(1);
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
     const ACCEPT_WAIT: Duration = Duration::from_secs(30);
     const STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -296,18 +297,23 @@ mod linux_daemon {
         }
     }
 
-    /// Adapter around `LinuxTunQueue` that uses bounded `poll()` (`25 ms`) inside
-    /// `PacketIo::read_packet` so a single-thread bidirectional loop alternates
-    /// outbound and inbound steps without blocking forever on an idle TUN fd.
+    /// Linux TUN adapter whose reads never introduce a polling delay. The
+    /// daemon waits on the TUN and outer TCP descriptors together when idle,
+    /// then drains ready work without a per-packet sleep.
     struct NonBlockingLinuxTun {
         queue: LinuxTunQueue,
-        poll_timeout: Duration,
+    }
+
+    impl NonBlockingLinuxTun {
+        fn raw_fd(&self) -> i32 {
+            self.queue.as_raw_fd()
+        }
     }
 
     impl PacketIo for NonBlockingLinuxTun {
         fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
             self.queue
-                .read_packet_timeout(self.poll_timeout)
+                .read_packet_timeout(Duration::ZERO)
                 .map_err(|e| match e {
                     boreas_tun::linux::LinuxTunError::Packet(p) => p,
                     _ => TunError::QueueClosed,
@@ -339,6 +345,13 @@ mod linux_daemon {
             match self {
                 Self::Real { io, .. } => io,
                 Self::Virtual { device, .. } => device,
+            }
+        }
+
+        fn raw_fd(&self) -> Option<i32> {
+            match self {
+                Self::Real { io, .. } => Some(io.raw_fd()),
+                Self::Virtual { .. } => None,
             }
         }
 
@@ -663,10 +676,7 @@ mod linux_daemon {
             let actual_name = dev.name().to_string();
             TunEndpoint::Real {
                 _device: dev,
-                io: NonBlockingLinuxTun {
-                    queue,
-                    poll_timeout: POLL_IO_TIMEOUT,
-                },
+                io: NonBlockingLinuxTun { queue },
                 name: actual_name,
             }
         };
@@ -776,24 +786,43 @@ mod linux_daemon {
         }
     }
 
-    fn tcp_fd_readable(fd: i32, timeout_ms: i32) -> Result<bool, String> {
-        if fd < 0 {
-            return Err("daemon: invalid socket fd".to_string());
+    /// Wait for the outer socket and (for a real device) the TUN fd as one
+    /// event set. A zero duration is a nonblocking readiness query; an idle
+    /// iteration uses a short bounded wait only to retain stop/status control.
+    fn poll_io(
+        sock_fd: i32,
+        tun_fd: Option<i32>,
+        timeout: Duration,
+    ) -> Result<(bool, bool), String> {
+        if sock_fd < 0 || tun_fd.is_some_and(|fd| fd < 0) {
+            return Err("daemon: invalid poll fd".to_string());
         }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let mut fds = [
+            libc::pollfd {
+                fd: sock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: tun_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let count = if tun_fd.is_some() { 2 } else { 1 };
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout_ms) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
+                return Ok((false, false));
             }
-            return Err("daemon: socket poll failed".to_string());
+            return Err("daemon: socket/TUN poll failed".to_string());
         }
-        Ok(rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
+        let ready = |pfd: &libc::pollfd| {
+            pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        };
+        Ok((ready(&fds[0]), count == 2 && ready(&fds[1])))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1043,9 +1072,13 @@ mod linux_daemon {
                 }
             }
 
-            // 1. Outbound step: `NonBlockingLinuxTun` polls `/dev/net/tun` up to 25ms.
+            // Both packet sources are nonblocking here. Real TUN reads use a
+            // zero-time readiness query; idle waiting happens once below on
+            // the combined TUN + TCP event set, never once per packet.
+            let mut made_progress = false;
             match path.step_outbound() {
                 Ok(Some(_len)) => {
+                    made_progress = true;
                     let st = path.stats();
                     counters
                         .tx_packets
@@ -1068,10 +1101,15 @@ mod linux_daemon {
                 }
             }
 
-            // 2. Inbound step: only enter `step_inbound` when TCP socket is readable!
-            if tcp_fd_readable(sock_fd, 10)? {
+            // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
+            // FrameIo and CircuitStream can all hold bytes after an earlier
+            // read. Drain whenever any layer reports buffered input as well.
+            let buffered = path.has_buffered_input();
+            let (socket_ready, _) = poll_io(sock_fd, None, Duration::ZERO)?;
+            if buffered || socket_ready {
                 match path.step_inbound() {
                     Ok(Some(_len)) => {
+                        made_progress = true;
                         let st = path.stats();
                         counters
                             .rx_packets
@@ -1085,6 +1123,17 @@ mod linux_daemon {
                     Err(e) => {
                         return Err(format!("daemon: inbound packet path error: {e:?}"));
                     }
+                }
+            }
+
+            if !made_progress && !buffered {
+                if tun.raw_fd().is_none() && !socket_ready {
+                    thread::sleep(VIRTUAL_IDLE_WAIT);
+                } else {
+                    // Sleep only when both sources are idle. Readiness is
+                    // consumed at the top of the next iteration; busy queues
+                    // continue immediately and sustain full-duplex forwarding.
+                    let _ = poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
                 }
             }
         }

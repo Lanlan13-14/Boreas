@@ -224,6 +224,12 @@ impl LinuxTunQueue {
     pub fn mtu(&self) -> usize {
         self.device.mtu
     }
+    /// Borrow the stable queue descriptor for an external event set. The queue
+    /// remains owned here; callers must not close or mutate the returned fd.
+    pub fn as_raw_fd(&self) -> RawFd {
+        let fd = self.fd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        fd.as_raw_fd()
+    }
     pub fn verify(&self) -> Result<(), LinuxTunError> {
         let fd = self
             .fd

@@ -7,12 +7,14 @@
 #   4. Real `boreas daemon serve` + `boreas daemon connect` over outer TLS 1.3 +
 #      WSS + pq768 (`X25519MLKEM768` + `ML-DSA-65`) inner mTLS + `RelayCircuit` +
 #      pq768 E2E mTLS + `PacketPath`
-#   5. Real kernel `ping -c 3 10.20.1.1` across the overlay + `boreas ctl status`
-#      verifying `tx_packets >= 3` and `rx_packets >= 3` with `0% packet loss`.
+#   5. Real kernel ICMP latency and an 8 MiB integrity/throughput probe across
+#      the overlay + `boreas ctl status` packet counters with `0% packet loss`.
+#      These are loopback-veth development measurements, not public-path SLA.
 set -euo pipefail
 
 BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
+PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 
 WORK="$(mktemp -d /tmp/boreas-netns-e2e.XXXXXX)"
 chmod 0700 "$WORK"
@@ -21,6 +23,7 @@ EDGE_NS="boreas-edge-$$"
 
 cleanup() {
   set +e
+  if [[ -f "$WORK/perf-receiver.pid" ]]; then kill "$(cat "$WORK/perf-receiver.pid")" 2>/dev/null || true; fi
   if [[ -f "$WORK/core.pid" ]]; then kill "$(cat "$WORK/core.pid")" 2>/dev/null || true; fi
   if [[ -f "$WORK/edge.pid" ]]; then kill "$(cat "$WORK/edge.pid")" 2>/dev/null || true; fi
   ip netns del "$CORE_NS" 2>/dev/null || true
@@ -145,7 +148,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --listen "192.0.2.1:8443" \
   --tun-name "btun0" \
   --mtu 1360 \
-  --max-seconds 12 \
+  --max-seconds 35 \
   > "$WORK/core.out" 2> "$WORK/core.err" &
 echo $! > "$WORK/core.pid"
 
@@ -169,7 +172,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --ws-host "wss.boreas.test:8443" \
   --tun-name "btun0" \
   --mtu 1360 \
-  --max-seconds 10 \
+  --max-seconds 33 \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &
 echo $! > "$WORK/edge.pid"
 
@@ -199,9 +202,44 @@ if [[ "$CONNECTED" -ne 1 ]]; then
   exit 1
 fi
 
-# Send 3 real kernel ICMP echo requests over the pq768 E2E overlay!
-ip netns exec "$EDGE_NS" ping -c 3 -W 2 -I 10.20.1.2 10.20.1.1 | tee "$WORK/ping.log"
+# Exercise sparse ICMP traffic and reject the former fixed 25 ms polling delay.
+# This threshold applies only to this isolated veth development environment.
+ip netns exec "$EDGE_NS" ping -c 10 -i 0.1 -W 2 -I 10.20.1.2 10.20.1.1 | tee "$WORK/ping.log"
 grep -q " 0% packet loss" "$WORK/ping.log"
+python3 - "$WORK/ping.log" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r"= [0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+ ms", text)
+if match is None:
+    raise SystemExit("could not parse ping average RTT")
+average = float(match.group(1))
+print(f"overlay_ping_average_ms={average:.3f}")
+if average > 15.0:
+    raise SystemExit(f"overlay average RTT {average:.3f} ms exceeds 15 ms regression bound")
+PY
+
+# Send 8 MiB through real inner TCP over the overlay and authenticate the test
+# payload by comparing independent SHA-256 digests. The modest regression floor
+# rejects the former ~1 Mbps path without claiming a public-network guarantee.
+ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" receive > "$WORK/perf-receiver.log" 2>&1 &
+echo $! > "$WORK/perf-receiver.pid"
+sleep 0.1
+ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" send | tee "$WORK/perf-sender.log"
+wait "$(cat "$WORK/perf-receiver.pid")"
+python3 - "$WORK/perf-sender.log" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    result = json.load(source)
+if result["bytes"] != 8 * 1024 * 1024:
+    raise SystemExit("throughput probe transferred an unexpected byte count")
+if result["throughput_mbps"] < 3.0:
+    raise SystemExit(f"overlay throughput {result['throughput_mbps']} Mbps is below 3 Mbps regression bound")
+print(f"overlay_throughput_mbps={result['throughput_mbps']:.3f}")
+PY
 
 CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock")"
 EDGE_CTL="$("$BIN" ctl status --socket "$EDGE_STATE/control.sock")"
@@ -215,4 +253,4 @@ echo " Core exit summary: $(cat "$WORK/core.out")"
 echo " Edge exit summary: $(cat "$WORK/edge.out")"
 grep -q '"status":"ok"' "$WORK/core.out"
 grep -q '"status":"ok"' "$WORK/edge.out"
-echo "REAL NETNS PQ768 E2E OVERLAY PING SUCCEEDED"
+echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"

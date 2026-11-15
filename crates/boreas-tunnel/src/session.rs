@@ -227,6 +227,12 @@ impl FrameIo {
         self.pending_bytes = 0;
     }
 
+    fn has_buffered_input(&self) -> bool {
+        !self.pending.is_empty()
+            || self.decoder.buffered_len() > 0
+            || self.stream.has_buffered_input()
+    }
+
     fn send_inner(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
@@ -340,6 +346,11 @@ impl EstablishedSession {
     /// Whether `pq1024` was explicitly enabled for this link.
     pub fn pq1024_enabled(&self) -> bool {
         self.policy.allow_pq1024
+    }
+
+    /// Whether decoded frames or lower-layer bytes remain buffered locally.
+    pub fn has_buffered_input(&self) -> bool {
+        self.io.has_buffered_input()
     }
 
     /// Send one application frame. Frame-level state transitions are validated

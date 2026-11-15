@@ -704,6 +704,15 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         Self::try_new(io, circuit, endpoints, mtu)
     }
 
+    /// Whether inbound bytes are buffered above the raw outer TCP socket.
+    /// The daemon combines this with socket readiness before entering a
+    /// blocking frame read, avoiding both arbitrary sleeps and missed TLS data.
+    pub fn has_buffered_input(&self) -> bool {
+        self.circuit
+            .as_ref()
+            .is_some_and(E2eCircuit::has_buffered_input)
+    }
+
     /// Close the path after telling the peer: TLS `close_notify`, then the
     /// circuit's own `CircuitClose`, then the stream is dropped.
     ///

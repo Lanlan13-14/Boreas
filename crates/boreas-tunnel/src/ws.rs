@@ -336,6 +336,15 @@ impl<T: Read + Write> WsStream<T> {
     }
 }
 
+impl<T: crate::stream::Duplex> WsStream<T> {
+    /// Whether payload bytes are buffered above the underlying transport.
+    /// A partial WebSocket frame is included conservatively; the event-loop
+    /// owner still applies the normal bounded read and protocol checks.
+    pub fn has_buffered_input(&self) -> bool {
+        self.pending_pos < self.pending.len() || self.io.has_buffered_input()
+    }
+}
+
 fn poisoned() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, WsError::Poisoned)
 }

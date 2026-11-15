@@ -316,6 +316,14 @@ impl<S> EstablishedStream<S> {
         self.stream.get_ref()
     }
 
+    /// Application bytes already decrypted and buffered inside OpenSSL.
+    ///
+    /// This is separate from transport readiness: raw socket polling cannot
+    /// observe these bytes after a previous TLS read consumed a larger record.
+    pub fn ssl_pending(&self) -> usize {
+        self.stream.ssl().pending()
+    }
+
     /// Mutably access the wrapped transport stream.
     pub fn get_mut(&mut self) -> &mut S {
         self.stream.get_mut()
