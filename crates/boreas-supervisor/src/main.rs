@@ -133,7 +133,9 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boreas_supervisor::{Activation, Journal, Phase, Recovery, Result, StoreLock, UpgradeStore};
+use boreas_supervisor::{
+    Activation, Journal, Phase, Recovery, Result, StoreLock, TrialState, UpgradeStore,
+};
 
 const EXIT_ERROR: u8 = 1;
 
@@ -159,7 +161,7 @@ USAGE:
                                 [--max-trial-attempts <N>] -- <argv...>
     boreas-supervisor recover --store <DIR> [--json]
     boreas-supervisor status --store <DIR> [--json]
-    boreas-supervisor reset-trial --store <DIR>
+    boreas-supervisor reset-trial --store <DIR> --confirm <VERSION>
     boreas-supervisor --help
 
 subcommands:
@@ -182,8 +184,11 @@ subcommands:
     recover     run UpgradeStore::recover() under the store lock; launches
                 nothing
     status      report the store's real journal/active-pointer/trial state
-    reset-trial clear the durable failed-trial ledger after an operator has
-                inspected the candidate that exhausted its budget
+    reset-trial clear the durable failed-trial ledger. High-risk and
+                operator-only: --confirm must repeat the exact candidate
+                version recorded in trial.state, an audit line is appended to
+                trial.audit, and only then is the budget reset. Name the OS
+                account that ran it via the systemd journal / event log.
 
 Every mutating subcommand takes an OS file lock on the store, so concurrent
 supervisors cannot race the journal. The lock dies with the process and never
@@ -606,17 +611,57 @@ fn phase_name(phase: &Phase) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Subcommand: reset-trial (operator acknowledgement of a spent trial budget)
+// Subcommand: reset-trial (confirmed + audited operator acknowledgement)
 // ---------------------------------------------------------------------------
 
+struct ResetTrialArgs {
+    store: String,
+    confirm: String,
+}
+
+fn parse_reset_trial_args(args: &[OsString]) -> std::result::Result<ResetTrialArgs, String> {
+    let mut store: Option<String> = None;
+    let mut confirm: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i]
+            .to_str()
+            .ok_or_else(|| "reset-trial: argument is not valid UTF-8".to_string())?;
+        match arg {
+            "--store" | "--confirm" => {
+                let slot = if arg == "--store" { &mut store } else { &mut confirm };
+                if slot.is_some() {
+                    return Err(format!("reset-trial: duplicate {arg}"));
+                }
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| format!("reset-trial: {arg} requires a value"))?
+                    .to_str()
+                    .ok_or_else(|| format!("reset-trial: {arg} value is not valid UTF-8"))?;
+                *slot = Some(value.to_owned());
+            }
+            other => return Err(format!("reset-trial: unexpected argument: {other}")),
+        }
+        i += 1;
+    }
+    Ok(ResetTrialArgs {
+        store: store.ok_or_else(|| "reset-trial: missing required --store <DIR>".to_string())?,
+        // A high-risk action needs an explicit, non-guessable acknowledgement:
+        // the operator must name the exact candidate recorded in `trial.state`.
+        confirm: confirm.ok_or_else(|| {
+            "reset-trial: --confirm <CANDIDATE_VERSION> is required (name the \
+             recorded candidate after inspecting the store)"
+                .to_string()
+        })?,
+    })
+}
+
 fn cmd_reset_trial(args: &[OsString]) -> CliOutcome {
-    let parsed = match parse_store_args(args, "reset-trial") {
+    let parsed = match parse_reset_trial_args(args) {
         Ok(p) => p,
         Err(e) => return usage_err(&e),
     };
-    if parsed.json {
-        return usage_err("reset-trial: --json is not supported");
-    }
     let store = match open_store(&parsed.store) {
         Ok(s) => s,
         Err(o) => return o,
@@ -625,27 +670,41 @@ fn cmd_reset_trial(args: &[OsString]) -> CliOutcome {
         Ok(lock) => lock,
         Err(e) => return err_out(&format!("cannot reset trial in {}: {e}", parsed.store)),
     };
-    match reset_trial_report(&store) {
+    match reset_trial_report(&store, &parsed.confirm) {
         Ok(out) => done(0, out, String::new()),
-        Err(e) => err_out(&format!("reset-trial failed: {e}")),
+        Err(e) => err_out(&format!("reset-trial refused: {e}")),
     }
 }
 
-/// Clear the durable trial ledger. Deliberately an explicit operator action:
-/// the supervisor never clears a spent budget by itself, so a crash loop cannot
-/// silently re-enable unlimited candidate trials.
-fn reset_trial_report(store: &UpgradeStore) -> Result<String> {
-    match store.trial_state()? {
-        Some(state) => {
-            store.clear_trial()?;
-            Ok(format!(
-                "reset-trial: cleared {} attempt(s) for candidate {}; \
-                 the next `supervise` may trial it again\n",
-                state.attempts, state.version
-            ))
-        }
-        None => Ok("reset-trial: no trial record to clear\n".to_string()),
+/// Clear the durable trial ledger after an exact confirmation, appending an
+/// audit record first. Deliberately an explicit operator action: the supervisor
+/// never clears a spent budget by itself, so a crash loop cannot silently
+/// re-enable unlimited candidate trials.
+fn reset_trial_report(
+    store: &UpgradeStore,
+    confirm: &str,
+) -> std::result::Result<String, String> {
+    let state = store.trial_state().map_err(|e| e.to_string())?;
+    let Some(state) = state else {
+        return Ok("reset-trial: no trial record to clear\n".to_string());
+    };
+    if state.version != confirm {
+        return Err(format!(
+            "confirmation does not match the recorded candidate {} \
+             (re-run with --confirm {})",
+            state.version, state.version
+        ));
     }
+    // Audit before clearing: if the audit write fails, the ledger is untouched.
+    store
+        .record_trial_reset(&state.version, state.attempts)
+        .map_err(|e| e.to_string())?;
+    store.clear_trial().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "reset-trial: cleared {} attempt(s) for candidate {} after confirmation; \
+         audit record appended to trial.audit; the next `supervise` may trial it again\n",
+        state.attempts, state.version
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -670,19 +729,25 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
     };
     let mut notes: Vec<String> = Vec::new();
 
-    // Refuse an exhausted candidate *before* `begin_activation` can move the
-    // active pointer: a spent budget must not even be briefly activated.
-    match trial_budget_spent(&store, parsed.max_trial_attempts) {
-        Ok(Some(reason)) => return err_out(&reason),
-        Ok(None) => {}
-        Err(e) => return err_out(&format!("cannot read the trial ledger: {e}")),
-    }
+    // Durable reservation *before* `begin_activation` can move the active
+    // pointer. If this process is killed anywhere after this point — including
+    // between `activate()` and the spawn — the attempt is already recorded and
+    // the next boot counts it. This is what closes the old
+    // "killed after activate, before reserve" window.
+    let reservation = match reserve_pending_trial(&store, parsed.max_trial_attempts) {
+        Ok(reserved) => reserved,
+        Err(e) => return err_out(&format!("cannot reserve a trial attempt: {e}")),
+    };
 
     // Recovery happens before anything is launched (master plan Sec.10.3).
     // `begin_activation` starts from `recover()` and only permits the one
     // trial launch of a `Prepared` candidate afterwards.
     let launch = match store.begin_activation() {
         Ok(Activation::Steady { active }) => {
+            // A reservation without a trial launch means the journal changed
+            // under us (it should not: we hold the lock). Consume it as a
+            // failed attempt rather than leaving it pending forever.
+            settle_unused_reservation(&store, &reservation);
             if let Some(v) = &active {
                 notes.push(format!("supervising active version {v}"));
             }
@@ -692,10 +757,8 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             candidate,
             previous,
         }) => {
-            // Durable reservation *before* the launch: a supervisor killed
-            // mid-trial still consumes this attempt on the next boot.
-            match store.reserve_trial(&candidate, parsed.max_trial_attempts) {
-                Ok(state) => notes.push(format!(
+            match &reservation {
+                Some(state) if state.version == candidate => notes.push(format!(
                     "trial launch {}/{} of candidate {candidate} (previous: {}); \
                      confirmed only after {} ms of liveness window",
                     state.attempts,
@@ -703,16 +766,21 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
                     previous.as_deref().unwrap_or("(none)"),
                     parsed.soak.as_millis(),
                 )),
-                Err(e) => {
-                    // `begin_activation` already moved the pointer, so restore
-                    // the retained version before refusing.
+                _ => {
+                    // Refuse rather than launch a trial whose attempt was never
+                    // recorded: an unreserved launch would be unbounded.
+                    let _ = store.mark_trial_failed();
                     if store.recover().is_err() {
-                        return err_out(&format!(
-                            "{e}; rollback of the activated candidate ALSO failed — \
-                             store may still point at the unconfirmed candidate"
-                        ));
+                        return err_out(
+                            "trial reservation and journal disagree; rollback of the \
+                             activated candidate ALSO failed — store may still point at \
+                             the unconfirmed candidate",
+                        );
                     }
-                    return err_out(&format!("{e}"));
+                    return err_out(
+                        "trial reservation and journal disagree; refusing to launch an \
+                         unreserved trial (inspect the store with `status`)",
+                    );
                 }
             }
             Launch::Trial { candidate }
@@ -734,6 +802,7 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             Launch::Steady { active }
         }
         Ok(Activation::Refused { active, candidate }) => {
+            settle_unused_reservation(&store, &reservation);
             return err_out(&format!(
                 "upgrade journal for candidate {candidate} is inconsistent \
                  with the active pointer; recovered to {} and refusing to \
@@ -741,7 +810,12 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
                 active.as_deref().unwrap_or("(none)"),
             ));
         }
-        Err(e) => return err_out(&format!("pre-launch recovery failed: {e}")),
+        Err(e) => {
+            // The reservation is already durable; record the failed outcome so
+            // the ledger is accurate even though nothing was launched.
+            settle_unused_reservation(&store, &reservation);
+            return err_out(&format!("pre-launch recovery failed: {e}"));
+        }
     };
     // `{version}` must resolve against the version the pointer names NOW
     // (the trial candidate, or the rolled-back/steady one) — never against
@@ -780,30 +854,37 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
     }
 }
 
-/// Is the durable trial budget for the journal's `Prepared` candidate spent?
+/// Reserve the next trial attempt **before** the active pointer can move.
 ///
-/// Returns the operator-facing reason when it is. This runs *before*
-/// `begin_activation`, so an exhausted candidate is never activated; the
-/// durable increment in [`UpgradeStore::reserve_trial`] remains the
-/// authoritative check.
-fn trial_budget_spent(store: &UpgradeStore, max_attempts: u32) -> Result<Option<String>> {
+/// Returns the reserved state when the journal is `Prepared` (this run will
+/// trial that candidate), `None` otherwise. Reserving first is what removes the
+/// old "killed between `activate()` and reservation" window: any kill after
+/// this returns still consumes the attempt on the next boot. An exhausted
+/// budget fails here, so the candidate is never briefly activated.
+fn reserve_pending_trial(
+    store: &UpgradeStore,
+    max_attempts: u32,
+) -> Result<Option<TrialState>> {
     let Some(journal) = store.journal()? else {
         return Ok(None);
     };
     if journal.phase != Phase::Prepared {
         return Ok(None);
     }
-    let Some(state) = store.trial_state()? else {
-        return Ok(None);
-    };
-    if state.version != journal.new_version || state.attempts < max_attempts {
-        return Ok(None);
+    store
+        .reserve_trial(&journal.new_version, max_attempts)
+        .map(Some)
+}
+
+/// A reservation that did not turn into a trial launch (journal changed under
+/// the lock, or recovery failed) is consumed as a failed attempt rather than
+/// left `in-flight` forever.
+fn settle_unused_reservation(store: &UpgradeStore, reservation: &Option<TrialState>) {
+    if reservation.is_some()
+        && let Err(e) = store.mark_trial_failed()
+    {
+        eprintln!("boreas-supervisor: warning: could not settle an unused trial reservation: {e}");
     }
-    Ok(Some(format!(
-        "trial budget for candidate {} is spent ({} of {} attempts); refusing to \
-         activate it again — inspect the store with `status`, then run `reset-trial`",
-        state.version, state.attempts, max_attempts
-    )))
 }
 
 /// Resolve `{version}` (prefix of `argv[0]` only) against the version that
@@ -1449,6 +1530,25 @@ mod unix_tests {
         }
     }
 
+    /// `reset-trial --store <dir> --confirm <version>` (the only accepted form).
+    fn reset_trial(f: &Fixture, confirm: &str) -> (u8, String, String) {
+        let args = vec![
+            os("reset-trial"),
+            os("--store"),
+            os(&f.store_str()),
+            os("--confirm"),
+            os(confirm),
+        ];
+        match run_cli(&args) {
+            CliOutcome::Done {
+                code,
+                stdout,
+                stderr,
+            } => (code, stdout, stderr),
+            CliOutcome::RunChild { .. } => panic!("reset-trial must not run a child"),
+        }
+    }
+
     // -- recover ----------------------------------------------------------
 
     #[test]
@@ -1864,13 +1964,70 @@ mod unix_tests {
         assert_eq!(store.journal().unwrap().unwrap().phase, Phase::Prepared);
         assert_eq!(store.active_version().unwrap().as_deref(), Some("1.0.0"));
 
-        // Operator acknowledgement clears the ledger and permits one more try.
-        let (code, out, _) = store_cmd(&f, "reset-trial", false);
+        // Operator acknowledgement must name the exact recorded candidate; a
+        // wrong confirmation leaves the ledger untouched.
+        let (code, _, stderr) = reset_trial(&f, "9.9.9");
+        assert_eq!(code, EXIT_ERROR);
+        assert!(stderr.contains("does not match"), "{stderr}");
+        assert_eq!(store.trial_state().unwrap().unwrap().attempts, 3);
+
+        // Correct confirmation clears the budget and appends an audit record.
+        let (code, out, _) = reset_trial(&f, "2.0.0");
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("cleared 3 attempt(s)"), "{out}");
+        assert!(out.contains("trial.audit"), "{out}");
         assert_eq!(store.trial_state().unwrap(), None);
+        let audit = fs::read_to_string(f.store_dir.join("trial.audit")).unwrap();
+        assert!(
+            audit.contains("reset-trial version=2.0.0 attempts=3"),
+            "{audit}"
+        );
         let (code, _) = supervise_with(&f, &["{version}/prog.sh"], 100, 3);
         assert_eq!(code, EXIT_ERROR);
+        assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn reset_trial_requires_an_explicit_confirmation() {
+        let f = Fixture::new();
+        f.seed_active("1.0.0", "exit 0");
+        let art = f.artifact("cand", "exit 3");
+        let store = f.store();
+        store
+            .prepare(
+                &Candidate {
+                    version: "2.0.0".into(),
+                },
+                &art,
+            )
+            .unwrap();
+        let (code, _) = supervise(&f, &["{version}/prog.sh"]);
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
+
+        // No --confirm at all: usage error, nothing cleared.
+        let args = vec![os("reset-trial"), os("--store"), os(&f.store_str())];
+        match run_cli(&args) {
+            CliOutcome::Done { code, stderr, .. } => {
+                assert_eq!(code, EXIT_ERROR);
+                assert!(stderr.contains("--confirm"), "{stderr}");
+            }
+            CliOutcome::RunChild { .. } => panic!("reset-trial must not run a child"),
+        }
+        // --json is not accepted for this command either.
+        let args = vec![
+            os("reset-trial"),
+            os("--store"),
+            os(&f.store_str()),
+            os("--json"),
+        ];
+        match run_cli(&args) {
+            CliOutcome::Done { code, stderr, .. } => {
+                assert_eq!(code, EXIT_ERROR);
+                assert!(stderr.contains("unexpected argument"), "{stderr}");
+            }
+            CliOutcome::RunChild { .. } => panic!("reset-trial must not run a child"),
+        }
         assert_eq!(store.trial_state().unwrap().unwrap().attempts, 1);
     }
 

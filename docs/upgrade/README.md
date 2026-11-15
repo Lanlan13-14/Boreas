@@ -65,18 +65,21 @@ supervised launch.
 
 `<root>/trial.state` records `BOREAS-TRIAL-1 / <version> / <attempts> /
 in-flight|failed`. `reserve_trial(version, max)` increments and writes
-*in-flight* **before** the candidate is launched, so a supervisor killed
-mid-trial still consumes the attempt when the next one starts. `mark_trial_failed`
-flips the record to `failed` (keeping the count); `clear_trial` removes it after
-a confirmed upgrade, or when the operator runs `reset-trial`. A corrupt ledger
-is `UpgradeError::CorruptTrial`, never "no attempts yet". The ledger can only
-ever *restrict* launches, so tampering causes denial of upgrades, never
+*in-flight* **before the active pointer can move** — `supervise` reserves from
+the journal's `Prepared` candidate and only then calls `begin_activation`, so a
+kill at any point after the reservation (including between `activate()` and the
+spawn) still consumes the attempt when the next supervisor starts. An exhausted
+budget therefore fails before activation: the candidate is never briefly
+selected just to be rolled back. `mark_trial_failed` flips the record to
+`failed` (keeping the count); `clear_trial` removes it after a confirmed
+upgrade, or when the operator runs the confirmed `reset-trial`. A corrupt
+ledger is `UpgradeError::CorruptTrial`, never "no attempts yet". The ledger can
+only ever *restrict* launches, so tampering causes denial of upgrades, never
 authorization.
 
-Known bound, stated exactly: a kill in the narrow window between `activate()`
-and the ledger reservation can allow **one** extra launch beyond the configured
-budget. The loop is still bounded (≤ `max + 1` per activation cycle), and it is
-never unbounded.
+The attempt counter uses `checked_add`, so a saturated counter can never grant
+extra trials: overflow is reported as an invalid ledger rather than treated as
+"below budget".
 
 ## External supervisor executable
 
@@ -94,8 +97,11 @@ unverified artifact can be staged through it:
 * `status --store <DIR> [--json]` — real journal, recorded pointer (including a
   dangling one via `pointer_ok: false`), retained version count, and the durable
   trial record.
-* `reset-trial --store <DIR>` — operator acknowledgement: clears a spent trial
-  budget after inspecting the candidate. Nothing else clears it.
+* `reset-trial --store <DIR> --confirm <VERSION>` — operator acknowledgement:
+  `--confirm` must repeat the exact candidate version recorded in `trial.state`;
+  an audit line is appended to `trial.audit` **before** the budget is cleared,
+  and a failed audit write leaves the ledger untouched. Nothing else clears a
+  spent budget.
 
 ### Liveness soak (this is not readiness, and not "exit 0 ⇒ confirmed")
 

@@ -1,35 +1,39 @@
 //! Minimal, self-contained primitives and an external-supervisor entrypoint
 //! for Boreas upgrades.
 //!
-//! This crate does not download or authenticate a release and exposes no
-//! install entry point. A future release-verification layer must provide
-//! independently verified artifact and manifest bytes plus provenance before
-//! calling [`UpgradeStore::prepare`]. There is no `bool`/"verified" escape
-//! hatch here.
+//! This crate does not download a release and exposes no install entry point.
+//! Manifest bytes can be authenticated through [`manifest::verify_release`]
+//! (see below), but nothing here wires authentication to
+//! [`UpgradeStore::prepare`], so no artifact is stageable through a user-facing
+//! path. There is no `bool`/"verified" escape hatch: the trusted types
+//! ([`manifest::VerifiedManifest`], [`manifest::VerifiedCandidate`]) have
+//! private fields and are produced only by the verifier.
 //!
 //! The bundled `boreas-supervisor` binary is the real process boundary for
 //! those primitives: it takes an exclusive store lock, recovers the store
 //! before launching anything, launches the selected program as a real child,
-//! confirms a trial candidate only after a health soak (survival, not merely
-//! exit status 0), and rolls back via [`UpgradeStore::recover`] on any other
-//! outcome. Failed trials are bounded by a durable per-candidate budget in
-//! `trial.state`, so a crash loop cannot retry a candidate forever.
+//! confirms a trial candidate only after a liveness soak (survival, not
+//! readiness and not merely exit status 0), and rolls back via
+//! [`UpgradeStore::recover`] on any other outcome. Failed trials are bounded by
+//! a durable per-candidate budget in `trial.state`, so a crash loop cannot
+//! retry a candidate forever.
 //!
 //! Strict release-metadata parsing, deployment policy and the single
 //! signature-verification choke point live in [`manifest`]. With the
 //! `openssl-backend` feature that choke point performs real Ed25519 **and**
-//! ML-DSA-65 verification (SPKI DER key parsing + `KeyType` checks + SHA-256
-//! asset hashes) through [`release_crypto`]; the default build compiles no
-//! crypto and fails verification closed, so [`UpgradeStore::prepare`] stays
-//! unreachable from any user-facing path either way.
+//! ML-DSA-65 verification (SPKI DER key parsing + `KeyType` checks) plus
+//! SHA-256 asset hashes through [`release_crypto`]; the default build compiles
+//! no crypto and fails verification closed. That backend is implemented but
+//! **not yet validated in CI** — it needs an OpenSSL 3.5+ job — so no release
+//! authenticity claim is made here.
 //!
-//! Hash/signature/manifest verification (master plan §10.1–§10.2), preflight
-//! (ELF/architecture/state-schema/seccomp/disk checks), signal forwarding and
-//! graceful stop handling, health channels and launch timeouts, OS service
-//! integration (systemd et al.), and the fault-injection / power-cut matrix
-//! remain NOT IMPLEMENTED. This crate makes no production-readiness or
-//! release-authenticity claim, and nothing here satisfies the master plan's
-//! `G-UPGRADE` or `G-SUPPLY` gate on its own.
+//! Still NOT implemented: preflight (ELF/architecture/state-schema/seccomp/disk
+//! checks), signal forwarding and graceful stop handling, an application
+//! readiness channel (authorized `AF_UNIX` + peer credentials, challenge bound
+//! to candidate SHA/schema/workers/TUN) and launch timeouts, TUF-style role
+//! separation with durable anti-rollback, OS service integration (systemd et
+//! al.), and the fault-injection / power-cut matrix. Nothing here satisfies the
+//! master plan's `G-UPGRADE` or `G-SUPPLY` gate.
 //!
 //! Transactions use a durable journal and one atomically replaced active
 //! pointer. Unconfirmed activations are rolled back by
@@ -566,7 +570,7 @@ impl UpgradeStore {
             return Err(UpgradeError::CorruptTrial);
         }
         let mut s = String::new();
-        File::open(&path)
+        File::open(&path)?
             .take(MAX_TRIAL_BYTES + 1)
             .read_to_string(&mut s)?;
         if s.len() as u64 > MAX_TRIAL_BYTES {
