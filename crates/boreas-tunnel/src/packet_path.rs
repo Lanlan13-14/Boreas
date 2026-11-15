@@ -314,13 +314,6 @@ impl EndpointFacts {
             vip,
         })
     }
-
-    fn matches(&self, identity: PeerIdentity) -> bool {
-        self.net_id == identity.net_id
-            && self.node_id == identity.node_id
-            && self.identity_generation == identity.identity_generation
-            && self.role == identity.role
-    }
 }
 
 /// The permanent IPv4 slot for a verified `(node_id, role)`, or `None` when the
