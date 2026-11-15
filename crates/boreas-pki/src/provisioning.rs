@@ -324,7 +324,9 @@ pub struct VerifiedBundle {
 /// `StatusSigner`, plus optional private outer-TLS origin CA) and emit `roots.cbor`.
 pub fn init_ca_dir(ca_dir: &Path, params: &CaInitParams) -> Result<CaInitSummary, ProvisionError> {
     if params.net_id == [0u8; 16] {
-        return Err(ProvisionError::InvalidParameter("net_id cannot be all-zero"));
+        return Err(ProvisionError::InvalidParameter(
+            "net_id cannot be all-zero",
+        ));
     }
     if params.issuer_generation == 0 {
         return Err(ProvisionError::InvalidParameter(
@@ -367,7 +369,12 @@ pub fn init_ca_dir(ca_dir: &Path, params: &CaInitParams) -> Result<CaInitSummary
     let ia_ml_pub = ia_ml
         .public_key_to_der()
         .map_err(|_| ProvisionError::OpenSsl("ia mldsa65 pub der"))?;
-    let ia_ca_cert = build_mldsa65_ca_cert(&ia_ml, "Boreas Identity Authority CA", params.now_us, expires_us)?;
+    let ia_ca_cert = build_mldsa65_ca_cert(
+        &ia_ml,
+        "Boreas Identity Authority CA",
+        params.now_us,
+        expires_us,
+    )?;
 
     // 3. Separated StatusSigner (Ed25519 + ML-DSA-65).
     let status_ed = generate_ed25519()?;
@@ -381,8 +388,12 @@ pub fn init_ca_dir(ca_dir: &Path, params: &CaInitParams) -> Result<CaInitSummary
 
     // 4. Dev/private-origin Outer TLS CA (EC P-256).
     let outer_ca_key = generate_p256()?;
-    let outer_ca_cert =
-        build_p256_ca_cert(&outer_ca_key, "Boreas Private Origin TLS CA", params.now_us, expires_us)?;
+    let outer_ca_cert = build_p256_ca_cert(
+        &outer_ca_key,
+        "Boreas Private Origin TLS CA",
+        params.now_us,
+        expires_us,
+    )?;
 
     // 5. Sign RootAuthorizationCandidate delegations under NetworkRoot.
     let ia_candidate = RootAuthorizationCandidate {
@@ -472,7 +483,10 @@ pub fn init_ca_dir(ca_dir: &Path, params: &CaInitParams) -> Result<CaInitSummary
             .map_err(|_| ProvisionError::OpenSsl("outer ca key pem"))?,
     )?;
 
-    write_public_atomic(&ca_dir.join("net_id.hex"), hex_encode(&params.net_id).as_bytes())?;
+    write_public_atomic(
+        &ca_dir.join("net_id.hex"),
+        hex_encode(&params.net_id).as_bytes(),
+    )?;
     write_public_atomic(
         &ca_dir.join("issuer.generation"),
         params.issuer_generation.to_string().as_bytes(),
@@ -524,8 +538,10 @@ pub fn issue_node_dir(
             "offline node issuance supports Core or Edge only",
         ));
     }
-    let computed_node_id = node_id(params.home_core_id, params.vip_octet, params.role)
-        .map_err(|_| ProvisionError::InvalidParameter("invalid home_core_id or vip_octet for role"))?;
+    let computed_node_id =
+        node_id(params.home_core_id, params.vip_octet, params.role).map_err(|_| {
+            ProvisionError::InvalidParameter("invalid home_core_id or vip_octet for role")
+        })?;
     let vip = expected_vip(params.home_core_id, params.vip_octet, params.role)
         .map_err(|_| ProvisionError::InvalidParameter("invalid permanent VIP slot"))?;
 
@@ -680,7 +696,13 @@ pub fn issue_node_dir(
 
     // Issue an initial fresh StatusSnapshot (default 1 hour, strictly <= 24h per §3.4).
     let status_ttl_secs = (u64::from(params.validity_hours) * 3600).min(3600);
-    sign_status_file(ca_dir, &out_dir.join("status.signed"), 1, params.now_us, status_ttl_secs)?;
+    sign_status_file(
+        ca_dir,
+        &out_dir.join("status.signed"),
+        1,
+        params.now_us,
+        status_ttl_secs,
+    )?;
 
     Ok(NodeIssueSummary {
         net_id_hex: hex_encode(&net_id),
@@ -750,9 +772,12 @@ pub fn sign_status_file(
     };
     let raw_tbs =
         objects::encode_tbs(&envelope).map_err(|_| ProvisionError::OpenSsl("encode status tbs"))?;
-    let sig_msg =
-        objects::signature_input(&raw_tbs, ObjectType::StatusSnapshot, MANAGEMENT_SCHEMA_VERSION)
-            .map_err(|_| ProvisionError::OpenSsl("status sig input"))?;
+    let sig_msg = objects::signature_input(
+        &raw_tbs,
+        ObjectType::StatusSnapshot,
+        MANAGEMENT_SCHEMA_VERSION,
+    )
+    .map_err(|_| ProvisionError::OpenSsl("status sig input"))?;
     let (ed_sig, ml_sig) = dual_sign(&sig_msg, &status_ed, &status_ml)?;
     let signed = SignedObject {
         object_type: ObjectType::StatusSnapshot,
@@ -790,7 +815,9 @@ pub fn verify_material_dir_with_roots(
     let roots_raw = read_bounded(roots_path)?;
     let roots_bundle = RootsBundle::decode(&roots_raw)?;
     let net_id = match expected_net_id {
-        Some(expected) if expected != roots_bundle.net_id => return Err(ProvisionError::WrongNetwork),
+        Some(expected) if expected != roots_bundle.net_id => {
+            return Err(ProvisionError::WrongNetwork);
+        }
         Some(expected) => expected,
         None => roots_bundle.net_id,
     };
@@ -1248,8 +1275,7 @@ fn build_p256_leaf_cert(
         .map_err(|_| ProvisionError::OpenSsl("outer leaf CN"))?;
     let name = name.build();
 
-    let mut builder =
-        X509::builder().map_err(|_| ProvisionError::OpenSsl("outer leaf builder"))?;
+    let mut builder = X509::builder().map_err(|_| ProvisionError::OpenSsl("outer leaf builder"))?;
     builder
         .set_version(2)
         .map_err(|_| ProvisionError::OpenSsl("outer leaf v3"))?;
@@ -1333,8 +1359,8 @@ fn dual_sign(
     ed_key: &PKey<Private>,
     ml_key: &PKey<Private>,
 ) -> Result<([u8; 64], Vec<u8>), ProvisionError> {
-    let mut ed_signer =
-        Signer::new_without_digest(ed_key).map_err(|_| ProvisionError::OpenSsl("Ed25519 signer"))?;
+    let mut ed_signer = Signer::new_without_digest(ed_key)
+        .map_err(|_| ProvisionError::OpenSsl("Ed25519 signer"))?;
     let ed_vec = ed_signer
         .sign_oneshot_to_vec(message)
         .map_err(|_| ProvisionError::OpenSsl("Ed25519 sign"))?;
@@ -1437,7 +1463,9 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, ProvisionError> {
         if n == 0 {
             break;
         }
-        if buf.len().saturating_add(n) > usize::try_from(MAX_PROVISION_FILE_BYTES).unwrap_or(usize::MAX) {
+        if buf.len().saturating_add(n)
+            > usize::try_from(MAX_PROVISION_FILE_BYTES).unwrap_or(usize::MAX)
+        {
             return Err(ProvisionError::FileTooLarge);
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -1467,7 +1495,9 @@ pub fn parse_net_id_hex(text: &str) -> Result<[u8; 16], ProvisionError> {
         *slot = (hi << 4) | lo;
     }
     if out == [0u8; 16] {
-        return Err(ProvisionError::InvalidParameter("net_id cannot be all-zero"));
+        return Err(ProvisionError::InvalidParameter(
+            "net_id cannot be all-zero",
+        ));
     }
     Ok(out)
 }
@@ -1584,7 +1614,9 @@ fn cbor_read_head(data: &[u8], pos: usize) -> Result<(u8, u64, usize), Provision
             Ok((major, v, pos + 2))
         }
         25 => {
-            let s = data.get(pos + 1..pos + 3).ok_or(ProvisionError::RootsFormat)?;
+            let s = data
+                .get(pos + 1..pos + 3)
+                .ok_or(ProvisionError::RootsFormat)?;
             let v = u64::from(u16::from_be_bytes([s[0], s[1]]));
             if v <= u64::from(u8::MAX) {
                 return Err(ProvisionError::RootsFormat);
@@ -1592,7 +1624,9 @@ fn cbor_read_head(data: &[u8], pos: usize) -> Result<(u8, u64, usize), Provision
             Ok((major, v, pos + 3))
         }
         26 => {
-            let s = data.get(pos + 1..pos + 5).ok_or(ProvisionError::RootsFormat)?;
+            let s = data
+                .get(pos + 1..pos + 5)
+                .ok_or(ProvisionError::RootsFormat)?;
             let v = u64::from(u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
             if v <= u64::from(u16::MAX) {
                 return Err(ProvisionError::RootsFormat);
@@ -1600,7 +1634,9 @@ fn cbor_read_head(data: &[u8], pos: usize) -> Result<(u8, u64, usize), Provision
             Ok((major, v, pos + 5))
         }
         27 => {
-            let s = data.get(pos + 1..pos + 9).ok_or(ProvisionError::RootsFormat)?;
+            let s = data
+                .get(pos + 1..pos + 9)
+                .ok_or(ProvisionError::RootsFormat)?;
             let v = u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
             if v <= u64::from(u32::MAX) {
                 return Err(ProvisionError::RootsFormat);
@@ -1611,7 +1647,11 @@ fn cbor_read_head(data: &[u8], pos: usize) -> Result<(u8, u64, usize), Provision
     }
 }
 
-fn cbor_read_value(data: &[u8], pos: usize, depth: usize) -> Result<(CborVal<'_>, usize), ProvisionError> {
+fn cbor_read_value(
+    data: &[u8],
+    pos: usize,
+    depth: usize,
+) -> Result<(CborVal<'_>, usize), ProvisionError> {
     if depth > 6 {
         return Err(ProvisionError::RootsFormat);
     }
@@ -1746,8 +1786,16 @@ mod tests {
         assert_eq!(edge_summary.vip, [10, 20, 1, 2]);
 
         // Cross-copy peer.signed (public management identities).
-        fs::copy(core_dir.0.join("local.signed"), edge_dir.0.join("peer.signed")).unwrap();
-        fs::copy(edge_dir.0.join("local.signed"), core_dir.0.join("peer.signed")).unwrap();
+        fs::copy(
+            core_dir.0.join("local.signed"),
+            edge_dir.0.join("peer.signed"),
+        )
+        .unwrap();
+        fs::copy(
+            edge_dir.0.join("local.signed"),
+            core_dir.0.join("peer.signed"),
+        )
+        .unwrap();
 
         // Neither node bundle contains CA private keys.
         assert!(!core_dir.0.join("root.ed25519.key").exists());
@@ -1759,7 +1807,10 @@ mod tests {
             .expect("core bundle verifies against roots.cbor");
         let verified_edge = verify_material_dir(&edge_dir.0, now_us + 1_000_000, true)
             .expect("edge bundle verifies against roots.cbor");
-        assert_eq!(verified_core.root_fingerprint, verified_edge.root_fingerprint);
+        assert_eq!(
+            verified_core.root_fingerprint,
+            verified_edge.root_fingerprint
+        );
         assert_eq!(verified_core.status_sequence, 1);
 
         // Fail-closed when status snapshot expires (> 1h here).

@@ -44,7 +44,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn write_config(path: &Path, role: &str, vip_octet: u8, node_id: u16, mat_dir: &Path, state_dir: &Path, primary: &str) {
+fn write_config(
+    path: &Path,
+    role: &str,
+    vip_octet: u8,
+    node_id: u16,
+    mat_dir: &Path,
+    state_dir: &Path,
+    primary: &str,
+) {
     let body = format!(
         r#"version = 2
 
@@ -185,8 +193,24 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     let listen = format!("127.0.0.1:{port}");
     let core_cfg = root.0.join("core.toml");
     let edge_cfg = root.0.join("edge.toml");
-    write_config(&core_cfg, "core", 1, 1, &core_mat, &core_state, "wss.boreas.test:443");
-    write_config(&edge_cfg, "edge", 2, 2, &edge_mat, &edge_state, &format!("wss.boreas.test:{port}"));
+    write_config(
+        &core_cfg,
+        "core",
+        1,
+        1,
+        &core_mat,
+        &core_state,
+        "wss.boreas.test:443",
+    );
+    write_config(
+        &edge_cfg,
+        "edge",
+        2,
+        2,
+        &edge_mat,
+        &edge_state,
+        &format!("wss.boreas.test:{port}"),
+    );
 
     let mut srv = Command::new(bin())
         .args([
@@ -262,7 +286,10 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(saw_connected, "never observed live connected daemon over control.sock");
+    assert!(
+        saw_connected,
+        "never observed live connected daemon over control.sock"
+    );
 
     let cli_res = cli.wait_with_output().unwrap();
     let srv_res = srv.wait_with_output().unwrap();
@@ -347,7 +374,9 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     );
     let err_txt = String::from_utf8_lossy(&cli2.stderr);
     assert!(
-        err_txt.contains("StatusSnapshot") || err_txt.contains("status.signed") || err_txt.contains("expired"),
+        err_txt.contains("StatusSnapshot")
+            || err_txt.contains("status.signed")
+            || err_txt.contains("expired"),
         "unexpected stderr on status expiry: {err_txt}"
     );
 }

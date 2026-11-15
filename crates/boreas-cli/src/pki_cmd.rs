@@ -270,10 +270,7 @@ fn cmd_sign_status(args: &[String]) -> Result<(), String> {
 
     println!(
         "{{\"command\":\"pki.sign-status\",\"status\":\"ok\",\"net_id\":\"{}\",\"sequence\":{},\"issued_at_us\":{},\"next_update_us\":{}}}",
-        summary.net_id_hex,
-        summary.sequence,
-        summary.issued_at_us,
-        summary.next_update_us
+        summary.net_id_hex, summary.sequence, summary.issued_at_us, summary.next_update_us
     );
     Ok(())
 }
@@ -309,12 +306,13 @@ fn cmd_verify_bundle(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let material_dir =
-        material_dir.ok_or_else(|| "pki verify-bundle: `--material-dir` is required".to_string())?;
+    let material_dir = material_dir
+        .ok_or_else(|| "pki verify-bundle: `--material-dir` is required".to_string())?;
     let roots = roots_path.unwrap_or_else(|| material_dir.join("roots.cbor"));
 
-    let verified = verify_material_dir_with_roots(&material_dir, &roots, None, now_utc_us()?, require_peer)
-        .map_err(|e| format!("pki verify-bundle failed: {e}"))?;
+    let verified =
+        verify_material_dir_with_roots(&material_dir, &roots, None, now_utc_us()?, require_peer)
+            .map_err(|e| format!("pki verify-bundle failed: {e}"))?;
     let ObjectBody::NodeIdentity(local) = &verified.local.object().body else {
         return Err("pki verify-bundle: local object is not NodeIdentity".to_string());
     };

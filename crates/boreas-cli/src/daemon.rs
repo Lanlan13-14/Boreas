@@ -53,8 +53,8 @@ pub fn query_control_socket(sock_path: &Path) -> Result<(StatusSnapshot, String)
         return Err("control socket owner UID mismatch".to_string());
     }
 
-    let mut stream =
-        UnixStream::connect(sock_path).map_err(|_| "cannot connect to control socket".to_string())?;
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|_| "cannot connect to control socket".to_string())?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     stream
@@ -87,7 +87,8 @@ fn parse_live_snapshot_json(raw: &str) -> Result<StatusSnapshot, String> {
     let node_name = json_str_field(raw, "node").unwrap_or_else(|| "(live)".to_string());
     let version =
         json_str_field(raw, "version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let mode_str = json_str_field(raw, "security_mode").unwrap_or_else(|| "e2e-required".to_string());
+    let mode_str =
+        json_str_field(raw, "security_mode").unwrap_or_else(|| "e2e-required".to_string());
     let security_mode = match mode_str.as_str() {
         "hop-only" => RenderSecurityMode::HopOnly,
         _ => RenderSecurityMode::E2eRequired,
@@ -140,10 +141,7 @@ fn json_u64_field(raw: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\":");
     let start = raw.find(&needle)? + needle.len();
     let rest = raw[start..].trim_start();
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u64>().ok()
 }
 
@@ -173,8 +171,9 @@ pub fn run_ctl_command(args: &[String]) -> Result<(), String> {
     let target = if let Some(s) = sock {
         s
     } else if let Some(c) = cfg_path {
-        let cfg = crate::config::Config::read_file(&c, crate::config::RuntimeCapabilities::NO_RUNTIME)
-            .map_err(|e| format!("ctl status: {e}"))?;
+        let cfg =
+            crate::config::Config::read_file(&c, crate::config::RuntimeCapabilities::NO_RUNTIME)
+                .map_err(|e| format!("ctl status: {e}"))?;
         cfg.paths.state_dir.join("control.sock")
     } else {
         std::path::PathBuf::from("/run/boreas/control.sock")
@@ -537,7 +536,9 @@ mod linux_daemon {
             .map_err(|e| format!("daemon config rejected: {e}"))?;
 
         if config.security.mode != CfgMode::E2eRequired {
-            return Err("daemon: pre.1 enforces `security_mode = e2e-required` (fail-closed)".to_string());
+            return Err(
+                "daemon: pre.1 enforces `security_mode = e2e-required` (fail-closed)".to_string(),
+            );
         }
         if config.security.suite != CfgSuite::Pq768 {
             return Err("daemon: pre.1 supports `suite = pq768` only".to_string());
@@ -563,14 +564,9 @@ mod linux_daemon {
 
         // Real mounted roots.cbor verification (§2.2 / §3.4): NO TOFU, NO bypass.
         let now_us = now_utc_us()?;
-        let verified = verify_material_dir_with_roots(
-            &mat_dir,
-            &roots_path,
-            Some(cfg_net_id),
-            now_us,
-            true,
-        )
-        .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
+        let verified =
+            verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
+                .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
 
         let local_vn = VerifiedNodeIdentity::from_verified_object(&verified.local)
             .map_err(|_| "daemon: invalid local VerifiedNodeIdentity".to_string())?;
@@ -638,11 +634,8 @@ mod linux_daemon {
             tls_policy,
         )
         .map_err(|_| "daemon: E2E pq768 acceptor setup failed".to_string())?;
-        let e2e_backend = OpenSslE2eBackend::new(
-            Arc::new(e2e_conn),
-            Arc::new(e2e_acc),
-            extractor.clone(),
-        );
+        let e2e_backend =
+            OpenSslE2eBackend::new(Arc::new(e2e_conn), Arc::new(e2e_acc), extractor.clone());
 
         // Open real Linux TUN (or VirtualTun for unprivileged tests) BEFORE starting traffic.
         let tun_endpoint = if virtual_tun {
@@ -659,7 +652,11 @@ mod linux_daemon {
                 multi_queue: false,
                 vnet_header: false,
             })
-            .map_err(|e| format!("daemon Linux TUN creation failed (need CAP_NET_ADMIN / /dev/net/tun): {e:?}"))?;
+            .map_err(|e| {
+                format!(
+                    "daemon Linux TUN creation failed (need CAP_NET_ADMIN / /dev/net/tun): {e:?}"
+                )
+            })?;
             let actual_name = dev.name().to_string();
             TunEndpoint::Real {
                 _device: dev,
@@ -756,7 +753,6 @@ mod linux_daemon {
         }
     }
 
-
     /// Outer TLS connector wrapper that records the raw socket `fd` on `connect`
     /// so the steady-state packet loop can `poll(fd, POLLIN, 20ms)` **before**
     /// calling `PacketPath::step_inbound()` (preventing idle reads from entering
@@ -827,9 +823,7 @@ mod linux_daemon {
             .set_nonblocking(true)
             .map_err(|_| "daemon serve: listener nonblocking failed".to_string())?;
 
-        let wait_limit = max_seconds
-            .map(Duration::from_secs)
-            .unwrap_or(ACCEPT_WAIT);
+        let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
         let accept_deadline = Instant::now() + wait_limit;
         let tcp = loop {
             match listener.accept() {
@@ -840,7 +834,9 @@ mod linux_daemon {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= accept_deadline {
-                        return Err("daemon serve: timed out waiting for peer connection".to_string());
+                        return Err(
+                            "daemon serve: timed out waiting for peer connection".to_string()
+                        );
                     }
                     thread::sleep(Duration::from_millis(25));
                 }
@@ -855,9 +851,16 @@ mod linux_daemon {
             authenticated_per_peer: 2,
             bytes_global: 16 * 1024 * 1024,
         });
-        let link_server = LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
+        let link_server =
+            LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
         let mut accepted = link_server
-            .accept_tls_stream(tcp, &outer_acc, session_policy, HANDSHAKE_TIMEOUT, &admission)
+            .accept_tls_stream(
+                tcp,
+                &outer_acc,
+                session_policy,
+                HANDSHAKE_TIMEOUT,
+                &admission,
+            )
             .map_err(|e| format!("daemon serve: WSS + pq768 hop session rejected: {e}"))?;
 
         let e2e = accept_e2e(&mut accepted.session, &e2e_backend, remote_peer)
@@ -1041,13 +1044,19 @@ mod linux_daemon {
             match path.step_outbound() {
                 Ok(Some(_len)) => {
                     let st = path.stats();
-                    counters.tx_packets.store(st.outbound_packets, Ordering::Relaxed);
-                    counters.tx_bytes.store(st.outbound_bytes, Ordering::Relaxed);
+                    counters
+                        .tx_packets
+                        .store(st.outbound_packets, Ordering::Relaxed);
+                    counters
+                        .tx_bytes
+                        .store(st.outbound_bytes, Ordering::Relaxed);
                 }
                 Ok(None) => {}
                 Err(PacketPathError::Denied(_)) => {
                     // Fail-closed per-packet denial already poisoned `path`.
-                    return Err("daemon: outbound L3 packet denied by PointToPoint policy".to_string());
+                    return Err(
+                        "daemon: outbound L3 packet denied by PointToPoint policy".to_string()
+                    );
                 }
                 Err(e) => {
                     return Err(format!("daemon: outbound packet path error: {e:?}"));
@@ -1059,7 +1068,9 @@ mod linux_daemon {
                 match path.step_inbound() {
                     Ok(Some(_len)) => {
                         let st = path.stats();
-                        counters.rx_packets.store(st.inbound_packets, Ordering::Relaxed);
+                        counters
+                            .rx_packets
+                            .store(st.inbound_packets, Ordering::Relaxed);
                         counters.rx_bytes.store(st.inbound_bytes, Ordering::Relaxed);
                     }
                     Ok(None) => {

@@ -163,15 +163,27 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         Some("node") => node::run(&args[1..]),
         Some("pki") => match pki_cmd::run_pki_command(&args[1..]) {
             Ok(()) => (0, String::new(), String::new()),
-            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+            Err(err) => (
+                2,
+                String::new(),
+                format!("error: {err}; no daemon was started"),
+            ),
         },
         Some("daemon") => match daemon::run_daemon_command(&args[1..]) {
             Ok(()) => (0, String::new(), String::new()),
-            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+            Err(err) => (
+                2,
+                String::new(),
+                format!("error: {err}; no daemon was started"),
+            ),
         },
         Some("ctl") => match daemon::run_ctl_command(&args[1..]) {
             Ok(()) => (0, String::new(), String::new()),
-            Err(err) => (2, String::new(), format!("error: {err}; no daemon was started")),
+            Err(err) => (
+                2,
+                String::new(),
+                format!("error: {err}; no daemon was started"),
+            ),
         },
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => {
             (0, help_text(), String::new())
