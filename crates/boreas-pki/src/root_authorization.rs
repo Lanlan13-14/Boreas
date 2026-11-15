@@ -7,7 +7,7 @@
 use std::fmt;
 
 use openssl::{
-    hash::{hash, MessageDigest},
+    hash::{MessageDigest, hash},
     pkey::{KeyType, PKey},
     sign::Verifier,
 };
@@ -781,24 +781,33 @@ mod tests {
         let compact: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
         let (pairs, remainder) = compact.as_bytes().as_chunks::<2>();
         assert!(remainder.is_empty(), "odd-length fixture hex");
-        pairs.iter().map(|pair| {
-            let byte = std::str::from_utf8(pair).unwrap();
-            u8::from_str_radix(byte, 16).unwrap()
-        }).collect()
+        pairs
+            .iter()
+            .map(|pair| {
+                let byte = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(byte, 16).unwrap()
+            })
+            .collect()
     }
 
     #[test]
     fn independent_python_root_structure_vector_and_bool_encoding() {
         // tools/candidate_bindings.py / security-bindings-candidate-v1.json uses synthetic
         // non-DER keys: structural decoding only, deliberately no signature verification.
-        let valid = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf4 0d80");
+        let valid = hex(
+            "ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf4 0d80",
+        );
         let parsed = RootAuthorizationCandidate::decode_candidate(&valid).unwrap();
         assert_eq!(parsed.purpose, Purpose::Identity);
         assert!(!parsed.may_delegate);
         assert_eq!(parsed.encode_candidate().unwrap(), valid);
-        let uint_false = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0c00 0d80");
+        let uint_false = hex(
+            "ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0c00 0d80",
+        );
         assert!(RootAuthorizationCandidate::decode_candidate(&uint_false).is_err());
-        let true_delegate = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf5 0d80");
+        let true_delegate = hex(
+            "ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf5 0d80",
+        );
         assert!(RootAuthorizationCandidate::decode_candidate(&true_delegate).is_err());
     }
 
