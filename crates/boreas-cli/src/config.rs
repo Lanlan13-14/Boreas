@@ -1360,11 +1360,14 @@ ipv6 = false
     fn overlay_default_is_explicit_in_output_and_round_trips_both_schemas() {
         for input in [v2_toml(), legacy_toml()] {
             let omitted = parse(&input).unwrap();
-            let explicit =
-                input.replace("net_id =", "overlay_prefix = \"10.20.0.0/16\"\nnet_id =");
+            let explicit = input.replace("net_id =", "overlay_prefix = \"10.20.0.0/16\"\nnet_id =");
             assert_eq!(parse(&explicit).unwrap(), omitted);
             assert_eq!(omitted.network.overlay_prefix, OverlayPrefix::DEFAULT);
-            assert!(omitted.redacted_json().contains("\"overlay_prefix\":\"10.20.0.0/16\""));
+            assert!(
+                omitted
+                    .redacted_json()
+                    .contains("\"overlay_prefix\":\"10.20.0.0/16\"")
+            );
             let migrated = omitted.to_v2_toml();
             assert!(migrated.contains("overlay_prefix = \"10.20.0.0/16\""));
             let reparsed = parse(&migrated).unwrap();
@@ -1424,7 +1427,10 @@ ipv6 = false
             Err(ConfigError::CustomOverlayPrefixUnavailable)
         );
         assert!(old.security_transition_requires_high_risk(&next));
-        assert!(next.to_v2_toml().contains("overlay_prefix = \"172.19.0.0/16\""));
+        assert!(
+            next.to_v2_toml()
+                .contains("overlay_prefix = \"172.19.0.0/16\"")
+        );
         assert!(
             ConfigError::CustomOverlayPrefixUnavailable
                 .to_string()

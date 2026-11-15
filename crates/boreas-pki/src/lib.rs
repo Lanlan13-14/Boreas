@@ -559,7 +559,10 @@ mod tests {
                 Err(PolicyError::InvalidVip)
             );
         }
-        assert_eq!(prefix.vip(1, 2, NodeRole::Core), Err(PolicyError::InvalidVip));
+        assert_eq!(
+            prefix.vip(1, 2, NodeRole::Core),
+            Err(PolicyError::InvalidVip)
+        );
         assert_eq!(
             prefix.vip(1, 1, NodeRole::EnrollmentService),
             Err(PolicyError::InvalidVip)
