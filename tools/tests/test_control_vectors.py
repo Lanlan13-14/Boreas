@@ -360,14 +360,33 @@ class SignedObjectTests(unittest.TestCase):
 
 class OtherBodyTests(unittest.TestCase):
     def test_probe_ping_and_pong(self):
-        ping = bytes([9, 1]) + bytes(16) + (1).to_bytes(8, "big") + bytes(8)
+        challenge = bytes(range(1, 17))
+        ping = bytes([9, 1]) + challenge + (1).to_bytes(8, "big") + bytes(8)
         self.assertEqual(len(ping), control.PROBE_BODY_LEN)
-        self.assertEqual(control.parse_control(ping)["kind"], "ping")
+        parsed_ping = control.parse_control(ping)
+        self.assertEqual(parsed_ping["kind"], "ping")
+        self.assertEqual(parsed_ping["challenge_hex"], challenge.hex())
+        self.assertEqual(parsed_ping["sent"], 1)
+        self.assertEqual(parsed_ping["echo"], 0)
 
-        broken = bytes([9, 1]) + bytes(16) + (1).to_bytes(8, "big") + (1).to_bytes(8, "big")
-        with self.assertRaises(control.Reject) as caught:
-            control.parse_control(broken)
-        self.assertEqual(caught.exception.category, "invalid_field")
+        pong = bytes([9, 2]) + challenge + (1).to_bytes(8, "big") + (2).to_bytes(8, "big")
+        parsed_pong = control.parse_control(pong)
+        self.assertEqual(parsed_pong["kind"], "pong")
+        self.assertEqual(parsed_pong["challenge_hex"], challenge.hex())
+        self.assertEqual(parsed_pong["sent"], 1)
+        self.assertEqual(parsed_pong["echo"], 2)
+
+        cases = (
+            ("invalid_field", bytes([9, 1]) + bytes(16) + (1).to_bytes(8, "big") + bytes(8)),
+            ("invalid_field", bytes([9, 1]) + challenge + (1).to_bytes(8, "big") + (1).to_bytes(8, "big")),
+            ("invalid_field", bytes([9, 3]) + challenge + (1).to_bytes(8, "big") + bytes(8)),
+            ("wrong_length", ping[:-1]),
+        )
+        for category, raw in cases:
+            with self.subTest(category=category, raw=raw.hex()):
+                with self.assertRaises(control.Reject) as caught:
+                    control.parse_control(raw)
+                self.assertEqual(caught.exception.category, category)
 
     def test_drain_length_and_reason(self):
         drain = bytes([10, 1]) + (5).to_bytes(8, "big") + (30).to_bytes(2, "big")

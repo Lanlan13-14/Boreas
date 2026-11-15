@@ -31,19 +31,7 @@
 
 持久化接口尚未分配实现。本阶段不新增 bootstrap/store crate；待 RootAuthorization verifier 评审后，先盘点现有 `boreas-pki::enrollment::EnrollmentStore` 与 `boreas-crypto::key_store`，由主代理指定窄接口及文件范围。
 
-```rust
-trait ProvisioningVerifier { fn verify_package(&self, exact_bytes: &[u8], out_of_band_pin: &RootPins) -> Result<VerifiedProvisioning, BootstrapError>; }
-trait DurableNodeStore {
-    fn load_anchors_and_genesis(&self) -> Result<VerifiedGenesis, StoreError>;
-    fn load_local_keypair(&self) -> Result<LocalKeyHandle, StoreError>;
-    fn load_identity_chain_and_raw_objects(&self) -> Result<VerifiedStartupObjects, StoreError>;
-    fn load_status_and_watermarks(&self) -> Result<DurableStatusState, StoreError>;
-    fn commit_verified_update(&mut self, update: VerifiedDurableUpdate) -> Result<(), StoreError>;
-    fn close(&mut self) -> Result<(), StoreError>;
-}
-```
-
-验证器构造值，不用 public fields / bool assertion：`VerifiedGenesis`, `VerifiedProvisioning`, `VerifiedLocalIdentity`, `VerifiedStartupObjects`, `FreshStatus`, `VerifiedRevocation`, `DurableUpdate`. Constructors 应仅在根链/密码验证模块可见。统一对路径用 `O_NOFOLLOW`/Windows reparse 等平台接口拒绝链接、检查 owner/mode、bounded read、私有原子写+fsync file/dir；存储回滚不可检测或无法原子提交即拒业务启动。密钥由零化/安全 store 管理，错误/Debug/log 不泄露 bytes/path/PEM/private key。
+不在本合同中先造一组泛化 store trait。后续存储任务先检查现有 `EnrollmentStore`、journal 与 `boreas-crypto::key_store`，再由主代理定明确文件归属和最窄增量 API。无论 API 如何定：验证器必须构造私有字段能力值，不用 public fields / bool assertion；路径需拒链接、检查 owner/mode、bounded read、私有原子写+fsync file/dir；存储回滚不可检测或无法原子提交即拒业务启动。密钥由零化/安全 store 管理，错误/Debug/log 不泄露 bytes/path/PEM/private key。
 
 验证顺序：
 1. 先读受限配置并验证 config 文件 owner/mode/symlink、大小、路径绝对、网络与身份声明一致；请求能力只能关闭，不能从配置开启未实现功能。
@@ -87,10 +75,11 @@ Every started background worker has a cancellation token/wakeup, owned JoinHandl
 
 ## 5. Implementation/dependency order (do not parallelize consumers ahead of interfaces)
 
-1. **P00/P01 gating baseline:** finish merge/Actions baseline; reconcile candidate schemas/Lease limit, trust root/RootAuthorization wire bytes, NodeIdentity Ed public-key binding/OID and trusted clock API; freeze errors/schema vectors. No daemon code can trust provisioned issuer records until then.
-2. **P02 backend/auth API:** strict outer+h1 WSS and hop TLS runtime integration, real peer extraction and full cert↔signed identity binding, no bool registration input, prove pq768 actual negotiated facts. Keep h2/CDN out of first slice.
-3. **P03 bootstrap/store:** local key generation/key-store; root provisioning validator; durable signed object verification/replay watermarks/equivocation evidence; durable clock floor/status snapshot and authorization capability; tested commit/restart/rollback/expiry semantics; actual route handle close interface. Enrollment can be offline preprovision first, but exact same key/CSR transaction needed before online join.
-4. **P04 NodeRuntime skeleton:** consume reviewed config parser/library; preflight/startup transaction and bounded resource ownership; strict errors/readiness/cancel/shutdown; Unix peer-credential management snapshot; actual capabilities from constructed services. Begin only after durable-trust and resource-closure APIs are agreed.
+1. **P00/P01 baseline:** finish merge/Actions baseline; reconcile candidate schemas/Lease limit, root/RootAuthorization byte contract, NodeIdentity Ed public-key binding/OID and trusted clock API. No daemon code can trust provisioned issuer records until root-authorized issuer input is real.
+2. **L0 root-authorized issuer capability:** exact three files in §6; if no existing proto RootAuthorization definition can carry the documented candidate exactly, stop and request a separately assigned proto/schema slice. Do not implement dependent consumers in parallel.
+3. **P03 durable state:** inspect existing enrollment journal/key-store APIs; narrow exact-byte RootAuthorization/replay/equivocation/root-version/trusted UTC watermark persistence and restart re-verification; then local key generation and identity/status state in separately approved slices. No new generic store crate.
+4. **P02 backend/auth API:** strict outer+h1 WSS and hop TLS runtime integration, real peer extraction and full cert↔signed identity binding, no bool registration input, prove pq768 actual negotiated facts. Keep h2/CDN out of first slice.
+5. **P04 NodeRuntime skeleton:** consume reviewed config parser/library; preflight/startup transaction and bounded resource ownership; strict errors/readiness/cancel/shutdown; Unix peer-credential management snapshot; actual capabilities from constructed services. Begin only after durable-trust and resource-closure APIs are agreed.
 5. **P05 PAIRED endpoints:** real packet reader and safe packet parser/authorized VIP checks; typed E2E confirmation; single-hop session/circuit owner; Global Admission+credit; actual VirtualTun-to-VirtualTun packet integration over E2E encrypted stream. Only after this works implement LinuxTun one queue with actual route/device ownership (the current Linux adapter alone does not install routes); collect packet hashes/bytes and real failure/reset/drop evidence. No HopTun helper.
 6. **Then broader P04/P05:** CLI daemon/config integration, service/system readiness, OS control endpoints and privileged bootstrap; DNS/smoltcp, owned route APIs, multi-queue/GSO, h2/CDN, multihop, subnet routes and scale each in separate slices. Actions exact commit after each slice; gates stay open pending genuine evidence and external review.
 
