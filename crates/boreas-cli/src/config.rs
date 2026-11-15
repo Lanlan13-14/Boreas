@@ -311,9 +311,7 @@ impl fmt::Display for ConfigError {
             Self::UnsupportedSchemaVersion => {
                 "unsupported `version`; only 1 (legacy) and 2 (current) are understood"
             }
-            Self::InvalidNetId => {
-                "network net_id must be exactly 32 hexadecimal digits (16 bytes)"
-            }
+            Self::InvalidNetId => "network net_id must be exactly 32 hexadecimal digits (16 bytes)",
             Self::InvalidNodeId => "node_id is outside the permanent 12-bit slot range (0..=4095)",
             Self::InvalidHomeCoreId => "home_core_id must be within 1..=16",
             Self::InvalidVipOctet => "vip_octet is not valid for the configured role",
@@ -354,9 +352,7 @@ impl fmt::Display for ConfigError {
             Self::SymlinkNotAllowed => {
                 "configuration path is a symbolic link or reparse point; pass the real file"
             }
-            Self::WrongOwner => {
-                "configuration file is not owned by root or the current user"
-            }
+            Self::WrongOwner => "configuration file is not owned by root or the current user",
             Self::TooLarge => "configuration file exceeds the 64 KiB limit",
             Self::ParseFailed => {
                 "configuration is not valid TOML or does not match the declared schema"
@@ -549,7 +545,8 @@ impl Config {
                 Self::migrate_legacy(raw)?
             }
             2 => {
-                let raw: V2Document = toml::from_str(input).map_err(|_| ConfigError::ParseFailed)?;
+                let raw: V2Document =
+                    toml::from_str(input).map_err(|_| ConfigError::ParseFailed)?;
                 if raw.version != 2 {
                     return Err(ConfigError::UnsupportedSchemaVersion);
                 }
@@ -668,10 +665,7 @@ impl Config {
     /// Windows: the file is opened without following reparse points, and a
     /// reparse point is refused. NTFS ACLs are not inspected; that is stated
     /// rather than implied.
-    pub fn read_file(
-        path: &Path,
-        capabilities: RuntimeCapabilities,
-    ) -> Result<Self, ConfigError> {
+    pub fn read_file(path: &Path, capabilities: RuntimeCapabilities) -> Result<Self, ConfigError> {
         let file = open_no_follow(path)?;
         let metadata = file.metadata().map_err(|_| ConfigError::ReadFailed)?;
         if !metadata.file_type().is_file() {
@@ -712,7 +706,8 @@ impl Config {
     /// Machine-readable summary. Secret-bearing values are replaced; `net_id` is
     /// a public genesis identifier and the path counts are not secret.
     pub fn redacted_json(&self) -> String {
-        let (backup_present, probe_paths) = (self.uplinks.backup.is_some(), self.uplinks.probe_paths);
+        let (backup_present, probe_paths) =
+            (self.uplinks.backup.is_some(), self.uplinks.probe_paths);
         let dns = match &self.dns {
             None => "\"dns\":null".to_string(),
             Some(dns) => format!(
@@ -769,7 +764,10 @@ impl Config {
         ));
         out.push_str("version = 2\n\n[node]\n");
         out.push_str(&format!("net_id = {}\n", toml_string(&self.network.net_id)));
-        out.push_str(&format!("role = {}\n", toml_string(self.identity.role.as_str())));
+        out.push_str(&format!(
+            "role = {}\n",
+            toml_string(self.identity.role.as_str())
+        ));
         out.push_str(&format!("home_core_id = {}\n", self.identity.home_core_id));
         out.push_str(&format!("vip_octet = {}\n", self.identity.vip_octet));
         out.push_str(&format!("node_id = {}\n", self.identity.node_id));
@@ -781,7 +779,10 @@ impl Config {
             "security_mode = {}\n",
             toml_string(self.security.mode.as_str())
         ));
-        out.push_str(&format!("suite = {}\n\n[paths]\n", toml_string(self.security.suite.as_str())));
+        out.push_str(&format!(
+            "suite = {}\n\n[paths]\n",
+            toml_string(self.security.suite.as_str())
+        ));
         out.push_str(&format!(
             "identity_key = {}\n",
             toml_string(&path_text(&self.identity.private_key))
@@ -797,7 +798,10 @@ impl Config {
             "state_dir = {}\n\n[uplink]\n",
             toml_string(&path_text(&self.paths.state_dir))
         ));
-        out.push_str(&format!("primary = {}\n", toml_string(&self.uplinks.primary)));
+        out.push_str(&format!(
+            "primary = {}\n",
+            toml_string(&self.uplinks.primary)
+        ));
         if let Some(backup) = &self.uplinks.backup {
             out.push_str(&format!("backup = {}\n", toml_string(backup)));
         }
@@ -959,7 +963,9 @@ fn open_no_follow(path: &Path) -> Result<File, ConfigError> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options.open(path).map_err(|error| classify_open_error(&error))
+    options
+        .open(path)
+        .map_err(|error| classify_open_error(&error))
 }
 
 /// Map an open failure onto the narrowest honest diagnostic. `ELOOP` means the
@@ -976,9 +982,7 @@ fn classify_open_error(error: &std::io::Error) -> ConfigError {
 /// Validate a `host:port` endpoint in the §5.5 form. No resolution, no dialling.
 fn valid_endpoint(value: &str) -> bool {
     if value.is_empty()
-        || value
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
         || value.contains('@')
         || value.contains('/')
         || value.contains('\\')
@@ -1037,9 +1041,7 @@ fn legacy_wss_to_endpoint(url: &str) -> Result<String, ConfigError> {
 fn valid_zone(zone: &str) -> bool {
     !zone.is_empty()
         && zone.len() <= 253
-        && !zone
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+        && !zone.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn toml_string(value: &str) -> String {
@@ -1122,7 +1124,8 @@ impl fmt::Debug for RedactedConfig<'_> {
 )]
 pub trait SecurityAudit {
     type Error;
-    fn record_security_transition(&mut self, old: &Config, new: &Config) -> Result<(), Self::Error>;
+    fn record_security_transition(&mut self, old: &Config, new: &Config)
+    -> Result<(), Self::Error>;
 }
 
 /// Drop every established session so a changed trust model cannot apply to old
@@ -1302,7 +1305,10 @@ ipv6 = false
         assert!(config.limits.ipv6);
         assert!(!config.limits.allow_edges);
 
-        let with_dns = format!("{}[dns]\nlisten_vip = \"10.20.0.53\"\nzone = \".boreas\"\n", v2_toml());
+        let with_dns = format!(
+            "{}[dns]\nlisten_vip = \"10.20.0.53\"\nzone = \".boreas\"\n",
+            v2_toml()
+        );
         let config = parse(&with_dns).unwrap();
         let dns = config.dns.as_ref().unwrap();
         assert_eq!(dns.zone.as_deref(), Some(".boreas"));
@@ -1342,7 +1348,10 @@ ipv6 = false
             "wss://core.example.net",
             "wss://core.example.net/boreas/edge",
         );
-        assert_eq!(parse(&with_path), Err(ConfigError::LegacyUplinkNeedsRewrite));
+        assert_eq!(
+            parse(&with_path),
+            Err(ConfigError::LegacyUplinkNeedsRewrite)
+        );
 
         let three = legacy_toml().replace(
             "uplinks = [\"wss://core.example.net\"]",
@@ -1351,7 +1360,10 @@ ipv6 = false
         assert_eq!(parse(&three), Err(ConfigError::TooManyLegacyUplinks));
 
         let plaintext = legacy_toml().replace("wss://core.example.net", "https://core.example.net");
-        assert_eq!(parse(&plaintext), Err(ConfigError::LegacyUplinkNeedsRewrite));
+        assert_eq!(
+            parse(&plaintext),
+            Err(ConfigError::LegacyUplinkNeedsRewrite)
+        );
     }
 
     #[test]
@@ -1379,7 +1391,10 @@ ipv6 = false
 
         let mut config = parse(&v2_toml()).unwrap();
         config.uplinks.probe_paths = 2;
-        assert_eq!(config.validate(NO_CAPS), Err(ConfigError::InvalidProbePaths));
+        assert_eq!(
+            config.validate(NO_CAPS),
+            Err(ConfigError::InvalidProbePaths)
+        );
 
         let mut config = parse(&v2_toml()).unwrap();
         config.security.suite = CryptoSuite::Pq1024;
@@ -1387,12 +1402,19 @@ ipv6 = false
 
         let mut config = parse(&v2_toml()).unwrap();
         config.limits.default_route = true;
-        assert_eq!(config.validate(NO_CAPS), Err(ConfigError::DefaultRouteUnsupported));
+        assert_eq!(
+            config.validate(NO_CAPS),
+            Err(ConfigError::DefaultRouteUnsupported)
+        );
     }
 
     #[test]
     fn endpoints_must_be_host_port() {
-        for accepted in ["core.example.net:443", "10.20.0.1:8443", "hub-us-c.example.net:1"] {
+        for accepted in [
+            "core.example.net:443",
+            "10.20.0.1:8443",
+            "hub-us-c.example.net:1",
+        ] {
             let document = v2_toml().replace(
                 "primary = \"hub-us-c.example.net:443\"",
                 &format!("primary = \"{accepted}\""),
@@ -1414,7 +1436,11 @@ ipv6 = false
                 "primary = \"hub-us-c.example.net:443\"",
                 &format!("primary = \"{rejected}\""),
             );
-            assert_eq!(parse(&document), Err(ConfigError::InvalidEndpoint), "accepted {rejected}");
+            assert_eq!(
+                parse(&document),
+                Err(ConfigError::InvalidEndpoint),
+                "accepted {rejected}"
+            );
         }
     }
 
@@ -1430,7 +1456,10 @@ ipv6 = false
 
         let mut config = parse(&v2_toml()).unwrap();
         config.identity.home_core_id = 17;
-        assert_eq!(config.validate(NO_CAPS), Err(ConfigError::InvalidHomeCoreId));
+        assert_eq!(
+            config.validate(NO_CAPS),
+            Err(ConfigError::InvalidHomeCoreId)
+        );
 
         let mut edge = parse(&v2_toml()).unwrap();
         edge.identity.role = NodeRole::Edge;
@@ -1459,7 +1488,10 @@ ipv6 = false
         config.identity.role = NodeRole::Edge;
         config.identity.vip_octet = 2;
         config.identity.node_id = ((2u16 - 1) << 8) | 2;
-        assert_eq!(config.validate(NO_CAPS), Err(ConfigError::AllowEdgesRequiresCore));
+        assert_eq!(
+            config.validate(NO_CAPS),
+            Err(ConfigError::AllowEdgesRequiresCore)
+        );
     }
 
     #[test]
@@ -1487,7 +1519,10 @@ ipv6 = false
             &format!("\"{TEST_BASE}/identity.key\""),
             "\"relative/identity.key\"",
         );
-        assert_eq!(parse(&document), Err(ConfigError::PrivateKeyPathNotAbsolute));
+        assert_eq!(
+            parse(&document),
+            Err(ConfigError::PrivateKeyPathNotAbsolute)
+        );
     }
 
     #[test]
@@ -1589,7 +1624,8 @@ ipv6 = false
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("boreas-mode-{}-{unique}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("boreas-mode-{}-{unique}.toml", std::process::id()));
         fs::write(&path, v2_toml()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
