@@ -199,7 +199,7 @@ impl LinkServer {
     /// terminated the outer TLS layer (or, in tests, deliberately skipped it).
     /// Keeping this private prevents an arbitrary stream from bypassing the
     /// outer TLS seam.
-    fn accept_established<T: Duplex>(
+    fn accept_established<T: Duplex + 'static>(
         &self,
         transport: T,
         handshake: HandshakeCredit,
