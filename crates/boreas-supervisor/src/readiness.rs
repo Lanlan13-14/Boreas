@@ -637,8 +637,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut pending = None;
         let report = loop {
-            match probe_once(&listener, std::process::id(), &policy(), &mut pending, deadline)
-                .expect("readiness poll")
+            match probe_once(
+                &listener,
+                std::process::id(),
+                &policy(),
+                &mut pending,
+                deadline,
+            )
+            .expect("readiness poll")
             {
                 Some(report) => break report,
                 None => std::thread::sleep(Duration::from_millis(10)),
