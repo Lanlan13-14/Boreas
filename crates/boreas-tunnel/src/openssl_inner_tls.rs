@@ -443,9 +443,10 @@ impl OpenSslOuterTlsConnector {
 
 impl OuterTlsConnector for OpenSslOuterTlsConnector {
     fn connect(&self, tcp: TcpStream, server_name: &str) -> Result<Box<dyn Duplex>, TunnelError> {
-        let stream = self.connector.connect(server_name, tcp).map_err(|error| {
-            TunnelError::InnerTls(outer_tls_reason("outer handshake", &error))
-        })?;
+        let stream = self
+            .connector
+            .connect(server_name, tcp)
+            .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer handshake", &error)))?;
         Ok(Box::new(stream))
     }
 }
@@ -487,9 +488,10 @@ impl OpenSslOuterTlsAcceptor {
 
 impl OuterTlsAcceptor for OpenSslOuterTlsAcceptor {
     fn accept(&self, tcp: TcpStream) -> Result<Box<dyn Duplex>, TunnelError> {
-        let stream = self.acceptor.accept(tcp).map_err(|error| {
-            TunnelError::InnerTls(outer_tls_reason("outer accept", &error))
-        })?;
+        let stream = self
+            .acceptor
+            .accept(tcp)
+            .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer accept", &error)))?;
         Ok(Box::new(stream))
     }
 }
@@ -506,9 +508,10 @@ fn outer_tls_reason(
     let kind = io_error.io_error().map(io::Error::kind);
     match (stage, kind) {
         (_, Some(io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)) => "outer tls timeout",
-        ("outer handshake", Some(io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof)) => {
-            "outer handshake reset"
-        }
+        (
+            "outer handshake",
+            Some(io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof),
+        ) => "outer handshake reset",
         ("outer accept", Some(io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof)) => {
             "outer accept reset"
         }
