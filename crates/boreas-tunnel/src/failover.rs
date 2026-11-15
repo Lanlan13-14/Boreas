@@ -715,7 +715,11 @@ mod tests {
             Selection::SameCoreCdn
         );
 
-        let ready = paths(status(Health::Healthy, NOW - RECOVER_HOLD), held(NOW), down());
+        let ready = paths(
+            status(Health::Healthy, NOW - RECOVER_HOLD),
+            held(NOW),
+            down(),
+        );
         assert_eq!(
             choose(PathId::SameCoreCdn, ready, NOW),
             Selection::SameCoreDir
@@ -852,7 +856,11 @@ mod tests {
             ),
             (
                 PathId::SameCoreCdn,
-                paths(status(Health::Healthy, NOW), status(Health::Suspect, NOW), down()),
+                paths(
+                    status(Health::Healthy, NOW),
+                    status(Health::Suspect, NOW),
+                    down(),
+                ),
             ),
         ] {
             assert_eq!(
