@@ -36,6 +36,17 @@ GitHub main through `1f98372` has been merged locally before continued implement
 
 The [machine-readable production ledger](gates.json) intentionally keeps every mandatory gate open. Native build/test success is not native production packet-path acceptance, and metadata validation is not external audit or artifact signature verification. No Phase is accepted complete.
 
+### Integration update at `c7962ab`
+
+Implementation checkpoints now include versioned configuration, genuine ML-DSA PKCS#10 proof verification, recoverable enrollment with OS advisory locking, strict raw dual-signed management-object envelopes, real release Ed25519/ML-DSA verification behind an explicit backend feature, supervised trial journaling, and native Wintun/utun adapters. These are implementation slices, not accepted phases. The WSS/circuit runtime checkpoint is under integration and has known security-review findings; it is not a production daemon. The candidate NodeIdentity Ed25519-management-key revision and Lease authorization remain in progress.
+
+- [Lock refresh 43660984802](https://github.com/Lanlan13-14/Boreas/actions/runs/43660984802), source `ebc5b44`, generated a complete dependency lock and passed the workflow's default-feature workspace/all-target compile validation. Actions committed that lock as `c7962ab`; this is not feature/backend or platform-function acceptance.
+- [Native device attempt 43660955782](https://github.com/Lanlan13-14/Boreas/actions/runs/43660955782), source `7791875`, failed all three jobs before device tests because `--locked` rejected the stale lock. Wintun ZIP/DLL hashes and Authenticode provenance passed, but no adapter traffic was tested in that run.
+- [TLS attempt 43660955906](https://github.com/Lanlan13-14/Boreas/actions/runs/43660955906), source `7791875`, built the pinned OpenSSL library but Rust tests were blocked by the stale lock. Do not call its backend tests passed.
+- Earlier [TLS attempt 43659543057](https://github.com/Lanlan13-14/Boreas/actions/runs/43659543057) exposed a Rust test diagnostic requiring secret-bearing connector Debug. That test was repaired without adding secret Debug output; it still requires a successful rerun.
+
+Native-device, TLS, Rust and platform workflows have been explicitly dispatched on synchronized `c7962ab`. Their results must be collected before any new acceptance claim. The original anomalous CLI agent has been stopped and a fresh independent-vector agent has been started. A control-parser negative vector was briefly removed to accommodate a missing Python check; lead review rejected that weakening and restored the negative vector. No external security review, real CDN acceptance, sustained topology/resource/performance acceptance, or production release exists yet.
+
 ## CI boundary
 
 Evidence snapshot (run IDs are immutable records for the attempts stated):
