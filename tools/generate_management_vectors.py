@@ -48,6 +48,8 @@ def cbor(value: object) -> bytes:
 ZERO16 = bytes(16)
 ZERO4 = bytes(4)
 ZERO_V6 = bytes(16)
+# Candidate NodeIdentity body key 11: node Ed25519 management-signing public key.
+ED25519_PUB = bytes([0x55]) * 32
 
 
 def envelope(kind: int, subject: list[int], body: dict[int, object], *,
@@ -58,7 +60,8 @@ def envelope(kind: int, subject: list[int], body: dict[int, object], *,
 
 
 node_body = {0: ZERO16, 1: 2, 2: 1, 3: bytes([10, 20, 1, 2]), 4: ZERO_V6,
-             5: 1, 6: 1, 7: b"\xaa", 8: 1, 9: 1, 10: 2, 11: b""}
+             5: 1, 6: 1, 7: b"\xaa", 8: 1, 9: 1, 10: 2,
+             11: ED25519_PUB, 12: b""}
 objects = {
     "node-identity-minimal-valid": envelope(1, [1, 2], node_body),
     "attachment-lease-minimal-valid": envelope(2, [1, 2],

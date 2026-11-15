@@ -1969,6 +1969,7 @@ mod tests {
                 role: NodeRole::Core,
                 mldsa_parameter_set: MldsaParameterSet::Mldsa65,
                 identity_pub_mldsa: vec![1; 32],
+                identity_pub_ed25519: [0x55; 32],
                 identity_generation: 1,
                 not_before: 10,
                 expires: 20,

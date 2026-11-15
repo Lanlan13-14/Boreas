@@ -81,6 +81,10 @@ pub struct NodeIdentity {
     pub role: NodeRole,
     pub mldsa_parameter_set: MldsaParameterSet,
     pub identity_pub_mldsa: Vec<u8>,
+    /// Node Ed25519 management-signing public key (raw 32 bytes).
+    /// TLS authentication remains ML-DSA; this key binds the management
+    /// Ed25519 signature required alongside ML-DSA.
+    pub identity_pub_ed25519: [u8; 32],
     pub identity_generation: u64,
     pub not_before: u64,
     pub expires: u64,
@@ -407,7 +411,8 @@ fn body_value(body: &ObjectBody) -> Result<V, Error> {
             (8, u(x.identity_generation)),
             (9, u(x.not_before)),
             (10, u(x.expires)),
-            (11, b(&x.scope)),
+            (11, b(&x.identity_pub_ed25519)),
+            (12, b(&x.scope)),
         ]),
         ObjectBody::AttachmentLease(x) => map(vec![
             (0, u(x.node_id as u64)),
@@ -474,7 +479,7 @@ fn parse_body(ty: ObjectType, v: &V) -> Result<ObjectBody, Error> {
     };
     Ok(match ty {
         ObjectType::NodeIdentity => {
-            check_fields(m, 11)?;
+            check_fields(m, 12)?;
             ObjectBody::NodeIdentity(NodeIdentity {
                 net_id: bytes(get(m, 0)?)?,
                 node_id: u16::try_from(num(get(m, 1)?)?)
@@ -489,7 +494,8 @@ fn parse_body(ty: ObjectType, v: &V) -> Result<ObjectBody, Error> {
                 identity_generation: num(get(m, 8)?)?,
                 not_before: num(get(m, 9)?)?,
                 expires: num(get(m, 10)?)?,
-                scope: blob(get(m, 11)?, MAX_SCOPE_LEN)?,
+                identity_pub_ed25519: bytes(get(m, 11)?)?,
+                scope: blob(get(m, 12)?, MAX_SCOPE_LEN)?,
             })
         }
         ObjectType::AttachmentLease => {
@@ -674,6 +680,7 @@ fn validate_context(x: &ManagementObject) -> Result<(), Error> {
                 || body.scope.len() > MAX_SCOPE_LEN
                 || body.identity_pub_mldsa.is_empty()
                 || body.identity_pub_mldsa.len() > 8192
+                || body.identity_pub_ed25519 == [0; 32]
             {
                 return Err(Error::InvalidField(
                     "NodeIdentity common/body mismatch or bound",

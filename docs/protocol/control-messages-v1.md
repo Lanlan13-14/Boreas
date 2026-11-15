@@ -120,7 +120,7 @@ Each signer block:
 | `mldsa_len` | u16, exactly 3309 or 4627 |
 | `mldsa` | exactly `mldsa_len` bytes |
 
-Rules: Primary must be first; a second signer must be CoSign. AttachmentLease requires exactly two signers (node Primary + Core CoSign); all other object types require exactly one. Both Ed25519 and ML-DSA are mandatory for every signer; the envelope never omits or silently downgrades Ed25519. The candidate `objects::NodeIdentity` schema currently carries only `identity_pub_mldsa`, so the node Ed25519 management-signing public key must be added to the identity binding (TLS remains ML-DSA) before NodeIdentity issuance/Lease co-signing can be verified end to end. This is a blocking schema/architecture issue to resolve jointly with pki; it is not an optional future mode and dual-signature verification must not be weakened. Maximum envelope size is 16 KiB; the control body cap applies after the subtype byte.
+Rules: Primary must be first; a second signer must be CoSign. AttachmentLease requires exactly two signers (node Primary + Core CoSign); all other object types require exactly one. Both Ed25519 and ML-DSA are mandatory for every signer; the envelope never omits or silently downgrades Ed25519. Candidate revision 2 adds `objects::NodeIdentity.identity_pub_ed25519[32]` (body key 11) so the node Ed25519 management signature is bound to the signed identity; TLS authentication remains ML-DSA. Pki must generate, persist and verify that key; proto only enforces its 32-byte nonzero shape and the signature-envelope lengths. Maximum envelope size is 16 KiB; the control body cap applies after the subtype byte.
 
 Signature input remains `objects::signature_input(raw_tbs, object_type, schema_version)`; proto does not verify signatures, select keys, or inspect certificates.
 
@@ -199,7 +199,7 @@ Neither codec proves TLS peer identity, validates expected source/destination ag
 ## Gate gaps
 
 - Phase 0 freeze, ADR review and independent dual-implementation vector acceptance remain open.
-- NodeIdentity has no Ed25519 management-signing public key; every SignedObject signer still requires both Ed25519 and ML-DSA, so this schema/architecture blocker must be closed with pki before NodeIdentity issuance or Lease co-signing can be verified end to end.
-- Lease 16 KiB is a candidate deviation from the plan's 4 KiB row and needs plan/registry review.
+- NodeIdentity now carries `identity_pub_ed25519[32]` in candidate revision 2, but pki key generation/persistence, proof-of-possession binding and end-to-end Ed25519+ML-DSA verification evidence remain open; proto itself does not verify signatures.
+- Lease 16 KiB is a candidate deviation from the plan's 4 KiB row, recorded in [ADR 0003](../adr/0003-lease-16k-dual-signature-envelope.md) for review.
 - The X.509 certificate chain and full enrollment receipt/confirm state machine are not in this candidate payload.
 - No fuzzing campaign, production TLS/WSS integration, or third-party protocol review is claimed.
