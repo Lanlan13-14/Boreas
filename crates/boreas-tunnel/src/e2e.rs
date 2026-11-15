@@ -748,7 +748,7 @@ impl<'a> E2eCircuit<'a> {
     /// went away into a local failure, and the circuit drop path still sends a
     /// `CircuitReset` if this close did not complete.
     pub fn close_gracefully(&mut self) {
-        let _ = self.stream.close_tls();
+        let _ = self.stream.close_stream();
         let _ = self.stream.finish();
     }
 }

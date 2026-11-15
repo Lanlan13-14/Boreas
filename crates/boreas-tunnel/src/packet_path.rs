@@ -687,6 +687,25 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let endpoints = AuthorizedEndpoints::from_e2e_circuit(&circuit)?;
         Self::try_new(io, circuit, endpoints, mtu)
     }
+
+    /// Close the path after telling the peer: TLS `close_notify`, then the
+    /// circuit's own `CircuitClose`, then the stream is dropped.
+    ///
+    /// A planned stop (a time or packet budget running out) must use this
+    /// rather than [`Self::close`]. Dropping the TLS record layer without
+    /// `close_notify` makes the peer read a truncated record and fail closed,
+    /// which is the right outcome for an error and the wrong one for a stop the
+    /// owner chose. Best-effort: a peer that is already gone does not turn the
+    /// local stop into a failure.
+    pub fn close_gracefully(&mut self) {
+        if matches!(self.state, PathState::Open) {
+            self.state = PathState::Closed;
+        }
+        if let Some(circuit) = self.circuit.as_mut() {
+            circuit.close_gracefully();
+        }
+        self.circuit = None;
+    }
 }
 
 impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
@@ -763,31 +782,17 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
 
     /// Close the path and release the circuit stream immediately.
     ///
-    /// Idempotent, and not counted as a failure. When `notify` is set the
-    /// circuit is closed cleanly first (`close_notify` then `CircuitClose`), so
-    /// a peer blocked in a read observes a finished stream rather than a
-    /// truncated TLS record. The owned `E2eCircuit` is dropped here rather than
-    /// left to the caller, so a closed adapter cannot keep an authenticated E2E
-    /// stream alive.
-    pub fn close_internal(&mut self, notify: bool) {
+    /// Idempotent, and not counted as a failure. The owned circuit is dropped
+    /// here rather than left to the caller, so a closed adapter cannot keep an
+    /// authenticated E2E stream alive. Dropping that stream is the existing
+    /// circuit teardown (its `CircuitStream` drop sends a best-effort reset);
+    /// this method does not claim to suppress it. A planned stop that must tell
+    /// the peer first uses [`Self::close_gracefully`] on the E2E specialization.
+    pub fn close(&mut self) {
         if matches!(self.state, PathState::Open) {
             self.state = PathState::Closed;
         }
-        if notify && let Some(circuit) = self.circuit.as_mut() {
-            circuit.close_gracefully();
-        }
         self.circuit = None;
-    }
-
-    /// Close the path without telling the peer. Used when the peer already
-    /// closed the circuit itself, so there is nothing left to notify.
-    pub fn close(&mut self) {
-        self.close_internal(false);
-    }
-
-    /// Close the path and tell the peer: TLS `close_notify`, then `CircuitClose`.
-    pub fn close_gracefully(&mut self) {
-        self.close_internal(true);
     }
 
     /// Read one packet from the host stack and send it to the peer.
