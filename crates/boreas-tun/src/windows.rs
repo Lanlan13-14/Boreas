@@ -26,9 +26,9 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_NO_MORE_ITEMS,
-        ERROR_NOT_FOUND, FreeLibrary, GetLastError, HANDLE, HMODULE, NO_ERROR, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER,
+        ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND, FreeLibrary, GetLastError, HANDLE, HMODULE, NO_ERROR,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     NetworkManagement::{
         IpHelper::{
@@ -833,7 +833,9 @@ fn alias_exists(name: &str) -> Result<bool, WintunError> {
     let result = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
     match result {
         NO_ERROR => Ok(true),
-        ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND => Ok(false),
+        // A missing alias is "not found" on some builds and ERROR_INVALID_PARAMETER
+        // (87) on the GitHub-hosted Wintun build. Either means the name is free.
+        ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND | ERROR_INVALID_PARAMETER => Ok(false),
         _ => Err(WintunError::Win32 {
             operation: "ConvertInterfaceAliasToLuid",
             code: result,
