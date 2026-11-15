@@ -9,6 +9,12 @@
 #[cfg(feature = "openssl-backend")]
 pub mod backend;
 
+#[cfg(feature = "openssl-backend")]
+pub mod ws_stream;
+
+#[cfg(feature = "openssl-backend")]
+pub use ws_stream::WsByteStream;
+
 use core::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

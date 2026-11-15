@@ -17,9 +17,17 @@
 //!   `zero_rtt == false`;
 //! * application plaintext (small ping/pong plus a 32 KiB blob) round-trips
 //!   intact in both directions;
+//! * the same strict handshake also runs in one process through the in-memory
+//!   `WsByteStream` payload queue adapter and the non-blocking
+//!   `HandshakeDriver`, with deterministic split/coalesced ciphertext chunks
+//!   and explicit queue backpressure, then carries the same ping/pong and
+//!   32 KiB plaintext payloads. This exercises the byte-queue boundary only;
+//!   it is **not** an HTTP Upgrade, RFC 6455 framing, outer HTTPS, or WSS
+//!   transport test;
 //! * failure is closed: wrong trust anchor on either side, an expired
 //!   client certificate, a missing client certificate, a classical-only
-//!   key-exchange offer, a disallowed AEAD-only offer and a classical (RSA)
+//!   key-exchange offer, a disallowed AEAD-only offer, a TLS 1.2-only
+//!   client, a malformed/truncated ciphertext stream and a classical (RSA)
 //!   client certificate are all rejected; pq1024 / wrong-key-type /
 //!   mismatched local identities are rejected at construction time. Where
 //!   only the server can detect the fault, TLS 1.3's 1-RTT shape means the
@@ -53,6 +61,12 @@
 //!   ChaCha20-Poly1305 suite is therefore proven against the Boreas
 //!   acceptor by constraining `s_client` to that single suite (and both
 //!   suites are covered by `tools/crypto-poc/run-openssl-mtls.sh`).
+//! * `WsByteStream` is the ordered payload bridge only. It does not parse
+//!   HTTP Upgrade, RFC 6455 frames, control frames, close handshakes,
+//!   fragmentation flags, or compression; rejecting text/compressed frames
+//!   and driving the real WebSocket state machine remain Phase 1 work. The
+//!   in-memory pair test proves TLS can run over arbitrary binary chunking,
+//!   not that a production WSS transport has been integrated.
 //!
 //! Test-material discipline: all keys/certificates are generated per test
 //! into a unique `std::env::temp_dir()` subdirectory (mode 0700 on Unix)
@@ -77,7 +91,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -85,10 +99,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boreas_crypto::backend::{
-    BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector, PemIdentity,
+    BackendError, DriveState, EstablishedStream, OpenSslAcceptor, OpenSslConnector, PemIdentity,
 };
 use boreas_crypto::{
     Aead, HybridGroup, IdentitySignature, NegotiatedParameters, Policy, Suite, TlsVersion,
+    WsByteStream,
 };
 
 /// Minimal provider config: built-in default provider only. Copied from the
@@ -273,6 +288,12 @@ fn resolve_openssl_bin(cnf: &Path) -> Option<PathBuf> {
     None
 }
 
+/// CI jobs that build the pinned OpenSSL must set this so a missing or
+/// incapable CLI cannot silently turn every TLS test into a skip.
+fn tls_tests_required() -> bool {
+    std::env::var("BOREAS_REQUIRE_TLS_TESTS").is_ok_and(|value| value == "1")
+}
+
 // ---------------------------------------------------------------------------
 // Ephemeral ML-DSA-65 PKI (plus one rogue CA and one RSA leaf for negatives).
 // ---------------------------------------------------------------------------
@@ -289,6 +310,11 @@ impl TestPki {
         std::fs::write(dir.path("openssl.cnf"), MINIMAL_CNF).expect("write minimal openssl.cnf");
         let cnf = dir.path("openssl.cnf");
         let Some(bin) = resolve_openssl_bin(&cnf) else {
+            assert!(
+                !tls_tests_required(),
+                "BOREAS_REQUIRE_TLS_TESTS=1 but no openssl CLI with X25519MLKEM768 + \
+                 ML-DSA-65 support was found; refusing to skip the TLS suite"
+            );
             eprintln!(
                 "SKIP ({tag}): no openssl CLI with X25519MLKEM768 + ML-DSA-65 support \
                  found (looked at $BOREAS_OPENSSL_BIN, /tmp/ossl/install/bin/openssl, \
@@ -297,6 +323,8 @@ impl TestPki {
             return None;
         };
         let pki = Self { dir, bin };
+        let version = pki.run(&["version".to_owned()], "version");
+        eprintln!("openssl runtime ({tag}): {}", sanitize(&version.stdout).trim());
 
         pki.make_ca("root", "Boreas Test ML-DSA-65 Root");
         pki.make_ca("rogue", "Rogue ML-DSA-65 Root");
@@ -803,6 +831,93 @@ fn blob() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory ordered payload-queue pump (no WebSocket framing).
+// ---------------------------------------------------------------------------
+
+/// Ciphertext chunk sizes used in order.  Deliberately includes sizes smaller
+/// and larger than a TLS record and is not a divisor of any handshake flight,
+/// so record boundaries are crossed in both directions.
+const STREAM_CHUNKS: [usize; 16] = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
+
+/// Move at most `chunk` ciphertext bytes from `from`'s outbound queue into
+/// `to`'s inbound queue.  Returns whether any byte moved.  This models one
+/// transport write being split/coalesced at the payload-queue boundary: the
+/// receiver may accept only part of it, and the remainder stays queued by the
+/// caller's transport.
+fn pump_stream(from: &mut WsByteStream, to: &mut WsByteStream, chunk: usize) -> bool {
+    let room = to.capacity().saturating_sub(to.inbound_len());
+    if room == 0 {
+        return false;
+    }
+    let mut buf = [0u8; 1024];
+    let limit = chunk.min(buf.len()).min(room);
+    let drained = from.drain_ciphertext(&mut buf[..limit]);
+    if drained == 0 {
+        return false;
+    }
+    let mut fed = 0;
+    while fed < drained {
+        match to.feed_ciphertext(&buf[fed..drained]) {
+            Ok(0) => break,
+            Ok(accepted) => fed += accepted,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("inbound ciphertext queue rejected bytes: {error}"),
+        }
+    }
+    // `room` was computed before draining; a shortfall would mean ciphertext
+    // was silently dropped, which this harness must never permit.
+    assert_eq!(fed, drained, "inbound queue accepted less than its checked room");
+    true
+}
+
+fn stream_write_all(
+    from: &mut EstablishedStream<WsByteStream>,
+    to: &mut EstablishedStream<WsByteStream>,
+    bytes: &[u8],
+    chunk: usize,
+) {
+    let mut written = 0;
+    while written < bytes.len() {
+        // On WouldBlock, `written` intentionally does not advance: the next
+        // call retries the exact same slice, which is required by SSL_write.
+        match from.write_plaintext(&bytes[written..]) {
+            Ok(0) => panic!("TLS write returned Ok(0) before all plaintext was written"),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("TLS write failed after {written} bytes: {error}"),
+        }
+        let _ = pump_stream(from.get_mut(), to.get_mut(), chunk);
+    }
+}
+
+fn stream_read_exact(
+    from: &mut EstablishedStream<WsByteStream>,
+    to: &mut EstablishedStream<WsByteStream>,
+    len: usize,
+    chunk: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut read = 0;
+    let mut idle = 0;
+    while read < len {
+        match from.read_plaintext(&mut out[read..]) {
+            Ok(0) => panic!("unexpected TLS EOF after {read} of {len} plaintext bytes"),
+            Ok(count) => {
+                read += count;
+                idle = 0;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let _ = pump_stream(to.get_mut(), from.get_mut(), chunk);
+                idle += 1;
+                assert!(idle < 100_000, "TLS plaintext read stalled after {read} bytes");
+            }
+            Err(error) => panic!("TLS read failed after {read} bytes: {error}"),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -914,6 +1029,206 @@ fn rust_to_rust_mutual_tls13_handshake_and_plaintext_roundtrip() {
         1,
         "Rust<->Rust AEAD must be stable across identical handshakes, saw {seen_aeads:?}"
     );
+}
+
+/// In-process mTLS handshake over the bounded `WsByteStream` payload queues
+/// using the non-blocking handshake/plaintext APIs, deterministic fragmentation
+/// and coalescing, and queue backpressure.
+///
+/// This is deliberately not described as a WSS test: no HTTP Upgrade, RFC 6455
+/// frame parser, outer HTTPS session, network WebSocket engine, or production
+/// transport is involved. It proves the TLS engine can run over an ordered,
+/// bounded binary queue, which is a prerequisite for Phase 1 WSS integration.
+#[test]
+fn payload_queue_carries_fragmented_mtls_without_websocket_framing() {
+    let Some(pki) = TestPki::create("payload-queue") else {
+        return;
+    };
+    let (connector, acceptor) = make_pair(&pki.client_identity(), &pki.server_identity());
+    let mut client = connector
+        .start_connect(WsByteStream::new())
+        .expect("start queue-backed connector");
+    let mut server = acceptor
+        .start_accept(WsByteStream::new())
+        .expect("start queue-backed acceptor");
+
+    let mut client_done = false;
+    let mut server_done = false;
+    let mut tick = 0usize;
+    for _ in 0..100_000 {
+        if !client_done {
+            client_done = client
+                .drive_handshake()
+                .expect("queue-backed connector handshake drive")
+                == DriveState::Complete;
+        }
+        if !server_done {
+            server_done = server
+                .drive_handshake()
+                .expect("queue-backed acceptor handshake drive")
+                == DriveState::Complete;
+        }
+        if client_done && server_done {
+            break;
+        }
+        let chunk = STREAM_CHUNKS[tick % STREAM_CHUNKS.len()];
+        tick += 1;
+        let client_to_server = pump_stream(client.transport_mut(), server.transport_mut(), chunk);
+        let server_to_client = pump_stream(server.transport_mut(), client.transport_mut(), chunk);
+        assert!(
+            client_to_server || server_to_client,
+            "queue handshake stalled (connector done={client_done}, acceptor done={server_done})"
+        );
+    }
+    assert!(
+        client_done && server_done,
+        "queue handshake did not complete (connector done={client_done}, acceptor done={server_done})"
+    );
+
+    let mut client = client.finish().expect("finish queue-backed connector");
+    let mut server = server.finish().expect("finish queue-backed acceptor");
+    assert_eq!(
+        client.peer_certificate().to_der().expect("peer DER"),
+        pki.cert_der("server.pem"),
+        "queue-backed connector must see the server leaf"
+    );
+    assert_eq!(
+        server.peer_certificate().to_der().expect("peer DER"),
+        pki.cert_der("client.pem"),
+        "queue-backed acceptor must see the client leaf"
+    );
+    assert_strict_negotiated(client.negotiated(), "queue-backed connector");
+    assert_strict_negotiated(server.negotiated(), "queue-backed acceptor");
+
+    stream_write_all(&mut client, &mut server, PING, 7);
+    assert_eq!(
+        stream_read_exact(&mut server, &mut client, PING.len(), 5),
+        PING
+    );
+    stream_write_all(&mut server, &mut client, PONG, 11);
+    assert_eq!(
+        stream_read_exact(&mut client, &mut server, PONG.len(), 3),
+        PONG
+    );
+
+    let payload = blob();
+    stream_write_all(&mut client, &mut server, &payload, 13);
+    assert_eq!(
+        stream_read_exact(&mut server, &mut client, payload.len(), 17),
+        payload,
+        "32 KiB queue payload client -> server must round-trip exactly"
+    );
+    stream_write_all(&mut server, &mut client, &payload, 19);
+    assert_eq!(
+        stream_read_exact(&mut client, &mut server, payload.len(), 23),
+        payload,
+        "32 KiB queue payload server -> client must round-trip exactly"
+    );
+
+    eprintln!(
+        "byte-stream payload queue (no WS framing): handshake ok over {} deterministic chunk sizes, plaintext + {BLOB_LEN} B blob round-trip ok",
+        STREAM_CHUNKS.len()
+    );
+}
+
+/// `HandshakeDriver::finish` must reject an incomplete handshake, not merely
+/// one with no peer certificate yet.
+#[test]
+fn finish_before_completed_handshake_is_rejected() {
+    let Some(pki) = TestPki::create("early-finish") else {
+        return;
+    };
+
+    // Stage 0: nothing was driven or exchanged.
+    {
+        let (connector, acceptor) = make_pair(&pki.client_identity(), &pki.server_identity());
+        let client = connector
+            .start_connect(WsByteStream::new())
+            .expect("start connector");
+        let server = acceptor
+            .start_accept(WsByteStream::new())
+            .expect("start acceptor");
+        assert!(
+            client.finish().is_err(),
+            "connector must not establish before any handshake bytes"
+        );
+        assert!(
+            server.finish().is_err(),
+            "acceptor must not establish before any handshake bytes"
+        );
+    }
+
+    // Stage 1: client completed its local 1-RTT handshake, server has only
+    // received part of the client's final flight. The server may already hold
+    // the client certificate, but the client Finished is incomplete, so
+    // `SSL_is_init_finished` must keep `finish()` closed.
+    {
+        let (connector, acceptor) = make_pair(&pki.client_identity(), &pki.server_identity());
+        let mut client = connector
+            .start_connect(WsByteStream::new())
+            .expect("start connector");
+        let mut server = acceptor
+            .start_accept(WsByteStream::new())
+            .expect("start acceptor");
+
+        assert_eq!(
+            client.drive_handshake().expect("client ClientHello"),
+            DriveState::Incomplete
+        );
+        while client.transport().outbound_len() > 0 {
+            assert!(pump_stream(client.transport_mut(), server.transport_mut(), 31));
+        }
+        assert_eq!(
+            server.drive_handshake().expect("server flight"),
+            DriveState::Incomplete
+        );
+        while server.transport().outbound_len() > 0 {
+            assert!(pump_stream(server.transport_mut(), client.transport_mut(), 37));
+        }
+
+        let mut client_done = false;
+        for _ in 0..8 {
+            if client
+                .drive_handshake()
+                .expect("client final flight")
+                == DriveState::Complete
+            {
+                client_done = true;
+                break;
+            }
+        }
+        assert!(
+            client_done,
+            "client should complete after consuming the full server flight"
+        );
+        assert!(
+            client.transport().outbound_len() > 0,
+            "completed client must have produced its Certificate/Finished flight"
+        );
+
+        // Deliver roughly half of the client's final flight. At least one
+        // record is necessarily missing, so the server cannot finish.
+        let before = client.transport().outbound_len();
+        let stop_at = before / 2;
+        while client.transport().outbound_len() > stop_at {
+            let chunk = (client.transport().outbound_len() - stop_at).min(23);
+            assert!(pump_stream(client.transport_mut(), server.transport_mut(), chunk));
+        }
+        assert_eq!(
+            server.drive_handshake().expect("partial client flight"),
+            DriveState::Incomplete,
+            "server must not complete on a truncated client final flight"
+        );
+
+        assert!(
+            client.finish().is_ok(),
+            "client-side 1-RTT completion is valid and must not be confused with server completion"
+        );
+        assert!(
+            server.finish().is_err(),
+            "server must not establish while the client Finished is incomplete"
+        );
+    }
 }
 
 /// Which ends a negative case may legitimately leave in `Ok`.
@@ -1031,6 +1346,68 @@ fn expired_client_certificate_fails_closed() {
     );
 }
 
+/// Malformed and truncated ciphertext must fail the acceptor promptly instead
+/// of hanging or surfacing a policy-mismatch error as if a handshake completed.
+#[test]
+fn malformed_and_truncated_ciphertext_fail_closed_promptly() {
+    let Some(pki) = TestPki::create("malformed") else {
+        return;
+    };
+    let acceptor = OpenSslAcceptor::from_pem_identity(
+        &pki.server_identity(),
+        Policy::production_default(),
+    )
+    .expect("acceptor construction");
+
+    // Wrong record version/length followed by EOF.
+    let (mut peer, transport) = UnixStream::pair().expect("UnixStream::pair");
+    peer.write_all(b"\x16\x03\x03\x00\x05hello")
+        .expect("write malformed record prefix");
+    peer.shutdown(Shutdown::Write).expect("shutdown write half");
+    let started = Instant::now();
+    match acceptor.accept(InterruptionShield(transport)) {
+        Ok(_) => panic!("acceptor completed a handshake on malformed ciphertext"),
+        Err(error) => assert!(
+            matches!(
+                error,
+                BackendError::Handshake
+                    | BackendError::PeerCertificateVerification
+                    | BackendError::WrongPeerKeyType
+                    | BackendError::WrongChainSignatureAlgorithm
+            ),
+            "malformed stream failed with unexpected error {error:?}"
+        ),
+    }
+    assert!(
+        started.elapsed() < STREAM_TIMEOUT - Duration::from_secs(2),
+        "malformed stream rejection took {:?}; expected a prompt failure",
+        started.elapsed()
+    );
+
+    // Immediate EOF before any TLS record.
+    let (peer, transport) = UnixStream::pair().expect("UnixStream::pair");
+    drop(peer);
+    let started = Instant::now();
+    match acceptor.accept(InterruptionShield(transport)) {
+        Ok(_) => panic!("acceptor completed a handshake on an empty transport"),
+        Err(error) => assert!(
+            matches!(
+                error,
+                BackendError::Handshake
+                    | BackendError::PeerCertificateVerification
+                    | BackendError::WrongPeerKeyType
+                    | BackendError::WrongChainSignatureAlgorithm
+            ),
+            "empty stream failed with unexpected error {error:?}"
+        ),
+    }
+    assert!(
+        started.elapsed() < STREAM_TIMEOUT - Duration::from_secs(2),
+        "empty stream rejection took {:?}; expected a prompt failure",
+        started.elapsed()
+    );
+}
+
 /// Construction-time fail-closed checks that need a real PKI: pq1024 in any
 /// shape, a classical (RSA) local certificate, a mixed ML-DSA/RSA key pair,
 /// and a cert/key mismatch between two genuine ML-DSA-65 identities.
@@ -1112,9 +1489,9 @@ fn backend_rejects_pq1024_classical_and_mismatched_identities() {
     assert!(
         matches!(
             OpenSslConnector::from_pem_identity(&mismatched, Policy::production_default()),
-            Err(BackendError::OpenSslConfiguration)
+            Err(BackendError::LocalIdentityMismatch)
         ),
-        "valid ML-DSA-65 cert with the other leaf's key must fail check_private_key"
+        "valid ML-DSA-65 cert with the other leaf's key must fail the local SPKI match check"
     );
 }
 
@@ -1262,6 +1639,23 @@ fn openssl_s_client_interop_with_boreas_acceptor() {
                 "tlsv1 alert",
             ],
         );
+        expect_cli_rejection(
+            scope,
+            &listener,
+            &acceptor,
+            &bin,
+            &cnf,
+            "TLS 1.2-only client",
+            &s_client_tls12_args(dir, addr.port()),
+            &[
+                "protocol version",
+                "unsupported protocol",
+                "no protocols available",
+                "handshake failure",
+                "sslv3 alert",
+                "tlsv1 alert",
+            ],
+        );
     });
 }
 
@@ -1350,6 +1744,31 @@ fn s_client_args(
         args.push("-key".into());
         args.push(dir.arg("client.key"));
     }
+    args
+}
+
+/// A structurally valid `s_client` invocation restricted to TLS 1.2.  The
+/// acceptor must reject it on protocol version, so the "TLS 1.3 only" gate is
+/// exercised at the wire level instead of being inferred from configuration.
+fn s_client_tls12_args(dir: &TempDir, port: u16) -> Vec<String> {
+    let mut args = s_client_args(
+        dir,
+        port,
+        "TLS_AES_256_GCM_SHA384",
+        "X25519MLKEM768",
+        true,
+    );
+    let version = args
+        .iter()
+        .position(|arg| arg == "-tls1_3")
+        .expect("s_client arguments carry -tls1_3");
+    args[version] = "-tls1_2".into();
+    let ciphersuites = args
+        .iter()
+        .position(|arg| arg == "-ciphersuites")
+        .expect("s_client arguments carry -ciphersuites");
+    args[ciphersuites] = "-cipher".into();
+    args[ciphersuites + 1] = "DEFAULT".into();
     args
 }
 
