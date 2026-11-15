@@ -1,6 +1,7 @@
 //! Candidate Boreas wire primitives; not a frozen protocol or cryptographic implementation.
 #![forbid(unsafe_code)]
 
+pub mod messages;
 pub mod objects;
 
 use std::fmt;
@@ -216,6 +217,8 @@ pub struct SessionContext {
     pub circuit_opening: bool,
     pub circuit_established: bool,
     pub mode: SecurityMode,
+    /// Local 128-bit network id; session payloads must match it exactly.
+    pub net_id: [u8; 16],
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -258,19 +261,27 @@ impl TryFrom<u8> for ControlType {
     }
 }
 impl ControlType {
-    pub fn body_cap(self) -> usize {
+    /// Candidate body cap including the subtype byte, shared by the payload
+    /// registry in [`messages`] so framing and payload codecs cannot drift.
+    pub const fn body_cap(self) -> usize {
         match self {
-            Self::SessionHello
-            | Self::SessionAccept
-            | Self::Lease
-            | Self::CircuitOpen
-            | Self::CircuitAccept => 4096,
-            Self::Enrollment | Self::DirectoryPage | Self::Revoke => 16384,
+            Self::SessionHello | Self::SessionAccept | Self::CircuitOpen | Self::CircuitAccept => {
+                4096
+            }
+            // A dual-signed AttachmentLease envelope needs ~9.5 KiB with
+            // ML-DSA-87 signatures plus TBS, so the plan's 4 KiB row is not
+            // implementable; 16 KiB is the candidate replacement pending plan
+            // review.
+            Self::Enrollment | Self::DirectoryPage | Self::Lease | Self::Revoke => 16384,
             Self::Lsa | Self::Grant => 8192,
             Self::Probe | Self::Drain | Self::CircuitReset | Self::CircuitClose => 256,
         }
     }
 }
+/// Validate one frame against the candidate registry, per-subtype body cap and
+/// session state gates. Payload schemas are intentionally separate: call
+/// [`messages::parse_control_body`] before applying state transitions so a
+/// structurally malformed `SessionHello` cannot advance the handshake.
 pub fn validate_frame_policy(frame: &Frame, ctx: &mut SessionContext) -> Result<(), Error> {
     frame.header.encode()?;
     if frame.header.body_len as usize != frame.body.len() {
@@ -621,6 +632,7 @@ mod tests {
             circuit_opening: false,
             circuit_established: false,
             mode: SecurityMode::E2eRequired,
+            net_id: [0x5A; 16],
         }
     }
 
@@ -1903,14 +1915,17 @@ mod tests {
 
     #[test]
     fn policy_control_body_caps_match_registry_table_exactly() {
-        // (subtype, cap) straight from plan SS5.4 / registry v0.1; the cap
-        // includes the subtype byte itself.
+        // Candidate caps including the subtype byte. The Lease row is 16 KiB,
+        // not the plan's 4 KiB: a dual-signed AttachmentLease envelope cannot
+        // fit 4 KiB once Ed25519 + ML-DSA signatures and the TBS are counted.
+        // That deviation is a reported plan/registry conflict, not a silent
+        // protocol change.
         let table = [
             (ControlType::SessionHello, 4096usize),
             (ControlType::SessionAccept, 4096),
             (ControlType::Enrollment, 16384),
             (ControlType::DirectoryPage, 16384),
-            (ControlType::Lease, 4096),
+            (ControlType::Lease, 16384),
             (ControlType::Lsa, 8192),
             (ControlType::Grant, 8192),
             (ControlType::Revoke, 16384),
@@ -1968,7 +1983,7 @@ mod tests {
             (2, 4096),
             (3, 16384),
             (4, 16384),
-            (5, 4096),
+            (5, 16384),
             (6, 8192),
             (7, 8192),
             (8, 16384),
@@ -2219,6 +2234,7 @@ mod tests {
             circuit_opening: false,
             circuit_established: false,
             mode: SecurityMode::E2eRequired,
+            net_id: [0x5A; 16],
         };
         let empty = Frame {
             header: AppHeader {

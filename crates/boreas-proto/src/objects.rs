@@ -637,7 +637,7 @@ fn prefix_host_bits_zero(prefix: &[u8], prefix_len: u8) -> bool {
         .get(start..)
         .is_some_and(|tail| tail.iter().all(|b| *b == 0))
 }
-fn valid_node_id(node_id: u16) -> bool {
+pub(crate) fn valid_node_id(node_id: u16) -> bool {
     let core = (node_id >> 8) + 1;
     let octet = (node_id & 0xff) as u8;
     (1..=16).contains(&core) && (octet == 1 || (2..=251).contains(&octet))
