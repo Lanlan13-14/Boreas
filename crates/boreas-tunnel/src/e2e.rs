@@ -494,6 +494,13 @@ impl<'a> E2eEstablished<'a> {
     pub fn into_parts(self) -> (Box<dyn Duplex + 'a>, InnerTlsSession) {
         (self.stream, self.session)
     }
+
+    /// End the E2E TLS record layer with `close_notify` before the circuit is
+    /// torn down. A raw (non-TLS) stream's default implementation does nothing,
+    /// so the in-memory confirmation tests are unaffected.
+    pub fn close_tls(&mut self) -> io::Result<()> {
+        self.stream.close_stream()
+    }
 }
 
 /// Runs the E2E TLS handshake over a circuit in either role.
@@ -731,6 +738,18 @@ impl<'a> E2eCircuit<'a> {
 
     pub fn circuit_id(&self) -> [u8; CIRCUIT_ID_LEN] {
         self.info.circuit_id
+    }
+
+    /// End the circuit cleanly: `close_notify` on the E2E TLS stream, then the
+    /// circuit's own `CircuitClose`. A peer reading the byte stream sees a
+    /// finished TLS record layer (`Ok(0)`) instead of a truncated record.
+    ///
+    /// Best-effort by design. A planned stop must not turn a peer that already
+    /// went away into a local failure, and the circuit drop path still sends a
+    /// `CircuitReset` if this close did not complete.
+    pub fn close_gracefully(&mut self) {
+        let _ = self.stream.close_tls();
+        let _ = self.stream.finish();
     }
 }
 

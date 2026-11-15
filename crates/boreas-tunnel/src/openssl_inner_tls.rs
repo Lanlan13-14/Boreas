@@ -18,7 +18,7 @@
 //! `cargo test -p boreas-tunnel --features openssl-inner-tls` before any claim
 //! about real inner TLS behaviour.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -146,6 +146,17 @@ impl OpenSslE2eBackend {
             acceptor,
             extractor,
         }
+    }
+}
+
+impl Duplex for EstablishedStream<CircuitStream<'_>> {
+    fn close_stream(&mut self) -> io::Result<()> {
+        // `shutdown` writes close_notify through the circuit stream, which
+        // fragments it into relay frames. The result is not checked: a peer
+        // that already closed still leaves the circuit usable for its own
+        // close frame, which the caller sends next.
+        let _ = self.get_mut().ssl_mut().shutdown();
+        Ok(())
     }
 }
 

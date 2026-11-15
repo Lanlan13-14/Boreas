@@ -997,14 +997,14 @@ mod linux_daemon {
             if let Some(sec) = max_seconds
                 && started.elapsed() >= Duration::from_secs(sec)
             {
-                path.close();
+                path.close_gracefully();
                 stop_reason = "max_seconds_reached";
                 break;
             }
             if let Some(limit) = max_packets {
                 let st = path.stats();
                 if st.outbound_packets.saturating_add(st.inbound_packets) >= limit {
-                    path.close();
+                    path.close_gracefully();
                     stop_reason = "max_packets_reached";
                     break;
                 }
