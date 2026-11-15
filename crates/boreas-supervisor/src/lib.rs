@@ -780,6 +780,23 @@ pub struct StoreLock {
     _file: File,
 }
 
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // `File::unlock` is the std-documented way to release the advisory
+        // lock held by this file. Attempt it before closing the descriptor,
+        // rather than relying only on close/handle cleanup; Drop cannot return
+        // an unlock error, so normal descriptor cleanup remains the fallback. On Unix the lock belongs to the open file description, and
+        // `fork(2)` duplicates that description into a child until the child
+        // execs (CLOEXEC only applies at exec), so closing just this
+        // descriptor could leave the lock alive through another thread's
+        // forked child. LOCK_UN on any duplicate releases the shared lock
+        // immediately. The supervisor CLI retains this guard until its child
+        // has been reaped. Library callers must likewise retain it for the
+        // entire protected operation; dropping it intentionally ends ownership.
+        let _ = self._file.unlock();
+    }
+}
+
 /// Durable record of trial launches for one candidate version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrialState {
@@ -1150,6 +1167,32 @@ mod tests {
         let a = Temp::new();
         artifact(&a, "candidate");
         (t, store, a)
+    }
+
+    /// The lock is released explicitly, not merely by closing the descriptor:
+    /// on Unix a `fork(2)` child inherits a duplicate of the same open file
+    /// description until it execs, and that duplicate would keep the flock
+    /// alive after this guard is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_lock_releases_it_even_with_an_inherited_duplicate_fd() {
+        let (_t, s, _a) = setup();
+        let guard = s.lock_exclusive().expect("first lock");
+        // dup(2) shares the open file description exactly as fork(2) does for
+        // a child that has not exec'd yet.
+        let inherited = guard._file.try_clone().expect("duplicate the lock fd");
+        // A live guard still refuses a second owner, even with the duplicate.
+        assert!(matches!(s.lock_exclusive(), Err(UpgradeError::Locked(_))));
+        drop(guard);
+        // The duplicate is still open, so this only succeeds if Drop released
+        // the shared flock explicitly.
+        let relocked = s
+            .lock_exclusive()
+            .expect("dropping the guard must release the shared lock");
+        // The new guard is real and keeps refusing a second owner.
+        assert!(matches!(s.lock_exclusive(), Err(UpgradeError::Locked(_))));
+        drop(relocked);
+        drop(inherited);
     }
 
     #[test]
