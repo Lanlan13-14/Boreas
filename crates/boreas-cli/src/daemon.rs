@@ -3,23 +3,24 @@
 //!
 //! Default builds have no OpenSSL 3.6+ ML-DSA backend and fail closed (`exit 2`).
 //! With `openssl-inner-tls` on Linux, `daemon` runs the full point-to-point stack:
-//! 1. Validates `config.toml` and verifies the mounted `roots.cbor` trust anchor
-//!    against `local.signed`, `peer.signed`, `status.signed`, and the ML-DSA-65
-//!    TLS leaf SPKI (`boreas_pki::provisioning::verify_material_dir_with_roots`).
-//! 2. Completes outer TLS 1.3 + RFC 6455 binary WSS + strict pq768 (`X25519MLKEM768`
-//!    + `mldsa65`) inner mTLS + `SessionHello`/`SessionAccept` + `RelayCircuit` +
-//!    strict pq768 E2E mTLS + encrypted `BE2E` confirmation.
-//! 3. Opens a real Linux `/dev/net/tun` queue (`LinuxTunDevice::create`) or bounded
-//!    `VirtualTun` (`--virtual-tun` for unprivileged tests), binds
-//!    `PacketPath::try_new_over_e2e`, and runs a bounded bidirectional packet loop.
-//! 4. Periodically re-verifies `status.signed` freshness (§3.4 fail-closed: if the
-//!    signed `next_update` expires without a refreshed snapshot, business forwarding
-//!    stops immediately and the E2E circuit is torn down).
-//! 5. Serves an owner-only (`0600`) Unix control socket (`state_dir/control.sock`)
-//!    with `SO_PEERCRED` caller UID verification so `boreas status` / `boreas menu`
-//!    / `boreas ctl status` read real live counters instead of fabricating state.
+//! - Step 1: Validates `config.toml` and verifies the mounted `roots.cbor` trust
+//!   anchor against `local.signed`, `peer.signed`, `status.signed`, and the
+//!   ML-DSA-65 TLS leaf SPKI (`boreas_pki::provisioning::verify_material_dir_with_roots`).
+//! - Step 2: Completes outer TLS 1.3 + RFC 6455 binary WSS + strict pq768
+//!   (`X25519MLKEM768` + `mldsa65`) inner mTLS + `SessionHello`/`SessionAccept` +
+//!   `RelayCircuit` + strict pq768 E2E mTLS + encrypted `BE2E` confirmation.
+//! - Step 3: Opens a real Linux `/dev/net/tun` queue (`LinuxTunDevice::create`) or
+//!   bounded `VirtualTun` (`--virtual-tun` for unprivileged tests), binds
+//!   `PacketPath::try_new_over_e2e`, and runs a bounded bidirectional packet loop.
+//! - Step 4: Periodically re-verifies `status.signed` freshness (§3.4 fail-closed:
+//!   if `next_update` expires without refresh, business forwarding stops immediately).
+//! - Step 5: Serves an owner-only (`0600`) Unix control socket (`state_dir/control.sock`)
+//!   with `SO_PEERCRED` caller UID verification.
 
+#[cfg(unix)]
 use crate::render::{DaemonState, SecurityMode as RenderSecurityMode, StatusSnapshot};
+#[cfg(not(unix))]
+use crate::render::StatusSnapshot;
 use std::path::Path;
 
 #[cfg(not(feature = "openssl-inner-tls"))]

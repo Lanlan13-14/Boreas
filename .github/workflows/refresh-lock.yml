@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout dispatch source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -102,7 +102,7 @@ jobs:
 
       - name: Upload generated lock and recovery records
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: generated-cargo-lock-${{ github.run_id }}
           path: |
@@ -127,7 +127,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout dispatch source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -140,7 +140,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y pkg-config libssl-dev
 
       - name: Download the exact generated lock artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: generated-cargo-lock-${{ github.run_id }}
           path: generated

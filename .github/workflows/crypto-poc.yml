@@ -32,7 +32,7 @@ jobs:
       ARTIFACT_DIR: ${{ github.workspace }}/crypto-poc-artifacts
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -85,7 +85,7 @@ jobs:
           fi
       - name: Upload test evidence even on failure
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openssl-${{ env.OPENSSL_VERSION }}-crypto-poc-${{ github.run_id }}
           path: |

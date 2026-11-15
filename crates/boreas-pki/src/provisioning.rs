@@ -14,15 +14,16 @@
 #![cfg(feature = "openssl-backend")]
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::Path;
 
-use boreas_crypto::backend::PemIdentity;
+use boreas_crypto::Policy;
+use boreas_crypto::backend::{OpenSslAcceptor, PemIdentity};
 use boreas_proto::messages::{SignedObject, SignerRole, SignerSignatures};
 use boreas_proto::objects::{
-    self, ManagementObject, MldsaParameterSet, NodeRole as ObjectNodeRole, ObjectBody, ObjectType,
-    StatusSnapshot, SubjectIdentity,
+    self, ManagementObject, MldsaParameterSet, ObjectBody, ObjectType, StatusSnapshot,
+    SubjectIdentity,
 };
 use openssl::asn1::{Asn1Integer, Asn1Time};
 use openssl::bn::BigNum;
@@ -36,7 +37,7 @@ use openssl::x509::extension::{
     AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
     SubjectKeyIdentifier,
 };
-use openssl::x509::{X509, X509Builder, X509NameBuilder, X509ReqBuilder};
+use openssl::x509::{X509, X509Builder, X509NameBuilder, X509Ref, X509ReqBuilder};
 
 use crate::management::{
     IdentityAuthority, IdentityTemplate, MANAGEMENT_SCHEMA_VERSION, ManagementTrust, VerifiedObject,
@@ -60,6 +61,7 @@ const STATUS_KEY_ID: &[u8] = b"status-signer-v1";
 #[derive(Debug)]
 pub enum ProvisionError {
     Io(&'static str),
+    FileTooLarge,
     AlreadyExists,
     InvalidParameter(&'static str),
     OpenSsl(&'static str),
@@ -78,6 +80,7 @@ impl fmt::Display for ProvisionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(ctx) => write!(f, "provisioning I/O failed: {ctx}"),
+            Self::FileTooLarge => write!(f, "provisioning file exceeds maximum bounded size"),
             Self::AlreadyExists => write!(f, "refusing to overwrite existing key or CA directory"),
             Self::InvalidParameter(msg) => write!(f, "invalid provisioning parameter: {msg}"),
             Self::OpenSsl(ctx) => write!(f, "OpenSSL operation failed: {ctx}"),
@@ -107,6 +110,16 @@ impl From<root_authorization::Error> for ProvisionError {
 impl From<crate::management::Error> for ProvisionError {
     fn from(value: crate::management::Error) -> Self {
         Self::Management(value)
+    }
+}
+
+impl From<std::io::Error> for ProvisionError {
+    fn from(err: std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            Self::AlreadyExists
+        } else {
+            Self::Io("filesystem I/O")
+        }
     }
 }
 
@@ -618,8 +631,7 @@ pub fn issue_node_dir(
         private_key_pem: node_ml_pem.clone(),
         trust_anchor_pem: ia_ca_pem.clone(),
     };
-    pem_id
-        .validate()
+    let _ = OpenSslAcceptor::new(Policy::strict_pq768(params.role), &pem_id)
         .map_err(|_| ProvisionError::CryptoIdentity)?;
 
     let body = authority.node_identity_from_csr(
@@ -1341,16 +1353,16 @@ fn sign_root_auth(
     candidate: &RootAuthorizationCandidate,
     root_ed: &PKey<Private>,
     root_ml: &PKey<Private>,
-) -> Result<SignedRootAuthEntry, ProvisionError> {
+) -> Result<SignedRootAuthorization, ProvisionError> {
     let raw_candidate = candidate.encode_candidate()?;
     let mut msg = Vec::with_capacity(ROOT_AUTH_DOMAIN.len() + raw_candidate.len());
     msg.extend_from_slice(ROOT_AUTH_DOMAIN);
     msg.extend_from_slice(&raw_candidate);
     let (ed_sig, ml_sig) = dual_sign(&msg, root_ed, root_ml)?;
-    Ok(SignedRootAuthEntry {
+    Ok(SignedRootAuthorization {
         raw_candidate,
-        ed25519_sig: ed_sig,
-        mldsa65_sig: ml_sig,
+        ed25519_signature: ed_sig.to_vec(),
+        mldsa_signature: ml_sig,
     })
 }
 
@@ -1453,7 +1465,7 @@ fn write_public_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProvisionError> 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, ProvisionError> {
     let mut f = File::open(path)?;
     let meta = f.metadata()?;
-    if meta.len() > MAX_PROVISION_FILE_BYTES {
+    if meta.len() > u64::try_from(MAX_MATERIAL_FILE_BYTES).unwrap_or(u64::MAX) {
         return Err(ProvisionError::FileTooLarge);
     }
     let mut buf = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
@@ -1463,9 +1475,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, ProvisionError> {
         if n == 0 {
             break;
         }
-        if buf.len().saturating_add(n)
-            > usize::try_from(MAX_PROVISION_FILE_BYTES).unwrap_or(usize::MAX)
-        {
+        if buf.len().saturating_add(n) > MAX_MATERIAL_FILE_BYTES {
             return Err(ProvisionError::FileTooLarge);
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -1546,170 +1556,10 @@ fn valid_dns_san(s: &str) -> bool {
         })
 }
 
-// Minimal canonical CBOR writers/readers matching `root_authorization.rs`.
-fn cbor_head(major: u8, n: u64, out: &mut Vec<u8>) {
-    let hi = major << 5;
-    if n < 24 {
-        out.push(hi | (n as u8));
-    } else if n <= u64::from(u8::MAX) {
-        out.push(hi | 24);
-        out.push(n as u8);
-    } else if n <= u64::from(u16::MAX) {
-        out.push(hi | 25);
-        out.extend_from_slice(&(n as u16).to_be_bytes());
-    } else if n <= u64::from(u32::MAX) {
-        out.push(hi | 26);
-        out.extend_from_slice(&(n as u32).to_be_bytes());
-    } else {
-        out.push(hi | 27);
-        out.extend_from_slice(&n.to_be_bytes());
-    }
-}
-fn cbor_uint(n: u64, out: &mut Vec<u8>) {
-    cbor_head(0, n, out);
-}
-fn cbor_bytes(b: &[u8], out: &mut Vec<u8>) {
-    cbor_head(2, b.len() as u64, out);
-    out.extend_from_slice(b);
-}
-fn cbor_array(len: usize, out: &mut Vec<u8>) {
-    cbor_head(4, len as u64, out);
-}
-fn cbor_map(len: usize, out: &mut Vec<u8>) {
-    cbor_head(5, len as u64, out);
-}
-
-#[derive(Debug)]
-enum CborVal<'a> {
-    UInt(u64),
-    Bytes(&'a [u8]),
-    Array(Vec<CborVal<'a>>),
-    Map(Vec<(u64, CborVal<'a>)>),
-}
-
-fn cbor_val_uint(v: &CborVal<'_>) -> Result<u64, ProvisionError> {
-    match v {
-        CborVal::UInt(n) => Ok(*n),
-        _ => Err(ProvisionError::RootsFormat),
-    }
-}
-fn cbor_val_bytes<'a>(v: &'a CborVal<'a>) -> Result<&'a [u8], ProvisionError> {
-    match v {
-        CborVal::Bytes(b) => Ok(b),
-        _ => Err(ProvisionError::RootsFormat),
-    }
-}
-
-fn cbor_read_head(data: &[u8], pos: usize) -> Result<(u8, u64, usize), ProvisionError> {
-    let b = *data.get(pos).ok_or(ProvisionError::RootsFormat)?;
-    let major = b >> 5;
-    let info = b & 0x1f;
-    match info {
-        0..=23 => Ok((major, u64::from(info), pos + 1)),
-        24 => {
-            let v = u64::from(*data.get(pos + 1).ok_or(ProvisionError::RootsFormat)?);
-            if v < 24 {
-                return Err(ProvisionError::RootsFormat);
-            }
-            Ok((major, v, pos + 2))
-        }
-        25 => {
-            let s = data
-                .get(pos + 1..pos + 3)
-                .ok_or(ProvisionError::RootsFormat)?;
-            let v = u64::from(u16::from_be_bytes([s[0], s[1]]));
-            if v <= u64::from(u8::MAX) {
-                return Err(ProvisionError::RootsFormat);
-            }
-            Ok((major, v, pos + 3))
-        }
-        26 => {
-            let s = data
-                .get(pos + 1..pos + 5)
-                .ok_or(ProvisionError::RootsFormat)?;
-            let v = u64::from(u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
-            if v <= u64::from(u16::MAX) {
-                return Err(ProvisionError::RootsFormat);
-            }
-            Ok((major, v, pos + 5))
-        }
-        27 => {
-            let s = data
-                .get(pos + 1..pos + 9)
-                .ok_or(ProvisionError::RootsFormat)?;
-            let v = u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
-            if v <= u64::from(u32::MAX) {
-                return Err(ProvisionError::RootsFormat);
-            }
-            Ok((major, v, pos + 9))
-        }
-        _ => Err(ProvisionError::RootsFormat),
-    }
-}
-
-fn cbor_read_value(
-    data: &[u8],
-    pos: usize,
-    depth: usize,
-) -> Result<(CborVal<'_>, usize), ProvisionError> {
-    if depth > 6 {
-        return Err(ProvisionError::RootsFormat);
-    }
-    let (major, len, mut cursor) = cbor_read_head(data, pos)?;
-    match major {
-        0 => Ok((CborVal::UInt(len), cursor)),
-        2 => {
-            let n = usize::try_from(len).map_err(|_| ProvisionError::RootsFormat)?;
-            let end = cursor.checked_add(n).ok_or(ProvisionError::RootsFormat)?;
-            let slice = data.get(cursor..end).ok_or(ProvisionError::RootsFormat)?;
-            Ok((CborVal::Bytes(slice), end))
-        }
-        4 => {
-            let n = usize::try_from(len).map_err(|_| ProvisionError::RootsFormat)?;
-            if n > MAX_ROOTS_ENTRIES {
-                return Err(ProvisionError::RootsFormat);
-            }
-            let mut items = Vec::with_capacity(n);
-            for _ in 0..n {
-                let (item, next) = cbor_read_value(data, cursor, depth + 1)?;
-                items.push(item);
-                cursor = next;
-            }
-            Ok((CborVal::Array(items), cursor))
-        }
-        5 => {
-            let n = usize::try_from(len).map_err(|_| ProvisionError::RootsFormat)?;
-            if n > 16 {
-                return Err(ProvisionError::RootsFormat);
-            }
-            let mut pairs = Vec::with_capacity(n);
-            let mut prev_key: Option<u64> = None;
-            for _ in 0..n {
-                let (k_val, after_k) = cbor_read_value(data, cursor, depth + 1)?;
-                let k = cbor_val_uint(&k_val)?;
-                if let Some(prev) = prev_key
-                    && k <= prev
-                {
-                    return Err(ProvisionError::RootsFormat);
-                }
-                prev_key = Some(k);
-                let (v_val, after_v) = cbor_read_value(data, after_k, depth + 1)?;
-                pairs.push((k, v_val));
-                cursor = after_v;
-            }
-            Ok((CborVal::Map(pairs), cursor))
-        }
-        _ => Err(ProvisionError::RootsFormat),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boreas_crypto::{
-        Policy,
-        backend::{OpenSslAcceptor, OpenSslConnector},
-    };
+    use boreas_crypto::backend::OpenSslConnector;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir(std::path::PathBuf);

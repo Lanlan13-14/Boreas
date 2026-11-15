@@ -50,7 +50,7 @@ jobs:
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -285,7 +285,7 @@ jobs:
           (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
       - name: Upload hop-node development binary
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
           path: hop-node-linux
@@ -293,7 +293,7 @@ jobs:
           retention-days: 14
       - name: Upload non-secret CI evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-tls-${{ github.run_id }}
           path: |

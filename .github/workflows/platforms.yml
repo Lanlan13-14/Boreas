@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Cargo.lock satisfies every workspace manifest
         shell: bash
@@ -58,7 +58,7 @@ jobs:
           echo "Cargo.lock SHA-256: $(cut -d' ' -f1 cargo-lock.sha256)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload locked workspace metadata
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lock-preflight-${{ github.run_id }}
           path: |
@@ -102,7 +102,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify native runner architecture (Unix)
         if: runner.os != 'Windows'
@@ -154,7 +154,7 @@ jobs:
           rustup target list --installed | tee -a toolchain.txt
           echo "rustc_summary=$(rustc -Vv | tr -d '\r' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -208,7 +208,7 @@ jobs:
           python tools/release/package.py "${args[@]}"
 
       - name: Upload development artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
           path: |
@@ -285,7 +285,7 @@ jobs:
             image: alpine:3.22
     steps:
       - name: Download Linux development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
           path: artifact
@@ -355,7 +355,7 @@ jobs:
 
       - name: Upload container runtime evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: container-runtime-${{ matrix.target }}-${{ matrix.distro_slug }}-${{ github.run_id }}
           path: |
@@ -377,37 +377,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Download Linux x86_64 development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-x86_64-unknown-linux-musl-${{ github.run_id }}
           path: downloaded/x86_64-unknown-linux-musl
 
       - name: Download Linux aarch64 development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-aarch64-unknown-linux-musl-${{ github.run_id }}
           path: downloaded/aarch64-unknown-linux-musl
 
       - name: Download Windows x86_64 development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-x86_64-pc-windows-msvc-${{ github.run_id }}
           path: downloaded/x86_64-pc-windows-msvc
 
       - name: Download macOS Intel development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-x86_64-apple-darwin-${{ github.run_id }}
           path: downloaded/x86_64-apple-darwin
 
       - name: Download macOS Apple Silicon development artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: boreas-development-aarch64-apple-darwin-${{ github.run_id }}
           path: downloaded/aarch64-apple-darwin
@@ -435,7 +435,7 @@ jobs:
           echo '- [ ] Offline Ed25519 + ML-DSA ReleaseRoot promotion bundle verified' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload development release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boreas-development-release-${{ github.run_id }}
           path: release-bundle/*

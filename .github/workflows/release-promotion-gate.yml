@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout candidate commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
@@ -74,7 +74,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -98,7 +98,7 @@ jobs:
 
       - name: Upload gate verification record
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-gate-ledger-${{ github.run_id }}
           path: gate-verification.txt
@@ -112,12 +112,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout candidate commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -164,7 +164,7 @@ jobs:
           fi
 
       - name: Download signed promotion bundle from the selected run
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.bundle_artifact }}
           run-id: ${{ inputs.bundle_run_id }}
@@ -191,7 +191,7 @@ jobs:
 
       - name: Upload promotion verification report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-promotion-report-${{ github.run_id }}
           path: production-promotion-report.json
