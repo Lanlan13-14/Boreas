@@ -50,6 +50,10 @@ version = "0.1.0"
 [[package]]
 name = "boreas-supervisor"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "openssl",
+]
 
 [[package]]
 name = "boreas-tun"
