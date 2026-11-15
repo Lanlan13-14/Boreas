@@ -27,11 +27,13 @@ Candidate fields (keys 0–13, matching the unsigned-integer-key/shortest-head d
 | 9 | not-before Unix microseconds |
 | 10 | expiry Unix microseconds; strictly greater than not-before |
 | 11 | chain depth, exactly 1 in this candidate |
-| 12 | may-delegate, exactly false |
+| 12 | may-delegate, CBOR simple boolean `false` (`0xf4`), exactly; integer `0` is not equivalent and is rejected |
 | 13 | extensions, currently exactly an empty array (unknown critical extensions cannot be smuggled) |
 
-The complete candidate is capped at 16 KiB. Unknown fields, duplicate fields, malformed/noncanonical
-CBOR, duplicate scope entries, invalid roles, invalid IDs, invalid prefixes, empty/oversized scopes,
+The complete candidate is capped at 16 KiB. The bounded parser limits maps to 16 entries, arrays to
+256 entries, and nesting to depth 8 (root depth 0); declared collection sizes are rejected before
+allocation/iteration. Unknown fields, duplicate fields, malformed/noncanonical CBOR, duplicate scope
+entries, invalid roles, invalid IDs, invalid prefixes, empty/oversized scopes,
 and unknown critical extensions (if extensions are added by a future revision) reject. Purpose and
 scope must agree. No chain traversal or delegated RootAuthorization issuance is accepted: chain
 length is one direct NetworkRoot authorization, and transitive issuance is prohibited.
@@ -79,7 +81,10 @@ validation, a daemon, or durable storage. These are subsequent integration work.
 
 The scoped code implements a bounded canonical candidate decoder/encoder and cryptographic
 verification boundary, but this is not a frozen interoperability profile. Before protocol freeze,
-add independently generated parser/encoder vectors, clarify scope serialization and chain/root
-rotation semantics, and align the candidate package with the provisioning contract. In particular,
-this direct-root-only slice rejects delegation and does not implement sequence persistence, root
-rotation, revocation, or durable replay.
+clarify scope serialization and chain/root rotation semantics, and align the candidate package with
+the provisioning contract. In particular, this direct-root-only slice rejects delegation and does
+not implement sequence persistence, root rotation, revocation, or durable replay. A Rust test checks
+the same fixed raw bytes as the independent structural RootAuthorization vectors in
+`security-bindings-candidate-v1.json` (the fixture file itself is not yet loaded by Rust); its synthetic key byte strings are not DER and are decoded
+for structure/re-encoding only, never accepted as cryptographic keys. The same fixture family checks
+delegation `true` (CBOR `0xf5`) and integer-zero-instead-of-false rejection.

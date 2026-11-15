@@ -7,6 +7,7 @@
 use std::fmt;
 
 use openssl::{
+    hash::{hash, MessageDigest},
     pkey::{KeyType, PKey},
     sign::Verifier,
 };
@@ -101,6 +102,29 @@ impl NetworkRootPin {
     /// The caller must source/fingerprint these bytes out of band under the NetworkRoot
     /// provisioning procedure. The type prevents accidental API substitution but cannot
     /// cryptographically distinguish copied ReleaseRoot DER; independent provenance is required.
+    /// SHA-256 identifier for correlating the externally provisioned pin. This only fingerprints
+    /// public configuration; it does not establish the pin's provenance or trustworthiness.
+    pub fn fingerprint(&self) -> Result<[u8; 32], Error> {
+        let mut input = b"BOREAS-NETWORK-ROOT-PIN-FINGERPRINT\0".to_vec();
+        input.extend_from_slice(&(self.net_id.len() as u32).to_be_bytes());
+        input.extend_from_slice(&self.net_id);
+        input.push(1); // Ed25519 SPKI DER
+        input.extend_from_slice(&(self.ed25519_public_key_der.len() as u32).to_be_bytes());
+        input.extend_from_slice(&self.ed25519_public_key_der);
+        input.push(match self.mldsa_parameter_set {
+            boreas_proto::objects::MldsaParameterSet::Mldsa65 => 65,
+            boreas_proto::objects::MldsaParameterSet::Mldsa87 => 87,
+        });
+        input.extend_from_slice(&(self.mldsa_public_key_der.len() as u32).to_be_bytes());
+        input.extend_from_slice(&self.mldsa_public_key_der);
+        let digest = hash(MessageDigest::sha256(), &input).map_err(|_| Error::Backend)?;
+        digest.as_ref().try_into().map_err(|_| Error::Backend)
+    }
+
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+
     pub fn provisioned(
         net_id: [u8; 16],
         ed25519_public_key_der: Vec<u8>,
@@ -209,9 +233,8 @@ impl RootAuthorizationCandidate {
         let expires = value_uint(get(10)?)?;
         let chain_depth =
             u8::try_from(value_uint(get(11)?)?).map_err(|_| Error::InvalidCandidate)?;
-        let may_delegate = match value_uint(get(12)?)? {
-            0 => false,
-            1 => true,
+        let may_delegate = match get(12)? {
+            Value::Bool(value) => *value,
             _ => return Err(Error::InvalidCandidate),
         };
         if !matches!(get(13)?, Value::Array(xs) if xs.is_empty()) {
@@ -268,7 +291,7 @@ impl RootAuthorizationCandidate {
         uint(11, &mut o);
         uint(self.chain_depth as u64, &mut o);
         uint(12, &mut o);
-        uint(self.may_delegate as u64, &mut o);
+        cbor_bool(self.may_delegate, &mut o);
         // Key 13 is reserved for candidate extensions and is currently an empty array.
         uint(13, &mut o);
         array(0, &mut o);
@@ -457,6 +480,7 @@ pub fn verify(
 #[derive(Debug)]
 enum Value<'a> {
     UInt(u64),
+    Bool(bool),
     Bytes(&'a [u8]),
     Array(Vec<Value<'a>>),
     Map(Vec<(u64, Value<'a>)>),
@@ -468,6 +492,13 @@ fn read_value(data: &[u8], depth: usize) -> Result<(Value<'_>, usize), Error> {
     let major = data[0] >> 5;
     let ai = data[0] & 31;
     let mut pos = 1usize;
+    if major == 7 {
+        return match ai {
+            20 => Ok((Value::Bool(false), pos)),
+            21 => Ok((Value::Bool(true), pos)),
+            _ => Err(Error::InvalidCandidate),
+        };
+    }
     let n = match ai {
         0..=23 => ai as u64,
         24 => {
@@ -674,6 +705,9 @@ fn head(major: u8, n: usize, o: &mut Vec<u8>) {
         o.extend((n as u16).to_be_bytes())
     }
 }
+fn cbor_bool(value: bool, o: &mut Vec<u8>) {
+    o.push(if value { 0xf5 } else { 0xf4 });
+}
 fn uint(n: u64, o: &mut Vec<u8>) {
     let m = 0;
     if n < 24 {
@@ -743,6 +777,31 @@ mod tests {
             may_delegate: false,
         }
     }
+    fn hex(raw: &str) -> Vec<u8> {
+        let compact: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let (pairs, remainder) = compact.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "odd-length fixture hex");
+        pairs.iter().map(|pair| {
+            let byte = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(byte, 16).unwrap()
+        }).collect()
+    }
+
+    #[test]
+    fn independent_python_root_structure_vector_and_bool_encoding() {
+        // tools/candidate_bindings.py / security-bindings-candidate-v1.json uses synthetic
+        // non-DER keys: structural decoding only, deliberately no signature verification.
+        let valid = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf4 0d80");
+        let parsed = RootAuthorizationCandidate::decode_candidate(&valid).unwrap();
+        assert_eq!(parsed.purpose, Purpose::Identity);
+        assert!(!parsed.may_delegate);
+        assert_eq!(parsed.encode_candidate().unwrap(), valid);
+        let uint_false = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0c00 0d80");
+        assert!(RootAuthorizationCandidate::decode_candidate(&uint_false).is_err());
+        let true_delegate = hex("ae 0001 0150 03030303030303030303030303030303 024101 0304 0401 054101 0601 074102 0847 a2008101018102 090a 0a14 0b01 0cf5 0d80");
+        assert!(RootAuthorizationCandidate::decode_candidate(&true_delegate).is_err());
+    }
+
     #[test]
     fn verified_token_requires_pinned_root_and_both_signatures() {
         let (root_ed, root_pq) = pair(9);
