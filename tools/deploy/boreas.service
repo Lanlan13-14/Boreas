@@ -1,0 +1,49 @@
+[Unit]
+Description=Boreas IPv4 point-to-point overlay (development deployment template)
+After=network-online.target
+Wants=network-online.target
+# Bounded restart policy: an unsupported or misconfigured state must not become a
+# hot loop. 78 is EX_CONFIG from the wrapper (pre-existing TUN, unsafe pointer,
+# missing tool); it is not restarted at all.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# The daemon has no sd_notify support, so readiness is not claimed: systemd
+# tracks the wrapper as a simple unit and the wrapper blocks in `wait`.
+User=root
+UMask=0077
+EnvironmentFile=/etc/boreas/boreas.env
+ExecStart=@@PREFIX@@/boreas-run
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+
+# Hardening. A TUN device needs root or CAP_NET_ADMIN, and /dev/net/tun must stay
+# available, so PrivateDevices is deliberately left at its default (disabled).
+# /opt is read-only for the unit: the wrapper and the daemon only read their
+# release. Only the installer-created state directory is writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@@PREFIX@@/state
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+# AF_INET6 is included only so name resolution for --tls-name keeps working; the
+# wrapper never configures IPv6 addresses or routes.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -16,7 +16,6 @@ default = []
 # does not enable this: it has no TLS backend and `node` refuses to start.
 openssl-inner-tls = [
     "dep:boreas-crypto",
-    "dep:boreas-pki",
     "dep:boreas-proto",
     "dep:boreas-tun",
     "dep:boreas-tunnel",
@@ -29,7 +28,7 @@ openssl-inner-tls = [
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.2.1+spec-1.1.0"
 boreas-crypto = { path = "../boreas-crypto", optional = true }
-boreas-pki = { path = "../boreas-pki", optional = true }
+boreas-pki = { path = "../boreas-pki" }
 boreas-proto = { path = "../boreas-proto", optional = true }
 boreas-tun = { path = "../boreas-tun", optional = true }
 boreas-tunnel = { path = "../boreas-tunnel", optional = true }

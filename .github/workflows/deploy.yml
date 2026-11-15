@@ -1,0 +1,58 @@
+name: '[Test] Secure deployment scripts (POSIX, systemd, procd)'
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/deploy/**'
+      - 'docs/deployment/ONE_CLICK.md'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    paths:
+      - 'tools/deploy/**'
+      - 'docs/deployment/ONE_CLICK.md'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-regressions:
+    name: shellcheck + sh/dash/BusyBox + deployment regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shells and static checker
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck dash busybox binutils
+      - name: Check every deployment shell entry point
+        run: |
+          set -euo pipefail
+          scripts=(tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh)
+          for script in "${scripts[@]}"; do
+            sh -n "$script"
+            dash -n "$script"
+            busybox ash -n "$script"
+          done
+          shellcheck -s sh tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh
+      - name: Run deployment regressions under all supported shell parsers
+        run: |
+          set -euo pipefail
+          sh tools/deploy/test-install.sh 2>&1 | tee deploy-sh.log
+          dash tools/deploy/test-install.sh 2>&1 | tee deploy-dash.log
+          busybox ash tools/deploy/test-install.sh 2>&1 | tee deploy-busybox.log
+      - name: Upload deployment test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-regressions-${{ github.run_id }}
+          path: deploy-*.log
+          if-no-files-found: warn
+          retention-days: 14

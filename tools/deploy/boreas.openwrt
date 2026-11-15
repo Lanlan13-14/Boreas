@@ -1,0 +1,79 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt procd template for Boreas. install.sh substitutes @@PREFIX@@.
+#
+# /etc/boreas/boreas.env is NEVER sourced. It is parsed line by line against a
+# strict key and character allowlist, so a world-readable or otherwise weak file
+# cannot inject shell code into a root init script. The file must be owned by
+# root and have exactly mode 0600 (`chmod 600 /etc/boreas/boreas.env`).
+# START/STOP/USE_PROCD are read by /etc/rc.common, not by this file.
+# shellcheck disable=SC2034
+START=95
+# shellcheck disable=SC2034
+STOP=10
+# shellcheck disable=SC2034
+USE_PROCD=1
+
+BOREAS_ENV_FILE=/etc/boreas/boreas.env
+BOREAS_ENV_KEYS='BOREAS_ROLE BOREAS_VIP BOREAS_PEER_VIP BOREAS_LISTEN BOREAS_CONNECT BOREAS_TLS_NAME BOREAS_WS_HOST BOREAS_TUN_NAME BOREAS_MTU'
+
+_boreas_env_perms() {
+  [ -f "$BOREAS_ENV_FILE" ] || { echo "boreas: missing $BOREAS_ENV_FILE" >&2; return 1; }
+  [ ! -L "$BOREAS_ENV_FILE" ] || { echo "boreas: $BOREAS_ENV_FILE must not be a symlink" >&2; return 1; }
+  _st=$(stat -c '%u %a' -- "$BOREAS_ENV_FILE") || { echo 'boreas: cannot stat the env file' >&2; return 1; }
+  [ "${_st%% *}" = 0 ] || { echo 'boreas: env file must be owned by root' >&2; return 1; }
+  [ "${_st##* }" = 600 ] || { echo 'boreas: env file must have mode 0600' >&2; return 1; }
+  return 0
+}
+
+# Prints validated KEY=VALUE lines on stdout. No eval, no sourcing, no expansion:
+# the value charset excludes quotes, backslashes, spaces, '$', '`', ';', '|', '&',
+# '(', ')', '<', '>' and CR, so nothing in the file can become shell syntax.
+_boreas_env_parse() {
+  _n=0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _n=$((_n + 1))
+    case "$_line" in ''|'#'*) continue ;; esac
+    case "$_line" in *=*) : ;; *) echo "boreas: line $_n is not KEY=VALUE" >&2; return 1 ;; esac
+    _k=${_line%%=*}
+    _v=${_line#*=}
+    case " $BOREAS_ENV_KEYS " in
+      *" $_k "*) : ;;
+      *) echo "boreas: unsupported key '$_k' on line $_n" >&2; return 1 ;;
+    esac
+    case "$_v" in
+      '') echo "boreas: empty value for $_k on line $_n" >&2; return 1 ;;
+      *[!A-Za-z0-9._:/-]*) echo "boreas: unsafe value for $_k on line $_n (no quotes, spaces, CRLF, expansion or shell metacharacters)" >&2; return 1 ;;
+    esac
+    printf '%s=%s\n' "$_k" "$_v"
+  done < "$BOREAS_ENV_FILE"
+}
+
+start_service() {
+  _boreas_env_perms || return 1
+  _parsed=$(mktemp) || { echo 'boreas: cannot create a temporary file' >&2; return 1; }
+  if ! _boreas_env_parse > "$_parsed"; then
+    rm -f "$_parsed"
+    return 1
+  fi
+  if [ ! -s "$_parsed" ]; then
+    rm -f "$_parsed"
+    echo 'boreas: the env file defines no settings' >&2
+    return 1
+  fi
+  procd_open_instance
+  procd_set_param command "@@PREFIX@@/boreas-run"
+  # Read from a file, not a pipe: procd_set_param must run in this shell.
+  set --
+  while IFS= read -r _kv; do
+    set -- "$@" "$_kv"
+  done < "$_parsed"
+  procd_set_param env "$@"
+  rm -f "$_parsed"
+  # procd has no RestartPreventExitStatus equivalent; the wrapper's EX_CONFIG (78)
+  # therefore also consumes a restart slot. 5 restarts per 10 minutes, then stop.
+  procd_set_param respawn 600 5 5
+  procd_set_param term_timeout 15
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
+}

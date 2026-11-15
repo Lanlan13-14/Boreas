@@ -96,3 +96,45 @@ jobs:
           path: netem-*.log
           if-no-files-found: warn
           retention-days: 14
+
+  routing:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    name: Policy and asymmetric routing / MTU 1280 and 1500
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Validate artifact and install namespace tools
+        run: |
+          set -euo pipefail
+          (cd artifact && sha256sum --check --strict SHA256SUMS)
+          chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 iputils-ping binutils
+          sudo modprobe tun || true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Exercise actual pq768 daemon with protected management routes
+        run: |
+          set -euo pipefail
+          sudo -E bash tools/release/netns_routing_matrix.sh \
+            "$PWD/artifact/boreas-linux-x86_64-musl-pq768" "$PWD/routing-matrix-artifacts"
+      - name: Upload exact-commit routing snapshots and traffic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: routing-matrix-${{ github.event.workflow_run.id }}
+          path: routing-matrix-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

@@ -112,8 +112,16 @@ fn dispatch(
         Err(msg) => return (2, String::new(), msg),
     };
     let lang = lang_probe(cli_lang.as_deref());
-    if is_easy_entrypoint(argv0) && args.is_empty() {
-        return run(&["console".to_string()], lang, stdout_tty);
+    if is_easy_entrypoint(argv0)
+        && (args.is_empty()
+            || matches!(
+                args.first().map(String::as_str),
+                Some("--socket" | "--config" | "--service" | "--json" | "--narrow")
+            ))
+    {
+        let mut console_args = vec!["console".to_string()];
+        console_args.extend(args);
+        return run(&console_args, lang, stdout_tty);
     }
     run(&args, lang, stdout_tty)
 }
@@ -1451,6 +1459,23 @@ uplinks = ["wss://hub-us-c.example.net"]
         let console = run(&args(&["console"]), Lang::En, false);
         assert_eq!(easy, console, "both must resolve to the console path");
         assert_eq!(easy.0, 0);
+    }
+
+    #[test]
+    fn easy_console_options_do_not_require_an_explicit_subcommand() {
+        let options = args(&[
+            "--socket",
+            "/nonexistent-boreas-console.sock",
+            "--json",
+            "--service",
+            "boreas",
+        ]);
+        let easy = dispatch("boreas-easy", &options, probe_en, false);
+        let mut explicit = args(&["console"]);
+        explicit.extend(options);
+        assert_eq!(easy, run(&explicit, Lang::En, false));
+        assert_eq!(easy.0, 0);
+        assert!(easy.1.contains("\"command\":\"console\""));
     }
 
     #[test]

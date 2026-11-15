@@ -1,0 +1,267 @@
+#!/bin/sh
+# Boreas service wrapper.
+#
+# Ownership rule: this wrapper owns exactly one TUN interface, one /32 VIP address
+# and one /32 peer route, and removes only the address/route it added itself. It
+# refuses to run when any of those already exist, so it can never delete
+# somebody else's route. It does not touch sysctl, firewall, policy routing,
+# default routes, IPv6 or resolv.conf.
+#
+# @@PREFIX@@ is replaced by tools/deploy/install.sh at install time. There is no
+# environment override for the install prefix: a root service must not resolve
+# its binaries or keys from a caller-controlled path.
+#
+# Exit codes: 2 = operator configuration error, 78 = unsupported/existing state
+# (supervisors must not hot-loop; see RestartPreventExitStatus in the unit),
+# anything else = runtime failure propagated from the daemon.
+set -eu
+umask 077
+
+PREFIX=@@PREFIX@@
+ENV_FILE=/etc/boreas/boreas.env
+
+die() { printf 'boreas-run: %s\n' "$*" >&2; exit 2; }
+ex_config() { printf 'boreas-run: %s\n' "$*" >&2; exit 78; }
+runtime_fail() { printf 'boreas-run: %s\n' "$*" >&2; exit 1; }
+
+case "$PREFIX" in
+  *'@'*) ex_config 'wrapper was not rendered by install.sh' ;;
+  /*) : ;;
+  *) ex_config 'wrapper prefix is not absolute' ;;
+esac
+
+BOREAS_ROLE=${BOREAS_ROLE:-}
+BOREAS_VIP=${BOREAS_VIP:-}
+BOREAS_PEER_VIP=${BOREAS_PEER_VIP:-}
+BOREAS_LISTEN=${BOREAS_LISTEN:-}
+BOREAS_CONNECT=${BOREAS_CONNECT:-}
+BOREAS_TLS_NAME=${BOREAS_TLS_NAME:-}
+BOREAS_WS_HOST=${BOREAS_WS_HOST:-}
+
+# Canonical dotted-quad only: no leading zeros (inet_pton would read 010 as
+# octal, so accepting it would mean validating something other than what `ip`
+# acts on), no empty octets, no leading/trailing dots.
+valid_v4() {
+  case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  _v4_ifs=$IFS
+  IFS=.
+  _v4_count=0
+  # Deliberate word splitting on '.' via IFS: that is how the octets are counted.
+  # shellcheck disable=SC2086
+  for _v4_octet in $1; do
+    case "$_v4_octet" in ''|0?*) IFS=$_v4_ifs; return 1 ;; esac
+    [ "${#_v4_octet}" -le 3 ] || { IFS=$_v4_ifs; return 1; }
+    [ "$_v4_octet" -le 255 ] || { IFS=$_v4_ifs; return 1; }
+    _v4_count=$((_v4_count + 1))
+  done
+  IFS=$_v4_ifs
+  [ "$_v4_count" -eq 4 ]
+}
+
+# Overlay addresses must be RFC1918 only; CGNAT shared space is not private.
+# Anything else is refused, because a single
+# PEER/32 route into the tunnel can blackhole a real destination.
+private_v4() {
+  case "$1" in
+    10.*) return 0 ;;
+    192.168.*) return 0 ;;
+  esac
+  case "$1" in
+    172.*) : ;;
+    *) return 1 ;;
+  esac
+  _pv_rest=${1#172.}
+  _pv_second=${_pv_rest%%.*}
+  [ "$_pv_second" -ge 16 ] && [ "$_pv_second" -le 31 ]
+}
+
+valid_port() {
+  case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] || return 1
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# IPv4:port only. IPv6 is a separate, unimplemented workstream.
+valid_hostport() {
+  case "$1" in *:*) : ;; *) return 1 ;; esac
+  _hp_host=${1%:*}
+  _hp_port=${1##*:}
+  valid_v4 "$_hp_host" || return 1
+  valid_port "$_hp_port"
+}
+
+valid_hostname() {
+  [ -n "$1" ] || return 1
+  [ "${#1}" -le 253 ] || return 1
+  case "$1" in *[!A-Za-z0-9.-]*|.*|*.|*..*) return 1 ;; esac
+  return 0
+}
+
+valid_ws_host() {
+  case "$1" in
+    *:*) valid_hostname "${1%:*}" && valid_port "${1##*:}" ;;
+    *) valid_hostname "$1" ;;
+  esac
+}
+
+# The env file is documentation-as-code for systemd/procd, but it is also read
+# here, so a weakly permissioned file is refused before any privileged action.
+if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+  [ ! -L "$ENV_FILE" ] || ex_config "$ENV_FILE must not be a symbolic link"
+  [ -f "$ENV_FILE" ] || ex_config "$ENV_FILE must be a regular file"
+  _env_state=$(stat -c '%u %a' -- "$ENV_FILE") || ex_config "cannot stat $ENV_FILE"
+  [ "${_env_state%% *}" = 0 ] || ex_config "$ENV_FILE must be owned by root"
+  [ "${_env_state##* }" = 600 ] || ex_config "$ENV_FILE must have mode 0600"
+fi
+
+case "$BOREAS_ROLE" in
+  core|edge) : ;;
+  '') die 'set BOREAS_ROLE=core or BOREAS_ROLE=edge in /etc/boreas/boreas.env' ;;
+  *) die "invalid BOREAS_ROLE: $BOREAS_ROLE" ;;
+esac
+
+[ -n "$BOREAS_VIP" ] || die 'set BOREAS_VIP to a bare private IPv4 address'
+[ -n "$BOREAS_PEER_VIP" ] || die 'set BOREAS_PEER_VIP to a bare private IPv4 address'
+valid_v4 "$BOREAS_VIP" || die "BOREAS_VIP is not a canonical dotted-quad: $BOREAS_VIP"
+valid_v4 "$BOREAS_PEER_VIP" || die "BOREAS_PEER_VIP is not a canonical dotted-quad: $BOREAS_PEER_VIP"
+private_v4 "$BOREAS_VIP" || die "BOREAS_VIP must be RFC1918 space, got $BOREAS_VIP"
+private_v4 "$BOREAS_PEER_VIP" || die "BOREAS_PEER_VIP must be RFC1918 space, got $BOREAS_PEER_VIP"
+case "$BOREAS_VIP" in 0.0.0.0|255.255.255.255) die 'BOREAS_VIP must be a usable host address' ;; esac
+case "$BOREAS_PEER_VIP" in 0.0.0.0|255.255.255.255) die 'BOREAS_PEER_VIP must be a usable host address' ;; esac
+[ "$BOREAS_VIP" != "$BOREAS_PEER_VIP" ] || die 'BOREAS_VIP and BOREAS_PEER_VIP must differ'
+
+TUN=${BOREAS_TUN_NAME:-btun0}
+case "$TUN" in ''|*[!A-Za-z0-9_.-]*) die "invalid BOREAS_TUN_NAME: $TUN" ;; esac
+[ "${#TUN}" -le 15 ] || die 'BOREAS_TUN_NAME must be at most 15 characters (IFNAMSIZ)'
+
+MTU=${BOREAS_MTU:-1360}
+case "$MTU" in ''|*[!0-9]*) die "invalid BOREAS_MTU: $MTU" ;; esac
+if [ "$MTU" -lt 1280 ] || [ "$MTU" -gt 1400 ]; then
+  die 'BOREAS_MTU must be 1280..1400'
+fi
+
+[ -f "$PREFIX/active" ] || ex_config "active release pointer missing: $PREFIX/active"
+IFS= read -r ACTIVE < "$PREFIX/active" || ex_config 'cannot read active release pointer'
+case "$ACTIVE" in ''|.|..|*[!A-Za-z0-9._+-]*) ex_config 'unsafe active release pointer' ;; esac
+BIN=$PREFIX/releases/$ACTIVE/boreas
+CONFIG=$PREFIX/releases/$ACTIVE/config.toml
+MATERIAL=$PREFIX/releases/$ACTIVE/materials
+[ -x "$BIN" ] || ex_config "active release binary missing: $BIN"
+[ -f "$CONFIG" ] || ex_config "active release config missing: $CONFIG"
+[ -d "$MATERIAL" ] || ex_config "active release materials missing: $MATERIAL"
+
+case "$BOREAS_ROLE" in
+  core)
+    [ -n "$BOREAS_LISTEN" ] || die 'set BOREAS_LISTEN=IPv4:port for the core role'
+    valid_hostport "$BOREAS_LISTEN" || die "BOREAS_LISTEN must be IPv4:port with port 1..65535: $BOREAS_LISTEN"
+    set -- "$BIN" daemon serve \
+      --config "$CONFIG" --material-dir "$MATERIAL" \
+      --listen "$BOREAS_LISTEN" --tun-name "$TUN" --mtu "$MTU"
+    ;;
+  edge)
+    [ -n "$BOREAS_CONNECT" ] || die 'set BOREAS_CONNECT=IPv4:port for the edge role'
+    valid_hostport "$BOREAS_CONNECT" || die "BOREAS_CONNECT must be IPv4:port with port 1..65535: $BOREAS_CONNECT"
+    [ -n "$BOREAS_TLS_NAME" ] || die 'set BOREAS_TLS_NAME to the server certificate SAN'
+    valid_hostname "$BOREAS_TLS_NAME" || die "BOREAS_TLS_NAME is not a DNS name: $BOREAS_TLS_NAME"
+    WS_HOST=${BOREAS_WS_HOST:-$BOREAS_TLS_NAME}
+    valid_ws_host "$WS_HOST" || die "BOREAS_WS_HOST must be host or host:port: $WS_HOST"
+    # A peer VIP that is also the transport endpoint would route the encrypted
+    # transport itself into the tunnel.
+    _connect_host=${BOREAS_CONNECT%:*}
+    [ "$BOREAS_PEER_VIP" != "$_connect_host" ] || die 'BOREAS_PEER_VIP must not be the BOREAS_CONNECT host'
+    [ "$BOREAS_VIP" != "$_connect_host" ] || die 'BOREAS_VIP must not be the BOREAS_CONNECT host'
+    set -- "$BIN" daemon connect \
+      --config "$CONFIG" --material-dir "$MATERIAL" \
+      --connect "$BOREAS_CONNECT" --tls-name "$BOREAS_TLS_NAME" --ws-host "$WS_HOST" \
+      --tun-name "$TUN" --mtu "$MTU"
+    ;;
+esac
+
+IP=$(command -v ip) || ex_config 'required command not found: ip'
+
+# Refuse to take over an existing interface: whoever created it owns its
+# addresses and routes.
+if "$IP" link show "$TUN" >/dev/null 2>&1; then
+  ex_config "refusing pre-existing interface $TUN (remove it or set BOREAS_TUN_NAME)"
+fi
+# Refuse if our VIP is already a host address, or if the peer VIP is a local
+# address (routing it into the tunnel would blackhole local management traffic).
+if "$IP" -4 -o addr show 2>/dev/null | grep -q "inet $BOREAS_VIP/"; then
+  ex_config "BOREAS_VIP $BOREAS_VIP is already configured on this host"
+fi
+if "$IP" -4 -o addr show 2>/dev/null | grep -q "inet $BOREAS_PEER_VIP/"; then
+  ex_config "BOREAS_PEER_VIP $BOREAS_PEER_VIP is a local address"
+fi
+if "$IP" -4 route show 2>/dev/null | grep -q "^$BOREAS_PEER_VIP/32 "; then
+  ex_config "a host route for $BOREAS_PEER_VIP/32 already exists; this wrapper only owns routes it adds"
+fi
+
+PID=
+OWN_ADDR=0
+OWN_ROUTE=0
+
+stop_daemon() {
+  [ -n "${PID:-}" ] || return 0
+  kill "$PID" 2>/dev/null || true
+  _stop_i=0
+  while kill -0 "$PID" 2>/dev/null && [ "$_stop_i" -lt 10 ]; do
+    sleep 1
+    _stop_i=$((_stop_i + 1))
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  PID=
+  return 0
+}
+
+cleanup() {
+  stop_daemon
+  if [ "$OWN_ROUTE" -eq 1 ]; then
+    "$IP" route del "$BOREAS_PEER_VIP/32" dev "$TUN" 2>/dev/null || true
+    OWN_ROUTE=0
+  fi
+  if [ "$OWN_ADDR" -eq 1 ]; then
+    "$IP" addr del "$BOREAS_VIP/32" dev "$TUN" 2>/dev/null || true
+    OWN_ADDR=0
+  fi
+  return 0
+}
+
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
+"$@" &
+PID=$!
+
+ready=0
+_wait_i=0
+while [ "$_wait_i" -lt 10 ]; do
+  if "$IP" link show "$TUN" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  if ! kill -0 "$PID" 2>/dev/null; then
+    _rc=0
+    wait "$PID" || _rc=$?
+    PID=
+    runtime_fail "daemon exited before creating $TUN (status $_rc)"
+  fi
+  sleep 1
+  _wait_i=$((_wait_i + 1))
+done
+[ "$ready" -eq 1 ] || runtime_fail "daemon did not create $TUN within 10 seconds"
+
+"$IP" link set "$TUN" up || runtime_fail "cannot bring $TUN up"
+"$IP" addr add "$BOREAS_VIP/32" dev "$TUN" || runtime_fail "refusing to replace an existing address for $BOREAS_VIP"
+OWN_ADDR=1
+"$IP" route add "$BOREAS_PEER_VIP/32" dev "$TUN" || runtime_fail "refusing to replace an existing route for $BOREAS_PEER_VIP"
+OWN_ROUTE=1
+
+set +e
+wait "$PID"
+_rc=$?
+set -e
+PID=
+exit "$_rc"

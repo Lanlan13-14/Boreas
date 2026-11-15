@@ -1,0 +1,23 @@
+{
+  "version": "3.6.5",
+  "reviewed_through_notice": "20261110",
+  "applicability": {
+    "CVE-2026-88822": "QUIC automated peer detection. No QUIC API call found in crates/*.rs search on 2026-11-15; not a whole-program reachability proof. Current 3.6 branch not analysed upstream.",
+    "CVE-2026-95691": "QUIC client CRYPTO retransmission UAF. No QUIC API call found; current 3.6 branch not analysed upstream.",
+    "CVE-2026-88823": "AES-GCM-SIV fragmented AAD including empty update. No AES-GCM-SIV API call found; must verify linked provider algorithm surface and external inputs.",
+    "CVE-2026-95692": "AES-GCM-SIV nonstandard IV length. No AES-GCM-SIV API call found; do not confuse TLS AES-GCM with AES-GCM-SIV.",
+    "CVE-2026-107496": "CMS_encrypt/CMS_encrypt_ex with attacker-controlled EC order=1 recipient. Upstream explicitly says TLS/QUIC do not use this path. No CMS call found; 4.x default explicit-curve rejection further limits exposure. Not proof that 3.6.5 is safe."
+  },
+  "affected_ranges": [
+    {"minimum": "4.1.0", "fixed": "4.1.1", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
+    {"minimum": "4.0.0", "fixed": "4.0.4", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
+    {"minimum": "3.5.0", "fixed": "3.5.10", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]}
+  ],
+  "queried_at": "2026-11-15",
+  "status": "20261110 reviewed: 3.6 is unsupported and unanalysed, not proven unaffected. Supported current releases have disclosed CVEs; patched 3.5.10/4.0.4/4.1.1 scheduled 2026-12-01. CI blocks unsupported pins and known affected ranges; new notices require renewed range review.",
+  "sources": [
+    "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-3.6.5",
+    "https://openssl-library.org/news/vulnerabilities/",
+    "https://openssl-library.org/news/secadv/20261110.txt"
+  ]
+}

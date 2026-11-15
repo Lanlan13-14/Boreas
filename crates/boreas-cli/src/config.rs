@@ -23,6 +23,7 @@
 //! supplied by the caller — never by a schema-level ban — so the check follows
 //! the actual integration state of the runtime.
 
+use boreas_pki::OverlayPrefix;
 use serde::Deserialize;
 use std::fmt;
 use std::fs::File;
@@ -185,6 +186,9 @@ pub struct Config {
 pub struct NetworkConfig {
     /// Exactly 32 hexadecimal digits (16 bytes), the network genesis parameter.
     pub net_id: String,
+    /// Candidate canonical RFC1918 /16 network parameter. Validation currently
+    /// refuses non-default values until the signed runtime path is integrated.
+    pub overlay_prefix: OverlayPrefix,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,6 +285,8 @@ pub enum ConfigError {
     SchemaVersionRequired,
     UnsupportedSchemaVersion,
     InvalidNetId,
+    InvalidOverlayPrefix,
+    CustomOverlayPrefixUnavailable,
     InvalidNodeId,
     InvalidHomeCoreId,
     InvalidVipOctet,
@@ -321,6 +327,12 @@ impl fmt::Display for ConfigError {
                 "unsupported `version`; only 1 (legacy) and 2 (current) are understood"
             }
             Self::InvalidNetId => "network net_id must be exactly 32 hexadecimal digits (16 bytes)",
+            Self::InvalidOverlayPrefix => {
+                "overlay_prefix must be a canonical RFC1918 IPv4 /16 (for example 10.20.0.0/16); public, CGNAT, host-bit and other mask lengths are rejected"
+            }
+            Self::CustomOverlayPrefixUnavailable => {
+                "non-default overlay_prefix is unavailable: the runtime still uses 10.20.0.0/16; end-to-end signed identity, negotiation and address-path integration are required"
+            }
             Self::InvalidNodeId => "node_id is outside the permanent 12-bit slot range (0..=4095)",
             Self::InvalidHomeCoreId => "home_core_id must be within 1..=16",
             Self::InvalidVipOctet => "vip_octet is not valid for the configured role",
@@ -407,6 +419,8 @@ struct V2Document {
 #[serde(deny_unknown_fields)]
 struct V2Node {
     net_id: String,
+    #[serde(default = "default_overlay_prefix")]
+    overlay_prefix: String,
     role: String,
     home_core_id: u8,
     vip_octet: u8,
@@ -482,6 +496,12 @@ struct LegacyDocument {
 #[serde(deny_unknown_fields)]
 struct LegacyNetwork {
     net_id: String,
+    #[serde(default = "default_overlay_prefix")]
+    overlay_prefix: String,
+}
+
+fn default_overlay_prefix() -> String {
+    OverlayPrefix::DEFAULT.to_string()
 }
 
 #[derive(Deserialize)]
@@ -580,6 +600,11 @@ impl Config {
             schema: SchemaVersion::V2,
             network: NetworkConfig {
                 net_id: raw.node.net_id,
+                overlay_prefix: raw
+                    .node
+                    .overlay_prefix
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidOverlayPrefix)?,
             },
             identity: IdentityConfig {
                 role,
@@ -628,6 +653,11 @@ impl Config {
             schema: SchemaVersion::LegacyV1,
             network: NetworkConfig {
                 net_id: raw.network.net_id,
+                overlay_prefix: raw
+                    .network
+                    .overlay_prefix
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidOverlayPrefix)?,
             },
             identity: IdentityConfig {
                 role: raw.identity.role,
@@ -732,7 +762,7 @@ impl Config {
         format!(
             concat!(
                 "{{\"valid\":true,\"schema_version\":{},\"schema\":\"{}\",\"migrated\":{},",
-                "\"net_id\":\"{}\",\"role\":\"{}\",\"home_core_id\":{},",
+                "\"net_id\":\"{}\",\"overlay_prefix\":\"{}\",\"role\":\"{}\",\"home_core_id\":{},",
                 "\"node_id\":{},\"identity_generation\":{},\"security_mode\":\"{}\",",
                 "\"suite\":\"{}\",\"uplink\":{{\"backup\":{},\"paths\":{},\"probe_paths\":{}}},",
                 "\"limits\":{{\"ipv6\":{},\"advertise_routes\":{},\"accept_routes\":{},",
@@ -745,6 +775,7 @@ impl Config {
             self.schema.label(),
             self.schema == SchemaVersion::LegacyV1,
             self.network.net_id,
+            self.network.overlay_prefix,
             self.identity.role.as_str(),
             self.identity.home_core_id,
             self.identity.node_id,
@@ -776,6 +807,10 @@ impl Config {
         ));
         out.push_str("version = 2\n\n[node]\n");
         out.push_str(&format!("net_id = {}\n", toml_string(&self.network.net_id)));
+        out.push_str(&format!(
+            "overlay_prefix = {}\n",
+            toml_string(&self.network.overlay_prefix.to_string())
+        ));
         out.push_str(&format!(
             "role = {}\n",
             toml_string(self.identity.role.as_str())
@@ -850,6 +885,12 @@ impl Config {
             || !self.network.net_id.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(ConfigError::InvalidNetId);
+        }
+        // Fail closed even for manually constructed Config values and callers
+        // reporting FULL capabilities: none of today's capability bits proves
+        // end-to-end prefix binding. Never accept intent that the daemon ignores.
+        if self.network.overlay_prefix != OverlayPrefix::DEFAULT {
+            return Err(ConfigError::CustomOverlayPrefixUnavailable);
         }
         let identity = &self.identity;
         if !(1..=16).contains(&identity.home_core_id) {
@@ -943,6 +984,7 @@ impl Config {
         self.security.mode != next.security.mode
             || self.security.suite != next.security.suite
             || self.network.net_id != next.network.net_id
+            || self.network.overlay_prefix != next.network.overlay_prefix
             || self.identity.role != next.identity.role
             || self.identity.home_core_id != next.identity.home_core_id
             || self.identity.vip_octet != next.identity.vip_octet
@@ -1312,6 +1354,82 @@ ipv6 = false
         assert_eq!(config.limits, LimitsConfig::default());
         assert!(config.dns.is_none());
         assert!(!config.redacted_json().contains("\"migrated\":true"));
+    }
+
+    #[test]
+    fn overlay_default_is_explicit_in_output_and_round_trips_both_schemas() {
+        for input in [v2_toml(), legacy_toml()] {
+            let omitted = parse(&input).unwrap();
+            let explicit =
+                input.replace("net_id =", "overlay_prefix = \"10.20.0.0/16\"\nnet_id =");
+            assert_eq!(parse(&explicit).unwrap(), omitted);
+            assert_eq!(omitted.network.overlay_prefix, OverlayPrefix::DEFAULT);
+            assert!(omitted.redacted_json().contains("\"overlay_prefix\":\"10.20.0.0/16\""));
+            let migrated = omitted.to_v2_toml();
+            assert!(migrated.contains("overlay_prefix = \"10.20.0.0/16\""));
+            let reparsed = parse(&migrated).unwrap();
+            assert_eq!(reparsed.network, omitted.network);
+        }
+    }
+
+    #[test]
+    fn overlay_invalid_values_fail_before_runtime_gate_in_both_schemas() {
+        for input in [v2_toml(), legacy_toml()] {
+            for prefix in [
+                "1.1.1.1",
+                "1.1.1.1/16",
+                "1.1.0.0/16",
+                "100.64.0.0/10",
+                "100.64.0.0/16",
+                "10.20.1.0/16",
+                "10.20.0.1/16",
+                "10.0.0.0/8",
+                "10.20.0.0/24",
+            ] {
+                let document = input.replace(
+                    "net_id =",
+                    &format!("overlay_prefix = \"{prefix}\"\nnet_id ="),
+                );
+                assert_eq!(
+                    parse(&document),
+                    Err(ConfigError::InvalidOverlayPrefix),
+                    "{prefix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_overlay_is_never_silently_accepted_by_current_runtime() {
+        for input in [v2_toml(), legacy_toml()] {
+            for prefix in ["10.21.0.0/16", "172.19.0.0/16", "192.168.0.0/16"] {
+                let document = input.replace(
+                    "net_id =",
+                    &format!("overlay_prefix = \"{prefix}\"\nnet_id ="),
+                );
+                for capabilities in [NO_CAPS, RuntimeCapabilities::FULL] {
+                    assert_eq!(
+                        Config::parse_toml(&document, capabilities),
+                        Err(ConfigError::CustomOverlayPrefixUnavailable)
+                    );
+                }
+            }
+        }
+        // Directly constructed configs cannot bypass the same validation guard.
+        let old = parse(&v2_toml()).unwrap();
+        let mut next = old.clone();
+        next.network.overlay_prefix = "172.19.0.0/16".parse().unwrap();
+        assert_eq!(
+            next.validate(RuntimeCapabilities::FULL),
+            Err(ConfigError::CustomOverlayPrefixUnavailable)
+        );
+        assert!(old.security_transition_requires_high_risk(&next));
+        assert!(next.to_v2_toml().contains("overlay_prefix = \"172.19.0.0/16\""));
+        assert!(
+            ConfigError::CustomOverlayPrefixUnavailable
+                .to_string()
+                .contains("signed identity")
+        );
     }
 
     #[test]

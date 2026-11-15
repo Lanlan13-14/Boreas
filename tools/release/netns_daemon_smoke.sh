@@ -15,6 +15,23 @@ set -euo pipefail
 BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
+TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+if [[ ! "$TUN_MTU" =~ ^[0-9]+$ ]] || (( TUN_MTU < 1280 || TUN_MTU > 1400 )); then
+  echo 'ERROR: BOREAS_TUN_MTU must be 1280..1400' >&2
+  exit 1
+fi
+export BOREAS_NETNS_HOOK_PROTOCOL=1
+if [[ -n "${BOREAS_NETNS_HOOK:-}" ]]; then
+  [[ "${BOREAS_NETNS_HOOK_VERSION:-}" == 1 && "$BOREAS_NETNS_HOOK" = /* && -f "$BOREAS_NETNS_HOOK" ]] || {
+    echo 'ERROR: routing hook requires an absolute regular file and version 1' >&2
+    exit 1
+  }
+fi
+run_hook() {
+  if [[ -n "${BOREAS_NETNS_HOOK:-}" ]]; then
+    bash "$BOREAS_NETNS_HOOK" "$1" "$CORE_NS" "$EDGE_NS" "$WORK"
+  fi
+}
 
 WORK="$(mktemp -d /tmp/boreas-netns-e2e.XXXXXX)"
 chmod 0700 "$WORK"
@@ -41,10 +58,10 @@ run_node() {
   local ns="$1"
   shift
   if [[ -n "${BOREAS_ROOTFS:-}" ]]; then
-    mkdir -p "${BOREAS_ROOTFS}/sys" "${BOREAS_ROOTFS}/dev" "${BOREAS_ROOTFS}${WORK}"
+    mkdir -p "${BOREAS_ROOTFS}/sys" "${BOREAS_ROOTFS}/dev/net" "${BOREAS_ROOTFS}${WORK}"
     touch "${BOREAS_ROOTFS}/dev/net/tun"
     exec ip netns exec "$ns" unshare --mount --propagation private \
-      bash -e -c 'mount --make-rprivate /; mount -t sysfs sysfs "$1/sys"; mount --bind /dev/net/tun "$1/dev/net/tun"; mount --bind "$2" "$1$2"; exec chroot "$1" /usr/local/bin/boreas "${@:3}"' \
+      bash -e -c 'mount --make-rprivate /; mount -t sysfs sysfs "$1/sys"; mount --bind /dev/net/tun "$1/dev/net/tun"; mount --bind "$2" "$1$2"; exec chroot "$1" /usr/local/bin/boreas "${@:4}"' \
       boreas-node "$BOREAS_ROOTFS" "$WORK" "$@"
   fi
   exec ip netns exec "$ns" unshare --mount --propagation private \
@@ -150,6 +167,8 @@ ip netns exec "$EDGE_NS" ip link set lo up
 ip netns exec "$EDGE_NS" ip addr add 192.0.2.2/24 dev veth-edge
 ip netns exec "$EDGE_NS" ip link set veth-edge up
 
+run_hook setup
+
 # Optional netem impairment is scoped to the two disposable underlay devices.
 # No host qdisc or global sysctl is touched. RTT is one-way per device.
 if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
@@ -168,7 +187,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --material-dir "$CORE_MAT" \
   --listen "192.0.2.1:8443" \
   --tun-name "btun0" \
-  --mtu 1360 \
+  --mtu "$TUN_MTU" \
   --max-seconds 35 \
   > "$WORK/core.out" 2> "$WORK/core.err" &
 echo $! > "$WORK/core.pid"
@@ -192,7 +211,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --tls-name "wss.boreas.test" \
   --ws-host "wss.boreas.test:8443" \
   --tun-name "btun0" \
-  --mtu 1360 \
+  --mtu "$TUN_MTU" \
   --max-seconds 33 \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &
 echo $! > "$WORK/edge.pid"
@@ -206,6 +225,8 @@ done
 ip netns exec "$EDGE_NS" ip addr add 10.20.1.2/32 dev btun0
 ip netns exec "$EDGE_NS" ip link set btun0 up
 ip netns exec "$EDGE_NS" ip route add 10.20.1.1/32 dev btun0
+
+run_hook ready
 
 # Wait until `boreas ctl status` reports `daemon_connected:true` on both nodes.
 CONNECTED=0
@@ -293,4 +314,5 @@ echo " Core exit summary: $(cat "$WORK/core.out")"
 echo " Edge exit summary: $(cat "$WORK/edge.out")"
 grep -q '"status":"ok"' "$WORK/core.out"
 grep -q '"status":"ok"' "$WORK/edge.out"
+run_hook verify
 echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"

@@ -1,12 +1,35 @@
 # Boreas 双机公网实战部署教程（`v0.1.0-pre.3`）
 
-本教程面向真机运维与测试人员，演示如何在两台公网 Linux 服务器之间从零部署 **Boreas `Core <-> Edge` 后量子端到端加密隧道**（外层 TLS 1.3 + RFC 6455 WSS + 逐跳 `X25519MLKEM768`/`ML-DSA-65` mTLS + 端到端 `pq768` mTLS + Linux `/dev/net/tun`）。文末附带无需公网服务器的**单机双 `netns` 本地演练方案**。
+本教程面向 Linux 开发测试与受控部署评估，介绍两节点 `Core <-> Edge` IPv4 隧道的离线 PKI、配置、启动、检查与常见故障。示例使用预发布 `pq768` 构建及 `/dev/net/tun`；它们不构成生产部署认证。文末附单机双 `netns` 演练。开始前建议阅读 [当前实现状态](../engineering/implementation-status.md) 与 [安装辅助脚本边界](ONE_CLICK.md)。
+
+> **入口导航：** 想用行式交互状态/服务菜单请看下方 [boreas-easy 控制台](#boreas-easy-行式控制台)；想审阅安装已有二进制的流程请读 [一键安装辅助脚本说明](ONE_CLICK.md)。后者和 OpenWrt procd 模板当前均处于验证中，不能据此认定 OpenWrt 产品支持。
 
 ### 当前版本边界与已知限制（部署前必读）
 
-- **适用版本**：GitHub Releases 预发布版本 **[`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)**（带 `-pq768` 后缀的 Linux 静态二进制，内嵌 OpenSSL 3.6.5）。切勿下载同页面约 510 KB 的 `boreas-0.1.0-*.tar.gz` 基础包部署隧道——基础包不含 TLS 后端，执行 `pki` 或 `daemon` 会直接拒绝退出（退出码 `2`）。
-- **数据面性能限制**：`v0.1.0-pre.3` 守护进程数据面当前仍为**单线程串行轮询**，跨公网实测吞吐约 **`0.7–1.2 Mbps`**、附加约 **`+27 ms`** 延迟。
-- **拓扑与生产门禁状态**：当前仅支持 Linux 双节点（`1 Core <-> 1 Edge`）IPv4 点对点转发；跨多 Core 多跳网格路由、自动化证书/状态轮换、内建 DNS 运行时及 [24 项正式生产门禁](../engineering/gates.json)（`production_approved: false`）仍在推进中，请勿用于承载高敏生产业务。
+- **发布资产与开发主线不是一回事**：目前可下载的最新预发布仍是 **[`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)**。仓库已有更新开发主线与下一版工作项，但在正式发布资产、校验和就绪前，请勿预设 `pre.4` 版本号、文件名或哈希。此教程中的下载命令严格对应 pre.3。发布页约 510 KB 的基础归档不含 TLS 后端；部署隧道应使用页面实际提供且经核验的 Linux `-pq768` 二进制。
+- **性能证据须对应提交与环境**：精确提交 [`8cf865e`](https://github.com/Lanlan13-14/Boreas/commit/8cf865ec7bc9f974b2db623c6c60917e6af7ec08) 的隔离 netns/veth 基准报告 glibc 平均延迟 `0.228 ms`、`268.450 Mbps`，musl 平均延迟 `0.256 ms`、`194.547 Mbps`（[性能工作流 run 43722214463](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214463)）。这是隔离测试结果，不是公网 SLA、跨地域延迟数据或持续负载容量保证，也不应无条件外推至其他版本/硬件。
+
+- **拓扑与生产门禁状态**：本教程范围是 Linux 双节点（`1 Core <-> 1 Edge`）IPv4 点对点评估；跨多 Core 多跳网格、自动故障切换、生产自动化证书/状态轮换与内建 DNS 运行时未完成。[24 项正式生产门禁](../engineering/gates.json)仍开放，`production_approved: false`，请勿用于高敏生产业务。
+- **安装器与平台边界**：`tools/deploy/install.sh`、procd 模板和 `boreas-easy` 正在开发验证；工作流/源文件存在不能代替目标机验证或产品支持声明。OpenWrt 需单独审查其工具链、procd、Linux TUN、网络配置及架构兼容性，参阅 [ONE_CLICK.md](ONE_CLICK.md)。
+
+---
+
+## `boreas-easy` 行式控制台
+
+`boreas-easy` 是同一 CLI 二进制的行式控制台入口，不是图形界面或 curses TUI。交互终端下会按行显示状态与操作提示；非 TTY（管道、脚本）下输出一次 JSON 并退出，不会等待交互输入。当前行式 UI 含状态、service status/start/stop 等动作入口，但不代表所有服务管理后端或跨平台动作均已验收；采取操作前应阅读本机确认提示并核实配置。
+
+```sh
+# 交互模式（若安装了 boreas-easy 入口）
+boreas-easy
+# 或显式进入同一控制台
+boreas console --config /etc/boreas/edge.toml --socket /var/lib/boreas/control.sock
+
+# 一次性机器可读状态；适用于非 TTY
+boreas-easy --json
+boreas console --json --socket /var/lib/boreas/control.sock
+```
+
+默认控制 socket 在 CLI 通用入口中为 `/run/boreas/control.sock`，而守护进程可按配置放在 `state_dir/control.sock`；请以实际 socket 路径为准。通过 `--socket`、`--config` 显式指定可避免默认路径与本文示例不一致。可用 `--lang zh-CN|zh-TW|en` 切换语言；窄终端可试 `--narrow`。若显示离线状态，先检查 daemon、socket 文件、属主/权限以及当前用户 UID；控制台错误不会被自动伪装成“无守护进程”。不要因 UI 可启动就推断生产控制面审计或完整授权已通过。
 
 ---
 
@@ -352,7 +375,7 @@ sudo ip route replace 10.20.1.1 dev btun0
    # 在 Edge 服务器上向 Core VIP 发起测试
    iperf3 -c 10.20.1.1 -B 10.20.1.2 -t 10
    ```
-   （注：如开篇已知限制所述，`v0.1.0-pre.3` 因单线程串行轮询，跨公网实测吞吐约为 `0.7–1.2 Mbps`、附加约 `+27 ms` 延迟。）
+   性能结果请按本文开头给出的精确提交及隔离 netns/veth 环境解读；它不是这两台公网服务器之间的预期值或 SLA。实际吞吐会受公网路径、主机 CPU、虚拟化与防火墙影响。
 
 ### 6.2 `systemd` 守护进程托管示例与状态续签
 
@@ -433,7 +456,7 @@ scp ./status.signed root@203.0.113.10:/etc/boreas/material/status.signed
 scp ./status.signed root@<EDGE_HOST>:/etc/boreas/material/status.signed
 ```
 
-### 6.3 常见报错速查表
+### 6.3 常见报错排查速查表
 
 | 报错现象（stderr 关键字） | 真实根因 | 解决方法 |
 |---|---|---|

@@ -1,128 +1,128 @@
 # Boreas
 
-Boreas 是一个用 Rust 编写的**零 UDP 三层（L3 TUN）加密互联隧道**，核心架构采用**标准外层 TLS 1.3 + RFC 6455 WebSocket（WSS）承载 + 双层内层 TLS 1.3（`X25519MLKEM768` 后量子混合密钥交换 + `ML-DSA-65` 身份证书）**。
+**将 IP 流量装进经认证的加密隧道。** Boreas 是以 Rust 编写的实验性 L3 TUN 隧道项目：以 TLS 1.3 + WebSocket over TCP 建立承载，在节点间协商后量子混合密钥套件，并为业务电路提供端到端加密设计。项目面向开发者、网络工程师与安全研究人员；当前仍是开发预发布项目，不是经审计的生产 VPN。
 
-业务 IP 报文在进入公网前依次经过三层封装与认证：
-1. **外层承载（Outer TLS 1.3 + Binary WSS）**：纯 TCP/HTTPS WebSocket 二进制流，零 UDP 端口依赖，可直连公网源站或穿越反向代理与标准 WebSocket 链路。
-2. **逐跳会话层（Hop Inner TLS 1.3，`pq768`）**：在 WebSocket 字节流之上建立基于 OpenSSL 3.6+ 的 `X25519MLKEM768` + `ML-DSA-65` 双向认证（mTLS），强制校验证书公钥与离线双签（`Ed25519 + ML-DSA-65`）`NodeIdentity` 的绑定关系。
-3. **端到端加密层（E2E TLS 1.3，`e2e-required`）**：在逐跳会话的 `RelayCircuit` 内再建立一层端点间 `X25519MLKEM768` + `ML-DSA-65` mTLS 电路并绑定 Linux `/dev/net/tun`；即使未来经过不可信中继节点，中继也无法解密业务载荷。
+> **先读边界：** 目前最新公开预发布资产仍为 [`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)。仓库正在推进下一版开发主线；工作流文件、安装器或 UI 实现存在，并不等于相应功能已通过设备验收。生产审批仍为 `false`，24 项生产门禁仍开放。不要用于高敏或关键生产业务。
 
----
-
-## 当前能做什么 / 还不能做什么（`v0.1.0-pre.3`）
-
-Boreas 当前处于**开发预发布阶段**（最新可用预发布版为 `v0.1.0-pre.3`），尚未通过正式生产发布审批（[`docs/engineering/gates.json`](docs/engineering/gates.json) 中 `production_approved: false`）。请按以下真实边界评估使用：
-
-### 已可真机运行的能力
-- **离线四权分离 PKI 签发与验签**：支持在离线管理端通过 `boreas pki` 初始化根信任锚（`roots.cbor`），分离签发节点 `ML-DSA-65` 证书、双签 `NodeIdentity`（`local.signed`）与有界有效期状态快照（`status.signed`），零在线 CA 依赖、禁止 TOFU（首次连接盲信）。
-- **跨公网双机点对点 L3 隧道（Linux）**：预编译静态二进制 `boreas-linux-x86_64-musl-pq768` 支持在两台公网 Linux 主机之间建立 `Core <-> Edge`（`suite = "pq768"` + `security_mode = "e2e-required"`）真实 `/dev/net/tun` 隧道，按永久槽位 VIP（如 `10.20.1.1 <-> 10.20.1.2`）双向转发 IPv4 流量，并自动静默丢弃宿主机发往 TUN 口的非对端本地杂包。
-- **状态新鲜度保护与实时观测**：守护进程运行期持续核验 `status.signed` 时效（过期自动阻断业务转发 fail-closed），并提供基于 `SO_PEERCRED` 同 UID 校验的 `control.sock` 供 `boreas ctl status` / `boreas status` 查询实时连接与收发包计数。
-
-### 尚未完成 / 已知限制
-- **单线程轮询数据面性能限制**：`v0.1.0-pre.3` 守护进程数据面仍为单线程串行轮询，跨公网实测吞吐约 **0.7–1.2 Mbps**、附加约 **+27 ms** 延迟，多线程异步/双工优化正在推进中。
-- **拓扑与控制面演进中**：当前仅支持 `1 Core <-> 1 Edge` 点对点转发；跨多 Core 多跳网格路由收敛、自动故障切换（Failover）、Edge 直连（DIR）及内建权威 DNS 运行时（`[dns].tcp`）尚未打通。
-- **运维自动化与跨平台范围**：生产级自动化证书/状态快照轮换与完整 `boreas-supervisor` 在线热升级闭环尚未就绪；守护进程（`boreas daemon`）目前仅支持 Linux（Windows Wintun 与 macOS `utun` 仅完成底层设备库切片，Release 中的五平台 `.tar.gz`/`.zip` 基础归档不含 OpenSSL 3.6+ 后端）。
-- **24 项正式版门禁推进中**：包括独立密码学审计（`G-EXTERNAL-REVIEW`）、双 TLS 栈互操作（`G-CRYPTO`）、长稳资源预算（`G-RESOURCE`）在内的 [24 项生产门禁](docs/engineering/gates.json) 仍为 `open`，请勿用于承载高敏生产业务。
+[双机部署教程](docs/deployment/README.md) · [一键安装器边界与流程](docs/deployment/ONE_CLICK.md) · [实现状态与 CI 证据](docs/engineering/implementation-status.md) · [配置参考](docs/config/README.md)
 
 ---
 
-## 5 分钟快速开始（Linux x86_64）
+## Boreas 的设计
 
-从 [GitHub Releases (`v0.1.0-pre.3`)](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3) 下载预编译的全静态后量子守护进程二进制 `boreas-linux-x86_64-musl-pq768`（内嵌静态链接的 OpenSSL 3.6.5，不依赖宿主机 `glibc` 或系统 `libssl`）并校验 SHA-256：
+Boreas 的目标是让业务 IP 报文经由 TCP/WSS 承载穿过常见网络，同时保留严格的节点身份校验与端到端保护。当前代码包含以下安全层设计与实现切片：
 
-```bash
+1. **承载层：** TLS 1.3 与 RFC 6455 WebSocket 二进制帧，使用 TCP，不要求开通 UDP 端口。
+2. **节点会话层：** 可选 OpenSSL 3.6+ 后端的 `X25519MLKEM768` 混合密钥交换及 `ML-DSA-65` 身份认证；离线 PKI 对身份对象签名并绑定证书公钥。
+3. **业务电路层：** `e2e-required` 模式旨在让端点之间再建立加密电路，避免中继读取业务载荷。
+
+这些是当前项目的架构与受限实现能力描述，不是独立密码学审计结论。协议互操作、部署拓扑、长稳性及生产安全仍需门禁验收。
+
+## 当前状态：已验证什么、仍在做什么
+
+| 范围 | 可据实陈述 | 不能据此推断 |
+|---|---|---|
+| Linux 双节点隧道 | `pre.3` 公开资产提供 Linux x86_64 musl pq768 二进制；项目已有 Linux TUN/CI 与隔离环境端到端验证记录 | 多节点网格、自动故障切换、通用生产 VPN 或其他平台 daemon 已支持 |
+| 性能 | 精确提交 [`8cf865e`](https://github.com/Lanlan13-14/Boreas/commit/8cf865ec7bc9f974b2db623c6c60917e6af7ec08) 的隔离 netns/veth 基准中，glibc 平均延迟 `0.228 ms`、吞吐 `268.450 Mbps`；musl 平均延迟 `0.256 ms`、吞吐 `194.547 Mbps`。参见 [该提交性能工作流](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214463) | 这些数字代表公网 SLA、跨地域 RTT、持续负载/攻击容量或任意版本的性能 |
+| CI | 同一精确提交的 Rust、平台及 Linux TUN 工作流分别为 [43722214359](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214359)、[43722214368](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214368)、[43722214397](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214397)，均成功 | CI 成功不等于所有生产门禁通过、独立互操作/审计通过或当前分支 tip 已覆盖 |
+| `boreas-easy` | 有行式控制台入口与中文简体、繁体、英文本地化；当前适合作为控制台/状态操作入口 | 它不是图形界面，也不能据此宣称已完成生产控制面、完整服务管理或安全操作验收 |
+| 一键安装 | `tools/deploy/` 含安装辅助脚本及 systemd/procd 模板；详见[安装器说明](docs/deployment/ONE_CLICK.md) | 脚本文件存在不等于已验证支持 OpenWrt、不同发行版、所有架构或生产升级回滚 |
+
+**拓扑与生产限制：** 当前可用说明集中于 Linux 上的 `1 Core ↔ 1 Edge` IPv4 点对点场景。多 Core 多跳路由、自动故障切换、内建 DNS 运行时、生产级证书/状态轮换及完整 supervisor 在线升级闭环未完成。Windows/macOS 原生 TUN 库或基础归档不代表 daemon 已支持这些平台。24 项生产门禁（含独立审计、互操作与资源测试）仍为 `open`；参阅[门禁账本](docs/engineering/gates.json)及[状态证据](docs/engineering/implementation-status.md)。
+
+---
+
+## 选择适合你的入口
+
+- **想先理解限制并手动搭建双机：** 从[双机公网部署教程](docs/deployment/README.md)开始。它涵盖离线 PKI、Core/Edge 配置、TUN 路由、状态检查、systemd 示例与排错；示例中所有 IP、域名、序号与权限都需按环境审阅。
+- **想审阅安装步骤：** 看[受限一键安装指南](docs/deployment/ONE_CLICK.md)。先用 `--dry-run`；它安装已有二进制，不负责编译，也不会替你验证来源信任、生产路由或设备兼容性。
+- **想看控制台：** `boreas-easy` 是行式三语入口，不是 curses/图形 TUI。交互终端下可以逐行操作；非 TTY 环境输出一次 JSON，避免脚本挂起。具体状态与可用操作以运行时探测和权限为准。
+- **想开发或审阅实现：** 查看[实现状态与证据门禁](docs/engineering/implementation-status.md)、[配置字段说明](docs/config/README.md)及仓库内工作流。
+
+### `boreas-easy` 快速入口
+
+二进制默认提供 `boreas` 命令；安装时可创建 `boreas-easy` 入口。交互 shell 中运行：
+
+```sh
+boreas-easy
+# 或
+boreas console
+```
+
+默认控制套接字为 `/run/boreas/control.sock`，默认配置路径为 `/etc/boreas/config.toml`；不同部署应明确传入实际路径。查看一次 JSON 状态（适合脚本或无 TTY）：
+
+```sh
+boreas-easy --json
+boreas console --json --socket /var/lib/boreas/control.sock --config /etc/boreas/edge.toml
+```
+
+终端宽度有限时可用 `--narrow`；语言可由 `--lang zh-CN|zh-TW|en` 指定。控制台不是绕过权限或信任策略的管理后门；启动服务等动作需审阅确认提示及本机服务配置。若控制套接字不可用，检查 daemon 是否运行、socket 路径与 UID/权限是否匹配。
+
+---
+
+## 快速开始：获取当前公开预发布资产
+
+下面命令**仅对应已经发布的 `v0.1.0-pre.3` 资产**，不要把下一版开发主线当作已发布版本，也不要自行套用未发布的文件名或校验和：
+
+```sh
 VERSION="v0.1.0-pre.3"
 BASE_URL="https://github.com/Lanlan13-14/Boreas/releases/download/${VERSION}"
-
-# 1. 下载 Linux x86_64 静态 pq768 二进制与校验和清单
 curl -fLO "${BASE_URL}/boreas-linux-x86_64-musl-pq768"
 curl -fLO "${BASE_URL}/SHA256SUMS-PRE3"
-
-# 2. 校验 SHA-256 完整性（预期输出：boreas-linux-x86_64-musl-pq768: OK）
 grep '  boreas-linux-x86_64-musl-pq768$' SHA256SUMS-PRE3 | sha256sum -c -
-
-# 3. 安装到系统路径并检查 pq768 后端能力
 sudo install -m 0755 boreas-linux-x86_64-musl-pq768 /usr/local/bin/boreas
 boreas doctor
 ```
 
-`boreas doctor` 输出包含 `"status":"pre_release_pq768_e2e"` 与 `"daemon":true,"tls_backend":true` 即表示二进制就绪。
-
-> **下一步直达**：请打开 **[双机公网实战部署教程（`docs/deployment/README.md`）](docs/deployment/README.md)**，按步骤完成离线 PKI 签发、`config.toml` 配置、Core/Edge 隧道拉起与单机 `netns` 本地演练。
+仅在发布页提供且本地校验通过时使用该资产。`doctor` 用于查看二进制编译能力，不会验证你的部署、网络可达性或生产安全。若要实际搭建，请先读[完整部署教程](docs/deployment/README.md)及[限制说明](docs/deployment/ONE_CLICK.md)。
 
 ---
 
-## 常用 CLI 命令速查表
+## 常用命令
 
-> 注：表中标记 **`[pq768]`** 的子命令需要启用了 `--features openssl-inner-tls` 的二进制（如 `boreas-linux-x86_64-musl-pq768`）；无 TLS 后端的基础 CLI 构建调用它们会以退出码 `2` 拒绝执行。
-
-| 命令 | 用途说明 |
+| 命令 | 用途与边界 |
 |---|---|
-| `boreas doctor` / `boreas self-check` | 输出当前二进制编译集成能力 JSON（是否包含 `daemon`、`tls_backend`、`control_socket`） |
-| `boreas config-check <config.toml>` | 校验 `0600` 权限与 `version = 1\|2` 静态配置策略，输出脱敏 JSON |
-| `boreas config-migrate <legacy.toml>` | 将旧版 `version = 1` 配置转换为规范 `version = 2` TOML 输出至 stdout（不改写原文件） |
-| `boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--generation <N>] [--validity-days <1..3650>]` | **`[pq768]`** 初始化离线 `NetworkRoot`、`IdentityAuthority`、`StatusSigner`、外层 TLS CA 与 `roots.cbor` |
-| `boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role <core\|edge> --home-core <1..16> --vip-octet <1..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]` | **`[pq768]`** 签发单节点密钥、ML-DSA-65 身份证书、`local.signed` 与初始 `status.signed` |
-| `boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]` | **`[pq768]`** 使用离线 `StatusSigner` 签发/续期网络状态快照（TTL 最长 24 小时） |
-| `boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]` | **`[pq768]`** 离线全链路校验节点材料包（根信任锚、证书公钥绑定、`peer.signed` 与状态时效） |
-| `boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>]` | **`[pq768, Linux]`** 启动 Core 服务端守护进程，监听 WSS 入站并绑定真实 TUN 网卡 |
-| `boreas daemon connect --config <FILE> --material-dir <DIR> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>]` | **`[pq768, Linux]`** 启动 Edge 客户端守护进程，拨号连接 Core 并建立端到端 `pq768` TUN 隧道 |
-| `boreas ctl status [--socket <PATH>] [--config <FILE>]` | 查询运行中守护进程的 Unix 控制套接字，输出实时连接状态与 `tx`/`rx` 字节/包统计 JSON |
-| `boreas [--lang zh-CN\|zh-TW\|en] status [--json] [--socket <PATH>]` | 渲染终端状态视图（传 `--socket` 时读取实时守护进程状态，否则显示离线快照） |
+| `boreas doctor` / `boreas self-check` | 显示此二进制的编译能力；不是健康检查或安全认证 |
+| `boreas config-check <FILE>` | 校验配置格式与文件权限，输出脱敏结果 |
+| `boreas config-migrate <FILE>` | 将受支持的旧版配置转换并输出至 stdout，不原地改写 |
+| `boreas pki init-ca ...` | 初始化离线 PKI；私钥必须离线保护，切勿上传到公网节点 |
+| `boreas pki issue-node ...` / `sign-status ...` | 签发节点材料或状态快照；请参考部署教程的完整参数与轮换流程 |
+| `boreas pki verify-bundle --material-dir <DIR> --require-peer` | 验证本地节点材料包，不证明其分发渠道安全 |
+| `boreas daemon serve ...` / `connect ...` | Linux pq768 构建上的 Core/Edge daemon 命令；需要 TUN、网络权限及正确材料 |
+| `boreas ctl status [--socket <PATH>]` / `boreas status` | 查询控制套接字状态或显示终端视图 |
+| `boreas-easy` / `boreas console` | 行式三语控制台；非交互场景可传 `--json` |
+
+带有 OpenSSL 后端要求的 `pki`/`daemon` 命令，需使用包含 `openssl-inner-tls` 能力的构建。缺少后端的基础 CLI 构建会拒绝相关命令；请以 `boreas doctor` 为准。
 
 ---
 
-## 仓库结构速览
+## 安全与故障排查起点
 
-| 路径 | 职责说明 |
-|---|---|
-| [`crates/boreas-cli`](crates/boreas-cli) | 单二进制命令行入口（`boreas` / `boreas-easy`），含配置校验、离线 `pki`、Linux `daemon` 与 `ctl` 控制查询 |
-| [`crates/boreas-proto`](crates/boreas-proto) | 有界应用层二进制帧格式、控制面握手消息与确定性 CBOR 管理对象编解码 |
-| [`crates/boreas-pki`](crates/boreas-pki) | 离线根授权（`roots.cbor`）、`Ed25519 + ML-DSA-65` 双签管理对象验签、节点证书签发与状态新鲜度策略 |
-| [`crates/boreas-crypto`](crates/boreas-crypto) | TLS 密码套件策略模型及基于 OpenSSL 3.6+ 的 `X25519MLKEM768` + `ML-DSA-65` mTLS 后端适配 |
-| [`crates/boreas-tunnel`](crates/boreas-tunnel) | 外层 TLS + RFC 6455 WSS 传输、逐跳内层 TLS、会话授权、`RelayCircuit` 与端到端 `PacketPath` |
-| [`crates/boreas-tun`](crates/boreas-tun) | 有界 L3 数据包 I/O 抽象及 Linux `/dev/net/tun`、Windows Wintun、macOS `utun`、`VirtualTun` 适配 |
-| [`crates/boreas-dns`](crates/boreas-dns) | 有界权威 `.boreas` DNS 报文解析与基于 `smoltcp` 的响应构造原语 |
-| [`crates/boreas-supervisor`](crates/boreas-supervisor) | 崩溃可恢复的升级事务日志（Journal）、活动版本指针与发布清单双签校验原语 |
-| [`docs/`](docs) | [实战部署教程](docs/deployment/README.md)、[配置参考](docs/config/README.md)、[v1.11.0 架构主计划](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md)、[门禁账本](docs/engineering/gates.json) |
-| [`tools/`](tools) | [Linux 双 netns 端到端冒烟脚本](tools/release/netns_daemon_smoke.sh)、发布打包校验与协议测试向量工具 |
+- **先验证信任材料：** 禁止把 `ca/`、根授权或状态签名私钥发到 Core/Edge。节点只接收其运行所需材料；对端身份与状态快照须由同一离线 CA 集合签发并离线验包。
+- **核对权限与时间：** 配置应为 `0600`，秘密材料仅授权运行用户读取；PKI 时间校验依赖正确 UTC/NTP。状态快照过期或回滚会 fail-closed，需由离线授权者递增序号重新签发。
+- **排查连接：** 裸 IP `--connect` 时确认 `--tls-name` 与 Core 证书 SAN 相符，并核实 `--ws-host`、TCP 防火墙、WSS 路径及反向代理升级设置。通常不需 UDP 端口。
+- **谨慎安装与路由：** 安装器提供摘要/静态 ELF 检查，但摘要必须来自独立可信渠道；同源下载不构成独立验证。安装不会自动评估 SSH/管理路由冲突；启动前核对路由、TUN 名称和防火墙环境。
+- **不要从 CI 推断生产就绪：** 仅引用对应精确提交的工作流与环境。netns/veth 基准不是公网实测 SLA；一键脚本/OpenWrt procd 模板也不等同于实机验证。
+
+更完整的错误现象、根因和修复步骤见[部署教程排错表](docs/deployment/README.md#常见报错排查)与[一键安装说明](docs/deployment/ONE_CLICK.md)。
 
 ---
 
-## 开发者验证命令
+## 仓库与开发验证
 
-1. **无外部 C 依赖的基础工作区检查与单元测试**：
-   ```bash
-   cargo check --locked --workspace --all-targets
-   cargo test --locked --workspace
-   ```
+主要 crate：`boreas-cli`（CLI/控制台）、`boreas-pki`（离线 PKI）、`boreas-crypto`（密码后端）、`boreas-tunnel`（传输与电路）、`boreas-tun`（TUN 适配）、`boreas-dns`（DNS 原语）、`boreas-supervisor`（升级原语）。它们的存在不表示每条产品链路已集成；详细完成度请以[实现状态文档](docs/engineering/implementation-status.md)为准。
 
-2. **启用 OpenSSL 3.6+（`openssl-inner-tls`）编译与全链路测试**：
-   需准备包含 `ML-KEM` 与 `ML-DSA` provider 的静态 OpenSSL 3.6.5（完整构建参数可参考 [`.github/workflows/rust-tls.yml`](.github/workflows/rust-tls.yml)）：
-   ```bash
-   export OPENSSL_DIR="/path/to/static-openssl-3.6.5"
-   export OPENSSL_STATIC=1
+按项目约定，CI/测试在隔离工作流中执行。基础本地开发命令示例：
 
-   cargo test --locked -p boreas-crypto -p boreas-pki --features openssl-backend
-   cargo test --locked -p boreas-tunnel -p boreas-cli --features boreas-cli/openssl-inner-tls
-   cargo build --locked --release -p boreas-cli --features openssl-inner-tls
-   ```
+```sh
+cargo check --locked --workspace --all-targets
+cargo test --locked --workspace
+```
 
-3. **Linux 双 `netns` + 真实 `/dev/net/tun` 端到端冒烟验证**：
-   在支持 `/dev/net/tun` 的 Linux 主机上，使用单条脚本自动完成离线 PKI 签发、双网络命名空间隔离、`daemon serve/connect` 握手、真实内核 `ping` 0% 丢包校验与 `ctl status` 包计数核对：
-   ```bash
-   sudo bash tools/release/netns_daemon_smoke.sh ./target/release/boreas
-   ```
+带 OpenSSL 后端的构建还需准备符合项目配置的 OpenSSL 3.6+ ML-KEM/ML-DSA provider；Linux TUN 验证需有 `/dev/net/tun` 与相应权限。更具体的 CI 工作流和已验证运行号请查状态文档。本次文档更新不声称运行测试。
 
-4. **CI 工作流说明**：
-   - [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：锁定依赖预检、Rust workspace Clippy/单测与协议向量校验。
-   - [`.github/workflows/rust-tls.yml`](.github/workflows/rust-tls.yml)：源码构建固定版本静态 OpenSSL 3.6.5、运行 `pq768` mTLS 测试、编译 `boreas-linux-x86_64-musl-pq768` 并执行真实 `netns` TUN 转发测试。
-   - [`.github/workflows/platforms.yml`](.github/workflows/platforms.yml) / [`linux-system.yml`](.github/workflows/linux-system.yml) / [`native-device.yml`](.github/workflows/native-device.yml)：五目标基础构建与各平台原生网卡驱动测试。
+## 文档与许可
 
----
-
-## 更多文档与许可证
-
-- **部署与配置**：[双机公网实战部署教程](docs/deployment/README.md) | [TOML 配置字段参考](docs/config/README.md) | [`version = 2` 配置示例](docs/config/config.example.toml)
-- **架构与工程**：[v1.11.0 安全与工程主计划](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md) | [实现状态记录](docs/engineering/implementation-status.md) | [发版规范](docs/releases/README.md)
-- **许可证**：本项目基于 [GPL-3.0-only](LICENSE) 许可证开源。
+- **安装与部署：** [双机教程](docs/deployment/README.md) · [一键安装器说明](docs/deployment/ONE_CLICK.md)
+- **配置与实现：** [配置参考](docs/config/README.md) · [实施状态](docs/engineering/implementation-status.md) · [v1.11.0 架构主计划](docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md)
+- **许可证：** [GPL-3.0-only](LICENSE)

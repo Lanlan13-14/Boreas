@@ -16,6 +16,9 @@ version = 2
 [node]
 # Network genesis parameter: exactly 32 hexadecimal digits (16 bytes).
 net_id = "0123456789abcdef0123456789abcdef"
+# Optional; omission has the same meaning. Custom RFC1918 /16 prefix policy is
+# candidate-only: non-default values are REFUSED until signed runtime wiring exists.
+overlay_prefix = "10.20.0.0/16"
 # "core" | "edge". "enrollment" exists in the model but cannot be provisioned
 # by this generic node schema (no VIP slot is defined for it here).
 role = "core"

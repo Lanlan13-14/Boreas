@@ -13,6 +13,9 @@ version = 1
 
 [network]
 net_id = "0123456789abcdef0123456789abcdef"
+# Optional; migrates to [node].overlay_prefix. Non-default values are REFUSED
+# until end-to-end signed runtime integration exists (candidate policy API only).
+overlay_prefix = "10.20.0.0/16"
 
 [identity]
 role = "core"

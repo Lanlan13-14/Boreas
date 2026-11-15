@@ -37,6 +37,7 @@ Required: `version`, `[node]`, `[paths]`, `[uplink]`. Optional: `[limits]`, `[dn
 |---|---|---|
 | — | `version` | `2` (canonical) or `1` (legacy) |
 | `[node]` | `net_id` | Exactly 32 hex digits (16 bytes) |
+| `[node]` | `overlay_prefix` | Optional, defaults to `10.20.0.0/16`; only that default is currently accepted by config validation; custom-prefix API is candidate-only |
 | `[node]` | `role` | `core` \| `edge` (model also knows `enrollment`, refused by this schema) |
 | `[node]` | `home_core_id` | `1..=16` |
 | `[node]` | `vip_octet` | Core: exactly `1`; Edge: `2..=251` |
@@ -58,6 +59,16 @@ Required: `version`, `[node]`, `[paths]`, `[uplink]`. Optional: `[limits]`, `[dn
 | `[dns]` | `tcp` | Requires a runtime that reports the TCP DNS capability |
 
 Range checks run before derived-value comparisons, so `node_id = 5000` reports an out-of-range slot instead of a mismatch. Nothing is defaulted to a "working" value and no invalid document is silently repaired.
+
+## Overlay prefix: candidate API, not completed runtime support
+
+The candidate `boreas_pki::OverlayPrefix` policy/derivation API accepts only canonical RFC1918 IPv4 `/16` networks: `10.x.0.0/16`, `172.16.0.0/16` through `172.31.0.0/16`, and `192.168.0.0/16`. It rejects public addresses (including `1.1.1.1`), CGNAT `100.64.0.0/10` and its `/16` subsets, loopback/link-local/multicast/reserved ranges, IPv6, nonzero host bits, whitespace, and other mask lengths. It never masks or silently repairs an input. `/16` preserves the existing two-octet base + home-Core + host layout; this is a deliberate layout restriction, not a claim that every other mask lacks enough addresses.
+
+The reserved service address derives as `base.0.53`; Core slots use `base.<1..16>.1`, and each of those sixteen Core blocks retains 250 Edge slots (`.2` through `.251`). NodeID encoding is unchanged. `expected_vip_in` and `NodeIdentity::validate_in` are candidate policy APIs only; the latter is **not** a cryptographic signature-verification or negotiation API. Its expected prefix must be trusted independently, never learned from the identity being checked or an unauthenticated handshake. Existing `expected_vip` / `validate` callers keep their `10.20.0.0/16` behavior.
+
+The v2 schema names the field `[node].overlay_prefix`; legacy v1 names it `[network].overlay_prefix`. Omission and explicit `10.20.0.0/16` are equivalent. JSON summaries and v2 migration output include it, and a prefix change is a high-risk network rebinding. However, **all non-default prefixes are explicitly refused with `CustomOverlayPrefixUnavailable`**, in both schemas and by direct `Config::validate`, even when current runtime capability bits are all enabled. Structurally invalid prefixes instead return `InvalidOverlayPrefix`. Thus `config-check`, migration and daemon config loading cannot silently accept a custom prefix while the runtime still signs/uses `10.20` VIPs. No custom runtime support is claimed by these unit tests.
+
+Before this refusal can be lifted, trusted genesis/network-policy binding, identity issuance and cryptographic verification, peer negotiation, local signed-VIP/config matching, TUN/routes, DNS, and packet/session paths must consistently consume and enforce the same prefix. End-to-end signed positive/negative and mismatched-network evidence is required; merely adding a capability boolean or deriving a prefix from a peer VIP is not sufficient. This slice does not change daemon, main, TUI, protocol or packet-path code.
 
 ## `[dns].tcp` is capability-gated, not schema-banned
 
@@ -94,7 +105,7 @@ No daemon, session manager or audit log integrates this API yet, and neither con
 
 Produced without any local compiler, test runner or package-manager invocation, by explicit project policy; every compile/test/format/lint result must come from GitHub Actions. Unverified at the time of writing:
 
-- `cargo check/clippy/test --workspace --locked` cannot resolve until `Cargo.lock` gains `serde_derive`, `serde_core`, `serde_spanned`, `toml_datetime`, `toml_parser`, `toml_writer` and `winnow` (`.github/workflows/refresh-lock.yml` exists for this). `libc 0.2.191` is already in the lock, so the Unix open flags add no new package.
+- The overlay slice adds no registry package: `boreas-pki` becomes an unconditional backend-free CLI dependency, and `openssl-inner-tls` still explicitly enables its crypto backend. The existing lock already lists that CLI dependency plus the serde/TOML dependencies; no lock refresh is expected for this slice. This is static inspection, not proof of `--locked` resolution; Actions must verify it.
 - Rustfmt formatting was applied by hand, not by `cargo fmt`.
 - No `G-CRYPTO`, `G-UI` or other §11 gate is asserted. `G-UI` still requires narrow-terminal, non-TTY, `NO_COLOR`, unavailable-DSR, dangerous-operation confirmation, and log/terminal-injection evidence; the status screen remains a one-shot 10-line box, not the §10.4.1 77x18 interactive TUI.
 - `config-check` is not daemon startup, not a key or trust-anchor loader, and not proof that any referenced file exists safely.
