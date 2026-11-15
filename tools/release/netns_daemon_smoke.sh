@@ -36,7 +36,7 @@ run_node() {
   local ns="$1"
   shift
   exec ip netns exec "$ns" unshare --mount --propagation private \
-    bash -c 'mount -t sysfs sysfs /sys; exec "$@"' boreas-node "$@"
+    bash -e -c 'mount --make-rprivate /; umount -l /sys; mount -t sysfs sysfs /sys; exec "$@"' boreas-node "$@"
 }
 
 CA_DIR="$WORK/ca"
