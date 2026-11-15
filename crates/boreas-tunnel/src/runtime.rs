@@ -12,7 +12,7 @@
 //! `boreas-crypto` OpenSSL backend. Tests use a `#[cfg(test)]` plaintext
 //! transport that performs no TLS and is not security evidence.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -198,7 +198,7 @@ impl LinkServer {
     /// terminated the outer TLS layer (or, in tests, deliberately skipped it).
     /// Keeping this private prevents an arbitrary stream from bypassing the
     /// outer TLS seam.
-    fn accept_established<T: Read + Write + Send + 'static>(
+    fn accept_established<T: Duplex>(
         &self,
         transport: T,
         handshake: HandshakeCredit,

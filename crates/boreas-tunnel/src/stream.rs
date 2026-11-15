@@ -9,6 +9,7 @@
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 
+#[cfg(feature = "openssl-inner-tls")]
 use boreas_crypto::backend::EstablishedStream;
 
 use crate::e2e::CircuitStream;
@@ -32,6 +33,12 @@ impl Duplex for TcpStream {
     }
 }
 
+impl<T: Duplex + ?Sized> Duplex for Box<T> {
+    fn has_buffered_input(&self) -> bool {
+        (**self).has_buffered_input()
+    }
+}
+
 impl Duplex for Cursor<Vec<u8>> {
     fn has_buffered_input(&self) -> bool {
         self.position() < self.get_ref().len() as u64
@@ -44,6 +51,7 @@ impl<T: Duplex> Duplex for WsStream<T> {
     }
 }
 
+#[cfg(feature = "openssl-inner-tls")]
 impl<S: Duplex> Duplex for EstablishedStream<S> {
     fn has_buffered_input(&self) -> bool {
         self.ssl_pending() > 0 || self.get_ref().has_buffered_input()
