@@ -404,7 +404,7 @@ probe_paths = 1
 "#
         )
     }
-    }
+}
 
     fn legacy_source() -> String {
         format!(
