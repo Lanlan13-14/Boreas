@@ -1,5 +1,22 @@
 name: Refresh Cargo.lock
 
+# Dedicated, explicit lockfile refresh.  The rest of CI always uses `--locked`;
+# this workflow is the only place allowed to regenerate the lock.
+#
+# It is split into two jobs on purpose:
+#
+#   generate  Always uploads the generated lock (even when later validation
+#             fails).  This is the recovery path out of a bootstrap deadlock:
+#             download the artifact, merge Cargo.lock, and let `--locked` jobs
+#             diagnose the real compile/test failures.
+#
+#   validate  Re-downloads that exact artifact and runs the compile gate with
+#             `--locked`.  Only a passing validation may commit to main.  A
+#             metadata-only pass is not a compile gate.
+#
+# Neither job force-pushes, and both refuse to commit when the dispatch commit
+# left main or workspace manifests changed after dispatch.
+
 on:
   workflow_dispatch:
 
@@ -10,47 +27,183 @@ concurrency:
   group: refresh-lock-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  refresh:
-    name: Generate and review Cargo.lock on demand
+  generate:
+    name: Generate Cargo.lock and upload recovery artifact
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout dispatch source
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
-      - name: Record source revision
+
+      - name: Record source revision and original lock
         shell: bash
         run: |
           set -euo pipefail
           echo "SOURCE_SHA=$(git rev-parse HEAD)" | tee source-revision.txt
+          cp Cargo.lock Cargo.lock.before
+
       - name: Generate lockfile explicitly
         run: cargo generate-lockfile
-      - name: Verify lock resolves all workspace members
-        run: cargo metadata --format-version 1 --locked --no-deps > workspace-metadata.json
-      - name: Upload exact generated lock and source revision for CI
+
+      - name: Record metadata result (not a compile gate)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo metadata --locked --format-version 1 --no-deps > workspace-metadata.json 2> metadata-error.txt
+          code=$?
+          echo "metadata_exit_code=$code" | tee metadata-result.txt
+          cat metadata-error.txt
+          exit 0
+
+      - name: Record generated lock diff and hash
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- Cargo.lock > Cargo.lock.diff || true
+          sha256sum Cargo.lock | tee Cargo.lock.sha256
+          echo '--- Cargo.lock diff ---'
+          cat Cargo.lock.diff
+
+      - name: Write recovery instructions
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > README-RECOVERY.txt <<'EOF'
+          Generated Cargo.lock recovery artifact
+          ======================================
+          This artifact exists even when the `validate` job fails.  It is the
+          escape hatch from a stale-lock bootstrap deadlock: `--locked` jobs
+          cannot diagnose new code until the lock includes new manifest
+          dependencies.
+
+          It has NOT been accepted.  Only `validate` may commit it, and only
+          after `cargo check --workspace --all-targets --locked` passes.
+
+          To use it manually:
+            1. Download this artifact.
+            2. Compare Cargo.lock.diff and Cargo.lock.sha256 with the dispatch
+               commit's manifests.
+            3. Merge/commit only Cargo.lock (never remove `--locked`).
+            4. Rerun normal CI; fix compile/test failures there.
+          EOF
+          cat README-RECOVERY.txt
+
+      - name: Upload generated lock and recovery records
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: generated-cargo-lock-${{ github.run_id }}
           path: |
             Cargo.lock
+            Cargo.lock.before
+            Cargo.lock.diff
+            Cargo.lock.sha256
             source-revision.txt
+            workspace-metadata.json
+            metadata-error.txt
+            metadata-result.txt
+            README-RECOVERY.txt
           if-no-files-found: error
-          retention-days: 3
-      - name: Commit generated lock on main
-        if: github.ref == 'refs/heads/main'
+          retention-days: 7
+
+  validate:
+    name: Validate generated lock and commit only on full pass
+    needs: generate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout dispatch source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libssl-dev
+
+      - name: Download the exact generated lock artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-cargo-lock-${{ github.run_id }}
+          path: generated
+
+      - name: Install generated lock for validation
         shell: bash
         run: |
           set -euo pipefail
-          if ! git diff --quiet -- Cargo.lock; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -- Cargo.lock
-            git commit -m 'Refresh Cargo.lock from workspace manifests'
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          else
-            echo 'Cargo.lock already matches the manifests; no commit required.'
+          test -f generated/Cargo.lock
+          cp generated/Cargo.lock Cargo.lock
+          sha256sum Cargo.lock
+          cat generated/source-revision.txt
+
+      - name: Metadata check (not sufficient for commit)
+        shell: bash
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+
+      - name: Compile gate with --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo check --workspace --all-targets --locked; then
+            echo "::error title=Generated lock failed compile validation::The generated Cargo.lock artifact is still available as 'generated-cargo-lock-${{ github.run_id }}'. Merge it manually to unblock --locked diagnostics, then fix the compile errors. This workflow will not commit a lock whose compile check failed."
+            exit 1
           fi
+
+      - name: Commit validated lock on main without force
+        if: success() && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          generated="$RUNNER_TEMP/Cargo.lock.generated"
+          cp Cargo.lock "$generated"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
+              echo 'Dispatch commit is no longer on main; rerun this workflow on current main.' >&2
+              exit 1
+            fi
+            if ! git diff --quiet "$SOURCE_SHA" origin/main -- Cargo.toml ':(glob)**/Cargo.toml'; then
+              echo 'Workspace manifests changed after the dispatch commit; rerun on current main.' >&2
+              exit 1
+            fi
+
+            git checkout --detach origin/main
+            cp "$generated" Cargo.lock
+            git add -- Cargo.lock
+            if git diff --cached --quiet; then
+              echo 'Cargo.lock already matches the manifests; no commit required.'
+              exit 0
+            fi
+            git commit -m 'Refresh Cargo.lock from validated workspace manifests'
+            if git push origin HEAD:main; then
+              echo "Committed validated Cargo.lock on attempt $attempt."
+              exit 0
+            fi
+            echo "Non-fast-forward push race on attempt $attempt; retrying after refetch." >&2
+          done
+
+          echo 'Could not commit Cargo.lock after three non-force attempts; rerun the workflow.' >&2
+          exit 1
