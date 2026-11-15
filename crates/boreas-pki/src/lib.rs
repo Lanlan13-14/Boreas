@@ -1,5 +1,5 @@
-//! Pure Boreas PKI policy checks. This crate deliberately performs no encoding,
-//! certificate parsing, signing, or cryptographic verification.
+//! Boreas PKI policy and verification boundaries. Default builds provide policy only;
+//! `openssl-backend` enables real candidate/management parsing and cryptographic checks.
 
 #![forbid(unsafe_code)]
 
@@ -9,6 +9,9 @@ pub mod enrollment;
 /// It requires OpenSSL 3.5+ for the ML-DSA provider and is therefore feature-gated.
 #[cfg(feature = "openssl-backend")]
 pub mod management;
+/// Bounded NetworkRoot authorization candidate validation; requires the real crypto backend.
+#[cfg(feature = "openssl-backend")]
+pub mod root_authorization;
 pub mod revoke_cleanup;
 
 use core::fmt;
