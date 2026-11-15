@@ -153,7 +153,7 @@ impl LinkServer {
         tcp: TcpStream,
         outer: &dyn crate::tls::OuterTlsAcceptor,
         policy: SessionPolicy,
-        io_timeout: Duration,
+        _io_timeout: Duration,
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
         let handshake = admission.reserve_handshake()?;
@@ -171,7 +171,7 @@ impl LinkServer {
         &self,
         listener: &TcpListener,
         policy: SessionPolicy,
-        io_timeout: Duration,
+        _io_timeout: Duration,
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
         let (tcp, _peer_address) = listener.accept()?;
