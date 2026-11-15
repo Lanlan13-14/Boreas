@@ -1430,10 +1430,7 @@ fn verify_csr_ed25519_extension(
     oid: &str,
     ml_dsa_public: &[u8],
 ) -> Result<[u8; 32], EnrollmentError> {
-    let expected_oid = openssl::asn1::Asn1Object::from_str(oid)
-        .map_err(|_| EnrollmentError::InvalidCsrPolicy)?
-        .to_der()
-        .map_err(|_| EnrollmentError::InvalidCsrPolicy)?;
+    let expected_oid = encode_oid_der(oid).map_err(|_| EnrollmentError::InvalidCsrPolicy)?;
     let extensions = request
         .extensions()
         .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
@@ -1442,8 +1439,8 @@ fn verify_csr_ed25519_extension(
         let der = extension
             .to_der()
             .map_err(|_| EnrollmentError::InvalidCsrExtension)?;
-        let (extension_oid, critical, value) = parse_extension_der(&der)?;
-        if extension_oid == expected_oid {
+        let (extension_oid_der, critical, value) = parse_extension_der(&der)?;
+        if extension_oid_der == expected_oid {
             if matched.is_some() {
                 return Err(EnrollmentError::InvalidCsrExtension);
             }
@@ -1475,6 +1472,55 @@ fn verify_csr_ed25519_extension(
         return Err(EnrollmentError::Ed25519ProofOfPossession);
     }
     Ok(ed25519_public)
+}
+
+#[cfg(feature = "openssl-backend")]
+fn encode_oid_der(oid: &str) -> Result<Vec<u8>, EnrollmentError> {
+    let arcs: Result<Vec<u64>, _> = oid.split('.').map(str::parse).collect();
+    let arcs = arcs.map_err(|_| EnrollmentError::InvalidCsrPolicy)?;
+    if arcs.len() < 2
+        || arcs[0] > 2
+        || (arcs[0] < 2 && arcs[1] > 39)
+        || oid.split('.').zip(&arcs).any(|(text, arc)| text != arc.to_string())
+    {
+        return Err(EnrollmentError::InvalidCsrPolicy);
+    }
+
+    fn append_base128(mut value: u128, output: &mut Vec<u8>) {
+        let mut encoded = [0u8; 19];
+        let mut index = encoded.len() - 1;
+        encoded[index] = (value & 0x7f) as u8;
+        while value >= 0x80 {
+            value >>= 7;
+            index -= 1;
+            encoded[index] = (value & 0x7f) as u8 | 0x80;
+        }
+        output.extend_from_slice(&encoded[index..]);
+    }
+
+    let first_subidentifier = u128::from(arcs[0]) * 40 + u128::from(arcs[1]);
+    let mut content = Vec::new();
+    append_base128(first_subidentifier, &mut content);
+    for arc in &arcs[2..] {
+        append_base128(u128::from(*arc), &mut content);
+    }
+
+    let mut der = Vec::with_capacity(content.len() + 2);
+    der.push(0x06);
+    if content.len() < 128 {
+        der.push(content.len() as u8);
+    } else {
+        let bytes = content.len().to_be_bytes();
+        let first_nonzero = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .ok_or(EnrollmentError::InvalidCsrPolicy)?;
+        let length_bytes = &bytes[first_nonzero..];
+        der.push(0x80 | u8::try_from(length_bytes.len()).map_err(|_| EnrollmentError::InvalidCsrPolicy)?);
+        der.extend_from_slice(length_bytes);
+    }
+    der.extend_from_slice(&content);
+    Ok(der)
 }
 
 #[cfg(feature = "openssl-backend")]
@@ -2042,6 +2088,28 @@ mod tests {
         assert_eq!(store.allocation_watermark(1).unwrap(), 1);
         drop(store);
         cleanup(&path);
+    }
+
+    #[cfg(feature = "openssl-backend")]
+    #[test]
+    fn oid_der_encoding_matches_asn1_rules() {
+        assert_eq!(
+            encode_oid_der("1.3.6.1.4.1.55555.1.1").unwrap(),
+            vec![0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xb2, 0x03, 0x01, 0x01]
+        );
+        assert_eq!(
+            encode_oid_der("2.999.3").unwrap(),
+            vec![0x06, 0x03, 0x88, 0x37, 0x03]
+        );
+        assert!(encode_oid_der("2.18446744073709551615").is_ok());
+        assert!(encode_oid_der("2.18446744073709551616").is_err());
+
+        let long_oid = format!("1.2{}", ".1".repeat(127));
+        let encoded = encode_oid_der(&long_oid).unwrap();
+        assert_eq!(&encoded[..3], &[0x06, 0x81, 0x80]);
+        assert_eq!(encoded.len(), 131);
+        assert!(encode_oid_der("1.03.6").is_err());
+        assert!(encode_oid_der("+1.3.6").is_err());
     }
 
     #[cfg(feature = "openssl-backend")]
