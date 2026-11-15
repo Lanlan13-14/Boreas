@@ -218,7 +218,6 @@ promotion-bundle/
   promotion-signature-envelope.json     # detached Ed25519 + ML-DSA-65 over (3)
   release-root/roots.json               # public SPKI DER by key_id; no private keys
   artifacts/                            # exactly five archives named by (1)
-  verification/verification.json        # written by the independent verifier
 ```
 
 `release-manifest.json` is the **actual release manifest**, using the same
@@ -251,7 +250,16 @@ sizes/SHA-256, the exact-commit gate ledger, and an independent verifier report
 covering **both manifests'** dual signatures and all five artifacts. It never
 parses or accepts a manifest with a self-hash.
 
-The independent verifier writes `verification/verification.json` with:
+The caller creates a private temporary directory **outside the bundle** for each
+verification and passes a not-yet-existing report path using `--json-out`.
+The independent verifier must write a fresh, regular, single-link JSON file there;
+a successful exit without that output fails. Any report prepackaged in the bundle
+is ignored and cannot authorize promotion. The temporary report is consumed and
+removed; retain audit evidence separately through a trusted archival process.
+Freshness does not establish verifier trust: independently provision and review
+the verifier executable, version and digest before configuring it.
+
+The report contains:
 `schema: "boreas.production.external-verification.v1"`, `result: "pass"`,
 `release_root_sha256`, `release_manifest_sha256`,
 `promotion_manifest_sha256`, a `verifier` object with `name` (and optionally

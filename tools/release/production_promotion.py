@@ -44,6 +44,7 @@ import hashlib
 import json
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -674,61 +675,69 @@ def run_external_verifier(
     if not command:
         errors.append("independent signature verifier command is empty")
         return None
-    verification_dir = bundle / "verification"
-    if verification_dir.is_symlink():
-        errors.append("verification directory must not be a symlink")
-        return None
+    # Never consume a report supplied by the untrusted bundle, nor reuse an
+    # earlier invocation's output. The private directory is outside the bundle
+    # and the output file does not exist when the verifier starts. A successful
+    # no-op therefore fails, even if the bundle embeds a plausible pass report.
+    # This establishes output freshness ONLY: the configured executable must
+    # still be independently trusted/reviewed. A malicious verifier can lie in
+    # a newly written report just as easily as in a stale one.
     try:
-        verification_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        errors.append(f"verification directory cannot be created: {error}")
-        return None
-    output_path = verification_dir / "verification.json"
-    command.extend(
-        [
-            "--release-manifest",
-            str(release_manifest),
-            "--release-signature-envelope",
-            str(release_envelope),
-            "--promotion-manifest",
-            str(promotion_manifest),
-            "--promotion-signature-envelope",
-            str(promotion_envelope),
-            "--release-root",
-            str(bundle / "release-root"),
-            "--artifacts",
-            str(bundle / ARTIFACTS_DIR),
-            "--json-out",
-            str(output_path),
-            "--commit",
-            commit,
-            "--release-root-sha256",
-            root_sha256,
-        ]
-    )
-    try:
-        result = run_command(command, timeout=600)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        errors.append(f"independent verifier could not run: {error}")
-        return None
-    if result.returncode != 0:
-        errors.append(
-            "independent verifier refused the bundle (exit "
-            f"{result.returncode}): {result.stderr.strip()[:2000]}"
-        )
-        return None
-    if not output_path.is_file() or output_path.is_symlink():
-        errors.append("independent verifier did not write verification/verification.json")
-        return None
-    try:
-        report = read_json_strict(output_path)
+        with tempfile.TemporaryDirectory(prefix="boreas-verifier-") as directory:
+            verification_dir = Path(directory).resolve()
+            if verification_dir.is_relative_to(bundle.resolve()):
+                errors.append("verification output directory must be outside the bundle")
+                return None
+            output_path = verification_dir / "verification.json"
+            command.extend(
+                [
+                    "--release-manifest",
+                    str(release_manifest.resolve()),
+                    "--release-signature-envelope",
+                    str(release_envelope.resolve()),
+                    "--promotion-manifest",
+                    str(promotion_manifest.resolve()),
+                    "--promotion-signature-envelope",
+                    str(promotion_envelope.resolve()),
+                    "--release-root",
+                    str((bundle / "release-root").resolve()),
+                    "--artifacts",
+                    str((bundle / ARTIFACTS_DIR).resolve()),
+                    "--json-out",
+                    str(output_path),
+                    "--commit",
+                    commit,
+                    "--release-root-sha256",
+                    root_sha256,
+                ]
+            )
+            try:
+                result = run_command(command, timeout=600)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                errors.append(f"independent verifier could not run: {error}")
+                return None
+            if result.returncode != 0:
+                errors.append(
+                    "independent verifier refused the bundle (exit "
+                    f"{result.returncode}): {result.stderr.strip()[:2000]}"
+                )
+                return None
+            try:
+                output_stat = output_path.lstat()
+            except FileNotFoundError:
+                errors.append("independent verifier did not write a fresh verification report")
+                return None
+            if not stat.S_ISREG(output_stat.st_mode) or output_stat.st_nlink != 1:
+                errors.append("independent verification report must be a regular single-link file")
+                return None
+            report = read_json_strict(output_path)
+            if not isinstance(report, dict):
+                errors.append("independent verification report must be a JSON object")
+                return None
+            return report
     except (OSError, ValueError) as error:
         errors.append(f"independent verification report is invalid: {error}")
         return None
-    if not isinstance(report, dict):
-        errors.append("independent verification report must be a JSON object")
-        return None
-    return report
 
 
 def validate_external_report(
@@ -936,11 +945,12 @@ def _write_json(path: Path, document: dict) -> None:
 def _build_positive_fixture(root: Path):
     """Build a complete synthetic bundle for the *test-only* positive path.
 
-    The signatures are zero-filled placeholders of the correct lengths and the
-    external verifier is a no-op.  This proves the promotion tool accepts a
-    structurally complete bundle and rejects tampering; it is not cryptographic
-    evidence.  Real dual-signature verification is exercised by the supervisor
-    and rust-tls workflows with test-generated keys.
+    The signatures are zero-filled placeholders of the correct lengths. The
+    test-only verifier writes a synthetic report during each invocation, without
+    checking cryptography. This proves output freshness and report/schema
+    plumbing only, NOT verifier trust or signature validity. Real dual-signature
+    verification is exercised by the supervisor and rust-tls workflows with
+    test-generated keys.
     """
 
     bundle = root / "positive-bundle"
@@ -1073,15 +1083,27 @@ def _build_positive_fixture(root: Path):
         ],
         "verifier": {"name": "fixture-verifier", "version": "test-only"},
     }
-    _write_json(bundle / "verification" / "verification.json", verification)
-
+    # Keep the synthetic verifier and its template OUTSIDE the candidate bundle.
+    # This helper is private and test-only: it intentionally does not verify any
+    # signatures and must never be configured as a production verifier.
+    template = root / "test-only-report-template.json"
+    _write_json(template, verification)
+    fixture_verifier = root / "test-only-verifier.py"
+    fixture_verifier.write_text(
+        "import pathlib, sys\n"
+        "template = pathlib.Path(sys.argv[1])\n"
+        "output = pathlib.Path(sys.argv[sys.argv.index('--json-out') + 1])\n"
+        "with output.open('x', encoding='utf-8') as handle:\n"
+        "    handle.write(template.read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
     return (
         bundle,
         commit,
         root_sha,
         ledger,
-        'python -c "import sys; sys.exit(0)"',
-        'python -c "import sys; sys.exit(0)"',
+        shlex.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
+        shlex.join([sys.executable, str(fixture_verifier), str(template)]),
     )
 
 

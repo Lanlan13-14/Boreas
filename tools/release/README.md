@@ -64,5 +64,10 @@ ReleaseRoot hash, an artifact hash, the manifest schema or the external
 verifier is missing. `--self-test` builds a complete synthetic test-key-only
 positive fixture and negative cases; it is not production evidence. The
 external verifier is a separate implementation; this script must not be
-changed to self-certify cryptography. See
+changed to self-certify cryptography. Its `--json-out` path is an absent file in
+a new private temporary directory outside the bundle. A bundled legacy report
+is ignored; exit zero without a newly written report is rejected. New reports
+still do not establish verifier trust: independently provision the executable
+and pin/review its version and digest. Synthetic self-test reports prove only
+orchestration, not signature validity or independence. See
 `docs/engineering/platform-release-gates.md`.
