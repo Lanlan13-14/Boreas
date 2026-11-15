@@ -11,7 +11,7 @@
 - 本轮初始本地 HEAD `dac120a5029bb3e6b430bd67670c4df6085fed26`；远端同步目标 `8457d0637c5714c08b73163b80e5e3e371f29c00`。本地领先 6、落后 14 个提交，另有 staged/unstaged/untracked 工作。
 - 先建立 `backup/pre-sync-20261115`，再将原工作树完整记录为 `22d268c8018d81512a396e88f2e780b0ee0ed704`，随后合并远端；不 reset、不丢弃、不 force-push。
 - 所有编译、格式化、lint、Python/Rust 测试在 GitHub Actions 执行，不在本机运行；Git、静态阅读、API 状态/日志提取不算测试。
-- 新实现主要委派明确路由 `lightcode/gpt-6-luna`。按用户最新指定，剩余监督器回归改由 `lightcode/deepseek-v4.1-flash` 处理；原 Luna 任务已确认无写入并停止，交接后才启动 Flash，禁止同文件并发写入。已经执行中的有界审查/修复完成后收回，不重复实现。主代理负责分工、最终 diff 审查、提交、正常推送、证据核对。
+- 按用户最新偏好，后续实现与修复默认委派 `lightcode/deepseek-v4.1-flash`，不再默认由 Luna 主写。已有 Luna 写任务先停止并交接已写范围，再启动 Flash，禁止同文件并发写入；历史任务记录仍保留实际执行模型，不改写为 Flash 完成。主代理负责分工、最终 diff 审查、提交、正常推送、证据核对。
 - 不请求批准，不输出凭据，不把 ReleaseRoot/NetworkRoot 私钥放入 CI，不用真实生产密钥作测试。
 - 不能以政策模块、测试桩、单机回环、单元测试或绿色平台构建替代实际产品集成、真实环境测量或独立安全评审。
 - 不降低 hybrid KEX/ML-DSA、双签 AND、新鲜度、资源硬限额或失败关闭要求来换取测试通过。

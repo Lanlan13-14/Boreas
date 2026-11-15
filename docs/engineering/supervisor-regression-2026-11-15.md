@@ -130,3 +130,55 @@ error: could not compile `boreas-supervisor` (lib test) due to 1 previous error
 Confirmed: after the docs-only commit the surviving supervisor blocker is still the dead
 `older` binding in `sequence_ledger_accepts_only_verified_manifests`, not the fixtures.
 Platform and TUN green at df80a5b is consistent with the supervisor tests passing at runtime.
+
+## Addendum 2 — 90a7ad5: both old blockers resolved, WSS fixture now the first error
+
+Evidence read from completed `90a7ad5` runs only; earlier sections unchanged.
+
+| workflow | run | state |
+| --- | --- | --- |
+| Rust CI | 43683442873 | completed success (rustfmt, preflight, windows-latest, ubuntu-latest all success) |
+| Platform functional… | 43683442836 | completed cancelled — 14 target jobs success, final bundle job cancelled |
+| Linux system TUN checks | 43683442993 | completed success |
+| Rust OpenSSL hybrid TLS | 43683443001 | completed cancelled (job red first) |
+
+Rust CI turning fully green confirms the `unused variable: older` lint is fixed at 90a7ad5;
+platform/TUN green is consistent with the PKI `NodeRole` work. Platform's only non-success
+entries are cancellation artifacts of the newer push, not test failures.
+
+### First remaining error: `wss_e2e_openssl` fixture generation
+
+TLS job 132718823330: steps 1–8 success, 10–13 success, **14 failure**, 15–16 success,
+job cancelled afterwards (step 9 recorded cancelled for the same reason). Step 11
+`Compile backend and all test targets` now succeeds, so the `NodeRole` mismatch is gone and
+the target compiles; step 12 real pq768 mTLS passes. Step 14 then actually runs the WSS suite:
+
+```
+running 7 tests
+thread 'e2e_generation_mismatch_never_yields_business_stream' panicked at
+  crates/boreas-tunnel/tests/wss_e2e_openssl.rs:99:17:
+OpenSSL fixture generation failed (Some(1)); output suppressed
+... (same panic for all 7 tests) ...
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+error: test failed, to rerun pass `-p boreas-tunnel --test wss_e2e_openssl`
+```
+
+No assertion is reached: every test dies in `setup()` on the first `openssl` invocation,
+which exits 1. The harness discards stderr (`Stdio::null()`), so CI cannot say why.
+
+Two static differences from the harness that does pass in the same job (step 12,
+`crates/boreas-crypto/tests/openssl_mtls_handshake.rs`) — hypotheses only, not run locally:
+
+1. `wss_e2e_openssl.rs:46` `MINIMAL_CNF` puts `activate = 1` inside `[provider_sect]` and
+   never defines `[default_sect]`; the passing harness at `openssl_mtls_handshake.rs:111`
+   defines a separate `[default_sect]` with `activate = 1`.
+2. The first fixture call is `genpkey -algorithm RSA:2048`, whereas the passing harness uses
+   `-algorithm ML-DSA-65` (bare algorithm name, no `:bits` suffix).
+
+Both are test-side fixture defects in `boreas-tunnel`'s test harness, unrelated to supervisor.
+
+### 065f24b (non-Linux trust-store cfg) — in flight at collection
+
+Rust CI 43683612086 completed with rustfmt, ubuntu-latest, windows-latest and preflight all
+success; TUN 43683611941 success; TLS 43683612062 and Platform 43683611988 still running
+(no conclusions claimed).

@@ -43,7 +43,32 @@ const IO_TIMEOUT: Duration = Duration::from_secs(12);
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 const APP_LEN: usize = 196_613;
 const NET: [u8; 16] = [0x39; 16];
-const MINIMAL_CNF: &str = "openssl_conf = openssl_init\n\n[openssl_init]\nproviders = provider_sect\n\n[provider_sect]\ndefault = default_sect\nactivate = 1\n";
+const MINIMAL_CNF: &str = "openssl_conf = openssl_init\n\n[openssl_init]\nproviders = provider_sect\n\n[provider_sect]\ndefault = default_sect\n\n[default_sect]\nactivate = 1\n";
+/// Never drain an unbounded CLI stderr stream: only this much of the private
+/// capture file is ever read back.
+const STDERR_CAP: u64 = 16 * 1024;
+const STDERR_TEXT_LIMIT: usize = 4 * 1024;
+const STDERR_LINE_LIMIT: usize = 320;
+/// Appended when the byte budget forces truncation. Its length is reserved
+/// before any partial line is emitted, so the retained text can never exceed
+/// `STDERR_TEXT_LIMIT` -- including when the cut lands mid-line.
+const STDERR_TRUNCATION: &str = "<truncated>\n";
+/// Recognised OpenSSL CLI / provider diagnostics. Anything else is dropped
+/// rather than echoed, so no key material, dump or invite text can leak.
+const STDERR_MARKERS: [&str; 12] = [
+    "error",
+    "unable to",
+    "unknown",
+    "invalid",
+    "failed",
+    "failure",
+    "not found",
+    "no such file",
+    "cannot",
+    "problems encountered",
+    "unsupported",
+    "expected",
+];
 
 struct Temp(PathBuf);
 impl Temp {
@@ -77,30 +102,198 @@ impl Drop for Temp {
     }
 }
 
+/// Replace the private fixture directory with a stable placeholder so
+/// diagnostics never disclose where the ephemeral key material lived.
+fn redact_dir(text: &str, dir: &str) -> String {
+    text.split(dir).collect::<Vec<_>>().join("@DIR@")
+}
+
+/// Longest prefix of `text` that fits in `max_bytes`, always cut on a UTF-8
+/// character boundary so truncation can never panic or emit a partial code
+/// point.
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Longest prefix of `text` holding at most `max_chars` characters.
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
+/// Strip ANSI escape sequences and every remaining control character.
+///
+/// A synthetic CLI (or a fixed CLI echoing attacker-influenced data) must not
+/// be able to inject terminal control bytes through a line that merely looks
+/// like an error: only inert, printable text survives.
+fn strip_terminal_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                // CSI: ESC '[' ... final byte in 0x40..=0x7E.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ']' ... BEL or ST (ESC '\').
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-byte escape: drop the whole sequence.
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Keep at most `STDERR_TEXT_LIMIT` bytes of *recognised* CLI diagnostics from
+/// the private stderr capture: PEM blocks, keying material, TLS dumps and
+/// invite text are dropped entirely, terminal control bytes are stripped, the
+/// fixture path is redacted, and every kept line is length-capped. The output
+/// is inert text that is safe to print in a panic message, and it can never
+/// exceed the byte budget because the truncation marker is reserved before a
+/// partial line is appended.
+fn sanitize_cli_stderr(bytes: &[u8], dir: &str) -> String {
+    let mut kept = String::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("-----begin")
+            || lower.contains("-----end")
+            || lower.contains("private key")
+            || lower.contains("pvk")
+            || lower.contains("secret")
+            || lower.contains("dump")
+            || lower.contains("invite")
+        {
+            continue;
+        }
+        if !STDERR_MARKERS.iter().any(|marker| lower.contains(*marker)) {
+            continue;
+        }
+        let text = strip_terminal_controls(&redact_dir(line, dir));
+        let cleaned = truncate_chars(&text, STDERR_LINE_LIMIT).trim_end();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let remaining = STDERR_TEXT_LIMIT.saturating_sub(kept.len());
+        if remaining == 0 {
+            break;
+        }
+        if cleaned.len() + 1 <= remaining {
+            kept.push_str(cleaned);
+            kept.push('\n');
+            continue;
+        }
+        // The line does not fit whole: emit the longest UTF-8-safe prefix that
+        // leaves room for the marker, then stop. Total stays <= the limit.
+        let budget = remaining.saturating_sub(STDERR_TRUNCATION.len());
+        if budget == 0 {
+            // Fewer bytes are left than the marker itself needs: shrink the
+            // retained text (never mid code point) so the marker still fits.
+            let cut =
+                truncate_utf8(&kept, STDERR_TEXT_LIMIT - STDERR_TRUNCATION.len()).len();
+            kept.truncate(cut);
+            kept.push_str(STDERR_TRUNCATION);
+            break;
+        }
+        kept.push_str(truncate_utf8(cleaned, budget));
+        kept.push_str(STDERR_TRUNCATION);
+        break;
+    }
+    if kept.is_empty() {
+        "<no recognised CLI diagnostics>".to_owned()
+    } else {
+        kept
+    }
+}
+
 fn openssl(t: &Temp, args: &[&str]) {
-    let args: Vec<String> = args
-        .iter()
-        .map(|a| a.replace("@DIR@", t.0.to_str().expect("temp path")))
-        .collect();
+    static STDERR_SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = t.0.to_str().expect("temp path");
+    let args: Vec<String> = args.iter().map(|a| a.replace("@DIR@", dir)).collect();
     let bin = std::env::var_os("BOREAS_OPENSSL_BIN").unwrap_or_else(|| "openssl".into());
+    // A private regular file inside the already-owner-only fixture directory
+    // (removed with it on drop) replaces a pipe: the CLI can never block on a
+    // full pipe buffer, and no unbounded stream is forwarded to the test log.
+    let stderr_path = t.path(&format!(
+        ".openssl-stderr-{}.log",
+        STDERR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let stderr_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stderr_path)
+        .expect("create private OpenSSL stderr capture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stderr_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict OpenSSL stderr capture");
+    }
     // Fixture generation is test-only, but still bounded so a stuck provider cannot hang CI.
     let mut child = Command::new(bin)
         .env("OPENSSL_CONF", t.path("openssl.cnf"))
-        .args(args)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("start OpenSSL fixture generator");
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match child.try_wait().expect("poll OpenSSL fixture process") {
             Some(status) => {
-                assert!(
-                    status.success(),
-                    "OpenSSL fixture generation failed ({:?}); output suppressed",
-                    status.code()
-                );
+                if !status.success() {
+                    let captured = std::fs::File::open(&stderr_path)
+                        .ok()
+                        .map(|file| {
+                            let mut buf = Vec::new();
+                            let mut reader = file.take(STDERR_CAP);
+                            let _ = reader.read_to_end(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    panic!(
+                        "OpenSSL fixture generation failed (status {:?}): {}\n{}",
+                        status.code(),
+                        redact_dir(&args.join(" "), dir),
+                        sanitize_cli_stderr(&captured, dir)
+                    );
+                }
                 break;
             }
             None if Instant::now() >= deadline => {
@@ -112,17 +305,43 @@ fn openssl(t: &Temp, args: &[&str]) {
         }
     }
 }
-fn make_ca(t: &Temp, name: &str, algorithm: &str, subject: &str) {
-    openssl(
-        t,
-        &[
-            "genpkey",
-            "-algorithm",
-            algorithm,
-            "-out",
-            &format!("@DIR@/{name}-ca.key"),
-        ],
-    );
+/// Key-generation recipe for one fixture identity.
+///
+/// `genpkey` takes the bare algorithm name plus option flags. `RSA:2048` is
+/// not a valid OpenSSL 3 algorithm identifier and made the very first fixture
+/// CLI invocation exit 1 before any TLS code ran; the modulus size belongs in
+/// `-pkeyopt rsa_keygen_bits:2048`. Pure post-quantum algorithm names
+/// (`ML-DSA-65`) stay as-is.
+#[derive(Clone, Copy)]
+enum KeyAlg {
+    Rsa2048,
+    MlDsa65,
+}
+
+fn genpkey(t: &Temp, out: &str, algorithm: KeyAlg) {
+    let out = format!("@DIR@/{out}");
+    match algorithm {
+        KeyAlg::Rsa2048 => openssl(
+            t,
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                &out,
+            ],
+        ),
+        KeyAlg::MlDsa65 => openssl(
+            t,
+            &["genpkey", "-algorithm", "ML-DSA-65", "-out", &out],
+        ),
+    }
+}
+
+fn make_ca(t: &Temp, name: &str, algorithm: KeyAlg, subject: &str) {
+    genpkey(t, &format!("{name}-ca.key"), algorithm);
     openssl(
         t,
         &[
@@ -150,17 +369,8 @@ struct LeafSpec<'a> {
     san: &'a str,
     serial: &'a str,
 }
-fn make_leaf(t: &Temp, ca: &str, stem: &str, algorithm: &str, spec: LeafSpec<'_>) {
-    openssl(
-        t,
-        &[
-            "genpkey",
-            "-algorithm",
-            algorithm,
-            "-out",
-            &format!("@DIR@/{stem}.key"),
-        ],
-    );
+fn make_leaf(t: &Temp, ca: &str, stem: &str, algorithm: KeyAlg, spec: LeafSpec<'_>) {
+    genpkey(t, &format!("{stem}.key"), algorithm);
     openssl(
         t,
         &[
@@ -199,12 +409,12 @@ fn make_leaf(t: &Temp, ca: &str, stem: &str, algorithm: &str, spec: LeafSpec<'_>
 }
 fn setup(t: &Temp) {
     std::fs::write(t.path("openssl.cnf"), MINIMAL_CNF).expect("write minimal provider config");
-    make_ca(t, "outer", "RSA:2048", "/CN=Loopback WebPKI Test Root");
+    make_ca(t, "outer", KeyAlg::Rsa2048, "/CN=Loopback WebPKI Test Root");
     make_leaf(
         t,
         "outer",
         "outer",
-        "RSA:2048",
+        KeyAlg::Rsa2048,
         LeafSpec {
             cn: "wss.boreas.test",
             eku: "serverAuth",
@@ -212,12 +422,12 @@ fn setup(t: &Temp) {
             serial: "101",
         },
     );
-    make_ca(t, "id", "ML-DSA-65", "/CN=Boreas Test Identity Root");
+    make_ca(t, "id", KeyAlg::MlDsa65, "/CN=Boreas Test Identity Root");
     make_leaf(
         t,
         "id",
         "edge",
-        "ML-DSA-65",
+        KeyAlg::MlDsa65,
         LeafSpec {
             cn: "edge.boreas.test",
             eku: "clientAuth,serverAuth",
@@ -229,7 +439,7 @@ fn setup(t: &Temp) {
         t,
         "id",
         "core",
-        "ML-DSA-65",
+        KeyAlg::MlDsa65,
         LeafSpec {
             cn: "core.boreas.test",
             eku: "clientAuth,serverAuth",
@@ -241,7 +451,7 @@ fn setup(t: &Temp) {
         t,
         "id",
         "unknown",
-        "ML-DSA-65",
+        KeyAlg::MlDsa65,
         LeafSpec {
             cn: "unknown.boreas.test",
             eku: "clientAuth,serverAuth",
@@ -249,7 +459,7 @@ fn setup(t: &Temp) {
             serial: "203",
         },
     );
-    make_ca(t, "rogue", "ML-DSA-65", "/CN=Untrusted Boreas Test Root");
+    make_ca(t, "rogue", KeyAlg::MlDsa65, "/CN=Untrusted Boreas Test Root");
 }
 fn read(t: &Temp, name: &str) -> Vec<u8> {
     std::fs::read(t.path(name)).expect("read generated fixture")
@@ -744,4 +954,140 @@ fn e2e_generation_mismatch_never_yields_business_stream() {
         "generation mismatch cannot open business stream"
     );
     assert!(server_result);
+}
+
+// ---------------------------------------------------------------------------
+// Sanitizer unit tests. The fixture-diagnostic path must be bounded, inert and
+// leak-free on its own, independent of whether a real CLI ever fails -- and it
+// must not trust an "error"-looking line blindly (a fixed or synthetic CLI
+// could carry terminal control bytes or key material through it).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sanitizer_keeps_only_recognised_cli_diagnostics() {
+    let out = sanitize_cli_stderr(
+        concat!(
+            "Loading provider\n",
+            "40AB1C:error:1E08010C:DECODER routines::unsupported\n",
+            "random chatter\n",
+            "unable to load certificate\n",
+        )
+        .as_bytes(),
+        "/tmp/boreas-wss-e2e-unit",
+    );
+    assert!(out.contains("error:1E08010C:DECODER routines::unsupported"));
+    assert!(out.contains("unable to load certificate"));
+    assert!(!out.contains("Loading provider"));
+    assert!(!out.contains("random chatter"));
+}
+
+#[test]
+fn sanitizer_drops_pem_key_material_and_secret_lines() {
+    let out = sanitize_cli_stderr(
+        concat!(
+            // A bare PEM block carries no recognised diagnostic marker.
+            "-----BEGIN PRIVATE KEY-----\n",
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n",
+            "-----END PRIVATE KEY-----\n",
+            // Even when the CLI prefixes it, key material is filtered.
+            "error: -----BEGIN PRIVATE KEY-----\n",
+            "error: secret=deadbeef\n",
+            "error: the private key is not ready\n",
+        )
+        .as_bytes(),
+        "/tmp/boreas-wss-e2e-unit",
+    );
+    assert_eq!(
+        out, "<no recognised CLI diagnostics>",
+        "PEM/key/secret lines must be dropped, got: {out}"
+    );
+}
+
+#[test]
+fn sanitizer_redacts_the_private_fixture_path() {
+    let dir = "/tmp/boreas-wss-e2e-4242-0-7";
+    let input = format!("error: could not open {dir}/outer.key\n");
+    let out = sanitize_cli_stderr(input.as_bytes(), dir);
+    assert!(out.contains("@DIR@/outer.key"), "got: {out}");
+    assert!(!out.contains(dir), "private fixture path leaked: {out}");
+}
+
+#[test]
+fn sanitizer_strips_escape_and_control_bytes() {
+    let out = sanitize_cli_stderr(
+        b"error: \x1b[31mboom\x1b[0m \x07bell\x00nul\n",
+        "/tmp/boreas-wss-e2e-unit",
+    );
+    assert!(out.contains("boom"), "got: {out}");
+    assert!(out.contains("bell"), "got: {out}");
+    assert!(out.contains("nul"), "got: {out}");
+    assert!(!out.contains('\u{1b}'), "ESC must not survive: {out:?}");
+    assert_eq!(
+        out.chars().filter(|c| c.is_control()).count(),
+        1,
+        "only the appended line terminator may be a control character: {out:?}"
+    );
+}
+
+#[test]
+fn sanitizer_caps_total_output_and_marks_truncation() {
+    let input = format!("error: {}\n", "A".repeat(200)).repeat(100);
+    let out = sanitize_cli_stderr(input.as_bytes(), "/tmp/boreas-wss-e2e-unit");
+    assert!(
+        out.len() <= STDERR_TEXT_LIMIT,
+        "{} bytes exceed the {STDERR_TEXT_LIMIT}-byte budget",
+        out.len()
+    );
+    assert!(
+        out.ends_with(STDERR_TRUNCATION),
+        "truncation must be marked, tail: {out:?}"
+    );
+}
+
+#[test]
+fn sanitizer_cap_is_utf8_safe_for_multibyte_lines() {
+    let input = format!("error: {}\n", "€".repeat(300)).repeat(40);
+    let out = sanitize_cli_stderr(input.as_bytes(), "/tmp/boreas-wss-e2e-unit");
+    assert!(
+        out.len() <= STDERR_TEXT_LIMIT,
+        "{} bytes exceed the {STDERR_TEXT_LIMIT}-byte budget",
+        out.len()
+    );
+    assert!(out.ends_with(STDERR_TRUNCATION), "tail: {out:?}");
+    assert!(out.starts_with("error: €"), "head: {out:?}");
+    assert!(
+        !out.contains('\u{fffd}'),
+        "truncation must not synthesise partial code points: {out:?}"
+    );
+}
+
+#[test]
+fn sanitizer_marks_truncation_even_when_only_a_sliver_remains() {
+    // 455 lines of "error: B\n" fill 4095 of the 4096 bytes, so the deciding
+    // line gets 1 remaining byte -- less than the marker itself needs.
+    let input = format!("error: {}\n", "B".repeat(1)).repeat(500);
+    let out = sanitize_cli_stderr(input.as_bytes(), "/tmp/boreas-wss-e2e-unit");
+    assert!(
+        out.len() <= STDERR_TEXT_LIMIT,
+        "{} bytes exceed the {STDERR_TEXT_LIMIT}-byte budget",
+        out.len()
+    );
+    assert!(out.ends_with(STDERR_TRUNCATION), "tail: {out:?}");
+}
+
+#[test]
+fn truncate_utf8_never_splits_a_code_point() {
+    let text = "é€😀x";
+    for max in 0..=text.len() + 2 {
+        let cut = truncate_utf8(text, max);
+        assert!(cut.len() <= max, "cut {cut:?} exceeds {max} bytes");
+        assert!(
+            text.starts_with(cut),
+            "cut {cut:?} is not a prefix of {text:?}"
+        );
+        assert!(
+            text.is_char_boundary(cut.len()),
+            "cut {cut:?} ends mid code point"
+        );
+    }
 }
