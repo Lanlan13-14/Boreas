@@ -1,11 +1,16 @@
-//! Bounded, platform-neutral packet I/O and L3 validation primitives.
-//! This crate deliberately does not claim to implement or validate a real Linux TUN device.
+//! Bounded packet I/O, L3 validation, and native Linux/Windows/macOS adapters.
+//! Native adapters manage only their own device and MTU; they install no routes
+//! and make no production VPN, performance, or security-certification claim.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod icmp;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use std::{
     collections::{HashMap, VecDeque},
