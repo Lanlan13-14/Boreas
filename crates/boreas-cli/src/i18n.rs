@@ -220,9 +220,7 @@ pub fn text(lang: Lang, msg: Msg) -> &'static str {
         }
         (Lang::ZhCn, Msg::HintConfirm) => " 输入确认词后回车; 直接回车取消",
         (Lang::ZhTw, Msg::HintConfirm) => " 輸入確認詞後回車; 直接回車取消",
-        (Lang::En, Msg::HintConfirm) => {
-            " Type the phrase above; bare Enter cancels"
-        }
+        (Lang::En, Msg::HintConfirm) => " Type the phrase above; bare Enter cancels",
         (Lang::ZhCn, Msg::HintNotice) => " [Enter] 返回主菜单 [q] 退出",
         (Lang::ZhTw, Msg::HintNotice) => " [Enter] 返回主選單 [q] 離開",
         (Lang::En, Msg::HintNotice) => " [Enter] Back to menu [q] Quit",

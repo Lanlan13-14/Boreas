@@ -328,9 +328,9 @@ struct ConsoleOptions {
 /// One value for a flag that requires it. Missing values are exit-2 errors,
 /// never a silent default.
 fn take_flag_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1).cloned().ok_or_else(|| {
-        format!("error: {flag} requires a value; run `boreas help`")
-    })
+    args.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("error: {flag} requires a value; run `boreas help`"))
 }
 
 /// `console [--json] [--narrow] [--socket <PATH>] [--config <FILE>]
@@ -412,9 +412,12 @@ fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, St
     let mut reader = stdin.lock();
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
-    let outcome = drive_console(&mut state, &mut reader, &mut writer, |effect, effect_lang| {
-        io.perform(effect, effect_lang)
-    });
+    let outcome = drive_console(
+        &mut state,
+        &mut reader,
+        &mut writer,
+        |effect, effect_lang| io.perform(effect, effect_lang),
+    );
     // Leave the shell prompt on a fresh line; no terminal mode was changed.
     let _ = writeln!(&mut writer);
 
@@ -435,8 +438,12 @@ fn preview_unit(options: &ConsoleOptions) -> String {
 }
 
 fn derive_unit(config: &Path) -> Result<String, String> {
-    let parsed = Config::read_file(config, RuntimeCapabilities::NO_RUNTIME)
-        .map_err(|error| format!("cannot read {} to derive the unit: {error}", config.display()))?;
+    let parsed = Config::read_file(config, RuntimeCapabilities::NO_RUNTIME).map_err(|error| {
+        format!(
+            "cannot read {} to derive the unit: {error}",
+            config.display()
+        )
+    })?;
     Ok(match parsed.identity.role {
         NodeRole::Core => "boreas-core".to_string(),
         NodeRole::Edge => "boreas-edge".to_string(),
@@ -771,8 +778,10 @@ fn service_invoke(unit: &str, verb: &str) -> Result<Vec<String>, String> {
 
 #[cfg(not(unix))]
 fn service_invoke(_unit: &str, _verb: &str) -> Result<Vec<String>, String> {
-    Err("service control is implemented for Linux targets only (systemd or OpenWrt procd)"
-        .to_string())
+    Err(
+        "service control is implemented for Linux targets only (systemd or OpenWrt procd)"
+            .to_string(),
+    )
 }
 
 /// Drive the line-mode console: paint, read one line, reduce, perform.
@@ -798,7 +807,8 @@ where
         writeln!(out, "{screen}").map_err(|_| "console write failed".to_string())?;
         write!(out, "{}", text(state.lang, Msg::PromptLabel))
             .map_err(|_| "console write failed".to_string())?;
-        out.flush().map_err(|_| "console flush failed".to_string())?;
+        out.flush()
+            .map_err(|_| "console flush failed".to_string())?;
 
         let mut line = String::new();
         let read = reader
@@ -994,10 +1004,8 @@ fn doctor_json() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{ConsoleEffect, ConsoleOutcome, ConsoleState, drive_console, run_console};
     use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
-    use super::{
-        ConsoleEffect, ConsoleOutcome, ConsoleState, drive_console, run_console,
-    };
     use crate::config::RuntimeCapabilities;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -1641,7 +1649,9 @@ uplinks = ["wss://hub-us-c.example.net"]
         let mut state = ConsoleState::new(Lang::En, false);
         let mut reader = BufReader::new(&b""[..]);
         let mut out: Vec<u8> = Vec::new();
-        let result = drive_console(&mut state, &mut reader, &mut out, |_, _| ConsoleOutcome::none());
+        let result = drive_console(&mut state, &mut reader, &mut out, |_, _| {
+            ConsoleOutcome::none()
+        });
         assert!(result.is_ok(), "a closed pipe must not hang or fail");
     }
 

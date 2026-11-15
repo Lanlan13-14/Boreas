@@ -947,7 +947,12 @@ fn render_boxed_detail(base: &MenuModel, heading: &str, rows: &[String], hint: &
         row_mesh_right,
         &base.auth_label,
     ));
-    lines.push(field_row("MEM", &base.mem_label, "GUARD", &base.guard_label));
+    lines.push(field_row(
+        "MEM",
+        &base.mem_label,
+        "GUARD",
+        &base.guard_label,
+    ));
     lines.push(rule('├', '┤'));
     lines.push(row(heading));
     for index in 0..DETAIL_ROWS {
@@ -1402,7 +1407,11 @@ mod tests {
         state.apply("");
         assert_eq!(state.apply("3"), ConsoleEffect::None);
         assert_eq!(state.pending, Some(ServiceAction::Stop));
-        assert_eq!(state.apply("START"), ConsoleEffect::None, "START is not STOP");
+        assert_eq!(
+            state.apply("START"),
+            ConsoleEffect::None,
+            "START is not STOP"
+        );
         assert_eq!(state.view, ConsoleView::Notice);
 
         let mut state = ConsoleState::new(Lang::En, false);
@@ -1428,7 +1437,10 @@ mod tests {
         assert!(rows[3].contains("取消"), "{:?}", rows[3]);
 
         state.pending = Some(ServiceAction::Start);
-        assert!(state.confirm_rows()[1].is_empty(), "a start has no such risk");
+        assert!(
+            state.confirm_rows()[1].is_empty(),
+            "a start has no such risk"
+        );
     }
 
     #[test]
