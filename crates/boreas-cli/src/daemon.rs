@@ -1060,8 +1060,7 @@ mod linux_daemon {
                     // Reaching here means the packet was malformed or the host
                     // packet interface failed; that remains fatal.
                     return Err(
-                        "daemon: outbound packet path rejected a malformed host packet"
-                            .to_string(),
+                        "daemon: outbound packet path rejected a malformed host packet".to_string(),
                     );
                 }
                 Err(e) => {
