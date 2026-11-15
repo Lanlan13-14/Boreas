@@ -11,6 +11,7 @@ on:
       - 'crates/boreas-proto/**'
       - 'crates/boreas-supervisor/**'
       - 'crates/boreas-tunnel/**'
+      - 'crates/boreas-cli/**'
       - '.github/workflows/rust-tls.yml'
   pull_request:
     paths:
@@ -21,6 +22,7 @@ on:
       - 'crates/boreas-proto/**'
       - 'crates/boreas-supervisor/**'
       - 'crates/boreas-tunnel/**'
+      - 'crates/boreas-cli/**'
       - '.github/workflows/rust-tls.yml'
 
 permissions:
@@ -126,6 +128,7 @@ jobs:
               "boreas-pki": "openssl-backend",
               "boreas-tunnel": "openssl-inner-tls",
               "boreas-supervisor": "openssl-backend",
+              "boreas-cli": "openssl-inner-tls",
           }
           packages = {package["name"]: package for package in metadata["packages"]}
           missing = []
@@ -149,7 +152,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt -p boreas-crypto -p boreas-pki -p boreas-tunnel -p boreas-supervisor
+          cargo fmt -p boreas-crypto -p boreas-pki -p boreas-tunnel -p boreas-supervisor -p boreas-cli
           git diff --binary > rust-tls-format.patch || true
           if [ -s rust-tls-format.patch ]; then
             echo '::warning title=Formatting patch produced::Review rust-tls-format.patch; this job did not commit it.'
@@ -215,6 +218,46 @@ jobs:
           set -o pipefail
           cargo test --locked -p boreas-supervisor --features openssl-backend \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
+      - name: CLI hop-node process tests with backend feature
+        if: always()
+        timeout-minutes: 15
+        shell: bash
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -o pipefail
+          cargo test --locked -p boreas-cli --features openssl-inner-tls \
+            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
+      - name: Build Linux hop-node development binary
+        if: success()
+        timeout-minutes: 15
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p boreas-cli --features openssl-inner-tls
+          mkdir -p hop-node-linux
+          cp target/release/boreas hop-node-linux/boreas
+          printf '%s\n' \
+            'BOREAS HOP-NODE DEVELOPMENT BINARY - NOT A PRODUCTION RELEASE' \
+            'Source commit: '"$GITHUB_SHA" \
+            'Feature: openssl-inner-tls' \
+            'This binary links the reviewed OpenSSL 3.6.1 pq768 backend.' \
+            'It is glibc/Debian development evidence, not a musl static archive.' \
+            'doctor still reports no production daemon. node serve/connect run one hop.' \
+            'Not G-CRYPTO, G-DATA, G-TUN, or production_approved.' \
+            > hop-node-linux/README-DEVELOPMENT.txt
+          sha256sum hop-node-linux/boreas > hop-node-linux/SHA256SUMS
+      - name: Upload hop-node development binary
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
+          path: hop-node-linux
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload non-secret CI evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -228,5 +271,6 @@ jobs:
             rust-tls-pki-tests.log
             rust-tls-tunnel-tests.log
             rust-tls-supervisor-tests.log
+            rust-tls-cli-tests.log
           if-no-files-found: warn
           retention-days: 14

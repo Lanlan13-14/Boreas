@@ -4,15 +4,31 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "GPL-3.0-only"
-description = "Boreas CLI foundation (policy/parser only; no daemon or TLS backend)"
+description = "Boreas CLI foundation plus optional hop-node process behind openssl-inner-tls"
 
 [[bin]]
 name = "boreas"
 path = "src/main.rs"
 
+[features]
+default = []
+# Links the reviewed OpenSSL pq768 hop path. The default five-target package
+# does not enable this: it has no TLS backend and `node` refuses to start.
+openssl-inner-tls = [
+    "dep:boreas-crypto",
+    "dep:boreas-pki",
+    "dep:boreas-tunnel",
+    "boreas-crypto/openssl-backend",
+    "boreas-pki/openssl-backend",
+    "boreas-tunnel/openssl-inner-tls",
+]
+
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.2.1+spec-1.1.0"
+boreas-crypto = { path = "../boreas-crypto", optional = true }
+boreas-pki = { path = "../boreas-pki", optional = true }
+boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 
 # Unix-only: O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC for the safe config open and
 # geteuid for the owner check. Already present in Cargo.lock via other crates,

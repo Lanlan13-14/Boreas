@@ -2,25 +2,29 @@
 //! binary also serves as the `boreas-easy` console when invoked through
 //! that symlink name (argv[0] detection, §10.5).
 //!
-//! This slice contains four honest pieces and nothing more:
+//! This slice contains the policy/config/console foundation plus an optional
+//! hop-node process:
 //!
 //! - a trilingual (`zh-CN` / `zh-TW` / `en`) one-shot rendering layer for the
 //!   status screen (`status`, and `boreas-easy` with no arguments);
 //! - a typed, fail-closed TOML configuration model with `config-check <path>`
 //!   static policy validation and `config-migrate <path>` schema migration
 //!   (stdout only; no file is rewritten);
-//! - `doctor` / `self-check`, which keep reporting the missing daemon, TLS
-//!   backend and networking.
+//! - `doctor` / `self-check`, which keep reporting the missing production
+//!   daemon, TUN data plane and control socket;
+//! - `node serve` / `node connect`, which refuse to start in the default
+//!   binary because it has no TLS backend. The `openssl-inner-tls` feature
+//!   links the reviewed OpenSSL pq768 hop path and runs one outer TLS 1.3
+//!   plus one hop inner TLS session. That is not a production daemon, not
+//!   E2E relay, and not a passed gate.
 //!
-//! There is NO daemon, control socket, networking or TLS backend behind any of
-//! this. `crates/boreas-tunnel` currently exposes only in-process session APIs
-//! (`LinkClient` / `LinkServer`), no status snapshot and no `control.sock`, so
-//! `status` keeps saying `daemon: not connected` and never fabricates a live
-//! state. `menu` renders the §10.4.1 screen from an offline model only: no
-//! raw mode, no DSR probe and no control socket (G-UI is not met).
+//! `status` keeps saying `daemon: not connected` unless a live control socket
+//! exists; none does. `menu` renders the §10.4.1 screen from an offline model
+//! only: no raw mode, no DSR probe and no control socket (G-UI is not met).
 
 mod config;
 mod i18n;
+mod node;
 mod render;
 mod tui;
 
@@ -154,6 +158,7 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
+        Some("node") => node::run(&args[1..]),
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => {
             (0, help_text(), String::new())
         }
@@ -336,23 +341,37 @@ fn run_config_migrate(args: &[String]) -> (u8, String, String) {
 }
 
 fn help_text() -> String {
-    "boreas — Phase 0 policy/config/console foundation\n\n\
+    let mut text = "boreas — Phase 0 policy/config/console foundation\n\n\
      USAGE:\n\
-     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|help]\n\
+     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|node serve|node connect|help]\n\
      \x20 boreas-easy   (one-shot status screen; interactive TUI not implemented)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\
      \x20 boreas menu [--narrow]    offline 9-entry screen (JSON when not a TTY)\n\
      \x20 boreas confirm hop-only|revoke:<id>|uninstall <phrase>\n\
-     \x20                          records the phrase only; never applies it\n\n\
+     \x20                          records the phrase only; never applies it\n\
+     \x20 boreas node serve <config> <listen> <material-dir>\n\
+     \x20 boreas node connect <config> <host:port> <tls-name> <material-dir>\n\
+     \x20                          hop process; TLS backend is feature-gated\n\n\
      config-check parses one TOML file (`version = 1` legacy or `version = 2`),\n\
      validates static policy and prints redacted JSON. config-migrate prints the\n\
      canonical version = 2 document for a legacy file and never rewrites it.\n\
      Neither starts a daemon, opens sockets, loads key or trust-anchor contents,\n\
      or establishes TLS.\n\n\
-     No daemon, TLS backend, or networking is implemented."
-        .to_string()
+     No production daemon, TUN data plane, or control socket is implemented.\n"
+        .to_string();
+    #[cfg(not(feature = "openssl-inner-tls"))]
+    {
+        text.push_str("The default binary has no TLS backend; `node` exits without opening a socket.");
+    }
+    #[cfg(feature = "openssl-inner-tls")]
+    {
+        text.push_str(
+            "This openssl-inner-tls binary can run one hop via `node serve`/`node connect`. That is not a production daemon.",
+        );
+    }
+    text
 }
 
 fn doctor_json() -> String {
@@ -655,7 +674,33 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(code, 0);
         assert!(stdout.contains("config-check <path>"));
         assert!(stdout.contains("config-migrate <path>"));
-        assert!(stdout.contains("No daemon, TLS backend, or networking is implemented."));
+        assert!(stdout.contains("node serve"));
+        assert!(!stdout.contains("No daemon, TLS backend, or networking is implemented."));
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        {
+            assert!(stdout.contains("The default binary has no TLS backend"));
+            let (code, _, stderr) = run(
+                &args(&[
+                    "node",
+                    "serve",
+                    "/boreas-tests/secret/config.toml",
+                    "127.0.0.1:443",
+                    "/boreas-tests/secret/material",
+                ]),
+                Lang::En,
+                false,
+            );
+            assert_eq!(code, 2);
+            assert!(stderr.contains("no TLS backend"));
+            assert!(stderr.contains("no daemon was started"));
+        }
+        #[cfg(feature = "openssl-inner-tls")]
+        {
+            assert!(stdout.contains("This openssl-inner-tls binary can run one hop"));
+        }
+        let (code, _, stderr) = run(&args(&["node", "serve"]), Lang::En, false);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("node serve <config>"));
         let (code, _, stderr) = run(&args(&["help", "extra"]), Lang::En, false);
         assert_eq!(code, 2);
         assert!(stderr.contains("unexpected argument"));
