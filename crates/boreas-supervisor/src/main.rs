@@ -1690,6 +1690,25 @@ mod tests {
     }
 
     #[test]
+    fn supervise_requires_ready_expected_schema() {
+        // The schema is bound to the target release, so it must not default:
+        // a structurally complete supervise command that omits it is rejected
+        // during parsing, before the store is opened or a child is planned.
+        let (code, _, err) = done_parts(run_cli(&[
+            os("supervise"),
+            os("--store"),
+            os("/x"),
+            os("--"),
+            os("/bin/true"),
+        ]));
+        assert_eq!(code, EXIT_ERROR);
+        assert!(
+            err.contains("--ready-expected-schema <ID> is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn store_commands_require_store_and_reject_unknown_flags() {
         let (code, _, err) = done_parts(run_cli(&[os("recover")]));
         assert_eq!(code, EXIT_ERROR);
@@ -2058,6 +2077,8 @@ mod unix_tests {
             os("supervise"),
             os("--store"),
             os(&ghost),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--"),
             os("/bin/true"),
         ];
@@ -2518,6 +2539,8 @@ mod unix_tests {
             os("supervise"),
             os("--store"),
             os(&f.store_str()),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--"),
             os("{version}/prog.sh"),
         ];
@@ -2538,6 +2561,8 @@ mod unix_tests {
             os("supervise"),
             os("--store"),
             os(&f.store_str()),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--"),
             os("/bin/sh"),
             os("-c"),
@@ -2561,6 +2586,8 @@ mod unix_tests {
             os("supervise"),
             os("--store"),
             os(&f.store_str()),
+            os("--ready-expected-schema"),
+            os("state-v1"),
             os("--"),
             os("{version}/prog.sh"),
         ];
