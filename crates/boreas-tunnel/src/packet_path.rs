@@ -149,6 +149,18 @@ impl fmt::Display for PacketDeny {
     }
 }
 
+impl PacketDeny {
+    /// A structurally valid packet produced by the local host that is not part
+    /// of this point-to-point flow. It is discarded without reaching the peer
+    /// and without failing the circuit. Malformed packets are not included.
+    pub const fn is_local_discard(self) -> bool {
+        matches!(
+            self,
+            Self::Ipv6NotNegotiated | Self::SourceNotLocal | Self::DestinationNotPeer
+        )
+    }
+}
+
 impl std::error::Error for PacketDeny {}
 
 impl From<TunError> for PacketDeny {
@@ -819,6 +831,12 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                 Ok(Some(length))
             }
             Ok(None) => Ok(None),
+            Err(PacketPathError::Denied(reason)) if reason.is_local_discard() => {
+                // Host configuration traffic is not evidence that the
+                // authenticated circuit failed. Do not frame it or close.
+                self.stats.dropped_outbound = self.stats.dropped_outbound.saturating_add(1);
+                Ok(None)
+            }
             Err(error) => Err(self.fail(error)),
         }
     }
