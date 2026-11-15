@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Independently verify Boreas candidate AppHeader and strict CBOR vectors.
+"""Independently verify Boreas candidate AppHeader, CBOR and Control vectors.
 
 This module intentionally uses only the Python standard library and does not
-import or mirror any Rust implementation. The vector file is treated as test
+import or mirror any Rust implementation. The vector files are treated as test
 input, not as an authority on how parsing works.
+
+Control payloads are handled by the sibling `control_vectors.py`, which is a
+second, independent implementation of the candidate layout. It is imported by
+file path so this module keeps working when loaded through `importlib` by the
+unit tests.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -244,18 +250,55 @@ def parse_management_tbs(data: bytes) -> dict[str, Any]:
             raise Reject("unknown_critical_extension")
 
     name = {1: "NodeIdentity", 2: "AttachmentLease", 3: "CoreLsa", 4: "RouteGrant", 5: "DirectGrant", 6: "StatusSnapshot"}[object_type]
-    required = {1: set(range(12)), 2: set(range(6)), 3: set(range(4)), 4: set(range(7)), 5: set(range(6)), 6: set(range(4))}[object_type]
+    required = {1: set(range(13)), 2: set(range(6)), 3: set(range(4)), 4: set(range(7)), 5: set(range(6)), 6: set(range(4))}[object_type]
     if set(body) != required:
         raise Reject("invalid_field")
     semantic: dict[str, Any] = {"object_type": name}
     if object_type == 1:
-        node_id, home, vip, vip6, role, param, pub, generation, not_before, body_expires, scope = (body[i] for i in range(1, 12))
-        if not _bytes(body[0],16,16) or body[0] != net_id or not _uint(node_id,65535) or not _uint(home,16,1) or not _bytes(vip,4,4) or not _bytes(vip6,16,16) or not _uint(role,3,1) or not _uint(param,2,1) or not _bytes(pub,1,8192) or not _uint(generation,minimum=1) or not _uint(not_before) or not _uint(body_expires) or body_expires <= not_before or not _bytes(scope,0,1024):
+        # Candidate revision 2: body key 11 is identity_pub_ed25519[32] and scope
+        # moved to key 12. The Ed25519 key is the management-signing key, not the
+        # TLS key; this decoder only enforces its shape and nonzero value.
+        node_id, home, vip, vip6, role, param, pub, generation, not_before, body_expires, ed25519, scope = (body[i] for i in range(1, 13))
+        if (
+            not _bytes(body[0], 16, 16)
+            or body[0] != net_id
+            or not _uint(node_id, 65535)
+            or not _uint(home, 16, 1)
+            or not _bytes(vip, 4, 4)
+            or not _bytes(vip6, 16, 16)
+            or not _uint(role, 3, 1)
+            or not _uint(param, 2, 1)
+            or not _bytes(pub, 1, 8192)
+            or not _uint(generation, minimum=1)
+            or not _uint(not_before)
+            or not _uint(body_expires)
+            or body_expires <= not_before
+            or not _bytes(ed25519, 32, 32)
+            or ed25519 == bytes(32)
+            or not _bytes(scope, 0, 1024)
+        ):
             raise Reject("invalid_field")
         expected_node_id = ((home - 1) << 8) | vip[3]
-        if node_id != expected_node_id or subject_kind != "Node" or subject_id != node_id or seq != generation or issued_at != not_before or expires != body_expires:
+        vip_ok = (
+            vip[0] == 10
+            and vip[1] == 20
+            and (
+                (role == 1 and vip[2] == home and 2 <= vip[3] <= 251)
+                or (role == 2 and vip[2] == home and vip[3] == 1)
+                or (role == 3 and vip[2] == 0 and vip[3] != 0)
+            )
+        )
+        if (
+            not vip_ok
+            or node_id != expected_node_id
+            or subject_kind != "Node"
+            or subject_id != node_id
+            or seq != generation
+            or issued_at != not_before
+            or expires != body_expires
+        ):
             raise Reject("invalid_field")
-        semantic.update({"net_id_hex": net_id.hex(), "issuer_key_id_hex": issuer_id.hex(), "issuer_generation": issuer_generation, "subject": ["Node", node_id], "seq": seq, "issued_at": issued_at, "expires": expires})
+        semantic.update({"net_id_hex": net_id.hex(), "issuer_key_id_hex": issuer_id.hex(), "issuer_generation": issuer_generation, "subject": ["Node", node_id], "seq": seq, "issued_at": issued_at, "expires": expires, "identity_pub_ed25519_hex": ed25519.hex()})
     elif object_type == 2:
         node_id, identity_gen, attach_gen, target_core, not_before, body_expires = (body[i] for i in range(6))
         if not _uint(node_id,65535) or not _uint(identity_gen,minimum=1) or not _uint(attach_gen,minimum=1) or not _uint(target_core,16,1) or not _uint(not_before) or not _uint(body_expires) or body_expires <= not_before or subject_kind != "Node" or subject_id != node_id or issued_at != not_before or expires != body_expires:
@@ -415,6 +458,36 @@ def verify_management_document(document: Any) -> list[str]:
     return errors
 
 
+_CONTROL_MODULE: Any = None
+
+
+def control_module() -> Any:
+    """Load the independent control-payload verifier by file path."""
+    global _CONTROL_MODULE
+    if _CONTROL_MODULE is None:
+        path = Path(__file__).resolve().parent / "control_vectors.py"
+        spec = importlib.util.spec_from_file_location("boreas_control_vectors", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CONTROL_MODULE = module
+    return _CONTROL_MODULE
+
+
+def verify_control_document(document: Any) -> list[str]:
+    """Verify the control-message fixture with the embedded TBS decoder.
+
+    The control verifier is handed this module's independent TBS parser so a
+    SignedObject envelope must carry a management object whose declared type
+    matches the envelope. No encoder is involved on either side.
+    """
+    module = control_module()
+    errors = module.verify_control_document(document, parse_management_tbs)
+    errors.extend(module.verify_control_pair_document(document))
+    return errors
+
+
 def verify_document(document: Any) -> list[str]:
     if not isinstance(document, dict):
         return ["root: expected JSON object"]
@@ -476,17 +549,27 @@ def verify_document(document: Any) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) > 2:
-        print("usage: python tools/verify_vectors.py [proto-vectors.json [management-vectors.json]]", file=sys.stderr)
+    if len(args) > 3:
+        print(
+            "usage: python tools/verify_vectors.py "
+            "[proto-vectors.json [management-vectors.json [control-vectors.json]]]",
+            file=sys.stderr,
+        )
         return 2
     root = Path(__file__).resolve().parents[1]
     proto_path = Path(args[0]) if args else root / "docs/protocol/vectors/candidate-vectors-v1.json"
-    management_path = Path(args[1]) if len(args) > 1 else root / "docs/protocol/vectors/management-objects-candidate-v1.json"
+    management_path = (
+        Path(args[1]) if len(args) > 1 else root / "docs/protocol/vectors/management-objects-candidate-v1.json"
+    )
+    control_path = (
+        Path(args[2]) if len(args) > 2 else root / "docs/protocol/vectors/control-messages-candidate-v1.json"
+    )
     errors: list[str] = []
     documents: list[tuple[str, Any]] = []
     for label, fixture_path, verifier in (
         ("vectors", proto_path, verify_document),
         ("management vectors", management_path, verify_management_document),
+        ("control vectors", control_path, verify_control_document),
     ):
         try:
             document = json.loads(fixture_path.read_text(encoding="utf-8"))
@@ -501,10 +584,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     proto_document = documents[0][1]
     management_document = documents[1][1]
+    control_document = documents[2][1]
     print(
         f"PASS: {len(proto_document['app_header'])} AppHeader and "
         f"{len(proto_document['cbor'])} CBOR vectors plus limits; "
-        f"{len(management_document['vectors'])} management vectors"
+        f"{len(management_document['vectors'])} management vectors; "
+        f"{len(control_document['vectors'])} control vectors and "
+        f"{len(control_document.get('session_pairs', []))} session pairs"
     )
     return 0
 

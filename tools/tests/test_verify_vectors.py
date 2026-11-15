@@ -143,6 +143,63 @@ class ManagementObjectTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, critical_fixture["expected_error"])
 
 
+class NodeIdentityEd25519Tests(unittest.TestCase):
+    """Candidate revision 2: NodeIdentity body key 11 Ed25519[32], key 12 scope."""
+
+    def fixture(self):
+        import json
+        fixture_path = Path(__file__).resolve().parents[2] / "docs/protocol/vectors/management-objects-candidate-v1.json"
+        return json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    def tbs_hex(self):
+        document = self.fixture()
+        return next(
+            vector for vector in document["vectors"]
+            if vector.get("id") == "node-identity-minimal-valid"
+        )["raw_tbs_hex"]
+
+    def test_body_key_11_is_validated_and_exposed(self):
+        tbs = bytes.fromhex(self.tbs_hex())
+        self.assertEqual(len(tbs), 138)
+        decoded = verify_vectors.parse_management_tbs(tbs)
+        self.assertEqual(decoded["identity_pub_ed25519_hex"], "55" * 32)
+        self.assertEqual(decoded["subject"], ["Node", 2])
+        self.assertEqual(decoded["seq"], 1)
+
+    def test_all_zero_ed25519_key_is_rejected(self):
+        tbs = bytes.fromhex(self.tbs_hex()).replace(
+            bytes.fromhex("0b5820") + bytes([0x55]) * 32,
+            bytes.fromhex("0b5820") + bytes(32),
+            1,
+        )
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_management_tbs(tbs)
+        self.assertEqual(caught.exception.category, "invalid_field")
+
+    def test_short_ed25519_key_is_rejected(self):
+        tbs = bytes.fromhex(self.tbs_hex()).replace(
+            bytes.fromhex("0b5820") + bytes([0x55]) * 32,
+            bytes.fromhex("0b581f") + bytes([0x55]) * 31,
+            1,
+        )
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_management_tbs(tbs)
+        self.assertEqual(caught.exception.category, "invalid_field")
+
+    def test_stale_key_12_scope_layout_is_rejected(self):
+        # A TBS with only body keys 0..11 (the superseded schema, where key 11 was
+        # scope) must not decode: key 12 is now required. Re-encode the body map
+        # as 12 pairs and drop key 12 while keeping the rest canonical.
+        tbs = bytes.fromhex(self.tbs_hex())
+        self.assertIn(bytes.fromhex("09ad"), tbs)
+        self.assertIn(bytes.fromhex("0c400a80"), tbs)
+        stale = tbs.replace(bytes.fromhex("09ad"), bytes.fromhex("09ac"), 1)
+        stale = stale.replace(bytes.fromhex("0c400a80"), bytes.fromhex("0a80"), 1)
+        with self.assertRaises(verify_vectors.Reject) as caught:
+            verify_vectors.parse_management_tbs(stale)
+        self.assertEqual(caught.exception.category, "invalid_field")
+
+
 class FixtureValidationTests(unittest.TestCase):
     def test_rejects_expected_result_mismatch(self):
         fixture = {
