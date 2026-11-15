@@ -1208,7 +1208,8 @@ fn real_loopback_e2e_circuit_carries_virtual_tun_packets() {
     assert_eq!(delivered, inbound);
     assert_eq!(sha256(&delivered), sha256(&inbound));
     assert_eq!(
-        path.step_inbound().expect("TLS close_notify must be clean EOF"),
+        path.step_inbound()
+            .expect("TLS close_notify must be clean EOF"),
         None
     );
 
