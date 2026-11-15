@@ -781,7 +781,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     if text.is_empty() {
         return Some(Vec::new());
     }
-    if text.len() % 4 != 0 {
+    if !text.len().is_multiple_of(4) {
         return None;
     }
     let chunks = text.len() / 4;
@@ -1062,7 +1062,7 @@ mod tests {
     #[test]
     fn server_answers_with_expected_accept() {
         let request = "GET /tunnel HTTP/1.1\r\nHost: hub\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        let mut stream = server_handshake(memory(request.as_bytes())).expect("handshake");
+        let stream = server_handshake(memory(request.as_bytes())).expect("handshake");
         let output = String::from_utf8(stream.io.output.clone()).expect("ascii response");
         assert!(output.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(output.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
@@ -1265,9 +1265,7 @@ mod tests {
         );
 
         let mut head = b"HTTP/1.1 101 Switching Protocols\r\n".to_vec();
-        for _ in 0..MAX_HTTP_HEAD_BYTES {
-            head.push(b'x');
-        }
+        head.extend(std::iter::repeat_n(b'x', MAX_HTTP_HEAD_BYTES));
         assert_eq!(
             client_handshake(memory(&head), "hub.example.net", "/tunnel").err(),
             Some(WsError::HeadTooLarge)
