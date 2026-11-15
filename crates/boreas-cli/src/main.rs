@@ -649,7 +649,6 @@ uplinks = ["wss://hub-us-c.example.net"]
                 .tcp
         );
     }
-}
 
     #[test]
     fn help_lists_config_commands_and_never_claims_a_daemon() {

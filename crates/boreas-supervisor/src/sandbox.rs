@@ -67,6 +67,7 @@
 //! undone.
 
 use std::fmt;
+#[cfg(target_os = "linux")]
 use std::io;
 
 /// Classic BPF instruction count limit used by this slice (`linux/filter.h`
