@@ -1,4 +1,4 @@
-name: Platform functional verification and development packaging
+name: '[Package] 5-platform build, test & unsigned dev bundle (NOT a release)'
 
 # What this workflow proves:
 #   - the workspace compiles and its tests pass on five native runners;

@@ -1,4 +1,4 @@
-name: OpenSSL ML-DSA hybrid TLS PoC
+name: '[Test] PoC: OpenSSL CLI ML-DSA hybrid TLS smoke (not product code)'
 
 on:
   workflow_dispatch:

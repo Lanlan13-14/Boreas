@@ -1,4 +1,4 @@
-name: Refresh candidate management vectors
+name: '[Maintenance] Refresh candidate test vectors'
 
 on:
   workflow_dispatch:

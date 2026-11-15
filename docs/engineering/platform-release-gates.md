@@ -324,8 +324,8 @@ entry, which is the correct diagnosis.
 
 To reproduce the development evidence:
 
-1. Open **Actions → “Platform functional verification and development
-   packaging”** (`platforms.yml`).
+1. Open **Actions → “[Package] 5-platform build, test & unsigned dev bundle
+   (NOT a release)”** (`platforms.yml`).
 2. Select the exact `main` commit and **Run workflow**.
 3. Inspect jobs `lock-preflight`, the five `build-test` entries,
    `linux-runtime-compat` and `development-bundle`.

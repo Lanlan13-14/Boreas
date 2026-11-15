@@ -1,4 +1,4 @@
-name: Rust CI
+name: '[Test] Rust unit tests & lint (cargo test + clippy)'
 
 on:
   push:

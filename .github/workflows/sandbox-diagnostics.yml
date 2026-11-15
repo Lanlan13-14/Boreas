@@ -1,4 +1,4 @@
-name: Sandbox audit and diagnostics evidence
+name: '[Test] Sandbox audit & diagnostics evidence'
 
 # Independent evidence workflow for tools/sandbox-audit + tools/diagnostics
 # (master plan v1.11.0 section 9.5 / Phase 3 G-SANDBOX groundwork).

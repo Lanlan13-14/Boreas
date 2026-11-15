@@ -1,4 +1,4 @@
-name: Linux system TUN checks
+name: '[Test] Linux TUN real-device tests (netns)'
 
 # Real Linux TUN device gate.  This is deliberately separate from the CLI
 # foundation workflow: `doctor` output is not TUN evidence, and this workflow

@@ -1,4 +1,4 @@
-name: Production promotion gate (fail-closed; never publishes)
+name: '[Release] Production promotion gate (fail-closed; never publishes)'
 
 # Manual, fail-closed production promotion verification.
 #

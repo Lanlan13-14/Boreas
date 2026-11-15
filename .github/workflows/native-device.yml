@@ -1,4 +1,4 @@
-name: Native packet I/O device tests (real driver only)
+name: '[Test] Native packet devices, real driver (Wintun/utun)'
 
 # This workflow is the CI wiring for the native-packetio contract:
 #

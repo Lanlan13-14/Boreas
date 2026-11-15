@@ -8,7 +8,7 @@
 
 ### 1.1 固定 commit 与 Actions run
 
-1. 在 [Boreas Actions](https://github.com/Lanlan13-14/Boreas/actions) 中选 **Platform functional verification and development packaging**。记录完整 40 位 source commit、run URL、run attempt、执行者及 workflow 来源；避免不可信 fork/PR 产物。
+1. 在 [Boreas Actions](https://github.com/Lanlan13-14/Boreas/actions) 中选 **[Package] 5-platform build, test & unsigned dev bundle (NOT a release)**。记录完整 40 位 source commit、run URL、run attempt、执行者及 workflow 来源；避免不可信 fork/PR 产物。
 2. 检查该次运行的 `lock-preflight`、五项 `build-test`、八项 `linux-runtime-compat` 和 `development-bundle`。以实际结论为准，不用[项目说明](<../../README.md>)的历史绿色记录替代本次结果。PR 不生成最终 bundle；job 未完成、失败或产物已过期时停下，不猜测存在可下载文件。
 3. 下载 run-scoped `boreas-development-release-<run_id>`，保留全部五目标归档和索引，使用可信归档工具将 Actions 外层 ZIP 展开至新的私有工作目录。产物默认保留 14 天；缺失时请维护者在 Actions 重跑准确 commit。
 

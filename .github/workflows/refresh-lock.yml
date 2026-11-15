@@ -1,4 +1,4 @@
-name: Refresh Cargo.lock
+name: '[Maintenance] Refresh Cargo.lock'
 
 # Dedicated, explicit lockfile refresh.  The rest of CI always uses `--locked`;
 # this workflow is the only place allowed to regenerate the lock.

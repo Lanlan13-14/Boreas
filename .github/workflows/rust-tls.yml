@@ -1,4 +1,4 @@
-name: Rust OpenSSL hybrid TLS backend
+name: '[Test] OpenSSL hybrid TLS backend (ML-KEM + ML-DSA)'
 
 on:
   workflow_dispatch:
