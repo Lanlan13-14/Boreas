@@ -1481,7 +1481,10 @@ fn encode_oid_der(oid: &str) -> Result<Vec<u8>, EnrollmentError> {
     if arcs.len() < 2
         || arcs[0] > 2
         || (arcs[0] < 2 && arcs[1] > 39)
-        || oid.split('.').zip(&arcs).any(|(text, arc)| text != arc.to_string())
+        || oid
+            .split('.')
+            .zip(&arcs)
+            .any(|(text, arc)| text != arc.to_string())
     {
         return Err(EnrollmentError::InvalidCsrPolicy);
     }
@@ -1516,7 +1519,10 @@ fn encode_oid_der(oid: &str) -> Result<Vec<u8>, EnrollmentError> {
             .position(|byte| *byte != 0)
             .ok_or(EnrollmentError::InvalidCsrPolicy)?;
         let length_bytes = &bytes[first_nonzero..];
-        der.push(0x80 | u8::try_from(length_bytes.len()).map_err(|_| EnrollmentError::InvalidCsrPolicy)?);
+        der.push(
+            0x80 | u8::try_from(length_bytes.len())
+                .map_err(|_| EnrollmentError::InvalidCsrPolicy)?,
+        );
         der.extend_from_slice(length_bytes);
     }
     der.extend_from_slice(&content);
@@ -2095,7 +2101,9 @@ mod tests {
     fn oid_der_encoding_matches_asn1_rules() {
         assert_eq!(
             encode_oid_der("1.3.6.1.4.1.55555.1.1").unwrap(),
-            vec![0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xb2, 0x03, 0x01, 0x01]
+            vec![
+                0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xb2, 0x03, 0x01, 0x01
+            ]
         );
         assert_eq!(
             encode_oid_der("2.999.3").unwrap(),
