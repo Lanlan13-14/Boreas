@@ -356,18 +356,16 @@ impl<S: Read + Write> EstablishedStream<S> {
         self.stream.ssl_write(buf).map_err(map_tls_io_error)
     }
 
-    /// Send TLS `close_notify` and return the inner transport.
+    /// Send TLS `close_notify` and return the TLS stream with its transport.
     ///
-    /// Used by the E2E circuit owner to shut the record layer down before the
-    /// circuit itself is closed, so the peer sees a clean end of the byte
-    /// stream instead of a truncated TLS record. The shutdown result is
-    /// deliberately ignored: a peer that already went away still leaves a
-    /// usable inner transport, and the caller decides what the transport's own
-    /// close means.
-    pub fn shutdown_quiet_and_into_inner(self) -> S {
-        let (mut raw, _, _) = self.into_parts();
-        let _ = raw.shutdown();
-        raw.into_inner()
+    /// OpenSSL keeps ownership of the transport inside `SslStream`, so this
+    /// cannot extract the inner transport. The shutdown result is deliberately
+    /// ignored: a peer that already went away still leaves the stream available
+    /// for the caller to finish draining any queued ciphertext.
+    pub fn shutdown_quiet(self) -> SslStream<S> {
+        let (mut stream, _, _) = self.into_parts();
+        let _ = stream.shutdown();
+        stream
     }
 }
 
