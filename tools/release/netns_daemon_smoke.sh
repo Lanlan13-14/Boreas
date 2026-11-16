@@ -98,6 +98,40 @@ report_startup_timings() {
   echo 'startup_timing_threshold=none-asserted'
 }
 
+# --- Opt-in daemon handshake stage diagnostics -------------------------------
+# The binary emits fixed-format, non-secret stderr lines
+#   boreas-diagnostic-timing phase=<static-label> elapsed_us=<digits>
+# only when BOREAS_DIAGNOSTIC_TIMING=1 (the controlled diagnostic job sets it).
+# On success the harness never prints `core.err`/`edge.err`, so without this
+# filter those stage lines would stay invisible. Only lines with one of the
+# static phase labels and a bounded decimal duration are copied to stdout,
+# prefixed with the static node label. This filtered copy discards every other
+# stderr line (errors, paths, key material) and every unknown phase or malformed
+# value; the existing failure path is unchanged and may still print raw daemon
+# logs. This is collection only: it does not gate, retry or extend any wait, and
+# emits nothing unless the exact opt-in value is present.
+DIAGNOSTIC_TIMING_PHASES='outer_tls|ws_handshake|inner_tls|session_handshake|confirmation|circuit_open|e2e_tls|circuit_accept|e2e_tls_accept'
+DIAGNOSTIC_TIMING_PATTERN='^boreas-diagnostic-timing phase=('"$DIAGNOSTIC_TIMING_PHASES"') elapsed_us=[0-9]{1,20}$'
+DIAGNOSTIC_TIMING_REPORTED=0
+
+report_diagnostic_timing() {
+  if (( DIAGNOSTIC_TIMING_REPORTED )) || [[ "${BOREAS_DIAGNOSTIC_TIMING:-}" != 1 ]]; then
+    return 0
+  fi
+  DIAGNOSTIC_TIMING_REPORTED=1
+  local node log line
+  for node in core edge; do
+    log="$WORK/$node.err"
+    [[ -f "$log" ]] || continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ $DIAGNOSTIC_TIMING_PATTERN ]]; then
+        printf '%s %s\n' "$node" "$line"
+      fi
+    done < "$log"
+  done
+  return 0
+}
+
 FAILURES=()
 record_failure() {
   FAILURES+=("$1")
@@ -125,6 +159,7 @@ report_daemon_state() {
 report_failure_evidence() {
   local log
   echo "--- failure evidence ---" >&2
+  report_diagnostic_timing
   report_daemon_state
   for log in "$WORK/ping.log" "$WORK"/perf-*.log; do
     if [[ -s "$log" ]]; then
@@ -463,6 +498,9 @@ cleanup() {
   fi
   if (( CORE_NS_CREATED )); then ip netns del "$CORE_NS" 2>/dev/null || true; fi
   if (( EDGE_NS_CREATED )); then ip netns del "$EDGE_NS" 2>/dev/null || true; fi
+  # Safety net for exits before the explicit reports below: the guarded filter
+  # never duplicates lines and reads the daemon logs only while WORK still exists.
+  report_diagnostic_timing
   rm -rf -- "$WORK"
 }
 trap cleanup EXIT
@@ -717,6 +755,7 @@ probe_ctl_state connected_result core "$CORE_STATE/control.sock"
 probe_ctl_state connected_result edge "$EDGE_STATE/control.sock"
 report_startup_timings
 if [[ "$CONNECTED" -ne 1 ]]; then
+  report_diagnostic_timing
   echo "ERROR: Edge daemon never reached connected state" >&2
   report_failure_evidence
   exit 1
@@ -934,5 +973,6 @@ if (( ${#FAILURES[@]} > 0 )); then
   report_failure_evidence
   exit 1
 fi
+report_diagnostic_timing
 run_hook verify
 echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"

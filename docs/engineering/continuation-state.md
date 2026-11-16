@@ -1,6 +1,13 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-17 round 19
+## Current handoff — 2026-11-17 round 20
+
+- CurrentHEAD3f1195f(durable-storeextra tests, localnotpushed) ontopab1020a(Actionstunnelruntimefmt), d6ddb19pushedbase. d6ddb19 Rust43969887681/TUN43969886965/OpenWrt43969886981/platform43969886959SUCCESS; TLS43969887087runningatlastsample,security43969886968runningblockedexpected. Don'tcancelbackendunnecessarily; collectterminalbeforepushbatch.
+- Store3f1195f addsactual0644unsafe-statefixture restore0600,sym/hardlink/stagingrefusal,duplicatebyteidentity,persistfailurePoisoned,restartFrozenhigherseq. Noimplementationchanges. Testsnotexecutedyet, cannotclaimnewnegativespassed.
+- Activewriters: candidate-save-impl20 Luna config.rs/main.rs(notui) actualCLIconfig-save-candidate exactSAVE/privatecreateonlymanageduserdir Linuxopenat. Parentcaughtliteral\\nserializerbug,unsafeincompletefsync/cleanup,TTYwithconfirmrefusedunnecessarily; requestedtestsusingrootparameterhelper(noenvmutation). Do notcommitdraftuntilcorrectandreadactualdiff.
+- timing-ci-enable20 DeepSeek performance.yml+smoke.sh outputsfilteredfixedlabels+integers only with optin env1, bothsuccess/failure; workflowsourcevalidatedbinarymustcontainnewtimers. Defaultgatesunchanged. Alltests/syntax/build/formattersActions-only.
+
+## Previous checkpoint — 2026-11-17 round 19
 
 - PushedHEAD0007d30593d7c8af69c5605c74042398c2b525c0: recovered network_policy_store.rs481lines + libexport + VerifiedNetworkPolicy exactrawobject_hash/matches_raw. Parentreviewedallsource, backedup.local/network_policy_store-recovered-round18.rs before repair; changedtesthelperversion→lifetime so same-seqexpires1vs2 validdualverifiedrawconflict, nonLinuxunusedfields/importcfg, LinuxCLOEXECflags. NoCLI/daemon/prefixenablement. CandidateawaitsActions, notdurabilityacceptance. Separate read-onlyreview foundnoconcretebug but didnotreviewhashbinding; notsecurityproof.
 - Store drafttwiceaccidentallyoverwrittenbychildren(emptywrite)beforecommit, recoveredfromauthor/readtranscript, parentbackedup+reviewed; noactivechildmaytouchstore. Recordswatermarknotauthority; open_with_expected externalpriorseq/hash neededfordeletiondetection; full-diskrollbacknonclaim. Testscoverrestartrollback/equivocationfreeze/lockbusy/prefix/rawmismatch/expectedmissing/alltruncations; stillneedactualCI/faultinjection.

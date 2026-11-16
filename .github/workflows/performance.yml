@@ -191,6 +191,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      # Controlled opt-in for this diagnostic job only: the smoke then echoes the
+      # binary's fixed-format handshake stage lines to stdout. The strict netem
+      # and routing gates below never set it, and no threshold changes.
+      BOREAS_DIAGNOSTIC_TIMING: '1'
     steps:
       - uses: actions/checkout@v7
         with:
