@@ -2,6 +2,16 @@ name: '[Test] Secure deployment scripts (POSIX, systemd, procd)'
 
 on:
   workflow_dispatch:
+    inputs:
+      run_real_install:
+        description: Run real static-artifact installation integration (main only)
+        type: boolean
+        default: false
+        required: true
+      source_run_id:
+        description: Successful main-branch rust-tls run containing a static candidate
+        type: string
+        required: false
   push:
     paths:
       - 'tools/deploy/**'
@@ -15,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -57,5 +68,66 @@ jobs:
         with:
           name: deploy-regressions-${{ github.run_id }}
           path: deploy-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  real-static-install:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_real_install
+    name: Real static candidate install (private sandbox, no service)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate trusted backend artifact source
+        id: source
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.source_run_id }}
+        shell: python
+        run: |
+          import json, os, re, urllib.request
+          repo, run_id = os.environ['REPO'], os.environ['RUN_ID']
+          if not re.fullmatch(r'[1-9][0-9]{0,19}', run_id):
+              raise SystemExit('A backend source_run_id is required')
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          run = get('/actions/runs/' + run_id)
+          workflow = get('/actions/workflows/' + str(run['workflow_id']))
+          if not (run['repository']['full_name'] == repo and run['head_repository']['full_name'] == repo
+                  and run['head_branch'] == 'main' and run['event'] in ('push', 'workflow_dispatch')
+                  and run['status'] == 'completed' and run['conclusion'] == 'success'
+                  and workflow['path'] == '.github/workflows/rust-tls.yml'
+                  and re.fullmatch(r'[0-9a-f]{40}', run['head_sha'])):
+              raise SystemExit('Refusing untrusted or unsuccessful artifact source')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('run=' + run_id + '\n')
+          print('binary_source_sha=' + run['head_sha'] + ' source_run=' + run_id)
+      - uses: actions/download-artifact@v8
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ steps.source.outputs.run }}
+          run-id: ${{ steps.source.outputs.run }}
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Validate artifact and run real production installer in sandbox
+        run: |
+          set -euo pipefail
+          (cd artifact && sha256sum --check --strict SHA256SUMS)
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y binutils
+          chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
+          sh -n tools/deploy/test-real-install.sh
+          sh tools/deploy/test-real-install.sh "$PWD/artifact/boreas-linux-x86_64-musl-pq768" 2>&1 | tee deploy-real-install.log
+      - name: Preserve real installation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-install-${{ github.run_id }}
+          path: deploy-real-install.log
           if-no-files-found: warn
           retention-days: 14
