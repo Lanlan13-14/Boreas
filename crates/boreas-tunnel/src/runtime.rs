@@ -103,7 +103,11 @@ impl LinkClient {
 
     /// Establish only the TCP transport. Errors returned here are strictly
     /// pre-TLS and pre-authentication; callers may safely classify dial failures.
-    pub fn connect_tcp(&self, target: &ClientTarget, io_timeout: Duration) -> io::Result<TcpStream> {
+    pub fn connect_tcp(
+        &self,
+        target: &ClientTarget,
+        io_timeout: Duration,
+    ) -> io::Result<TcpStream> {
         TcpStream::connect_timeout(&target.address, io_timeout)
     }
 
