@@ -74,5 +74,52 @@ if sudo sh "$DEPLOY/install.sh" --binary "$T/conflict" --sha256 "$CH" --release 
 fi
 grep -q 'already exists with a different bundle' "$BAD"
 [ "$(sudo sed -n '1p' "$P/active")" = "$REL" ]
-[ ! -e /etc/systemd/system/boreas.service ] || { echo 'unexpected systemd unit on host' >&2; exit 1; }
+# Negative prefix-security gates on the real install path. Every input except
+# --prefix is the same valid set used above; --service none means no service
+# manager runs and /etc is not written. Snapshot the genuine successful install
+# so each refusal must leave the pointer and active binary byte-identical.
+GOOD_INSTALL=$(sudo sha256sum -- "$P/active" "$P/releases/$ACTIVE/boreas")
+expect_unsafe_prefix_rejected() { # $1=prefix, $2=exact production error line
+  if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$HASH" --release "$REL" \
+      --materials "$CORE" --config "$T/config.toml" --prefix "$1" --bindir "$B" --service none >"$BAD" 2>&1; then
+    echo "installer accepted unsafe --prefix: $1" >&2; exit 1
+  fi
+  # Whole-line, case-sensitive production message: an earlier unrelated failure
+  # must not satisfy the gate.
+  grep -Fqx -- "$2" "$BAD" || {
+    echo "installer refused unsafe --prefix for an unexpected reason: $1" >&2
+    sed -n '1,80p' "$BAD" >&2
+    exit 1
+  }
+  [ "$(sudo sha256sum -- "$P/active" "$P/releases/$ACTIVE/boreas")" = "$GOOD_INSTALL" ] || {
+    echo "existing good installation changed after refusing: $1" >&2; exit 1
+  }
+}
+# Only these fresh children of the root-owned 0700 T are deliberately weakened.
+UNSAFE=$T/unsafe-writable
+sudo mkdir -m 0700 -- "$UNSAFE"
+sudo chmod 0777 -- "$UNSAFE"
+NONROOT=$T/nonroot-owner
+sudo mkdir -m 0700 -- "$NONROOT"
+sudo chown "$(id -u):$(id -g)" -- "$NONROOT"
+sudo ln -s -- "$P" "$T/prefix-symlink"
+expect_unsafe_prefix_rejected "$UNSAFE/prefix" \
+  "install: error: --prefix must not be group/other writable: $UNSAFE"
+# The non-root case is an empty fresh directory; node material ownership and
+# modes (including private keys) are never weakened for the unprivileged user.
+expect_unsafe_prefix_rejected "$NONROOT/prefix" \
+  "install: error: --prefix must be owned by root (uid 0): $NONROOT"
+expect_unsafe_prefix_rejected "$T/prefix-symlink" \
+  "install: error: --prefix must not be a symbolic link: $T/prefix-symlink"
+LEFTOVERS=$(sudo find "$UNSAFE" "$NONROOT" -mindepth 1 -maxdepth 1 -print -quit) || {
+  echo 'cannot verify unsafe prefixes stayed unwritten' >&2; exit 1
+}
+[ -z "$LEFTOVERS" ] || { echo 'installer wrote beneath an unsafe prefix ancestor' >&2; exit 1; }
+# Undo the deliberate 0777 and remove only this run's temporary children; the
+# EXIT trap still removes T itself.
+sudo chmod 0700 -- "$UNSAFE"
+sudo rm -rf -- "$UNSAFE" "$NONROOT"
+sudo rm -f -- "$T/prefix-symlink"
+echo "unsafe --prefix gates passed; existing good install preserved (active $ACTIVE, sha256 $HASH)"
+[ ! -e /etc/systemd/system/boreas.service ] && [ ! -e /etc/init.d/boreas ] || { echo 'unexpected service unit on host' >&2; exit 1; }
 echo 'real installer integration passed (development candidate; no service start)'

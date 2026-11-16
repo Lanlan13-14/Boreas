@@ -148,3 +148,16 @@ BusyBox 限制（如实）：wrapper 只用 POSIX shell 内建 + `ip`、`grep`�
 - 该测试源**本次未在本机执行**，需要在隔离 Linux runner 上接线并保存日志；由部署 CI 工作流接线并在隔离 runner 执行；必须以 CI 日志为准，不能把新增断言等同于已通过。
 - 真实 x86_64/aarch64 Linux 与 OpenWrt 设备上的 TUN 数据面、配置、服务启停、管理/SSH/Core endpoint 路由保护、升级指针原子性与故障恢复（崩溃/SIGKILL/断电/磁盘满）仍需实测。
 - 没有签名信任链、没有自动回滚、没有 procd 真机验证、没有 BusyBox `ip` 验证。
+
+### 真实安装 harness（`test-real-install.sh`，非生产）
+
+**范围**：只覆盖 `.github/workflows/deploy.yml` 的 `real-static-install` 手动任务：在 GitHub 托管 `ubuntu-24.04` runner 上，从一次成功的 main 分支 `rust-tls.yml` 运行下载静态候选制品（先校验 `SHA256SUMS`），由 root 在 `/var/cache` 下新建 `0700` 临时前缀，以 `--service none` 调用真实 `install.sh` 安装一次，再执行拒绝用例。**不覆盖** systemd/procd 真机、TUN 数据面、物理 OpenWrt、真实生产主机或升级回滚。
+
+覆盖内容：
+
+- 正向：SHA-256、静态 ELF、文本 `active` 指针、活动 release 二进制摘要、`doctor`、dispatcher 链接。
+- 摘要错误、同一 release 不同 bundle：拒绝且 `active` 不变。
+- 不安全 `--prefix`（只使用本次运行在 root `0700` 临时树下新建的子目录）：故意 `0777` 的可写祖先、由非 root runner 拥有的目录、指向现有安装的符号链接。三者必须分别命中生产安装器的原文错误 `--prefix must not be group/other writable`、`--prefix must be owned by root (uid 0)`、`--prefix must not be a symbolic link`；断言匹配完整错误行（含 `install: error:` 与具体路径）且区分大小写，防止更早的无关错误冒充门禁通过。
+- 拒绝发生在写入前：三个用例后活动指针与活动二进制逐字节不变，两个不安全前缀下没有生成目录；测试以 `--service none` 运行，不启动服务、不写 `/etc`；非 root 用例使用新的空目录，不修改节点材料或私钥的属主/权限。
+
+**已知结果（非生产证据）**：手动运行 [`43895104195`](https://github.com/Lanlan13-14/Boreas/actions/runs/43895104195) 的 `Real static candidate install (private sandbox, no service)` job [`133396409062`](https://github.com/Lanlan13-14/Boreas/actions/runs/43895104195/job/133396409062) 在 harness/installer `5a51a1c` 上成功；所用静态候选来自 `rust-tls.yml` 运行 [`43886308602`](https://github.com/Lanlan13-14/Boreas/actions/runs/43886308602)，源提交 `91acf0c`。这只是一次性 GitHub 托管 Ubuntu runner 的结果，不是 systemd/procd 真机、物理 OpenWrt 或生产部署验收；且该次运行早于上述新增的不安全 `--prefix` 用例，新增门禁仍需新的 Actions 运行和日志确认，不能把断言本身视为已通过。
