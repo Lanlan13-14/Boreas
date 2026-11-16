@@ -1,5 +1,23 @@
 # P04/P05 双节点 NodeRuntime 纵切合同
 
+## 实际下一 slice：接入 supervisor ready-client（CI pending）
+
+**范围：仅 Linux `daemon serve` 首个可用 readiness 汇报；本 slice 不改 Rust。** CI 仍 pending，不能声称 API 已接入或已验证。依据：`daemon.rs` 在 `run_mode` 中已先验证 config/roots/material、创建真实 TUN（或显式 `--virtual-tun`）、启动 `state_dir/control.sock`；`run_serve_loop` 随后解析并 bind TCP listener、设为 nonblocking，再等待连接、做 TLS/WSS/hop/E2E。`ready_client::report_ready(path, schema, workers, tun)` 只把调用者提供的三个值作为断言，经 supervisor Unix socket challenge-response 写出；源码明确不证明 artifact identity/facts。API Linux 验证 supervisor 同 UID、socket UID/type/mode 0600、challenge/nonce 格式及 bounded exchange；非 Linux 返回 `Unsupported`。nonce 仅防协议重放/配对，不是 artifact proof。
+
+### 最小可实现运行路径
+
+1. supervisor 在启动 daemon 时传入 readiness socket 的**唯一来源**：例如专用 `--ready-socket <PATH>`（优先于环境变量，避免环境继承歧义）；若部署只支持环境，则约定 `BOREAS_READY_SOCKET`，缺失/空值视为该次受管启动配置错误。此路径仅定位 socket，不得从它推导 readiness 值。daemon 原有 `--config`、`--material-dir`、serve 必需 `--listen` 保持原样；不添加可任意指定 schema/workers/TUN status 的 CLI 参数。
+2. daemon 完成既有 trust/config 检查、实际创建 TUN、成功启动 `control.sock`，并在 `run_serve_loop` 成功 `TcpListener::bind` + nonblocking 设置之后，调用一次 `report_ready`；此处是 listener 真正可接受连接的点、但尚未阻塞等待 peer。只在 `serve` 走此调用；`connect` 的 ready 时机需另行定义，不伪称本 slice 覆盖。`TunStatus::Ready` 仅在真实 `LinuxTunDevice` 成功创建时报告；显式 `--virtual-tun` 必须拒绝该 production-ready 路径（或未来使用 supervisor 明确接受的不同策略），不能把 VirtualTun 报为 Ready。control socket 只有创建、权限设置及 listener thread spawn 全成功才可继续。
+3. `schema` 不来自 daemon CLI/env。由 daemon 侧编译常量/固定版本映射（与实际 state writer/schema 实现绑定），supervisor 对同一 daemon rollout 配置自己的精确 expected schema；未知版本 fail closed。现在 `daemon.rs` 的 `ctl.status` JSON 字段不是此 API 的 state-schema 证明，不能凭 JSON 临时猜 schema。若部署尚无真实 schema 常量/写入实现，则先不发 ready，或把集成保持关闭，不能用可由任意调用者选择的字符串冒充。
+4. `workers` 使用代码中实际已启动且由 runtime 管理的线程数，并在 supervisor 侧按该固定运行拓扑配置 expected count；不得接受用户任意 `--workers`。当前此 readiness 点已有 control-socket accept thread；serve 的 packet loop 在主线程，StatusWatchdog 要到连接/E2E 成功进入 `drive_packet_path` 才启动。因此最小合同可把 workers 定义为“启动 readiness 时 daemon-owned background worker 数”，报告实际计数 1；若要把 watchdog 算入，必须把 readiness 点移到 watchdog 启动之后并相应改变“listenerready”时序/监督语义。不要将系统总线程数当成稳定指标。
+5. supervisor 的 expected 值独立于 daemon 报告：由 supervisor 自己的受控 unit/launch 配置固定 socket path、允许的 schema 值、worker count 和所需 TUN 状态；部署 rollout 同步更新 schema allowlist。API 参数来自 daemon 的可信执行路径/已建资源状态，不是接受外部输入的“事实”。监督端仍须把响应与受信任的启动记录关联；challenge nonce 不绑定二进制、发布签名或 hash，不能称为 artifact attestation。
+
+### 失败与平台合同
+
+上述任何 prerequisites、socket 定位/权限/peer credential、challenge、写回、schema/worker 本地不变量、bind/listener 或 TUN/control 初始化失败：启动返回错误并退出非零；不得继续 accept/forward，也不得输出 ready。report_ready 失败是 fail-closed startup failure，而不是 warning/retry 后假 ready。`--virtual-tun` 只用于明确的非 production 测试，supervisor 不应将它接纳为 real-TUN ready。无 `openssl-inner-tls` 的现有 fail-closed 行为保留。非 Linux 的 daemon 既有 Unsupported 错误保留；ready-client 自身也返回 `ReadyClientError::Unsupported`，不降级成跳过上报或成功。当前 client connect 本身没有可移植连接超时保证，不能宣称整个交换严格有总时限。
+
+**实现顺序建议：**先确定并由 supervisor 固定 schema + worker 语义/期望值，再将依赖接入 CLI 的 ready-client 调用放在真实 listener bind 成功之后；任何尚未能由 runtime 资源/编译身份决定的字段都暂不报告。此建议避免任意 schema CLI、假 TUN-ready 和“随机 nonce = artifact proof”。
+
 状态：历史设计基线（保留当时规划/缺口描述；不应视为当前实现清单）。当前 `crates/boreas-cli/src/daemon.rs` 已包含 Linux daemon 的 TCP→TLS/WSS→pq768 hop session→pq768 E2E→PacketPath 纵切；本次窄增量仅在初始 TCP 阶段允许 primary 被明确拒绝/超时后尝试配置 backup。两个端点共享已验证的单一 `peer.signed` / `remote_peer`，每个 endpoint 分别派生 TLS name 与 WS Host；显式 `--connect` 禁用隐式 backup，显式 `--tls-name` / `--ws-host` 继续覆盖。握手、身份/session、E2E、状态或任何非 TCP refused/timeout 失败均不 fallback；不会重连，不支持不同 Core 身份。若 backup 指向不同 Core，同身份验证将失败并停止。该行为不是多 Core、高可用/漫游或生产可部署声明。本文后续章节的历史缺口需结合代码复核；未完成的持久信任/业务 gate/生命周期/路由/确认等生产边界仍然成立。DNS解析沿用现有阻塞实现，不承诺严格总截止时间。
 
 ## 1. 安全成功条件

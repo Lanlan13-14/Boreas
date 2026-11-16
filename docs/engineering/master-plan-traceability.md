@@ -26,6 +26,12 @@
 审查时(2026-11-16)本地 HEAD 为 `6799a13`,当时 origin/main 为 `4f70b04`;此后资源采样器已 push 为 `b6ead95`。所有编译/测试/格式化仅在 Actions;
 本追溯**未读遍全部 source**,无法由现有状态判定的项一律标“未复核”。
 
+## 后续精确证据更新（不关闭门禁）
+
+- `13428c3`：Rust [43895908057](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908057)、TLS [43895908026](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908026)、OpenWrt [43895908751](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908751)、TUN [43895908252](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908252) 成功，覆盖修复后的候选字节解析、端点预览与签名 VIP 查询桥；平台包被取消，不算通过。原生安全门仍失败。
+- 真实安装与新增权限负例：[43897688166 / job 133405608424](https://github.com/Lanlan13-14/Boreas/actions/runs/43897688166/job/133405608424) 成功。harness/installer 来源 `ac752d9`，被安装二进制来自后端 `43886308602`、source `91acf0c`。可写祖先、非 root 祖先、符号链接前缀均被拒，现有 active 与二进制保持不变。仅一次性 Ubuntu runner、`--service none`；不是 systemd/procd 真机、物理 OpenWrt 或发布验收。
+- `8424b84` 的共享就绪客户端与候选策略双签尚在精确 Actions 验收中，不得复用上述绿色结果。候选策略即使验签成功也未接入材料包/持久防回滚/运行时，自定义前缀仍拒绝。
+
 ## 24 门禁逐行映射
 
 | 门禁 | Phase(计划行) | 已有实现入口(集成状态未复核) | 精确证据(来源 SHA → run) | 剩余 runtime / 外部验收 |
