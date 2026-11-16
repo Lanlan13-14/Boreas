@@ -768,4 +768,82 @@ mod tests {
         assert!(decode(&bytes).is_ok());
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn disk_link_permission_and_staging_paths_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (pin, ed, pq) = keys();
+
+        let (dir, path) = temp();
+        fs::write(dir.join("target"), b"not a state").unwrap();
+        symlink(dir.join("target"), &path).unwrap();
+        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        fs::remove_dir_all(dir).unwrap();
+
+        let (dir, path) = temp();
+        fs::write(dir.join("target"), b"not a state").unwrap();
+        fs::hard_link(dir.join("target"), &path).unwrap();
+        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        fs::remove_dir_all(dir).unwrap();
+
+        let (dir, path) = temp();
+        let (raw, token) = signed(&pin, &ed, &pq, 1, 10, [10, 20, 0, 0], 1);
+        let state_bytes = encode(&State {
+            record: Some(Record {
+                net: [7; 16],
+                root: token.root_key_fingerprint(),
+                prefix: token.overlay_base(),
+                seq: token.seq(),
+                issued: token.validity().0,
+                object_hash: sha256(&raw).unwrap(),
+                raw_tbs: raw,
+            }),
+            frozen: false,
+            conflict_hash: None,
+        })
+        .unwrap();
+        fs::write(&path, &state_bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        assert_eq!(fs::read(&path).unwrap(), state_bytes);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        let (dir, path) = temp();
+        fs::write(suffix(&path, ".staging"), b"leftover staging").unwrap();
+        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_failure_poisons_and_restart_freeze_rejects_higher_sequence() {
+        let (dir, path) = temp();
+        let (pin, ed, pq) = keys();
+        let (first, first_token) = signed(&pin, &ed, &pq, 4, 10, [10, 20, 0, 0], 1);
+        let (conflict, conflict_token) = signed(&pin, &ed, &pq, 4, 10, [10, 20, 0, 0], 2);
+        let (higher, higher_token) = signed(&pin, &ed, &pq, 5, 11, [10, 20, 0, 0], 1);
+        let mut store = open(&path, &dir, &pin);
+        store.commit(&first_token, &first).unwrap();
+        let durable_before_duplicate = fs::read(&path).unwrap();
+        assert_eq!(store.commit(&first_token, &first).unwrap(), CommitResult::Duplicate);
+        assert_eq!(fs::read(&path).unwrap(), durable_before_duplicate);
+
+        // Introduce the existing staging artifact only after open; persist fails before
+        // touching it, and commit_or_poison must prevent any further mutation.
+        fs::write(suffix(&path, ".staging"), b"fixture").unwrap();
+        assert!(matches!(store.commit(&conflict_token, &conflict), Err(Error::UnsafePath)));
+        assert!(matches!(store.commit(&higher_token, &higher), Err(Error::Poisoned)));
+        drop(store);
+        fs::remove_file(suffix(&path, ".staging")).unwrap();
+
+        let mut store = open(&path, &dir, &pin);
+        assert!(matches!(store.commit(&conflict_token, &conflict), Err(Error::Equivocation)));
+        drop(store);
+        let mut restarted = open(&path, &dir, &pin);
+        assert!(restarted.is_frozen());
+        assert!(matches!(restarted.commit(&higher_token, &higher), Err(Error::Frozen)));
+        drop(restarted);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
