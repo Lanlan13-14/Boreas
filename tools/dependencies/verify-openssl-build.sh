@@ -79,8 +79,20 @@ if grep -Fxq 'cms' <<<"$commands_output"; then
 fi
 client_options_output="$("$bin" list -options s_client)"
 record 'openssl list -options s_client' "$client_options_output"
-if grep -Eq '^quic([[:space:]]|$)' <<<"$client_options_output"; then
-    echo 's_client -quic remains registered despite no-quic' >&2
+# OpenSSL 4.1.0 apps/s_client.c registers -quic unconditionally; only the
+# OPT_QUIC implementation is guarded by OPENSSL_NO_QUIC. CLI option presence
+# therefore cannot prove implementation presence. Inspect the linked static
+# library definitions instead, alongside the header/configdata checks above.
+ssl_archives=("${prefix}"/lib/libssl.a "${prefix}"/lib64/libssl.a)
+ssl_archive=
+for candidate in "${ssl_archives[@]}"; do
+    if [[ -f "$candidate" ]]; then ssl_archive=$candidate; break; fi
+done
+[[ -n "$ssl_archive" ]] || { echo 'static libssl archive not found' >&2; exit 1; }
+ssl_symbols="$(nm --defined-only "$ssl_archive")"
+record 'libssl.a defined symbols (QUIC method implementations must be absent)' "$ssl_symbols"
+if grep -Eq '[[:space:]][TtWw][[:space:]]+OSSL_QUIC_(client|server)_method$' <<<"$ssl_symbols"; then
+    echo 'QUIC method implementation remains defined despite no-quic' >&2
     exit 1
 fi
 ciphers_output="$("$bin" list -cipher-algorithms)"
