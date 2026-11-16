@@ -355,6 +355,405 @@ jobs:
           PY
           sudo -E bash "$variant_dir/netns_daemon_smoke.sh" hop-node-linux/boreas \
             2>&1 | tee rust-tls-initial-backup.log
+      - name: 'Negative: initial outer-TLS rejection must fail closed (backup untouched)'
+        # Negative counterpart of the step above. The configured primary endpoint
+        # accepts TCP and then answers the outer TLS handshake with bytes that are
+        # not a TLS record; a genuinely usable backup is configured at the same
+        # time (the real core daemon, reached through a counting TCP proxy). The
+        # edge daemon must exit nonzero and must never dial the backup.
+        #
+        # The observation is not message matching:
+        #   * primary mock accepted >= 1 TCP connection -> the primary was reachable
+        #   * edge daemon exit status 2                 -> the product failed closed
+        #   * backup proxy accepted connections == 0    -> the backup was never dialed
+        #   * core `ctl status` inbound_connections==0  -> no backup session existed
+        #   * a post-negative control connect through the same backup proxy succeeds
+        #     (status ok) and moves that counter to exactly 1, which proves the zero
+        #     above is a real "not used" and the backup really was usable.
+        #
+        # This harness is deliberately independent of the netns smoke: the smoke's
+        # single success path cannot be turned into an expected-failure run by
+        # strict `replace count == 1` edits, and no Rust, smoke or perf file is
+        # touched here. `--virtual-tun` is used because the failure happens before
+        # any business traffic; the positive smoke above still covers the real
+        # netns/TUN path.
+        if: success()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a rust-tls-initial-backup-negative.log) 2>&1
+
+          BIN="$PWD/hop-node-linux/boreas"
+          test -x "$BIN"
+
+          NEG_ROOT="$(mktemp -d "$RUNNER_TEMP/initial-backup-negative.XXXXXX")"
+          NEG="$NEG_ROOT/work"
+          mkdir -p "$NEG"
+
+          PRIMARY_PORT=18445
+          BACKUP_PORT=18446
+          CORE_PORT=18447
+          cleanup() {
+            set +e
+            # Only signal live child jobs, never stale PIDs recorded earlier.
+            for pid in $(jobs -pr); do
+              kill -KILL "$pid" 2>/dev/null || true
+            done
+            wait 2>/dev/null || true
+            rm -rf -- "$NEG_ROOT"
+          }
+          trap cleanup EXIT
+
+          for port in "$PRIMARY_PORT" "$BACKUP_PORT" "$CORE_PORT"; do
+            if ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+              echo "ERROR: TCP port $port is already in use" >&2
+              exit 1
+            fi
+          done
+
+          # Fresh PKI with the same provisioning commands as the netns smoke.
+          # Node certificates use an explicit 12 h lifetime so the leaf notAfter
+          # can never race past the 30-day issuer notAfter computed a moment
+          # earlier (issue-node defaults to 720 h, i.e. the whole CA span).
+          "$BIN" pki init-ca \
+            --ca-dir "$NEG/ca" \
+            --net-id "0123456789abcdef0123456789abcdef" \
+            --validity-days 30
+          "$BIN" pki issue-node \
+            --ca-dir "$NEG/ca" --out-dir "$NEG/core-mat" \
+            --role core --home-core 1 --vip-octet 1 --validity-hours 12 \
+            --outer-san "wss.boreas.test"
+          "$BIN" pki issue-node \
+            --ca-dir "$NEG/ca" --out-dir "$NEG/edge-mat" \
+            --role edge --home-core 1 --vip-octet 2 --validity-hours 12
+          cp "$NEG/core-mat/local.signed" "$NEG/edge-mat/peer.signed"
+          cp "$NEG/edge-mat/local.signed" "$NEG/core-mat/peer.signed"
+          "$BIN" pki verify-bundle --material-dir "$NEG/core-mat" --require-peer
+          "$BIN" pki verify-bundle --material-dir "$NEG/edge-mat" --require-peer
+
+          CORE_STATE="$NEG/core-state"
+          EDGE_STATE="$NEG/edge-state"
+          CONTROL_STATE="$NEG/edge-control-state"
+          mkdir -p "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"
+
+          cat > "$NEG/core.toml" <<EOF
+          version = 2
+          [node]
+          net_id = "0123456789abcdef0123456789abcdef"
+          role = "core"
+          home_core_id = 1
+          vip_octet = 1
+          node_id = 1
+          identity_generation = 1
+          security_mode = "e2e-required"
+          suite = "pq768"
+          [paths]
+          identity_key = "$NEG/core-mat/identity.key"
+          roots = ["$NEG/core-mat/roots.cbor"]
+          state_dir = "$CORE_STATE"
+          [uplink]
+          primary = "127.0.0.1:$CORE_PORT"
+          paths = 4
+          probe_paths = 1
+          EOF
+          chmod 0600 "$NEG/core.toml"
+
+          cat > "$NEG/edge.toml" <<EOF
+          version = 2
+          [node]
+          net_id = "0123456789abcdef0123456789abcdef"
+          role = "edge"
+          home_core_id = 1
+          vip_octet = 2
+          node_id = 2
+          identity_generation = 1
+          security_mode = "e2e-required"
+          suite = "pq768"
+          [paths]
+          identity_key = "$NEG/edge-mat/identity.key"
+          roots = ["$NEG/edge-mat/roots.cbor"]
+          state_dir = "$EDGE_STATE"
+          [uplink]
+          primary = "127.0.0.1:$PRIMARY_PORT"
+          backup = "127.0.0.1:$BACKUP_PORT"
+          paths = 4
+          probe_paths = 1
+          EOF
+          chmod 0600 "$NEG/edge.toml"
+
+          # Same identity and material, separate state dir so the control connect
+          # later does not collide with the negative daemon's control socket.
+          cat > "$NEG/edge-control.toml" <<EOF
+          version = 2
+          [node]
+          net_id = "0123456789abcdef0123456789abcdef"
+          role = "edge"
+          home_core_id = 1
+          vip_octet = 2
+          node_id = 2
+          identity_generation = 1
+          security_mode = "e2e-required"
+          suite = "pq768"
+          [paths]
+          identity_key = "$NEG/edge-mat/identity.key"
+          roots = ["$NEG/edge-mat/roots.cbor"]
+          state_dir = "$CONTROL_STATE"
+          [uplink]
+          primary = "127.0.0.1:$BACKUP_PORT"
+          paths = 4
+          probe_paths = 1
+          EOF
+          chmod 0600 "$NEG/edge-control.toml"
+
+          # Mock primary: TCP-connectable, but the first server bytes are not a
+          # TLS record, so the outer handshake is rejected after a successful TCP
+          # connect. Each accepted connection is counted independently of the
+          # daemon's own diagnostics.
+          cat > "$NEG/mock_primary.py" <<'PY'
+          import pathlib
+          import socket
+          import sys
+          import time
+
+          port = int(sys.argv[1])
+          counter = pathlib.Path(sys.argv[2])
+          deadline = time.monotonic() + 120.0
+          server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", port))
+          server.listen(8)
+          server.settimeout(1.0)
+          while time.monotonic() < deadline:
+              try:
+                  conn, _ = server.accept()
+              except socket.timeout:
+                  continue
+              except OSError:
+                  break
+              with counter.open("a", encoding="utf-8") as handle:
+                  handle.write("accept\n")
+                  handle.flush()
+              try:
+                  conn.settimeout(5.0)
+                  try:
+                      conn.recv(4096)  # consume the ClientHello; the failure is after TCP
+                  except OSError:
+                      pass
+                  conn.sendall(b"NOT-A-TLS-RECORD\r\n")
+                  conn.shutdown(socket.SHUT_WR)
+                  time.sleep(0.2)
+              except OSError:
+                  pass
+              finally:
+                  conn.close()
+          PY
+
+          # Backup endpoint: a transparent byte proxy in front of the real core
+          # daemon. It counts every accepted connection, so a fallback to the
+          # configured backup is observable at the network level even if it never
+          # reaches a session.
+          cat > "$NEG/counting_proxy.py" <<'PY'
+          import pathlib
+          import select
+          import socket
+          import sys
+          import threading
+          import time
+
+          listen_port = int(sys.argv[1])
+          upstream_port = int(sys.argv[2])
+          counter = pathlib.Path(sys.argv[3])
+
+          def pump(conn):
+              with counter.open("a", encoding="utf-8") as handle:
+                  handle.write("accept\n")
+                  handle.flush()
+              try:
+                  upstream = socket.create_connection(("127.0.0.1", upstream_port), timeout=5.0)
+              except OSError:
+                  conn.close()
+                  return
+              # Bounded: a stalled peer can never block this thread forever.
+              conn.settimeout(30.0)
+              upstream.settimeout(30.0)
+              try:
+                  while True:
+                      readable, _, _ = select.select([conn, upstream], [], [], 30.0)
+                      if not readable:
+                          return
+                      for source in readable:
+                          data = source.recv(65536)
+                          if not data:
+                              return
+                          (upstream if source is conn else conn).sendall(data)
+              except OSError:
+                  return
+              finally:
+                  conn.close()
+                  upstream.close()
+
+          server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", listen_port))
+          server.listen(8)
+          server.settimeout(1.0)
+          deadline = time.monotonic() + 300.0
+          while time.monotonic() < deadline:
+              try:
+                  conn, _ = server.accept()
+              except socket.timeout:
+                  continue
+              except OSError:
+                  break
+              threading.Thread(target=pump, args=(conn,), daemon=True).start()
+          PY
+
+          python3 "$NEG/mock_primary.py" "$PRIMARY_PORT" "$NEG/primary-accepts.log" \
+            > "$NEG/mock-primary.out" 2>&1 &
+          python3 "$NEG/counting_proxy.py" "$BACKUP_PORT" "$CORE_PORT" "$NEG/backup-accepts.log" \
+            > "$NEG/proxy.out" 2>&1 &
+
+          # The backup itself is the real core daemon (usable by construction).
+          "$BIN" daemon serve \
+            --config "$NEG/core.toml" \
+            --material-dir "$NEG/core-mat" \
+            --listen "127.0.0.1:$CORE_PORT" \
+            --virtual-tun \
+            --max-seconds 120 \
+            > "$NEG/core.out" 2> "$NEG/core.err" &
+
+          LISTENING=0
+          for _ in $(seq 1 200); do
+            if ss -ltn "sport = :$PRIMARY_PORT" 2>/dev/null | grep -q LISTEN \
+               && ss -ltn "sport = :$BACKUP_PORT" 2>/dev/null | grep -q LISTEN \
+               && ss -ltn "sport = :$CORE_PORT" 2>/dev/null | grep -q LISTEN; then
+              LISTENING=1
+              break
+            fi
+            sleep 0.05
+          done
+          if (( LISTENING != 1 )); then
+            echo 'ERROR: primary mock, backup proxy or core listener never came up' >&2
+            cat "$NEG/core.err" >&2 || true
+            exit 1
+          fi
+          for _ in $(seq 1 100); do
+            if "$BIN" ctl status --socket "$CORE_STATE/control.sock" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.05
+          done
+
+          # No `--connect` override: initial endpoint selection must use the
+          # configured `[uplink]` primary + backup exactly like the positive step.
+          set +e
+          "$BIN" daemon connect \
+            --config "$NEG/edge.toml" \
+            --material-dir "$NEG/edge-mat" \
+            --tls-name "wss.boreas.test" \
+            --ws-host "wss.boreas.test:$PRIMARY_PORT" \
+            --virtual-tun \
+            --max-seconds 10 \
+            > "$NEG/negative.out" 2> "$NEG/negative.err"
+          NEG_RC=$?
+          set -e
+
+          count_accepts() {
+            local file="$1"
+            if [[ -f "$file" ]]; then
+              grep -c '^accept$' "$file" || true
+            else
+              echo 0
+            fi
+          }
+
+          PRIMARY_ACCEPTS=0
+          for _ in $(seq 1 40); do
+            PRIMARY_ACCEPTS="$(count_accepts "$NEG/primary-accepts.log")"
+            if (( PRIMARY_ACCEPTS >= 1 )); then
+              break
+            fi
+            sleep 0.05
+          done
+          BACKUP_ACCEPTS="$(count_accepts "$NEG/backup-accepts.log")"
+          CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock" 2>&1 || true)"
+
+          echo "initial_backup_negative.primary_tcp_accepts=$PRIMARY_ACCEPTS"
+          echo "initial_backup_negative.backup_tcp_accepts=$BACKUP_ACCEPTS"
+          echo "initial_backup_negative.edge_exit_code=$NEG_RC"
+          echo "initial_backup_negative.core_ctl=$CORE_CTL"
+
+          FAILED=0
+          if (( NEG_RC != 2 )); then
+            echo "ERROR: edge daemon exit status $NEG_RC, expected 2 (fail closed)" >&2
+            FAILED=1
+          fi
+          if (( PRIMARY_ACCEPTS < 1 )); then
+            echo 'ERROR: primary endpoint never accepted a TCP connection; the run did not test outer-TLS rejection' >&2
+            FAILED=1
+          fi
+          if (( BACKUP_ACCEPTS != 0 )); then
+            echo "ERROR: edge daemon dialed the configured backup $BACKUP_ACCEPTS time(s) after the primary outer TLS was rejected" >&2
+            FAILED=1
+          fi
+          if ! grep -q '"inbound_connections":0' <<<"$CORE_CTL"; then
+            echo "ERROR: backup core reports a session; core ctl status was: $CORE_CTL" >&2
+            FAILED=1
+          fi
+          if ! grep -q '"daemon_connected":false' <<<"$CORE_CTL"; then
+            echo "ERROR: backup core reports a connected peer; core ctl status was: $CORE_CTL" >&2
+            FAILED=1
+          fi
+          if grep -q '"status":"ok"' "$NEG/negative.out"; then
+            echo 'ERROR: negative edge daemon reported status ok' >&2
+            FAILED=1
+          fi
+          if (( FAILED != 0 )); then
+            echo '--- negative edge stderr ---' >&2
+            cat "$NEG/negative.err" >&2 || true
+            echo '--- negative edge stdout ---' >&2
+            cat "$NEG/negative.out" >&2 || true
+            echo '--- backup core stderr ---' >&2
+            cat "$NEG/core.err" >&2 || true
+            exit 1
+          fi
+
+          # Instrument control: the same backup endpoint, proxy and core process
+          # must carry a real session when it is the only configured endpoint.
+          set +e
+          "$BIN" daemon connect \
+            --config "$NEG/edge-control.toml" \
+            --material-dir "$NEG/edge-mat" \
+            --connect "127.0.0.1:$BACKUP_PORT" \
+            --tls-name "wss.boreas.test" \
+            --ws-host "wss.boreas.test:$BACKUP_PORT" \
+            --virtual-tun \
+            --max-seconds 2 \
+            > "$NEG/control.out" 2> "$NEG/control.err"
+          CONTROL_RC=$?
+          set -e
+          BACKUP_ACCEPTS_AFTER="$(count_accepts "$NEG/backup-accepts.log")"
+          echo "initial_backup_negative.backup_tcp_accepts_after_control=$BACKUP_ACCEPTS_AFTER"
+          echo "initial_backup_negative.control_exit_code=$CONTROL_RC"
+
+          if (( CONTROL_RC != 0 )); then
+            echo "ERROR: control connect to the usable backup failed with status $CONTROL_RC" >&2
+            cat "$NEG/control.err" >&2 || true
+            exit 1
+          fi
+          if (( BACKUP_ACCEPTS_AFTER != 1 )); then
+            echo "ERROR: backup proxy counted $BACKUP_ACCEPTS_AFTER connection(s), expected exactly 1" >&2
+            exit 1
+          fi
+          if ! grep -q '"status":"ok"' "$NEG/control.out"; then
+            echo "ERROR: control connect to the usable backup did not report status ok" >&2
+            cat "$NEG/control.out" >&2 || true
+            exit 1
+          fi
+
+          echo 'initial_backup_negative=pass'
+          echo 'initial_backup_negative.backup_usable=control-connect-through-same-proxy-status-ok'
       - name: Upload hop-node development binary
         if: success()
         uses: actions/upload-artifact@v7
@@ -382,5 +781,6 @@ jobs:
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
             rust-tls-initial-backup.log
+            rust-tls-initial-backup-negative.log
           if-no-files-found: warn
           retention-days: 14
