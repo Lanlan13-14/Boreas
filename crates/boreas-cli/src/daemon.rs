@@ -1227,9 +1227,7 @@ mod linux_daemon {
                         expected_net_id,
                         now_us,
                     )
-                    .map_err(|e| {
-                        format!("daemon connect: StatusSnapshot stale or invalid: {e}")
-                    })?;
+                    .map_err(|e| format!("daemon connect: StatusSnapshot stale or invalid: {e}"))?;
                     let session = link_client
                         .connect_preconnected(tcp, &target, session_policy.clone())
                         .map_err(|e| {
@@ -1244,8 +1242,8 @@ mod linux_daemon {
                 }
             }
         }
-        let (mut hop_session, sock_fd) = connected
-            .ok_or_else(|| "daemon connect: no endpoint connected".to_string())?;
+        let (mut hop_session, sock_fd) =
+            connected.ok_or_else(|| "daemon connect: no endpoint connected".to_string())?;
 
         let e2e = open_e2e(&mut hop_session, &e2e_backend, remote_peer, 1)
             .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
@@ -1486,22 +1484,18 @@ mod linux_daemon {
                 2,
                 || {
                     calls += 1;
-                    Err(std::io::Error::from(
-                        std::io::ErrorKind::ConnectionRefused,
-                    ))
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
                 },
                 may_try_backup,
             );
             assert!(matches!(result, Err(EndpointAttemptError::TryBackup(_))));
             assert_eq!(calls, 1);
 
-            let result: Result<(), _> = attempt_endpoint(
-                0,
-                2,
-                || Err("TLS rejected"),
-                |_| false,
-            );
-            assert!(matches!(result, Err(EndpointAttemptError::Stop("TLS rejected"))));
+            let result: Result<(), _> = attempt_endpoint(0, 2, || Err("TLS rejected"), |_| false);
+            assert!(matches!(
+                result,
+                Err(EndpointAttemptError::Stop("TLS rejected"))
+            ));
 
             for kind in [
                 std::io::ErrorKind::ConnectionReset,
