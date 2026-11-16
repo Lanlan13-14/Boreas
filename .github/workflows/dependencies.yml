@@ -104,3 +104,47 @@ jobs:
           path: dependency-reports/
           if-no-files-found: error
           retention-days: 30
+
+  # Independent regression gate for the reduced-build verifier itself. It builds
+  # nothing, downloads nothing and does not replace the real reduced-build
+  # evidence: it fails if the verifier's assertions weaken, misread tool output
+  # or stop failing on the fabricated negative cases.
+  openssl-verifier-fixture:
+    name: OpenSSL build verifier regression fixture (Actions-only, no build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Syntax-check fixture and verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n tools/dependencies/test-verify-openssl-build.sh
+          bash -n tools/dependencies/verify-openssl-build.sh
+      - name: Prove the fixture refuses non-Actions execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=tools/dependencies/test-verify-openssl-build.sh
+          check_refusal() {
+            local description=$1
+            shift
+            local status=0
+            "$@" >/dev/null 2>&1 || status=$?
+            if [[ $status -ne 2 ]]; then
+              printf 'FAIL - %s (exit %s, expected 2)\n' "$description" "$status" >&2
+              exit 1
+            fi
+            printf 'ok - %s\n' "$description"
+          }
+          check_refusal 'fixture refuses GITHUB_ACTIONS=false' env GITHUB_ACTIONS=false bash "$fixture"
+          check_refusal 'fixture refuses an unset GITHUB_ACTIONS' env -u GITHUB_ACTIONS bash "$fixture"
+      - name: Run fabricated-tree verifier regression (no build, no network)
+        shell: bash
+        env:
+          GITHUB_ACTIONS: 'true'
+        run: |
+          set -euo pipefail
+          GITHUB_ACTIONS=true bash tools/dependencies/test-verify-openssl-build.sh
