@@ -47,8 +47,8 @@ use config::{Config, NodeRole, RuntimeCapabilities};
 use i18n::{Lang, Msg, lang_from_env, parse_lang, text};
 use render::{DaemonState, StatusSnapshot, render_status};
 use tui::{
-    ConfigWizardStep, ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction, MenuModel,
-    confirm_dangerous, render_menu, sanitize_line,
+    ConfigWizardStep, ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction,
+    MenuModel, confirm_dangerous, render_menu, sanitize_line,
 };
 
 const IMPLEMENTATION_SCOPE: &str = "Phase 0 policy/config/console-rendering foundation only";
@@ -979,8 +979,11 @@ where
             // success; validation errors are plain notice text instead.
             let valid_candidate = outcome.rows.first().is_some_and(|row| row == "[uplink]");
             if valid_candidate {
-                writeln!(out, "# BEGIN endpoint-only TOML preview (not saved/applied)")
-                    .map_err(|_| "console write failed".to_string())?;
+                writeln!(
+                    out,
+                    "# BEGIN endpoint-only TOML preview (not saved/applied)"
+                )
+                .map_err(|_| "console write failed".to_string())?;
                 for row in &outcome.rows {
                     writeln!(out, "{row}").map_err(|_| "console write failed".to_string())?;
                 }
@@ -993,9 +996,13 @@ where
                 match state.lang {
                     Lang::ZhCn => vec!["候选片段已原样输出；未保存、应用或重载。".into()],
                     Lang::ZhTw => vec!["候選片段已原樣輸出；未保存、套用或重新載入。".into()],
-                    Lang::En => vec!["Candidate emitted verbatim above; not saved, applied, or reloaded.".into()],
+                    Lang::En => vec![
+                        "Candidate emitted verbatim above; not saved, applied, or reloaded.".into(),
+                    ],
                 }
-            } else { outcome.rows };
+            } else {
+                outcome.rows
+            };
             state.view = ConsoleView::Notice;
             continue;
         }
@@ -1859,12 +1866,26 @@ uplinks = ["wss://hub-us-c.example.net"]
         let mut reader = BufReader::new(input.as_bytes());
         let mut output = Vec::new();
         let mut state = ConsoleState::new(Lang::En, false);
-        let mut io = ConsoleIo { socket: std::path::PathBuf::new(), config: path.clone(), service: None };
-        drive_console(&mut state, &mut reader, &mut output, |effect, lang| io.perform(effect, lang)).expect("driver");
+        let mut io = ConsoleIo {
+            socket: std::path::PathBuf::new(),
+            config: path.clone(),
+            service: None,
+        };
+        drive_console(&mut state, &mut reader, &mut output, |effect, lang| {
+            io.perform(effect, lang)
+        })
+        .expect("driver");
         let rendered = String::from_utf8(output).unwrap();
         let start = rendered.find("# BEGIN endpoint-only TOML preview").unwrap();
         let preview = &rendered[start..];
-        let emitted = preview.lines().skip(1).take_while(|line| !line.starts_with("# Preview only") && !line.starts_with("BOREAS CONSOLE")).collect::<Vec<_>>().join("\n");
+        let emitted = preview
+            .lines()
+            .skip(1)
+            .take_while(|line| {
+                !line.starts_with("# Preview only") && !line.starts_with("BOREAS CONSOLE")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let table: toml::Table = emitted.parse().expect("candidate fragment is valid TOML");
         assert_eq!(table["uplink"]["primary"].as_str(), Some(endpoint.as_str()));
         assert!(!rendered.contains("identity.key"));
@@ -1886,11 +1907,20 @@ uplinks = ["wss://hub-us-c.example.net"]
             let mut reader = BufReader::new(input.as_bytes());
             let mut output = Vec::new();
             let mut state = ConsoleState::new(Lang::En, false);
-            let mut io = ConsoleIo { socket: std::path::PathBuf::new(), config: path.clone(), service: None };
-            drive_console(&mut state, &mut reader, &mut output, |effect, lang| io.perform(effect, lang)).expect("driver");
+            let mut io = ConsoleIo {
+                socket: std::path::PathBuf::new(),
+                config: path.clone(),
+                service: None,
+            };
+            drive_console(&mut state, &mut reader, &mut output, |effect, lang| {
+                io.perform(effect, lang)
+            })
+            .expect("driver");
             let rendered = String::from_utf8(output).unwrap();
             assert!(rendered.contains(expected), "{phrase:?}: {rendered}");
-            if expected == "candidate rejected" { assert!(!rendered.contains("BEGIN endpoint-only TOML preview")); }
+            if expected == "candidate rejected" {
+                assert!(!rendered.contains("BEGIN endpoint-only TOML preview"));
+            }
         }
         let _ = std::fs::remove_file(path);
     }
@@ -1921,8 +1951,15 @@ uplinks = ["wss://hub-us-c.example.net"]
         let mut reader = BufReader::new(input.as_bytes());
         let mut output = Vec::new();
         let mut state = ConsoleState::new(Lang::En, false);
-        drive_console(&mut state, &mut reader, &mut output, |_, _| panic!("no effect expected")).expect("bounded exit");
-        assert!(String::from_utf8(output).unwrap().contains("Unknown command"));
+        drive_console(&mut state, &mut reader, &mut output, |_, _| {
+            panic!("no effect expected")
+        })
+        .expect("bounded exit");
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Unknown command")
+        );
     }
 
     #[test]
