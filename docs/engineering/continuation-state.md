@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 10
+## Current handoff — 2026-11-16 round 11
+
+- 9c5c3e9 TLS43881225757 job133347336861 FAILED by negative-step10min timeout AFTER all actual assertions passed: .local/round11-133347336861.log6351–6358 primary accepts1,backup0,edgeexit2,core disconnected; controlconnect exit0,backupcount1,passmarker. Cleanup barewait after `exec > >(tee...)` likely waits tee while tee waits stdoutclose. Do not report overallpass. DeepSeek negative-cleanup-fix owns onlyrust-tls.yml, must wait only capturedmock/proxy/core children, no barewait/stalePIDkill/timeoutincrease.
+- Local72c7f1b adds performance1MiB/8MiB diagnostic keepingstrict gates,PIPESTATUS bothsmoke+tee and finalnonzero. Notpushed at checkpoint. Need push withcleanupfix,then dispatch performance using trusted successfulbackend43879991003/sourceb6ead95 to obtain actualwindowcomparison; don't substitute latestbinary mismatchedSHA.
+- Luna easy-config-wizard failed leaving main.rs/tui.rs halfdraft; replacement wizard-repair-finish exclusively owns bothfiles. Must finish actualendpointinput→Configclone.validate→exactPREVIEW→escapeduplinkfragment with originalpaths/probe_paths, nofilewrites/apply/secrets. Fixpayload enum matches and complete tests before commit. No other writer touchesmain/tui. No localtests/build/formatters.
+
+## Previous checkpoint — 2026-11-16 round 10
 
 - Current pushed9c5c3e986e0cd70cd09676936a844fa290481705 includes full master-plan-traceability.md(all24gates open) and400-line real outerTLS failure/no-backup negative harness. Rust43881225795,TUN43881226060,platform43881225852 succeeded; native dependency43881225790 blocked; TLS43881225757 running negative step at last sample. Need collect log/artifact/terminal result before claim or newpush; do not cancel longcheck unnecessarily.
 - Positive samepeer initialbackup1880da2 TLS43878657864 SUCCESS; onlyinitialdial refusal→backup not multCore/steadyfailover. All applicable nonsecurity codechecks at1880da2 succeeded. Resource candidateb6ead95 TLS43879991003 SUCCESS and OpenWrt43879991224 SUCCESS. Host glibc 0.3s window core/edge56.67%CPU sampledRSS10648/10564KiB; musl0.4s core50%edge52.5%,RSS8520/8520KiB; initialbackup0.4s45/47.5%,10420/10420KiB. These are tiny sampled windows, no budget acceptance. Rootfs both architectures reportunmeasured as intended(binarycopy inode mismatch); no fake numbers.
