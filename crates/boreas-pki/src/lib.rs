@@ -22,6 +22,9 @@ pub mod revoke_cleanup;
 pub mod root_authorization;
 #[cfg(feature = "openssl-backend")]
 pub use network_policy::{NetworkPolicyError, VerifiedNetworkPolicy, verify_network_policy};
+/// Durable NetworkPolicy anti-replay watermark; Linux durability only, backend required.
+#[cfg(feature = "openssl-backend")]
+pub mod network_policy_store;
 /// Durable signed-status freshness store; Linux durability only, backend required.
 #[cfg(feature = "openssl-backend")]
 pub mod status_store;

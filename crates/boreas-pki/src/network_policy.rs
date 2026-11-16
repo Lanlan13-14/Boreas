@@ -16,6 +16,8 @@ pub struct VerifiedNetworkPolicy {
     seq: u64,
     issued_at: u64,
     expires: u64,
+    #[cfg(target_os = "linux")]
+    object_hash: [u8; 32],
 }
 impl VerifiedNetworkPolicy {
     pub fn net_id(&self) -> [u8; 16] {
@@ -35,6 +37,15 @@ impl VerifiedNetworkPolicy {
     }
     pub fn validity(&self) -> (u64, u64) {
         (self.issued_at, self.expires)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn matches_raw(&self, raw_tbs: &[u8]) -> bool {
+        use openssl::hash::{MessageDigest, hash};
+        hash(MessageDigest::sha256(), raw_tbs)
+            .ok()
+            .and_then(|digest| <[u8; 32]>::try_from(digest.as_ref()).ok())
+            .is_some_and(|digest| digest == self.object_hash)
     }
 }
 
@@ -107,6 +118,15 @@ pub fn verify_network_policy(
         seq: candidate.seq,
         issued_at: candidate.issued_at,
         expires: candidate.expires,
+        #[cfg(target_os = "linux")]
+        object_hash: {
+            let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), raw_tbs)
+                .map_err(|_| NetworkPolicyError::InvalidCandidate)?;
+            digest
+                .as_ref()
+                .try_into()
+                .map_err(|_| NetworkPolicyError::InvalidCandidate)?
+        },
     })
 }
 
