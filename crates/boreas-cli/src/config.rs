@@ -315,9 +315,12 @@ pub enum ConfigError {
     TooLarge,
     ParseFailed,
     UnsafePermissions,
+    #[cfg(not(target_os = "linux"))]
     CandidateSaveUnsupported,
     CandidateSaveFailed,
+    #[cfg(target_os = "linux")]
     CandidateDirectoryUnsafe,
+    #[cfg(target_os = "linux")]
     CandidateHomeUnavailable,
 }
 
@@ -385,11 +388,14 @@ impl fmt::Display for ConfigError {
             Self::UnsafePermissions => {
                 "configuration file is group- or world-accessible; expected mode 0600"
             }
+            #[cfg(not(target_os = "linux"))]
             Self::CandidateSaveUnsupported => "candidate saving is supported only on Linux",
             Self::CandidateSaveFailed => "candidate could not be saved safely",
+            #[cfg(target_os = "linux")]
             Self::CandidateDirectoryUnsafe => {
                 "candidate directory is not a private user-owned directory"
             }
+            #[cfg(target_os = "linux")]
             Self::CandidateHomeUnavailable => "no safe per-user candidate directory is available",
         };
         f.write_str(message)
