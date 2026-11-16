@@ -130,3 +130,9 @@ A future `validate_with_verified_policy(...)` MAY bind config prefix to the `Ver
 - The implementing slice is limited to parser/verifier/bundle-carrier plus vectors. It MUST NOT remove the config gate, change `OverlayPrefix::DEFAULT`, alter `NodeIdentity`, wire a custom prefix into the daemon, or claim wire freeze.
 
 Non-claims: this is not a wire freeze, implementation, security proof, or production acceptance; it does not make custom prefixes usable; `verify_all` is not an independent pin check; and no local rollback protection is claimed against whole-state replacement.
+
+## Parser slice implementation status (2026-11-16)
+
+Implemented in the isolated `boreas_proto::network_policy` module: bounded (16 KiB) deterministic-CBOR TBS encoder/parser for the candidate envelope and body, exact-byte round-trip parsing, RFC1918 canonical `/16` validation, and the documented `BOREAS-MGMT-OBJECT\0 || u16be(1) || u8(7) || u64be(len) || raw_tbs` signature-input adapter. Candidate object type `7` is encoded as a domain-specific numeric constant; the existing `ObjectType` enum remains unchanged. Fixed positive/negative byte-vector unit tests cover round-trip, malformed/non-shortest data, unsupported extension/critical field, trailing bytes, bad prefix and size cap.
+
+This slice does **not** implement either signature verification (including the required dual-signature AND), issue or return any `VerifiedToken`, integrate a bundle carrier, modify daemon/config behavior, or open a custom overlay prefix. Signature verification remains the next slice; no production acceptance or wire freeze is claimed. No local tests/build/syntax/format checks were run for this slice.

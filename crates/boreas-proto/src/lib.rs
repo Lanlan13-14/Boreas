@@ -4,6 +4,7 @@
 pub mod batch;
 pub mod h1h2;
 pub mod messages;
+pub mod network_policy;
 pub mod objects;
 pub mod session_auth;
 
