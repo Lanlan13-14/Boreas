@@ -1,22 +1,43 @@
 {
-  "version": "3.6.5",
+  "version": "4.1.0",
+  "configuration_review": {
+    "status": "PENDING_ACTIONS_AND_HUMAN_REVIEW_NOT_A_WAIVER",
+    "release_sha256": "50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd",
+    "required_options": ["no-quic", "no-cms", "no-siv", "no-shared", "no-tests"],
+    "configurations": [
+      {"workflow": ".github/workflows/crypto-poc.yml", "target": "linux-x86_64", "compiler": "default cc / glibc", "extra_options": []},
+      {"workflow": ".github/workflows/rust-tls.yml", "target": "linux-x86_64", "compiler": "default cc / glibc", "extra_options": []},
+      {"workflow": ".github/workflows/rust-tls.yml", "target": "linux-x86_64", "compiler": "musl-gcc", "extra_options": ["no-async"]},
+      {"workflow": ".github/workflows/openwrt.yml", "target": "linux-x86_64", "compiler": "musl-gcc", "extra_options": ["no-async", "no-legacy"]},
+      {"workflow": ".github/workflows/openwrt.yml", "target": "linux-aarch64", "compiler": "musl-gcc", "extra_options": ["no-async", "no-legacy", "-mno-outline-atomics"]}
+    ],
+    "evidence": "Source-level expected path removal only. CI must collect generated AND installed configuration.h defines, structured configdata disabled map, runtime disabled listings, negative CMS/QUIC/SIV registration checks, positive native group/signature/AES-GCM capability, static linkage and real mTLS. No successful Actions evidence reviewed; affected_ranges remain blocking. crypto-poc now uses the same candidate pin and verifier, also pending Actions."
+  },
   "reviewed_through_notice": "20261110",
   "applicability": {
-    "CVE-2026-88822": "QUIC automated peer detection. No QUIC API call found in crates/*.rs search on 2026-11-15; not a whole-program reachability proof. Current 3.6 branch not analysed upstream.",
-    "CVE-2026-95691": "QUIC client CRYPTO retransmission UAF. No QUIC API call found; current 3.6 branch not analysed upstream.",
-    "CVE-2026-88823": "AES-GCM-SIV fragmented AAD including empty update. No AES-GCM-SIV API call found; must verify linked provider algorithm surface and external inputs.",
-    "CVE-2026-95692": "AES-GCM-SIV nonstandard IV length. No AES-GCM-SIV API call found; do not confuse TLS AES-GCM with AES-GCM-SIV.",
-    "CVE-2026-107496": "CMS_encrypt/CMS_encrypt_ex with attacker-controlled EC order=1 recipient. Upstream explicitly says TLS/QUIC do not use this path. No CMS call found; 4.x default explicit-curve rejection further limits exposure. Not proof that 3.6.5 is safe."
+    "CVE-2026-88822": "4.1.0 affected upstream: QUIC automated peer detection leaks stack data. For the five exact configurations above, no-quic is expected to exclude the QUIC implementation (OPENSSL_NO_QUIC), not patch it. Runtime/header/linkage and mTLS evidence pending; CI still blocks. Remaining 3.6.5 is unsupported/unanalysed.",
+    "CVE-2026-95691": "4.1.0 affected upstream: retransmitted QUIC CRYPTO client UAF. Same no-quic removal expectation for the five exact configurations; no whole-program or produced-binary proof yet. CI still blocks.",
+    "CVE-2026-88823": "4.1.0 affected upstream: AES-GCM-SIV fragmented/zero-length AAD authentication error. no-siv controls both SIV and GCM-SIV implementation sources and default-provider registration. Require OPENSSL_NO_SIV plus no AES-*-SIV/AES-*-GCM-SIV runtime registration; ordinary AES-GCM retained. Evidence pending; CI still blocks.",
+    "CVE-2026-95692": "4.1.0 affected upstream: AES-GCM-SIV short/long IV handling. Same no-siv removal expectation, not an AES-GCM TLS vulnerability or a patch. Evidence pending; CI still blocks.",
+    "CVE-2026-107496": "CMS_encrypt/CMS_encrypt_ex with attacker-controlled EC order=1 recipient. Advisory limits 4.x exposure to enable-ec_explicit_curves; these configurations do not enable it and additionally use no-cms. Require OPENSSL_NO_CMS and OPENSSL_NO_EC_EXPLICIT_CURVES and absent CMS CLI registration. TLS/QUIC do not use the CMS path, but that fact alone is not a waiver. Evidence pending; CI still blocks."
   },
   "affected_ranges": [
     {"minimum": "4.1.0", "fixed": "4.1.1", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
     {"minimum": "4.0.0", "fixed": "4.0.4", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
     {"minimum": "3.5.0", "fixed": "3.5.10", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]}
   ],
-  "queried_at": "2026-11-15",
-  "status": "20261110 reviewed: 3.6 is unsupported and unanalysed, not proven unaffected. Supported current releases have disclosed CVEs; patched 3.5.10/4.0.4/4.1.1 scheduled 2026-12-01. CI blocks unsupported pins and known affected ranges; new notices require renewed range review.",
+  "queried_at": "2026-11-16",
+  "status": "4.1.0 release digest and tagged source independently reviewed on 2026-11-16. Reduced builds are migration candidates, NOT a CVE waiver; no successful Actions evidence reviewed. CI continues to block known affected ranges; all three native workflow pins now target the same migration candidate, not an approved backend. New notices require renewed review.",
   "sources": [
+    "https://openssl-library.org/source/",
     "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-3.6.5",
+    "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-4.1.0",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/Configure",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/include/openssl/configuration.h.in",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/apps/include/configuration.h.in",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/apps/list.c",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/providers/implementations/ciphers/build.info",
+    "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/providers/defltprov.c",
     "https://openssl-library.org/news/vulnerabilities/",
     "https://openssl-library.org/news/secadv/20261110.txt"
   ]

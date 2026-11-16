@@ -37,18 +37,61 @@ WORK="$(mktemp -d /tmp/boreas-netns-e2e.XXXXXX)"
 chmod 0700 "$WORK"
 CORE_NS="boreas-core-$$"
 EDGE_NS="boreas-edge-$$"
+HOST_CORE="bc-$$"
+HOST_EDGE="be-$$"
+CORE_NS_CREATED=0
+EDGE_NS_CREATED=0
+VETH_CREATED=0
 
 cleanup() {
   set +e
-  for pidfile in "$WORK"/*.pid; do
-    if [[ -f "$pidfile" ]]; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi
+  # Only signal live child jobs, never stale PIDs from already-waited pidfiles.
+  # Reap them before deleting WORK: their private mounts must be gone first.
+  local pid
+  for pid in $(jobs -pr); do
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
   done
-  ip netns del "$CORE_NS" 2>/dev/null || true
-  ip netns del "$EDGE_NS" 2>/dev/null || true
-  rm -rf "$WORK"
+  if (( VETH_CREATED )); then
+    ip link del "$HOST_CORE" 2>/dev/null || true
+    ip link del "$HOST_EDGE" 2>/dev/null || true
+  fi
+  if (( CORE_NS_CREATED )); then ip netns del "$CORE_NS" 2>/dev/null || true; fi
+  if (( EDGE_NS_CREATED )); then ip netns del "$EDGE_NS" 2>/dev/null || true; fi
+  rm -rf -- "$WORK"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'echo "ERROR: netns smoke failed at line $LINENO" >&2; for log in "$WORK/core.err" "$WORK/edge.err"; do if [[ -f "$log" ]]; then cat "$log" >&2; fi; done' ERR
+
+# Validate all mount destinations before either child starts. Never follow a
+# rootfs symlink into the host when preparing privileged bind-mount targets.
+if [[ -n "${BOREAS_ROOTFS:-}" ]]; then
+  BOREAS_ROOTFS="$(realpath -e -- "$BOREAS_ROOTFS")"
+  [[ "$BOREAS_ROOTFS" != / && -d "$BOREAS_ROOTFS" ]] || {
+    echo 'ERROR: BOREAS_ROOTFS must be a non-root directory' >&2
+    exit 1
+  }
+  for relative in sys dev dev/net tmp "${WORK#/}"; do
+    destination="$BOREAS_ROOTFS/$relative"
+    [[ ! -L "$destination" ]] || { echo "ERROR: symlink mount path: $destination" >&2; exit 1; }
+    if [[ -e "$destination" && ! -d "$destination" ]]; then
+      echo "ERROR: non-directory mount path: $destination" >&2
+      exit 1
+    fi
+    mkdir -p -- "$destination"
+  done
+  for device in net/tun urandom; do
+    destination="$BOREAS_ROOTFS/dev/$device"
+    [[ ! -L "$destination" ]] && { [[ ! -e "$destination" ]] || [[ -f "$destination" || -c "$destination" ]]; } || {
+      echo "ERROR: unsafe device mount target: $destination" >&2
+      exit 1
+    }
+    if [[ ! -e "$destination" ]]; then : > "$destination"; fi
+    [[ -c "/dev/$device" ]] || { echo "ERROR: missing host /dev/$device" >&2; exit 1; }
+  done
+fi
 
 # LinuxTunDevice sets MTU through sysfs. A network namespace alone retains
 # the host sysfs view; remount it in a private mount namespace after setns.
@@ -58,10 +101,8 @@ run_node() {
   local ns="$1"
   shift
   if [[ -n "${BOREAS_ROOTFS:-}" ]]; then
-    mkdir -p "${BOREAS_ROOTFS}/sys" "${BOREAS_ROOTFS}/dev/net" "${BOREAS_ROOTFS}${WORK}"
-    touch "${BOREAS_ROOTFS}/dev/net/tun"
     exec ip netns exec "$ns" unshare --mount --propagation private \
-      bash -e -c 'mount --make-rprivate /; mount -t sysfs sysfs "$1/sys"; mount --bind /dev/net/tun "$1/dev/net/tun"; mount --bind "$2" "$1$2"; exec chroot "$1" /usr/local/bin/boreas "${@:4}"' \
+      bash -e -c 'mount --make-rprivate /; mount -t sysfs sysfs "$1/sys"; mount --bind /dev/net/tun "$1/dev/net/tun"; mount --bind /dev/urandom "$1/dev/urandom"; mount --bind "$2" "$1$2"; exec chroot "$1" /usr/local/bin/boreas "${@:4}"' \
       boreas-node "$BOREAS_ROOTFS" "$WORK" "$@"
   fi
   exec ip netns exec "$ns" unshare --mount --propagation private \
@@ -148,16 +189,21 @@ chmod 0600 "$WORK/edge.toml"
 
 # Create isolated network namespaces and underlay veth link.
 ip netns add "$CORE_NS"
+CORE_NS_CREATED=1
 ip netns add "$EDGE_NS"
+EDGE_NS_CREATED=1
 # This candidate negotiates IPv4 only. Disable automatic IPv6 link-local/DAD
 # traffic in these disposable namespaces before any interfaces are brought up.
 for ns in "$CORE_NS" "$EDGE_NS"; do
   ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
   ip netns exec "$ns" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
 done
-ip link add veth-core type veth peer name veth-edge
-ip link set veth-core netns "$CORE_NS"
-ip link set veth-edge netns "$EDGE_NS"
+ip link add "$HOST_CORE" type veth peer name "$HOST_EDGE"
+VETH_CREATED=1
+ip link set "$HOST_CORE" netns "$CORE_NS"
+ip link set "$HOST_EDGE" netns "$EDGE_NS"
+ip netns exec "$CORE_NS" ip link set "$HOST_CORE" name veth-core
+ip netns exec "$EDGE_NS" ip link set "$HOST_EDGE" name veth-edge
 
 ip netns exec "$CORE_NS" ip link set lo up
 ip netns exec "$CORE_NS" ip addr add 192.0.2.1/24 dev veth-core

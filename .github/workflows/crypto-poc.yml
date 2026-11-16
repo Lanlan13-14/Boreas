@@ -5,11 +5,15 @@ on:
   push:
     paths:
       - 'tools/crypto-poc/**'
+      - 'tools/dependencies/verify-openssl-build.sh'
+      - 'tools/dependencies/openssl-review.json'
       - '.github/workflows/crypto-poc.yml'
       - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
   pull_request:
     paths:
       - 'tools/crypto-poc/**'
+      - 'tools/dependencies/verify-openssl-build.sh'
+      - 'tools/dependencies/openssl-review.json'
       - '.github/workflows/crypto-poc.yml'
       - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
 
@@ -22,12 +26,12 @@ concurrency:
 
 jobs:
   openssl-ml-dsa-tls:
-    name: OpenSSL 3.6.5 source build + TLS tests
+    name: OpenSSL 4.1.0 reduced source build + TLS tests (CVE review pending)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      OPENSSL_VERSION: 3.6.5
-      OPENSSL_SHA256: a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98
+      OPENSSL_VERSION: 4.1.0
+      OPENSSL_SHA256: 50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd
       OPENSSL_PREFIX: ${{ github.workspace }}/.poc-openssl
       ARTIFACT_DIR: ${{ github.workspace }}/crypto-poc-artifacts
     steps:
@@ -57,7 +61,8 @@ jobs:
         run: |
           set -euo pipefail
           cd openssl-src
-          ./Configure linux-x86_64 no-shared no-tests --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          # Candidate surface reduction only; the independent CVE gate stays blocking.
+          ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
           make -j2
           make install_sw
           test -x "${OPENSSL_PREFIX}/bin/openssl"
@@ -74,6 +79,16 @@ jobs:
           set -euo pipefail
           chmod +x tools/crypto-poc/run-openssl-mtls.sh
           tools/crypto-poc/run-openssl-mtls.sh
+      - name: Verify exact reduced OpenSSL build (not a CVE waiver)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OPENSSL_PREFIX}/ssl"
+          cp "${ARTIFACT_DIR}/openssl-test-config.cnf" "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-src "${OPENSSL_PREFIX}" \
+            "${ARTIFACT_DIR}/openssl-runtime.txt" \
+            "${ARTIFACT_DIR}/openssl-build.txt"
       - name: Fail if private TLS material escaped sanitizer
         if: always()
         shell: bash

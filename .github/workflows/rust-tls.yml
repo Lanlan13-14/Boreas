@@ -15,6 +15,9 @@ on:
       - 'crates/boreas-cli/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
+      - 'tools/dependencies/verify-openssl-build.sh'
+      - 'tools/dependencies/openssl-review.json'
+      - 'tools/dependencies/report.py'
       - '.github/workflows/rust-tls.yml'
   pull_request:
     paths:
@@ -29,6 +32,9 @@ on:
       - 'crates/boreas-cli/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
+      - 'tools/dependencies/verify-openssl-build.sh'
+      - 'tools/dependencies/openssl-review.json'
+      - 'tools/dependencies/report.py'
       - '.github/workflows/rust-tls.yml'
 
 permissions:
@@ -40,12 +46,12 @@ concurrency:
 
 jobs:
   openssl-rust-mtls:
-    name: OpenSSL 3.6.5 + rust-openssl 0.10.82 pq768 mTLS
+    name: OpenSSL 4.1.0 (no-quic/no-cms/no-siv) + rust-openssl 0.10.82 pq768 mTLS
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     env:
-      OPENSSL_VERSION: 3.6.5
-      OPENSSL_SHA256: a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98
+      OPENSSL_VERSION: 4.1.0
+      OPENSSL_SHA256: 50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd
       OPENSSL_PREFIX: ${{ github.workspace }}/.rust-tls-openssl
       OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
       OPENSSL_NO_VENDOR: '1'
@@ -76,7 +82,11 @@ jobs:
           source openssl-src/VERSION.dat
           test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}"
           cd openssl-src
-          ./Configure linux-x86_64 no-shared no-tests \
+          # 4.1.0 remains affected by the 2026-11-10 advisory. These exact
+          # options are expected to exclude QUIC, CMS and SIV implementations
+          # and registrations; CI must verify the produced build. This is an
+          # unpatched, review-required reduction, not a security approval.
+          ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
           make -j2
           make install_sw
@@ -96,8 +106,11 @@ jobs:
             'activate = 1' \
             > "${OPENSSL_PREFIX}/ssl/openssl.cnf"
           test -s "${OPENSSL_PREFIX}/ssl/openssl.cnf"
-          "${OPENSSL_PREFIX}/bin/openssl" version -a \
-            | tee "${GITHUB_WORKSPACE}/openssl-runtime.txt"
+          cd "${GITHUB_WORKSPACE}"
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-src "${OPENSSL_PREFIX}" \
+            "${GITHUB_WORKSPACE}/openssl-runtime.txt" \
+            "${GITHUB_WORKSPACE}/openssl-build.txt"
           readelf -d "${OPENSSL_PREFIX}/bin/openssl" \
             | tee "${GITHUB_WORKSPACE}/openssl-linkage.txt"
           if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' \
@@ -255,7 +268,7 @@ jobs:
           cp target/release/boreas hop-node-linux/boreas
 
           # Also build a zero-glibc-dependency static x86_64-unknown-linux-musl binary
-          # linked against musl-compiled OpenSSL 3.6.5 for portable Linux pre-releases.
+          # linked against musl-compiled OpenSSL 4.1.0 for portable Linux pre-releases.
           rustup target add x86_64-unknown-linux-musl
           OPENSSL_MUSL_PREFIX="${GITHUB_WORKSPACE}/.rust-tls-openssl-musl"
           mkdir -p openssl-musl-src
@@ -268,12 +281,18 @@ jobs:
           ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
           ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm"
           pushd openssl-musl-src
-          CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests no-async \
+          CC=musl-gcc ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests no-async \
             -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_MUSL_PREFIX}" --openssldir="${OPENSSL_MUSL_PREFIX}/ssl"
           make -j2
           make install_sw
           popd
+          mkdir -p "${OPENSSL_MUSL_PREFIX}/ssl"
+          cp "${OPENSSL_PREFIX}/ssl/openssl.cnf" "${OPENSSL_MUSL_PREFIX}/ssl/openssl.cnf"
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-musl-src "${OPENSSL_MUSL_PREFIX}" \
+            "${GITHUB_WORKSPACE}/openssl-musl-runtime.txt" \
+            "${GITHUB_WORKSPACE}/openssl-musl-build.txt"
           OPENSSL_DIR="${OPENSSL_MUSL_PREFIX}" OPENSSL_STATIC=1 \
             cargo build --locked --release --target x86_64-unknown-linux-musl \
               -p boreas-cli --features openssl-inner-tls
@@ -288,7 +307,7 @@ jobs:
           printf '%s\n' \
             'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
             'Source commit: '"$GITHUB_SHA" \
-            'Feature: openssl-inner-tls (OpenSSL 3.6.5 X25519MLKEM768 + ML-DSA-65)' \
+            'Feature: openssl-inner-tls (OpenSSL 4.1.0 no-quic/no-cms/no-siv; X25519MLKEM768 + ML-DSA-65)' \
             'Included binaries:' \
             '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
             '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
@@ -311,6 +330,9 @@ jobs:
           name: rust-tls-${{ github.run_id }}
           path: |
             openssl-runtime.txt
+            openssl-build.txt
+            openssl-musl-runtime.txt
+            openssl-musl-build.txt
             openssl-linkage.txt
             rust-tls-format.patch
             rust-tls-tests.log

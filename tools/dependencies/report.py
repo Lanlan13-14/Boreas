@@ -91,11 +91,21 @@ def main():
         if not notices:
             raise RuntimeError('No security notice dates parsed; upstream format changed')
         policy = json.loads((ROOT / 'tools/dependencies/openssl-review.json').read_text())
+        configuration = policy['configuration_review']
+        if configuration['status'] != 'APPROVED_WITH_ACTIONS_EVIDENCE':
+            errors.append('Native OpenSSL configuration review remains blocking: ' + configuration['status'])
         pins = {}
         for workflow in sorted((ROOT / '.github/workflows').glob('*.yml')):
-            found = re.findall(r'^\s+OPENSSL_VERSION:\s*[\'"]?(\d+\.\d+\.\d+)', workflow.read_text(), re.M)
+            workflow_text = workflow.read_text()
+            found = re.findall(r'^\s+OPENSSL_VERSION:\s*[\'"]?(\d+\.\d+\.\d+)', workflow_text, re.M)
             if found:
-                pins[str(workflow.relative_to(ROOT))] = found
+                workflow_name = str(workflow.relative_to(ROOT))
+                pins[workflow_name] = found
+                digests = re.findall(r'^\s+OPENSSL_SHA256:\s*[\'"]?([0-9a-f]{64})[\'"]?\s*$', workflow_text, re.M)
+                if len(found) != 1 or len(digests) != 1:
+                    errors.append('Native OpenSSL workflow pin/digest ambiguous or absent: ' + workflow_name)
+                elif found[0] == policy['version'] and digests[0] != configuration['release_sha256']:
+                    errors.append('Native OpenSSL workflow digest differs from reviewed release: ' + workflow_name)
         if not pins:
             raise RuntimeError('No OpenSSL workflow pins found')
         if any(v != policy['version'] for values in pins.values() for v in values):
@@ -115,7 +125,15 @@ def main():
         if new:
             errors.append('Native OpenSSL security notices need review: ' + ', '.join(new))
         release = json.loads(fetch('https://api.github.com/repos/openssl/openssl/releases/latest', 'openssl-latest.json', True))
-        fetch('https://api.github.com/repos/openssl/openssl/releases/tags/openssl-' + policy['version'], 'openssl-pinned-release.json', True)
+        pinned_release = json.loads(fetch('https://api.github.com/repos/openssl/openssl/releases/tags/openssl-' + policy['version'], 'openssl-pinned-release.json', True))
+        archive_name = 'openssl-' + policy['version'] + '.tar.gz'
+        archives = [asset for asset in pinned_release.get('assets', []) if asset['name'] == archive_name]
+        if (pinned_release.get('tag_name') != 'openssl-' + policy['version']
+                or pinned_release.get('draft') is not False
+                or pinned_release.get('prerelease') is not False
+                or len(archives) != 1
+                or archives[0].get('digest') != 'sha256:' + configuration['release_sha256']):
+            errors.append('Native OpenSSL official release metadata/digest does not match reviewed stable archive')
         (OUT / 'openssl.json').write_text(json.dumps({'pins': pins, 'latest_release_pointer': release['tag_name'], 'notice_dates': notices, 'policy': policy, 'unreviewed_notices': new}, indent=2))
     except Exception as exc:
         errors.append('Native OpenSSL query incomplete: ' + str(exc))
@@ -126,6 +144,15 @@ def main():
     lines = ['# Dependency intelligence', '', 'Queried (UTC): ' + queried, '', '| Crate | Locked | Latest non-yanked stable | Outdated |', '| --- | --- | --- | --- |']
     lines.extend('| {name} | {locked} | {latest_stable} | {outdated} |'.format(**r) for r in rows)
     review = json.loads((ROOT / 'tools/dependencies/openssl-review.json').read_text())
+    configuration = review['configuration_review']
+    lines += ['', '## Exact native OpenSSL configuration review (NOT a waiver)',
+              '- Status: ' + configuration['status'],
+              '- Reviewed release: ' + review['version'] + '; SHA-256: ' + configuration['release_sha256'],
+              '- Required options: ' + ' '.join(configuration['required_options'])]
+    for config in configuration['configurations']:
+        lines.append('- {workflow}: {target}; {compiler}; extra options: {options}'.format(
+            **config, options=' '.join(config['extra_options']) or '(none)'))
+    lines += ['- Evidence boundary: ' + configuration['evidence']]
     lines += ['', '## Native OpenSSL CVE applicability (not exploitability proof)', *['- ' + cve + ': ' + note for cve, note in review['applicability'].items()]]
     lines += ['', '## Blocking findings', *['- ' + e.replace('\n', ' ') for e in errors], '', result['warning']]
     text = '\n'.join(lines) + '\n'
