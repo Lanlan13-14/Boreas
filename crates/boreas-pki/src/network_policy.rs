@@ -18,12 +18,24 @@ pub struct VerifiedNetworkPolicy {
     expires: u64,
 }
 impl VerifiedNetworkPolicy {
-    pub fn net_id(&self) -> [u8; 16] { self.net_id }
-    pub fn root_key_fingerprint(&self) -> [u8; 32] { self.root_key_fingerprint }
-    pub fn overlay_base(&self) -> [u8; 4] { self.overlay_base }
-    pub fn version(&self) -> u64 { self.version }
-    pub fn seq(&self) -> u64 { self.seq }
-    pub fn validity(&self) -> (u64, u64) { (self.issued_at, self.expires) }
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+    pub fn root_key_fingerprint(&self) -> [u8; 32] {
+        self.root_key_fingerprint
+    }
+    pub fn overlay_base(&self) -> [u8; 4] {
+        self.overlay_base
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+    pub fn validity(&self) -> (u64, u64) {
+        (self.issued_at, self.expires)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +47,9 @@ pub enum NetworkPolicyError {
     InvalidRootOrSignature,
 }
 impl fmt::Display for NetworkPolicyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for NetworkPolicyError {}
 
@@ -54,7 +68,9 @@ pub fn verify_network_policy(
     if candidate.net_id != expected_net_id || pin.net_id() != expected_net_id {
         return Err(NetworkPolicyError::WrongNetwork);
     }
-    let fingerprint = pin.fingerprint().map_err(|_| NetworkPolicyError::InvalidRootOrSignature)?;
+    let fingerprint = pin
+        .fingerprint()
+        .map_err(|_| NetworkPolicyError::InvalidRootOrSignature)?;
     if candidate.root_key_fingerprint != fingerprint {
         return Err(NetworkPolicyError::WrongRootFingerprint);
     }
@@ -62,10 +78,18 @@ pub fn verify_network_policy(
         return Err(NetworkPolicyError::InvalidTime);
     }
     root_authorization::verify_network_policy_message(
-        raw_tbs, ed25519_signature, mldsa65_signature, pin, expected_net_id, fingerprint,
-    ).map_err(|e| match e {
+        raw_tbs,
+        ed25519_signature,
+        mldsa65_signature,
+        pin,
+        expected_net_id,
+        fingerprint,
+    )
+    .map_err(|e| match e {
         root_authorization::Error::WrongNetwork => NetworkPolicyError::WrongNetwork,
-        root_authorization::Error::InvalidCandidate | root_authorization::Error::TooLarge => NetworkPolicyError::InvalidCandidate,
+        root_authorization::Error::InvalidCandidate | root_authorization::Error::TooLarge => {
+            NetworkPolicyError::InvalidCandidate
+        }
         _ => NetworkPolicyError::InvalidRootOrSignature,
     })?;
     Ok(VerifiedNetworkPolicy {
@@ -82,14 +106,26 @@ pub fn verify_network_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openssl::{pkey::{KeyType, PKey, Private}, sign::Signer};
     use boreas_proto::{network_policy::NetworkPolicyCandidate, objects::MldsaParameterSet};
+    use openssl::{
+        pkey::{KeyType, PKey, Private},
+        sign::Signer,
+    };
 
     fn keys(seed: u8) -> (PKey<Private>, PKey<Private>) {
-        (PKey::generate_ed25519().unwrap(), PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[seed; 32]).unwrap())
+        (
+            PKey::generate_ed25519().unwrap(),
+            PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[seed; 32]).unwrap(),
+        )
     }
     fn make_pin(ed: &PKey<Private>, pq: &PKey<Private>) -> NetworkRootPin {
-        NetworkRootPin::provisioned([3; 16], ed.public_key_to_der().unwrap(), MldsaParameterSet::Mldsa65, pq.public_key_to_der().unwrap()).unwrap()
+        NetworkRootPin::provisioned(
+            [3; 16],
+            ed.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        )
+        .unwrap()
     }
     fn sign(ed: &PKey<Private>, pq: &PKey<Private>, raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let msg = NetworkPolicyCandidate::signature_input(raw).unwrap();
@@ -102,8 +138,13 @@ mod tests {
         let (ed, pq) = keys(7);
         let pin = make_pin(&ed, &pq);
         let candidate = NetworkPolicyCandidate {
-            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(),
-            overlay_base: [10, 20, 0, 0], version: 1, seq: 4, issued_at: 10, expires: 20,
+            net_id: [3; 16],
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 4,
+            issued_at: 10,
+            expires: 20,
         };
         let raw = candidate.encode_tbs().unwrap();
         let (es, ps) = sign(&ed, &pq, &raw);
@@ -114,12 +155,20 @@ mod tests {
         let ed = PKey::generate_ed25519().unwrap();
         let pq87 = PKey::private_key_from_seed(None, KeyType::ML_DSA_87, None, &[9; 32]).unwrap();
         let pin = NetworkRootPin::provisioned(
-            [3; 16], ed.public_key_to_der().unwrap(), MldsaParameterSet::Mldsa87,
+            [3; 16],
+            ed.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa87,
             pq87.public_key_to_der().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let candidate = NetworkPolicyCandidate {
-            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(),
-            overlay_base: [10, 20, 0, 0], version: 1, seq: 1, issued_at: 10, expires: 20,
+            net_id: [3; 16],
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 1,
+            issued_at: 10,
+            expires: 20,
         };
         let raw = candidate.encode_tbs().unwrap();
         let msg = NetworkPolicyCandidate::signature_input(&raw).unwrap();
@@ -136,9 +185,11 @@ mod tests {
         let ok = verify_network_policy(&raw, &es, &ps, &pin, [3; 16], 10).unwrap();
         assert_eq!(ok.seq(), 4);
         assert_eq!(ok.validity(), (10, 20));
-        let mut bad = es.clone(); bad[0] ^= 1;
+        let mut bad = es.clone();
+        bad[0] ^= 1;
         assert!(verify_network_policy(&raw, &bad, &ps, &pin, [3; 16], 10).is_err());
-        let mut bad = ps.clone(); bad[0] ^= 1;
+        let mut bad = ps.clone();
+        bad[0] ^= 1;
         assert!(verify_network_policy(&raw, &es, &bad, &pin, [3; 16], 10).is_err());
         let (wrong_ed, wrong_pq) = keys(8);
         let wrong = make_pin(&wrong_ed, &wrong_pq);
