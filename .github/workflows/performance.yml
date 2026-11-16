@@ -5,6 +5,11 @@ on:
     workflows: ['[Test] OpenSSL hybrid TLS backend (ML-KEM + ML-DSA)']
     types: [completed]
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Successful main-branch rust-tls run containing the tested binary'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,12 +20,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  source:
+    name: Validate exact trusted backend artifact source
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      run: ${{ steps.source.outputs.run }}
+    steps:
+      - name: Resolve and validate backend run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ inputs.source_run_id || github.event.workflow_run.id }}
+        shell: python
+        run: |
+          import json, os, re, urllib.request
+          repo, run_id = os.environ['REPOSITORY'], os.environ['RUN_ID']
+          if not re.fullmatch(r'[1-9][0-9]{0,19}', run_id):
+              raise SystemExit('Invalid source run id')
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          run = get('/actions/runs/' + run_id)
+          workflow = get('/actions/workflows/' + str(run['workflow_id']))
+          if not (run['repository']['full_name'] == repo
+                  and run['head_repository']['full_name'] == repo
+                  and run['head_branch'] == 'main'
+                  and run['event'] in ('push', 'workflow_dispatch')
+                  and run['status'] == 'completed' and run['conclusion'] == 'success'
+                  and workflow['path'] == '.github/workflows/rust-tls.yml'
+                  and re.fullmatch(r'[0-9a-f]{40}', run['head_sha'])):
+              raise SystemExit('Source must be a successful trusted main-branch backend run')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sha=' + run['head_sha'] + '\nrun=' + run_id + '\n')
+          print('Validated source_sha=' + run['head_sha'] + ' source_run=' + run_id)
+
   netem:
-    # Manual dispatch is a source-only diagnostic unless an artifact run is
-    # explicitly supplied; automatic runs always bind to the triggering SHA.
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success'
+    # Manual and automatic execution use only the validated source run and SHA.
+    needs: source
     name: one-way ${{ matrix.rtt }}ms / loss ${{ matrix.loss }}% / ${{ matrix.rate }}Mbps
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -52,16 +93,16 @@ jobs:
       - name: Record triggering source commit
         run: |
           set -euo pipefail
-          test -n '${{ github.event.workflow_run.head_sha }}'
-          echo 'source_sha=${{ github.event.workflow_run.head_sha }}' >> "$GITHUB_ENV"
-          echo 'source_run=${{ github.event.workflow_run.id }}' >> "$GITHUB_ENV"
+          test -n '${{ needs.source.outputs.sha }}'
+          echo 'source_sha=${{ needs.source.outputs.sha }}' >> "$GITHUB_ENV"
+          echo 'source_run=${{ needs.source.outputs.run }}' >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.source.outputs.sha }}
       - uses: actions/download-artifact@v8
         with:
-          name: boreas-hop-node-linux-x86_64-${{ github.event.workflow_run.id }}
-          run-id: ${{ github.event.workflow_run.id }}
+          name: boreas-hop-node-linux-x86_64-${{ needs.source.outputs.run }}
+          run-id: ${{ needs.source.outputs.run }}
           github-token: ${{ github.token }}
           path: artifact
       - name: Install network-namespace tools
@@ -92,26 +133,24 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: netem-${{ github.event.workflow_run.id }}-${{ matrix.rtt }}ms-${{ matrix.loss }}pct-${{ matrix.rate }}mbps
+          name: netem-${{ needs.source.outputs.run }}-${{ matrix.rtt }}ms-${{ matrix.loss }}pct-${{ matrix.rate }}mbps
           path: netem-*.log
           if-no-files-found: warn
           retention-days: 14
 
   routing:
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success'
+    needs: source
     name: Policy and asymmetric routing / MTU 1280 and 1500
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.source.outputs.sha }}
       - uses: actions/download-artifact@v8
         with:
-          name: boreas-hop-node-linux-x86_64-${{ github.event.workflow_run.id }}
-          run-id: ${{ github.event.workflow_run.id }}
+          name: boreas-hop-node-linux-x86_64-${{ needs.source.outputs.run }}
+          run-id: ${{ needs.source.outputs.run }}
           github-token: ${{ github.token }}
           path: artifact
       - name: Validate artifact and install namespace tools
@@ -134,7 +173,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: routing-matrix-${{ github.event.workflow_run.id }}
+          name: routing-matrix-${{ needs.source.outputs.run }}
           path: routing-matrix-artifacts/
           if-no-files-found: warn
           retention-days: 14
