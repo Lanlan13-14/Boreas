@@ -37,6 +37,17 @@ is retained, with no reduced byte counts, throughput thresholds or failure skips
 
 This closes only the listed two-node harness cases. The same overall workflow **failed** its impaired-path matrix: one-way 50 ms / zero loss / 10 Mbps passed; 200 ms / 0.1% loss reached only 2.279 Mbps Edge→Core against the unchanged 3 Mbps floor; 200 ms / 3% loss recorded 9/10 ping replies and 1111.072 ms maximum RTT; 400 ms / 1% loss did not reach connected state within the harness window. These are unresolved failures, not waived TCP-over-TCP costs or production acceptance. Native dependency security review also remains blocking.
 
+## Paired transfer diagnostic — source `b6ead95`
+
+[Workflow 43886347643, diagnostic job 133365499986](https://github.com/Lanlan13-14/Boreas/actions/runs/43886347643/job/133365499986) checked out scripts and binary from successful backend run `43879991003`, source `b6ead95967d4f03bb3e14fb569f7b0ad9123fac4`. Workflow definition was `91acf0c`. Both samples used one-way 200 ms, 0.1% loss, 100 Mbps, unchanged 3 Mbps floor and existing time budgets.
+
+| Payload per direction | Edge → Core (Mbps) | Core → Edge (Mbps) | Result |
+| --- | ---: | ---: | --- |
+| 1 MiB | 1.264 | 1.303 | Failed both throughput bounds |
+| 8 MiB | 3.472 | 2.588 | Failed Core → Edge bound |
+
+The longer transfer improved observed throughput in this one paired trial but did **not** pass both directions. This is not a steady-state measurement or proof that short-window bias explains all underperformance. Random loss realizations differ; repeated controlled trials and transport/backpressure/retransmission evidence are still needed. The strict 200 ms / 0.1% job independently failed at 2.298 / 2.179 Mbps. No bound was lowered and the diagnostic job correctly remained red.
+
 ## Topology and assertions
 
 The original Core `192.0.2.1` and Edge `192.0.2.2` remain the daemon listen/connect
