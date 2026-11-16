@@ -557,15 +557,19 @@ fn peer(object: &VerifiedObject) -> PeerIdentity {
         unreachable!("verified helper returns NodeIdentity")
     };
     assert_eq!(value.vip(), body.vip);
-    assert_eq!(value.node_id(), boreas_pki::node_id(
-        body.home_core_id,
-        body.vip[3],
-        match body.role {
-            ObjectRole::Core => PkiNodeRole::Core,
-            ObjectRole::Edge => PkiNodeRole::Edge,
-            ObjectRole::EnrollmentService => PkiNodeRole::EnrollmentService,
-        },
-    ).expect("verified node mapping"));
+    assert_eq!(
+        value.node_id(),
+        boreas_pki::node_id(
+            body.home_core_id,
+            body.vip[3],
+            match body.role {
+                ObjectRole::Core => PkiNodeRole::Core,
+                ObjectRole::Edge => PkiNodeRole::Edge,
+                ObjectRole::EnrollmentService => PkiNodeRole::EnrollmentService,
+            },
+        )
+        .expect("verified node mapping")
+    );
     assert_eq!(
         value.vip(),
         boreas_pki::expected_vip(
