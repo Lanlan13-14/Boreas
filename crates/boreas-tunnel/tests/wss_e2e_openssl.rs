@@ -599,6 +599,73 @@ fn extractor(a: &VerifiedObject, b: &VerifiedObject) -> Arc<PkiIdentityExtractor
         .expect("unique trusted SPKIs"),
     )
 }
+
+#[test]
+fn signed_vip_lookup_requires_exact_verified_peer_and_certificate_owner() {
+    let t = Temp::new();
+    setup(&t);
+    let edge_object = verified_identity(&t, "edge", 2, 4, ObjectRole::Edge);
+    let core_object = verified_identity(&t, "core", 1, 9, ObjectRole::Core);
+    let extractor = extractor(&edge_object, &core_object);
+    let edge_peer = peer(&edge_object);
+    let edge_certificate = X509::from_pem(&read(&t, "edge.pem"))
+        .expect("parse verified Edge leaf")
+        .to_der()
+        .expect("encode Edge leaf DER");
+    let ObjectBody::NodeIdentity(edge_body) = &edge_object.object().body else {
+        unreachable!("verified helper returns NodeIdentity")
+    };
+
+    assert_eq!(
+        extractor.signed_vip_for_verified_peer(edge_peer, &edge_certificate),
+        Some(edge_body.vip),
+        "signed VIP round-trips from the ManagementTrust-verified object"
+    );
+
+    let mut wrong_generation = edge_peer;
+    wrong_generation.identity_generation += 1;
+    assert_eq!(
+        extractor.signed_vip_for_verified_peer(wrong_generation, &edge_certificate),
+        None
+    );
+    let mut wrong_net = edge_peer;
+    wrong_net.net_id[0] ^= 1;
+    assert_eq!(
+        extractor.signed_vip_for_verified_peer(wrong_net, &edge_certificate),
+        None
+    );
+    let mut wrong_role = edge_peer;
+    wrong_role.role = boreas_crypto::NodeRole::Core;
+    assert_eq!(
+        extractor.signed_vip_for_verified_peer(wrong_role, &edge_certificate),
+        None
+    );
+    let core_certificate = X509::from_pem(&read(&t, "core.pem"))
+        .expect("parse verified Core leaf")
+        .to_der()
+        .expect("encode Core leaf DER");
+    assert_eq!(
+        extractor.signed_vip_for_verified_peer(edge_peer, &core_certificate),
+        None,
+        "a different certificate SPKI cannot claim Edge's signed VIP"
+    );
+
+    // Distinct certificate keys claiming the same complete peer tuple are
+    // ambiguous; even an otherwise valid cert must not select one VIP record.
+    let duplicate_peer_object = verified_identity(&t, "unknown", 2, 4, ObjectRole::Edge);
+    let ambiguous_extractor = PkiIdentityExtractor::new(vec![
+        VerifiedNodeIdentity::from_verified_object(&edge_object).expect("verified Edge"),
+        VerifiedNodeIdentity::from_verified_object(&duplicate_peer_object)
+            .expect("verified duplicate peer tuple"),
+    ])
+    .expect("different SPKIs are individually unique");
+    assert_eq!(
+        ambiguous_extractor.signed_vip_for_verified_peer(edge_peer, &edge_certificate),
+        None,
+        "duplicate verified peer tuple must be rejected as ambiguous"
+    );
+}
+
 fn admission() -> Admission {
     Admission::new(Limits {
         handshakes_global: 4,

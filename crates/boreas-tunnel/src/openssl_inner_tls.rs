@@ -401,6 +401,36 @@ impl PkiIdentityExtractor {
         }
         Ok(Self { trusted })
     }
+
+    /// Return the signed VIP only when `certificate_der` is the exact-SPKI
+    /// certificate owner of the supplied peer identity. This trust-store lookup
+    /// is not a fresh authorization decision: callers must independently enforce
+    /// current fresh status (including validity, generation and revocation)
+    /// before using the result for an action.
+    pub fn signed_vip_for_verified_peer(
+        &self,
+        peer: PeerIdentity,
+        certificate_der: &[u8],
+    ) -> Option<[u8; 4]> {
+        let extracted = self.extract(certificate_der)?;
+        if extracted != peer {
+            return None;
+        }
+        let mut matched = None;
+        for identity in &self.trusted {
+            if identity.net_id == peer.net_id
+                && identity.node_id == peer.node_id
+                && identity.identity_generation == peer.identity_generation
+                && identity.role == peer.role
+            {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(identity.vip);
+            }
+        }
+        matched
+    }
 }
 
 impl PeerIdentityExtractor for PkiIdentityExtractor {
