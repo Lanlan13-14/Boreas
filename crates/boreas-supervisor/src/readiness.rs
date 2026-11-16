@@ -40,16 +40,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Instant;
 
+use crate::readiness_protocol::{CHALLENGE_MAGIC, MAX_LINE_BYTES, MAX_SCHEMA_BYTES, MAX_WORKERS, RESPONSE_MAGIC};
+
 /// Environment variable carrying the readiness socket path to the candidate.
 pub const SOCKET_ENV: &str = "BOREAS_READY_SOCKET";
-
-const CHALLENGE_MAGIC: &str = "BOREAS-READY-1";
-const RESPONSE_MAGIC: &str = "BOREAS-READY-OK";
-/// Hard cap for the whole response line. The read buffer is exactly this plus
-/// one byte, so the limit is enforced by construction.
-const MAX_LINE_BYTES: usize = 512;
-const MAX_SCHEMA_BYTES: usize = 64;
-const MAX_WORKERS: u32 = 4096;
 
 #[derive(Debug)]
 pub enum ReadinessError {

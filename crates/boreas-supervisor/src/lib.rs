@@ -67,6 +67,12 @@ pub mod manifest;
 pub mod preflight;
 pub mod sandbox;
 
+/// Shared private constants for the supervisor readiness wire protocol.
+#[cfg(target_os = "linux")]
+mod readiness_protocol;
+/// Bounded client for applications reporting trial readiness.
+pub mod ready_client;
+
 /// Real Ed25519 + ML-DSA-65 verification and artifact SHA-256. Compiled only
 /// with the `openssl-backend` feature (OpenSSL 3.5+); `manifest::verify_release`
 /// delegates to it and stays fail-closed in the default build.

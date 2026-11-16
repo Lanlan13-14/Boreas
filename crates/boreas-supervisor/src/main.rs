@@ -151,11 +151,18 @@ use boreas_supervisor::{
 /// POSIX signal forwarding + controlled stop (no-ops off Unix).
 mod signals;
 
+/// Shared wire-format constants for readiness protocol.
+#[cfg(unix)]
+mod readiness_protocol;
+
 /// Authorized AF_UNIX readiness handshake. Unix-only: Windows has no `AF_UNIX`
 /// in `std` and no peer-credential binding here, so a trial launch there fails
 /// closed instead of confirming on liveness alone.
 #[cfg(unix)]
 mod readiness;
+
+#[cfg(all(test, target_os = "linux"))]
+mod readiness_client_tests;
 
 const EXIT_ERROR: u8 = 1;
 
