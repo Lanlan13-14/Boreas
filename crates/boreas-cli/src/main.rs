@@ -1166,7 +1166,8 @@ fn doctor_json() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsoleEffect, ConsoleIo, ConsoleOutcome, ConsoleState, drive_console, run_console,
+        ConfigWizardStep, ConsoleEffect, ConsoleIo, ConsoleOutcome, ConsoleState, drive_console,
+        run_console,
     };
     use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
     use crate::config::RuntimeCapabilities;
