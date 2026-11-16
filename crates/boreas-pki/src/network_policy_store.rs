@@ -778,13 +778,19 @@ mod tests {
         let (dir, path) = temp();
         fs::write(dir.join("target"), b"not a state").unwrap();
         symlink(dir.join("target"), &path).unwrap();
-        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        assert!(matches!(
+            try_open(&path, &dir, &pin),
+            Err(Error::UnsafePath)
+        ));
         fs::remove_dir_all(dir).unwrap();
 
         let (dir, path) = temp();
         fs::write(dir.join("target"), b"not a state").unwrap();
         fs::hard_link(dir.join("target"), &path).unwrap();
-        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        assert!(matches!(
+            try_open(&path, &dir, &pin),
+            Err(Error::UnsafePath)
+        ));
         fs::remove_dir_all(dir).unwrap();
 
         let (dir, path) = temp();
@@ -805,14 +811,20 @@ mod tests {
         .unwrap();
         fs::write(&path, &state_bytes).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        assert!(matches!(
+            try_open(&path, &dir, &pin),
+            Err(Error::UnsafePath)
+        ));
         assert_eq!(fs::read(&path).unwrap(), state_bytes);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_dir_all(dir).unwrap();
 
         let (dir, path) = temp();
         fs::write(suffix(&path, ".staging"), b"leftover staging").unwrap();
-        assert!(matches!(try_open(&path, &dir, &pin), Err(Error::UnsafePath)));
+        assert!(matches!(
+            try_open(&path, &dir, &pin),
+            Err(Error::UnsafePath)
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -826,23 +838,38 @@ mod tests {
         let mut store = open(&path, &dir, &pin);
         store.commit(&first_token, &first).unwrap();
         let durable_before_duplicate = fs::read(&path).unwrap();
-        assert_eq!(store.commit(&first_token, &first).unwrap(), CommitResult::Duplicate);
+        assert_eq!(
+            store.commit(&first_token, &first).unwrap(),
+            CommitResult::Duplicate
+        );
         assert_eq!(fs::read(&path).unwrap(), durable_before_duplicate);
 
         // Introduce the existing staging artifact only after open; persist fails before
         // touching it, and commit_or_poison must prevent any further mutation.
         fs::write(suffix(&path, ".staging"), b"fixture").unwrap();
-        assert!(matches!(store.commit(&conflict_token, &conflict), Err(Error::UnsafePath)));
-        assert!(matches!(store.commit(&higher_token, &higher), Err(Error::Poisoned)));
+        assert!(matches!(
+            store.commit(&conflict_token, &conflict),
+            Err(Error::UnsafePath)
+        ));
+        assert!(matches!(
+            store.commit(&higher_token, &higher),
+            Err(Error::Poisoned)
+        ));
         drop(store);
         fs::remove_file(suffix(&path, ".staging")).unwrap();
 
         let mut store = open(&path, &dir, &pin);
-        assert!(matches!(store.commit(&conflict_token, &conflict), Err(Error::Equivocation)));
+        assert!(matches!(
+            store.commit(&conflict_token, &conflict),
+            Err(Error::Equivocation)
+        ));
         drop(store);
         let mut restarted = open(&path, &dir, &pin);
         assert!(restarted.is_frozen());
-        assert!(matches!(restarted.commit(&higher_token, &higher), Err(Error::Frozen)));
+        assert!(matches!(
+            restarted.commit(&higher_token, &higher),
+            Err(Error::Frozen)
+        ));
         drop(restarted);
         fs::remove_dir_all(dir).unwrap();
     }
