@@ -1455,11 +1455,23 @@ uplinks = ["wss://hub-us-c.example.net"]
     #[test]
     fn config_candidate_confirmation_is_exact_and_never_prompts() {
         for confirm in ["save", "SAVE ", "SAVE\\n", "SAV"] {
-            let result = super::run_config_save_candidate(&args(&["--config", "/does/not/exist", "--primary", "hub.example:443", "--confirm", confirm]));
+            let result = super::run_config_save_candidate(&args(&[
+                "--config",
+                "/does/not/exist",
+                "--primary",
+                "hub.example:443",
+                "--confirm",
+                confirm,
+            ]));
             assert_eq!(result.0, 2);
             assert!(result.2.contains("exactly SAVE"));
         }
-        let missing = super::run_config_save_candidate(&args(&["--config", "/does/not/exist", "--primary", "hub.example:443"]));
+        let missing = super::run_config_save_candidate(&args(&[
+            "--config",
+            "/does/not/exist",
+            "--primary",
+            "hub.example:443",
+        ]));
         assert_eq!(missing.0, 2);
         assert!(missing.2.contains("required"));
     }
