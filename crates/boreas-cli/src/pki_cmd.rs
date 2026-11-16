@@ -280,15 +280,16 @@ fn cmd_sign_status(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "openssl-inner-tls")]
 fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
-    use boreas_pki::{root_authorization::NetworkRootPin, verify_network_policy};
     use boreas_pki::provisioning::{hex_encode, parse_net_id_hex};
+    use boreas_pki::{root_authorization::NetworkRootPin, verify_network_policy};
     use boreas_proto::objects::MldsaParameterSet;
     use std::{collections::HashMap, io::Read, path::Path};
 
     fn read_input(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>, String> {
         let meta = std::fs::symlink_metadata(path)
             .map_err(|_| format!("pki verify-policy: cannot inspect {label}"))?;
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > limit as u64 {
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > limit as u64
+        {
             return Err(format!("pki verify-policy: invalid or oversized {label}"));
         }
         #[cfg(unix)]
@@ -309,15 +310,20 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
                 use std::os::windows::fs::OpenOptionsExt;
                 options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
             }
-            options.open(path).map_err(|_| format!("pki verify-policy: cannot safely open {label}"))?
+            options
+                .open(path)
+                .map_err(|_| format!("pki verify-policy: cannot safely open {label}"))?
         };
-        let opened_meta = file.metadata()
+        let opened_meta = file
+            .metadata()
             .map_err(|_| format!("pki verify-policy: cannot inspect {label}"))?;
         if !opened_meta.file_type().is_file() || opened_meta.len() > limit as u64 {
             return Err(format!("pki verify-policy: invalid or oversized {label}"));
         }
         let mut bytes = Vec::with_capacity(opened_meta.len() as usize);
-        (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)
+        (&mut file)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(|_| format!("pki verify-policy: cannot read {label}"))?;
         if bytes.is_empty() || bytes.len() > limit {
             return Err(format!("pki verify-policy: empty or oversized {label}"));
@@ -325,8 +331,14 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
         Ok(bytes)
     }
 
-    let required = ["--tbs-file", "--ed25519-signature-file", "--mldsa65-signature-file",
-        "--net-id", "--root-ed25519-der", "--root-mldsa65-der"];
+    let required = [
+        "--tbs-file",
+        "--ed25519-signature-file",
+        "--mldsa65-signature-file",
+        "--net-id",
+        "--root-ed25519-der",
+        "--root-mldsa65-der",
+    ];
     let mut values = HashMap::new();
     let mut i = 0;
     while i < args.len() {
@@ -337,7 +349,9 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
         if values.contains_key(flag) {
             return Err(format!("pki verify-policy: duplicate argument `{flag}`"));
         }
-        let value = args.get(i + 1).ok_or_else(|| format!("pki verify-policy: missing value for `{flag}`"))?;
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("pki verify-policy: missing value for `{flag}`"))?;
         if value.starts_with("--") {
             return Err(format!("pki verify-policy: missing value for `{flag}`"));
         }
@@ -352,13 +366,29 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
     let net_id = parse_net_id_hex(values["--net-id"])
         .map_err(|e| format!("pki verify-policy: invalid --net-id: {e}"))?;
     let tbs = read_input(Path::new(values["--tbs-file"]), 16 * 1024, "TBS")?;
-    let ed_sig = read_input(Path::new(values["--ed25519-signature-file"]), 64, "Ed25519 signature")?;
-    let pq_sig = read_input(Path::new(values["--mldsa65-signature-file"]), 3309, "ML-DSA-65 signature")?;
+    let ed_sig = read_input(
+        Path::new(values["--ed25519-signature-file"]),
+        64,
+        "Ed25519 signature",
+    )?;
+    let pq_sig = read_input(
+        Path::new(values["--mldsa65-signature-file"]),
+        3309,
+        "ML-DSA-65 signature",
+    )?;
     if ed_sig.len() != 64 || pq_sig.len() != 3309 {
         return Err("pki verify-policy: signature has invalid length".to_string());
     }
-    let ed_der = read_input(Path::new(values["--root-ed25519-der"]), 4096, "Ed25519 root key")?;
-    let pq_der = read_input(Path::new(values["--root-mldsa65-der"]), 4096, "ML-DSA-65 root key")?;
+    let ed_der = read_input(
+        Path::new(values["--root-ed25519-der"]),
+        4096,
+        "Ed25519 root key",
+    )?;
+    let pq_der = read_input(
+        Path::new(values["--root-mldsa65-der"]),
+        4096,
+        "ML-DSA-65 root key",
+    )?;
     let pin = NetworkRootPin::provisioned(net_id, ed_der, MldsaParameterSet::Mldsa65, pq_der)
         .map_err(|e| format!("pki verify-policy: invalid root pin: {e}"))?;
     let now = now_utc_us()?;
@@ -366,19 +396,38 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("pki verify-policy failed: {e}"))?;
     let overlay = verified.overlay_base();
     let (issued, expires) = verified.validity();
-    println!("{{\"command\":\"pki.verify-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"overlay_base\":\"{}.{}.{}.{}\",\"version\":{},\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{},\"clock\":\"local-untrusted\",\"pin_provenance\":\"operator-supplied; verify independently\"}}",
-        hex_encode(&verified.net_id()), hex_encode(&verified.root_key_fingerprint()), overlay[0], overlay[1], overlay[2], overlay[3], verified.version(), verified.seq(), issued, expires);
+    println!(
+        "{{\"command\":\"pki.verify-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"overlay_base\":\"{}.{}.{}.{}\",\"version\":{},\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{},\"clock\":\"local-untrusted\",\"pin_provenance\":\"operator-supplied; verify independently\"}}",
+        hex_encode(&verified.net_id()),
+        hex_encode(&verified.root_key_fingerprint()),
+        overlay[0],
+        overlay[1],
+        overlay[2],
+        overlay[3],
+        verified.version(),
+        verified.seq(),
+        issued,
+        expires
+    );
     Ok(())
 }
 
 #[cfg(all(test, feature = "openssl-inner-tls"))]
 mod verify_policy_cli_tests {
     use super::*;
-    use std::{fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("boreas-policy-cli-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "boreas-policy-cli-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         path
     }
@@ -395,14 +444,24 @@ mod verify_policy_cli_tests {
             ("--root-mldsa65-der", "pq.der", vec![1]),
         ] {
             fs::write(dir.join(file), bytes).unwrap();
-            args.extend([flag.to_string(), dir.join(file).to_string_lossy().into_owned()]);
+            args.extend([
+                flag.to_string(),
+                dir.join(file).to_string_lossy().into_owned(),
+            ]);
         }
-        args.extend(["--net-id".to_string(), "03030303030303030303030303030303".to_string()]);
+        args.extend([
+            "--net-id".to_string(),
+            "03030303030303030303030303030303".to_string(),
+        ]);
         args
     }
     #[test]
     fn verify_policy_rejects_unknown_duplicate_and_missing_flags() {
-        assert!(run(&["verify-policy", "--unknown", "x"]).unwrap_err().contains("unknown"));
+        assert!(
+            run(&["verify-policy", "--unknown", "x"])
+                .unwrap_err()
+                .contains("unknown")
+        );
         let dir = temp_dir();
         let args = baseline(&dir);
         let mut duplicate = args.clone();
@@ -410,9 +469,19 @@ mod verify_policy_cli_tests {
         let duplicate_args = std::iter::once("verify-policy".to_string())
             .chain(duplicate)
             .collect::<Vec<_>>();
-        assert!(run(&duplicate_args.iter().map(String::as_str).collect::<Vec<_>>())
-            .unwrap_err().contains("duplicate"));
-        assert!(run(&["verify-policy", "--tbs-file", "x"]).unwrap_err().contains("required"));
+        assert!(
+            run(&duplicate_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>())
+            .unwrap_err()
+            .contains("duplicate")
+        );
+        assert!(
+            run(&["verify-policy", "--tbs-file", "x"])
+                .unwrap_err()
+                .contains("required")
+        );
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
@@ -435,7 +504,11 @@ mod verify_policy_cli_tests {
             linked[index] = link.to_string_lossy().into_owned();
             let mut argv = vec!["verify-policy".to_string()];
             argv.extend(linked);
-            assert!(run(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap_err().contains("invalid or oversized TBS"));
+            assert!(
+                run(&argv.iter().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap_err()
+                    .contains("invalid or oversized TBS")
+            );
         }
         let _ = fs::remove_dir_all(dir);
     }
