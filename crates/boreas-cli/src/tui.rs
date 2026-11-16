@@ -830,6 +830,7 @@ impl ConsoleState {
                     self.config_step = ConfigWizardStep::Primary;
                     ConsoleEffect::None
                 }
+                "3" => ConsoleEffect::CheckConfig,
                 "2" => {
                     self.notice_rows = config_save_unavailable_rows(self.lang);
                     self.view = ConsoleView::Notice;
@@ -882,7 +883,11 @@ impl ConsoleState {
                         .and_then(|b| b.as_deref())
                         .unwrap_or("")
                 )),
-                "q" | "b" => {
+                "q" => {
+                    self.clear_config_wizard();
+                    ConsoleEffect::Quit
+                }
+                "b" => {
                     self.clear_config_wizard();
                     self.view = ConsoleView::ConfigWizard;
                     ConsoleEffect::None
@@ -1076,21 +1081,21 @@ fn config_wizard_rows(lang: Lang) -> Vec<String> {
             "primary/backup 是运行时使用的端点字段".into(),
             "不编辑身份、安全模式、私钥或自定义网段".into(),
             "本切片不保存候选，也不应用或重载".into(),
-            "按 1 检查；按 2 查看保存限制；b 返回".into(),
+            "按 1 编辑；按 2 查看保存限制；按 3 检查配置；b 返回".into(),
         ],
         Lang::ZhTw => vec![
             "[1] 編輯並預覽端點（不連線、不啟動）".into(),
             "primary/backup 是執行階段使用的端點欄位".into(),
             "不編輯身分、安全模式、私鑰或自訂網段".into(),
             "此切片不保存候選，也不套用或重新載入".into(),
-            "按 1 檢查；按 2 查看保存限制；b 返回".into(),
+            "按 1 編輯；按 2 查看保存限制；按 3 檢查設定；b 返回".into(),
         ],
         Lang::En => vec![
             "[1] Edit and preview endpoints (no connect/start)".into(),
             "primary/backup are the runtime endpoint fields".into(),
             "Identity, security, keys and custom prefixes stay locked".into(),
             "This slice cannot save, apply or reload a candidate".into(),
-            "Press 1 to check; 2 for save limits; b to return".into(),
+            "Press 1 to edit; 2 for save limits; 3 to check config; b to return".into(),
         ],
     }
 }
@@ -1290,7 +1295,7 @@ mod tests {
         confirm_dangerous, display_width, is_emoji, render_menu,
     };
     use super::{
-        ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, ServiceAction, render_detail,
+        ConsoleEffect, ConsoleState, ConsoleView, ConfigWizardStep, DETAIL_ROWS, ServiceAction, render_detail,
         sanitize_line,
     };
     use crate::i18n::Lang;
@@ -1644,6 +1649,20 @@ mod tests {
     }
 
     #[test]
+    fn config_wizard_menu_routes_check_config_for_all_languages() {
+        for (lang, expected) in [
+            (Lang::ZhCn, "按 3 检查配置"),
+            (Lang::ZhTw, "按 3 檢查設定"),
+            (Lang::En, "3 to check config"),
+        ] {
+            let mut state = ConsoleState::new(lang, false);
+            state.view = ConsoleView::ConfigWizard;
+            assert!(state.screen("test").unwrap().contains(expected));
+            assert_eq!(state.apply("3"), ConsoleEffect::CheckConfig);
+        }
+    }
+
+    #[test]
     fn console_only_telemetry_and_service_have_a_backend() {
         let mut state = ConsoleState::new(Lang::En, false);
         state.selected = 1;
@@ -1763,6 +1782,26 @@ mod tests {
         state.apply("3");
         let rows = state.confirm_rows();
         assert!(rows[0].contains("(unknown)"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn wizard_back_and_quit_clear_candidate_state() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.view = ConsoleView::ConfigWizard;
+        state.config_step = ConfigWizardStep::Preview;
+        state.config_primary = Some("candidate.example.net:443".into());
+        state.config_backup = Some(Some("backup.example.net:443".into()));
+        assert_eq!(state.apply("b"), ConsoleEffect::None);
+        assert_eq!(state.config_primary, None);
+        assert_eq!(state.config_backup, None);
+        assert_eq!(state.config_step, ConfigWizardStep::Menu);
+
+        state.config_step = ConfigWizardStep::Preview;
+        state.config_primary = Some("candidate.example.net:443".into());
+        assert_eq!(state.apply("q"), ConsoleEffect::Quit);
+        assert_eq!(state.config_primary, None);
+        assert_eq!(state.config_backup, None);
+        assert_eq!(state.config_step, ConfigWizardStep::Menu);
     }
 
     #[test]

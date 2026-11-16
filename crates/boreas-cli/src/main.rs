@@ -47,7 +47,7 @@ use config::{Config, NodeRole, RuntimeCapabilities};
 use i18n::{Lang, Msg, lang_from_env, parse_lang, text};
 use render::{DaemonState, StatusSnapshot, render_status};
 use tui::{
-    ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction, MenuModel,
+    ConfigWizardStep, ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction, MenuModel,
     confirm_dangerous, render_menu, sanitize_line,
 };
 
@@ -739,6 +739,14 @@ impl ConsoleIo {
             config.uplinks.probe_paths,
             footer
         );
+        // Verify the emitted fragment is itself valid TOML, including hostile
+        // quote/backslash endpoint characters. Keep paths and other config out.
+        if let Err(error) = fragment.parse::<toml::Table>() {
+            return ConsoleOutcome::rows(vec![format!(
+                "candidate serialization failed: {}",
+                sanitize_line(&error.to_string())
+            )]);
+        }
         ConsoleOutcome::rows(fragment.split('\n').map(str::to_string).collect::<Vec<_>>())
     }
 
@@ -965,7 +973,29 @@ where
             continue;
         }
         if is_wizard_preview {
-            state.notice_rows = outcome.rows;
+            // A boxed detail row is only 73 columns wide. Do not render a
+            // TOML candidate through that truncating path: emit exact TOML
+            // lines without terminal rendering. The outcome's first row marks
+            // success; validation errors are plain notice text instead.
+            let valid_candidate = outcome.rows.first().is_some_and(|row| row == "[uplink]");
+            if valid_candidate {
+                writeln!(out, "# BEGIN endpoint-only TOML preview (not saved/applied)")
+                    .map_err(|_| "console write failed".to_string())?;
+                for row in &outcome.rows {
+                    writeln!(out, "{row}").map_err(|_| "console write failed".to_string())?;
+                }
+            }
+            // Candidate is one-shot; do not retain any endpoint data in UI state.
+            state.config_primary = None;
+            state.config_backup = None;
+            state.config_step = ConfigWizardStep::Menu;
+            state.notice_rows = if valid_candidate {
+                match state.lang {
+                    Lang::ZhCn => vec!["候选片段已原样输出；未保存、应用或重载。".into()],
+                    Lang::ZhTw => vec!["候選片段已原樣輸出；未保存、套用或重新載入。".into()],
+                    Lang::En => vec!["Candidate emitted verbatim above; not saved, applied, or reloaded.".into()],
+                }
+            } else { outcome.rows };
             state.view = ConsoleView::Notice;
             continue;
         }
@@ -1715,6 +1745,15 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     #[test]
+    fn console_non_tty_is_json_and_does_not_read_any_stdin() {
+        let (code, stdout, stderr) = run_console(&[], Lang::En, false);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.starts_with("{\"command\":\"console\""));
+        assert!(!stdout.contains("PREVIEW"));
+    }
+
+    #[test]
     fn console_reports_offline_when_the_socket_is_absent() {
         let missing = std::env::temp_dir().join(format!(
             "boreas-console-absent-{}-{}.sock",
@@ -1797,7 +1836,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(output.contains("primary = \"new-hub.example.net:443\""));
         assert!(output.contains("backup = \"backup.example.net:443\""));
         assert!(output.contains("paths = 4") && output.contains("probe_paths = 1"));
-        assert!(output.contains("not saved, applied, or reloaded"));
+        assert!(output.contains("Candidate emitted verbatim above"));
+        assert!(output.contains("# BEGIN endpoint-only TOML preview"));
+        assert!(output.contains("not saved/applied"));
+        assert!(!output.contains("identity.key"));
         assert_eq!(
             std::fs::read_to_string(&path).expect("config remains"),
             original
@@ -1805,6 +1847,52 @@ uplinks = ["wss://hub-us-c.example.net"]
         let _ = std::fs::remove_file(&path);
         assert_eq!(state.config_primary, None);
         assert_eq!(state.config_backup, None);
+        assert_eq!(state.config_step, ConfigWizardStep::Menu);
+    }
+
+    #[test]
+    fn wizard_quote_long_endpoint_preview_is_valid_and_untruncated() {
+        use std::io::BufReader;
+        let path = write_fixture("wizard-escaped", &config_source());
+        let endpoint = format!("{}\".example.net:443", "a".repeat(180));
+        let input = format!("8\n\n4\n1\n{endpoint}\n\nPREVIEW\nq\n");
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut output = Vec::new();
+        let mut state = ConsoleState::new(Lang::En, false);
+        let mut io = ConsoleIo { socket: std::path::PathBuf::new(), config: path.clone(), service: None };
+        drive_console(&mut state, &mut reader, &mut output, |effect, lang| io.perform(effect, lang)).expect("driver");
+        let rendered = String::from_utf8(output).unwrap();
+        let start = rendered.find("# BEGIN endpoint-only TOML preview").unwrap();
+        let preview = &rendered[start..];
+        let emitted = preview.lines().skip(1).take_while(|line| !line.starts_with("# Preview only") && !line.starts_with("BOREAS CONSOLE")).collect::<Vec<_>>().join("\n");
+        let table: toml::Table = emitted.parse().expect("candidate fragment is valid TOML");
+        assert_eq!(table["uplink"]["primary"].as_str(), Some(endpoint.as_str()));
+        assert!(!rendered.contains("identity.key"));
+        assert!(rendered.contains("\\\".example.net:443"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wizard_preview_rejects_near_match_and_invalid_candidates() {
+        use std::io::BufReader;
+        let path = write_fixture("wizard-invalid", &config_source());
+        for (phrase, endpoint, expected) in [
+            (" preview", "valid.example.net:443", "Preview cancelled"),
+            ("preview", "valid.example.net:443", "Preview cancelled"),
+            ("PREVIEW", "not an endpoint", "candidate rejected"),
+            ("PREVIEW", "\\\\bad.example.net:443", "candidate rejected"),
+        ] {
+            let input = format!("8\n\n4\n1\n{endpoint}\n\n{phrase}\nq\n");
+            let mut reader = BufReader::new(input.as_bytes());
+            let mut output = Vec::new();
+            let mut state = ConsoleState::new(Lang::En, false);
+            let mut io = ConsoleIo { socket: std::path::PathBuf::new(), config: path.clone(), service: None };
+            drive_console(&mut state, &mut reader, &mut output, |effect, lang| io.perform(effect, lang)).expect("driver");
+            let rendered = String::from_utf8(output).unwrap();
+            assert!(rendered.contains(expected), "{phrase:?}: {rendered}");
+            if expected == "candidate rejected" { assert!(!rendered.contains("BEGIN endpoint-only TOML preview")); }
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1824,6 +1912,17 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(screen.matches("BOREAS CONSOLE").count(), 2);
         assert!(screen.contains("> [2] Identity & DIR"));
         assert!(!screen.as_bytes().contains(&0x1B));
+    }
+
+    #[test]
+    fn console_driver_bounds_overlong_input_and_exits() {
+        use std::io::BufReader;
+        let input = format!("{}\nq\n", "x".repeat(1100));
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut output = Vec::new();
+        let mut state = ConsoleState::new(Lang::En, false);
+        drive_console(&mut state, &mut reader, &mut output, |_, _| panic!("no effect expected")).expect("bounded exit");
+        assert!(String::from_utf8(output).unwrap().contains("Unknown command"));
     }
 
     #[test]
