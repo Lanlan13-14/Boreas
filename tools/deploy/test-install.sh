@@ -728,9 +728,11 @@ assert_contains "$UNIT" 'TimeoutStopSec=20'
 assert_not_contains "$UNIT" 'ExecStart=/opt/boreas'
 
 assert_contains "$PROCD" '@@PREFIX@@/boreas-run'
-assert_not_contains "$PROCD" '. /etc/boreas'
-assert_not_contains "$PROCD" 'source '
-assert_not_contains "$PROCD" 'eval '
+# Match executable command starts, not prose or the chmod example in comments.
+# A bare '.' is a regex wildcard and incorrectly matches '600 /etc/boreas'.
+assert_not_contains "$PROCD" '^[[:space:]]*\.[[:space:]]'
+assert_not_contains "$PROCD" '^[[:space:]]*source[[:space:]]'
+assert_not_contains "$PROCD" '^[[:space:]]*eval[[:space:]]'
 assert_not_contains "$PROCD" 'ExecStart='
 
 # shellcheck disable=SC1091 # the procd template is an input file, not a library
