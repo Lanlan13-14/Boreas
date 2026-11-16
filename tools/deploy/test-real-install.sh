@@ -27,18 +27,24 @@ BIN=$ROOT_BIN
 P=$T/prefix
 B=$T/bindir
 sudo mkdir -m 0700 "$P" "$B"
-# Make a real, internally consistent node bundle with the candidate itself.
+# Make real, internally consistent node bundles with the candidate itself.
+# local.signed and peer.signed must carry two independent node identities.
 NET=0123456789abcdef0123456789abcdef
+CORE=$T/materials-core
+EDGE=$T/materials-edge
 sudo "$BIN" pki init-ca --ca-dir "$T/ca" --net-id "$NET" --validity-days 30
-sudo "$BIN" pki issue-node --ca-dir "$T/ca" --out-dir "$T/materials" --role core --home-core 1 --vip-octet 1 --validity-hours 12 --outer-san wss.example.net
-sudo cp "$T/materials/local.signed" "$T/materials/peer.signed"
-sudo "$BIN" pki verify-bundle --material-dir "$T/materials" --require-peer >/dev/null
+sudo "$BIN" pki issue-node --ca-dir "$T/ca" --out-dir "$CORE" --role core --home-core 1 --vip-octet 1 --validity-hours 12 --outer-san wss.example.net
+sudo "$BIN" pki issue-node --ca-dir "$T/ca" --out-dir "$EDGE" --role edge --home-core 1 --vip-octet 2 --validity-hours 12
+# Peer exchange is normally bidirectional; only the core bundle is installed below.
+sudo cp "$EDGE/local.signed" "$CORE/peer.signed"
+sudo cp "$CORE/local.signed" "$EDGE/peer.signed"
+sudo "$BIN" pki verify-bundle --material-dir "$CORE" --require-peer >/dev/null
 sudo cp -- "$ROOT/docs/config/config.legacy-v1.example.toml" "$T/config.toml"
 # Config's absolute input paths are references only; installer canonicalizes
 # and relocates its three path fields into the temporary prefix.
 HASH=$(sudo sha256sum -- "$BIN" | awk '{print $1}')
 REL=gha-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}
-set -- --binary "$BIN" --sha256 "$HASH" --release "$REL" --materials "$T/materials" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none
+set -- --binary "$BIN" --sha256 "$HASH" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none
 sudo sh "$DEPLOY/install.sh" "$@"
 ACTIVE=$(sudo readlink "$P/active")
 [ "$ACTIVE" = "releases/$REL" ]
@@ -53,7 +59,7 @@ fi
 sudo "$B/boreas" --help >/dev/null
 sudo "$B/boreas" doctor >/dev/null
 # Wrong digest must fail before candidate execution or changing active pointer.
-if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$(printf '%064d' 0)" --release "$REL" --materials "$T/materials" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
+if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$(printf '%064d' 0)" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
   echo 'wrong hash unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'SHA-256 mismatch' "$BAD"
@@ -63,7 +69,7 @@ grep -q 'SHA-256 mismatch' "$BAD"
 sudo cp -- "$BIN" "$T/conflict"
 printf '\nconflict\n' | sudo tee -a "$T/conflict" >/dev/null
 CH=$(sudo sha256sum "$T/conflict" | awk '{print $1}')
-if sudo sh "$DEPLOY/install.sh" --binary "$T/conflict" --sha256 "$CH" --release "$REL" --materials "$T/materials" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
+if sudo sh "$DEPLOY/install.sh" --binary "$T/conflict" --sha256 "$CH" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
   echo 'conflicting existing release unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'already exists with a different bundle' "$BAD"
