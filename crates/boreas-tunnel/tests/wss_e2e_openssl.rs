@@ -575,10 +575,10 @@ fn peer(object: &VerifiedObject) -> PeerIdentity {
         boreas_pki::expected_vip(
             body.home_core_id,
             value.vip()[3],
-            match value.role() {
-                NodeRole::Core => boreas_pki::NodeRole::Core,
-                NodeRole::Edge => boreas_pki::NodeRole::Edge,
-                NodeRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
+            match body.role {
+                ObjectRole::Core => PkiNodeRole::Core,
+                ObjectRole::Edge => PkiNodeRole::Edge,
+                ObjectRole::EnrollmentService => PkiNodeRole::EnrollmentService,
             },
         )
         .expect("default overlay VIP")
