@@ -180,6 +180,7 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
+        Some("config-save-candidate") => run_config_save_candidate(&args[1..]),
         Some("node") => node::run(&args[1..]),
         Some("pki") => match pki_cmd::run_pki_command(&args[1..]) {
             Ok(()) => (0, String::new(), String::new()),
@@ -1109,10 +1110,78 @@ fn run_config_migrate(args: &[String]) -> (u8, String, String) {
     }
 }
 
+fn run_config_save_candidate(args: &[String]) -> (u8, String, String) {
+    let mut config_path = None;
+    let mut primary = None;
+    let mut backup = None;
+    let mut confirm = None;
+    let mut i = 0;
+    while i < args.len() {
+        let slot = match args[i].as_str() {
+            "--config" => &mut config_path,
+            "--primary" => &mut primary,
+            "--backup" => &mut backup,
+            "--confirm" => &mut confirm,
+            _ => {
+                return (
+                    2,
+                    String::new(),
+                    "error: invalid config-save-candidate arguments".into(),
+                );
+            }
+        };
+        if slot.is_some() || i + 1 >= args.len() {
+            return (
+                2,
+                String::new(),
+                "error: duplicate or missing argument value".into(),
+            );
+        }
+        *slot = Some(args[i + 1].clone());
+        i += 2;
+    }
+    let (Some(path), Some(primary), Some(confirm)) = (config_path, primary, confirm) else {
+        return (
+            2,
+            String::new(),
+            "error: required --config, --primary, and --confirm SAVE".into(),
+        );
+    };
+    if confirm != "SAVE" {
+        return (
+            2,
+            String::new(),
+            "error: confirmation must be exactly SAVE; nothing was saved".into(),
+        );
+    }
+    let config = match Config::read_file(Path::new(&path), RuntimeCapabilities::NO_RUNTIME) {
+        Ok(config) => config,
+        Err(err) => {
+            return (
+                2,
+                String::new(),
+                format!("error: configuration rejected: {err}"),
+            );
+        }
+    };
+    match config.save_endpoint_candidate(&primary, backup.as_deref()) {
+        Ok(name) => (
+            0,
+            format!("{{\"saved\":true,\"applied\":false,\"candidate\":\"{name}\"}}"),
+            String::new(),
+        ),
+        Err(err) => (
+            2,
+            String::new(),
+            format!("error: candidate not saved: {err}"),
+        ),
+    }
+}
+
 fn help_text() -> String {
     let mut text = "boreas — Phase 0 policy/config/console foundation\n\n\
      USAGE:\n\
-     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|console [--json] [--socket <p>] [--config <f>] [--service <u>]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|node serve|node connect|help]\n\
+     \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|console [--json] [--socket <p>] [--config <f>] [--service <u>]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|config-save-candidate ...|node serve|node connect|help]\n\
      \x20 boreas-easy   (line-mode console: menu, service status/start/stop)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
@@ -1384,6 +1453,18 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     #[test]
+    fn config_candidate_confirmation_is_exact_and_never_prompts() {
+        for confirm in ["save", "SAVE ", "SAVE\\n", "SAV"] {
+            let result = super::run_config_save_candidate(&args(&["--config", "/does/not/exist", "--primary", "hub.example:443", "--confirm", confirm]));
+            assert_eq!(result.0, 2);
+            assert!(result.2.contains("exactly SAVE"));
+        }
+        let missing = super::run_config_save_candidate(&args(&["--config", "/does/not/exist", "--primary", "hub.example:443"]));
+        assert_eq!(missing.0, 2);
+        assert!(missing.2.contains("required"));
+    }
+
+    #[test]
     fn config_check_requires_path_and_never_starts_daemon() {
         let (code, stdout, stderr) = run(&args(&["config-check"]), Lang::En, false);
         assert_eq!(code, 2);
@@ -1489,6 +1570,7 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(code, 0);
         assert!(stdout.contains("config-check <path>"));
         assert!(stdout.contains("config-migrate <path>"));
+        assert!(stdout.contains("config-save-candidate"));
         assert!(stdout.contains("node serve"));
         assert!(!stdout.contains("No daemon, TLS backend, or networking is implemented."));
         #[cfg(not(feature = "openssl-inner-tls"))]

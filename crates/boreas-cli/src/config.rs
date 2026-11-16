@@ -315,6 +315,10 @@ pub enum ConfigError {
     TooLarge,
     ParseFailed,
     UnsafePermissions,
+    CandidateSaveUnsupported,
+    CandidateSaveFailed,
+    CandidateDirectoryUnsafe,
+    CandidateHomeUnavailable,
 }
 
 impl fmt::Display for ConfigError {
@@ -381,6 +385,12 @@ impl fmt::Display for ConfigError {
             Self::UnsafePermissions => {
                 "configuration file is group- or world-accessible; expected mode 0600"
             }
+            Self::CandidateSaveUnsupported => "candidate saving is supported only on Linux",
+            Self::CandidateSaveFailed => "candidate could not be saved safely",
+            Self::CandidateDirectoryUnsafe => {
+                "candidate directory is not a private user-owned directory"
+            }
+            Self::CandidateHomeUnavailable => "no safe per-user candidate directory is available",
         };
         f.write_str(message)
     }
@@ -693,6 +703,41 @@ impl Config {
         })
     }
 
+    /// Save only the validated uplink endpoint fragment as a candidate, never
+    /// applying or activating it. The returned string is a basename, never a path.
+    pub fn save_endpoint_candidate(
+        &self,
+        primary: &str,
+        backup: Option<&str>,
+    ) -> Result<String, ConfigError> {
+        let mut candidate = self.clone();
+        candidate.uplinks.primary = primary.to_string();
+        candidate.uplinks.backup = backup.map(str::to_string);
+        candidate.validate(RuntimeCapabilities::NO_RUNTIME)?;
+        let fragment = candidate.endpoint_candidate_toml()?;
+        save_candidate_bytes(&fragment)
+    }
+
+    /// Serialize only the uplink section, excluding every private and unrelated field.
+    pub fn endpoint_candidate_toml(&self) -> Result<String, ConfigError> {
+        self.validate(RuntimeCapabilities::NO_RUNTIME)?;
+        let mut fragment = format!(
+            "[uplink]\nprimary = {}\n",
+            toml_string(&self.uplinks.primary)
+        );
+        if let Some(backup) = &self.uplinks.backup {
+            fragment.push_str(&format!("backup = {}\n", toml_string(backup)));
+        }
+        fragment.push_str(&format!(
+            "paths = {}\nprobe_paths = {}\n\n# Candidate only: not applied, reloaded, or activated.\n",
+            self.uplinks.paths, self.uplinks.probe_paths
+        ));
+        if fragment.len() > MAX_CONFIG_BYTES || fragment.parse::<toml::Table>().is_err() {
+            return Err(ConfigError::CandidateSaveFailed);
+        }
+        Ok(fragment)
+    }
+
     /// Read a bounded configuration file through a single safe open.
     ///
     /// Unix: `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`, so a FIFO cannot block the
@@ -1002,6 +1047,183 @@ impl Config {
     pub fn redacted(&self) -> RedactedConfig<'_> {
         RedactedConfig(self)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn save_candidate_bytes(bytes: &str) -> Result<String, ConfigError> {
+    let root = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(xdg);
+        if !path.is_absolute() {
+            return Err(ConfigError::CandidateHomeUnavailable);
+        }
+        path
+    } else {
+        let home =
+            PathBuf::from(std::env::var_os("HOME").ok_or(ConfigError::CandidateHomeUnavailable)?);
+        if !home.is_absolute() {
+            return Err(ConfigError::CandidateHomeUnavailable);
+        }
+        home.join(".config")
+    };
+    save_candidate_at_root(bytes, &root)
+}
+
+#[cfg(target_os = "linux")]
+fn save_candidate_at_root(bytes: &str, root: &Path) -> Result<String, ConfigError> {
+    if !root.is_absolute() {
+        return Err(ConfigError::CandidateHomeUnavailable);
+    }
+    if root.parent().is_none() {
+        return Err(ConfigError::CandidateDirectoryUnsafe);
+    }
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge);
+    }
+    let uid = unsafe { libc::geteuid() };
+    let mut fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(ConfigError::CandidateSaveFailed);
+    }
+    let mut current = unsafe { std::fs::File::from_raw_fd(fd) };
+    for component in root.components().skip(1) {
+        let std::path::Component::Normal(name) = component else {
+            return Err(ConfigError::CandidateHomeUnavailable);
+        };
+        let c = CString::new(name.as_bytes()).map_err(|_| ConfigError::CandidateHomeUnavailable)?;
+        fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(ConfigError::CandidateDirectoryUnsafe);
+        }
+        let next = unsafe { std::fs::File::from_raw_fd(fd) };
+        let m = next
+            .metadata()
+            .map_err(|_| ConfigError::CandidateDirectoryUnsafe)?;
+        if m.uid() != uid && !(m.uid() == 0 && m.permissions().mode() & 0o022 == 0) {
+            return Err(ConfigError::CandidateDirectoryUnsafe);
+        }
+        if m.permissions().mode() & 0o022 != 0 {
+            return Err(ConfigError::CandidateDirectoryUnsafe);
+        }
+        current = next;
+    }
+    // Never treat an ancestor owned by root as a usable per-user config root.
+    // In particular, XDG_CONFIG_HOME=/ must not place candidates directly under /
+    // (or create /boreas). The complete selected root must belong to this user.
+    let root_metadata = current
+        .metadata()
+        .map_err(|_| ConfigError::CandidateDirectoryUnsafe)?;
+    if root_metadata.uid() != uid {
+        return Err(ConfigError::CandidateDirectoryUnsafe);
+    }
+    for name in ["boreas", "candidates"] {
+        let c = CString::new(name).unwrap();
+        let mut child = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if errno != Some(libc::ENOENT) {
+                return Err(ConfigError::CandidateDirectoryUnsafe);
+            }
+            if unsafe { libc::mkdirat(current.as_raw_fd(), c.as_ptr(), 0o700) } != 0 {
+                return Err(ConfigError::CandidateSaveFailed);
+            }
+            if unsafe { libc::fsync(current.as_raw_fd()) } != 0 {
+                return Err(ConfigError::CandidateSaveFailed);
+            }
+            child = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if child < 0 {
+            return Err(ConfigError::CandidateDirectoryUnsafe);
+        }
+        let next = unsafe { std::fs::File::from_raw_fd(child) };
+        let m = next
+            .metadata()
+            .map_err(|_| ConfigError::CandidateDirectoryUnsafe)?;
+        if m.uid() != uid || m.permissions().mode() & 0o777 != 0o700 {
+            return Err(ConfigError::CandidateDirectoryUnsafe);
+        }
+        current = next;
+    }
+    for _ in 0..8 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "uplink-{}-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            nonce
+        );
+        let c = CString::new(name.as_bytes()).unwrap();
+        let out = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if out < 0 {
+            if unsafe { *libc::__errno_location() } == libc::EEXIST {
+                continue;
+            }
+            return Err(ConfigError::CandidateSaveFailed);
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(out) };
+        use std::io::Write;
+        if file.write_all(bytes.as_bytes()).is_err() || file.sync_all().is_err() {
+            drop(file);
+            unsafe {
+                libc::unlinkat(current.as_raw_fd(), c.as_ptr(), 0);
+                libc::fsync(current.as_raw_fd());
+            }
+            return Err(ConfigError::CandidateSaveFailed);
+        }
+        if unsafe { libc::fsync(current.as_raw_fd()) } != 0 {
+            drop(file);
+            unsafe {
+                libc::unlinkat(current.as_raw_fd(), c.as_ptr(), 0);
+                libc::fsync(current.as_raw_fd());
+            }
+            return Err(ConfigError::CandidateSaveFailed);
+        }
+        return Ok(name);
+    }
+    Err(ConfigError::CandidateSaveFailed)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn save_candidate_bytes(_bytes: &str) -> Result<String, ConfigError> {
+    Err(ConfigError::CandidateSaveUnsupported)
 }
 
 /// Open a path without following a final-component symlink/reparse point and
@@ -1643,6 +1865,114 @@ ipv6 = false
         let config = Config::parse_toml(&document, RuntimeCapabilities::FULL).unwrap();
         assert!(config.dns.as_ref().unwrap().tcp);
         assert!(config.redacted_json().contains("\"tcp\":true"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn endpoint_candidate_is_fragment_only_and_validated() {
+        let config = parse(&v2_toml()).unwrap();
+        let fragment = config.endpoint_candidate_toml().unwrap();
+        assert!(fragment.starts_with("[uplink]\n"));
+        assert!(fragment.contains("primary = \"hub-us-c.example.net:443\""));
+        assert!(!fragment.contains("identity"));
+        assert!(!fragment.contains("roots"));
+        assert!(fragment.parse::<toml::Table>().is_ok());
+        assert_eq!(config.endpoint_candidate_toml().unwrap(), fragment);
+        assert_eq!(
+            config.clone().save_endpoint_candidate("bad/host:443", None),
+            Err(ConfigError::InvalidEndpoint)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn candidate_test_root() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::current_dir().unwrap().join(format!(
+            ".boreas-candidate-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_save_creates_private_fragment_without_touching_source() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = candidate_test_root();
+        let source_path = root.join("source.toml");
+        let source = "unchanged source config";
+        std::fs::write(&source_path, source).unwrap();
+        let fragment = "[uplink]\nprimary = \"candidate.example:443\"\n";
+        let name = save_candidate_at_root(fragment, &root).unwrap();
+        assert!(name.starts_with("uplink-"));
+        assert_eq!(std::fs::read_to_string(source_path).unwrap(), source);
+        let directory = root.join("boreas").join("candidates");
+        for path in [root.join("boreas"), directory.clone()] {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        let path = directory.join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert_eq!(saved, fragment);
+        assert!(saved.parse::<toml::Table>().is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_save_refuses_unsafe_roots_and_existing_app_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let relative = Path::new("relative/path");
+        assert_eq!(
+            save_candidate_at_root("[uplink]\n", relative),
+            Err(ConfigError::CandidateHomeUnavailable)
+        );
+        assert_eq!(
+            save_candidate_at_root("[uplink]\n", Path::new("/")),
+            Err(ConfigError::CandidateDirectoryUnsafe)
+        );
+        let root = candidate_test_root();
+        let boreas = root.join("boreas");
+        std::fs::create_dir(&boreas).unwrap();
+        std::fs::set_permissions(&boreas, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            save_candidate_at_root("[uplink]\n", &root),
+            Err(ConfigError::CandidateDirectoryUnsafe)
+        );
+        std::fs::set_permissions(&boreas, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let candidates = boreas.join("candidates");
+        std::fs::create_dir(&candidates).unwrap();
+        std::fs::set_permissions(&candidates, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            save_candidate_at_root("[uplink]\n", &root),
+            Err(ConfigError::CandidateDirectoryUnsafe)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_save_rejects_symlinked_parent() {
+        let root = candidate_test_root();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, root.join("linked")).unwrap();
+        assert_eq!(
+            save_candidate_at_root("[uplink]\n", &root.join("linked")),
+            Err(ConfigError::CandidateDirectoryUnsafe)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
