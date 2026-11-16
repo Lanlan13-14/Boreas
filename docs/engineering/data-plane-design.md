@@ -1,6 +1,14 @@
 # Data-plane state primitives: limits and integration boundary
 
-This note describes the pure state types added under `crates/boreas-tunnel/src/`. They are not a functioning network data plane. There is no TLS implementation, socket/WebSocket path, TUN device, kernel route installation, cryptographic circuit ID generation, or production resource audit. All plan gates remain open; see [the v1.11 master plan](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) §11 and [the implementation gate ledger](implementation-status.md).
+Historical primitive-design note: the sections below describe isolated state types, not the complete current product. The Linux point-to-point daemon now has a real WSS/hop/E2E TLS and TUN path; that does not complete these primitives' topology-wide integration or the production resource audit. All plan gates remain open; see [the v1.11 master plan](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) §11 and [the implementation gate ledger](implementation-status.md).
+
+## Short daemon resource observations (candidate, pending Actions)
+
+The netns smoke samples the recorded Core/Edge exec PIDs during its concurrent bidirectional transfer, approximately every 100 ms, bounded to 500 samples or 45 seconds. Before accepting a process, its executable device/inode must match the tested binary; every sample must retain the same process starttime and executable identity. Wrapper processes, substituted PIDs, missing samples, unknown clock-tick/page units and insufficient windows yield `unmeasured`, never fabricated values. Installed OpenWrt rootfs copies have different inodes and currently report `unmeasured`.
+
+CPU seconds are the process thread group's user+system tick delta divided by the kernel-reported `SC_CLK_TCK`; CPU percentage is relative to one CPU over the observed window. RSS is the maximum sampled resident-page count times `SC_PAGE_SIZE`, not a lifetime high-water mark. Sampling excludes handshake/startup, child CPU, kernel socket memory, PSS and total cgroup usage; 100 ms sampling can miss short peaks and perturbs the workload. There is no arbitrary CPU/RSS pass threshold; unavailable observations do not turn a functional smoke green or red. Original functional, security and performance gates remain mandatory.
+
+This short two-node observation does **not** satisfy the full plan's `G-RESOURCE`: 195/291-connection load, admission attacks, stopped readers, TLS/HTTP2 costs, 30-minute endurance, RSS/PSS/cgroup/sockstat/credit/queue accounting and unexplained growth analysis remain open. No CPU/RSS improvement or budget acceptance is claimed until actual exact-commit evidence is reviewed. Syntax/build/test execution remains GitHub Actions-only.
 
 ## Resource admission (`resource.rs`)
 

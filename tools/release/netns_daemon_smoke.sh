@@ -38,7 +38,7 @@ record_failure() {
   FAILURES+=("$1")
 }
 report_daemon_state() {
-  local label socket status log
+  local label socket status log spec
   echo "--- daemon state ---" >&2
   for spec in "Core:$CORE_STATE/control.sock" "Edge:$EDGE_STATE/control.sock"; do
     label="${spec%%:*}"
@@ -70,6 +70,206 @@ report_failure_evidence() {
   return 0
 }
 
+# --- Daemon resource evidence (read-only /proc, no threshold asserted) --------
+# Both daemons must be measured as the real exec'd processes, never the
+# `ip netns exec`/`unshare`/`bash -c` wrapper chain nor the short-lived probe
+# workers: only the recorded `$!` PIDs are candidates, and every sample re-checks
+# `/proc/<pid>/stat` starttime ticks plus the `/proc/<pid>/exe` name and inode.
+# Unverified becomes `unmeasured`, never counted. Read-only /proc: no sysctl,
+# route or qdisc change, no key material, numbers only. No CPU/RSS threshold is
+# asserted (no accepted budget exists) and missing evidence never fails the smoke.
+RESOURCE_INTERVAL_MS=100
+RESOURCE_SAMPLER_PID=""
+RESOURCE_SUMMARY=""
+RESOURCE_SAMPLER_ERR=""
+RESOURCE_STOP_FILE=""
+
+# One bounded background child. It exits on the stop sentinel or on its own
+# sample/time deadline, then prints the derived summary (numbers only).
+start_resource_sampler() { # $1=core exec pid|- $2=edge exec pid|-
+  RESOURCE_SUMMARY="$WORK/resource-summary.txt"
+  RESOURCE_SAMPLER_ERR="$WORK/resource-sampler.err"
+  RESOURCE_STOP_FILE="$WORK/resource-sampler.stop"
+  RESOURCE_SAMPLER_PID=""
+  rm -f "$RESOURCE_STOP_FILE" "$RESOURCE_SUMMARY"
+  python3 - "$1" "$2" "$RESOURCE_STOP_FILE" "$RESOURCE_INTERVAL_MS" "$BIN" \
+    >"$RESOURCE_SUMMARY" 2>"$RESOURCE_SAMPLER_ERR" <<'PY' &
+import os
+import sys
+import time
+
+core_pid, edge_pid, stop_path, interval_ms, binary = sys.argv[1:6]
+# Bounded: 500 samples or 45 s, whichever comes first. The stop sentinel ends
+# the loop within one interval, so a normal probe reaches neither bound.
+interval = max(1, int(interval_ms)) / 1000.0
+MAX_SAMPLES, MAX_SECONDS = 500, 45.0
+FIELDS = {"utime": 14, "stime": 15, "starttime": 22, "rss_pages": 24}
+
+
+def sysconf(name):
+    """No fallback: a fabricated tick rate or page size would fake the units."""
+    try:
+        value = int(os.sysconf(name))
+    except (AttributeError, OSError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def read_stat(pid):
+    """utime/stime ticks, starttime ticks and resident pages for one PID.
+    Parsing starts after the last ') ' because `comm` may contain spaces."""
+    try:
+        raw = open("/proc/%s/stat" % pid, "rb").read().decode("ascii", "replace")
+    except OSError:
+        return None
+    head = raw.rfind(")")
+    if head < 0:
+        return None
+    fields = raw[head + 2:].split()
+    try:
+        return {key: int(fields[number - 3]) for key, number in FIELDS.items()}
+    except (IndexError, ValueError):
+        return None
+
+
+def exe_identity(pid):
+    """Kernel-reported executable of this PID: (basename, device, inode)."""
+    try:
+        link = os.readlink("/proc/%s/exe" % pid)
+        info = os.stat("/proc/%s/exe" % pid)
+    except OSError:
+        return None
+    return (os.path.basename(link), info.st_dev, info.st_ino)
+
+
+def start_identity(pid):
+    """Identity token; (None, reason) is unmeasured and never a substituted PID."""
+    if pid == "-":
+        return None, "recorded-exec-pid-missing"
+    entry, ident = read_stat(pid), exe_identity(pid)
+    if entry is None or ident is None:
+        return None, "recorded-exec-pid-stat-or-exe-unreadable"
+    try:
+        want = os.stat(binary)
+    except OSError:
+        return None, "tested-binary-stat-unreadable"
+    if ident[1:] != (want.st_dev, want.st_ino):
+        # A same-name impostor and an in-rootfs install copy both fail here: only
+        # the tested binary image itself may be reported as measured, so a rootfs
+        # run reports `unmeasured` rather than being accepted by name.
+        return None, "recorded-exec-pid-is-not-the-tested-binary-inode"
+    return (entry["starttime"], ident), None
+
+
+def snapshot(pid, token):
+    """Re-verifies starttime and exe name/inode on every single sample."""
+    entry, ident = read_stat(pid), exe_identity(pid)
+    if entry is None or ident is None or (entry["starttime"], ident) != token:
+        return None
+    return {"utime": entry["utime"], "stime": entry["stime"],
+            "rss_kb": entry["rss_pages"] * PAGE_BYTES // 1024}
+
+
+def uptime():
+    with open("/proc/uptime", encoding="ascii") as handle:
+        return float(handle.read().split()[0])
+
+
+CLK_TCK, PAGE_BYTES = sysconf("SC_CLK_TCK"), sysconf("SC_PAGE_SIZE")
+core_token, core_problem = start_identity(core_pid)
+edge_token, edge_problem = start_identity(edge_pid)
+if CLK_TCK is None or PAGE_BYTES is None:
+    core_problem = core_problem or "sysconf-unavailable"
+    edge_problem = edge_problem or "sysconf-unavailable"
+rows = []
+if core_problem is None or edge_problem is None:
+    deadline = uptime() + MAX_SECONDS
+    while len(rows) < MAX_SAMPLES:
+        now = uptime()
+        rows.append({"t": now,
+                     "core": None if core_problem else snapshot(core_pid, core_token),
+                     "edge": None if edge_problem else snapshot(edge_pid, edge_token)})
+        if now >= deadline or os.path.exists(stop_path):
+            break
+        time.sleep(interval)
+
+
+def summarise(label, pid, token, problem):
+    if problem is not None:
+        return ["%s_evidence_status=unmeasured" % label,
+                "%s_evidence_detail=%s" % (label, problem)], False
+    picks = [row[label] for row in rows if row[label] is not None]
+    if len(picks) != len(rows) or len(picks) < 2:
+        # Every sample must re-verify starttime and exe inode; a partially
+        # verified window is unmeasured instead of being counted as evidence.
+        return ["%s_evidence_status=unmeasured" % label,
+                "%s_evidence_detail=unverified-samples:%d-of-%d" % (label, len(picks), len(rows))], False
+    window = rows[-1]["t"] - rows[0]["t"]
+    ticks = (picks[-1]["utime"] + picks[-1]["stime"]) - (picks[0]["utime"] + picks[0]["stime"])
+    if window <= 0 or ticks < 0:
+        return ["%s_evidence_status=unmeasured" % label,
+                "%s_evidence_detail=clock-or-counter-regression" % label], False
+    return ["%s_evidence_status=measured" % label,
+            "%s_daemon_pid=%s" % (label, pid),
+            "%s_daemon_starttime_ticks=%d" % (label, token[0]),
+            "%s_window_seconds=%.3f" % (label, window),
+            "%s_samples=%d" % (label, len(picks)),
+            "%s_cpu_ticks=%d" % (label, ticks),
+            "%s_cpu_seconds=%.3f" % (label, ticks / CLK_TCK),
+            "%s_cpu_percent_of_one_cpu=%.2f" % (label, ticks / CLK_TCK / window * 100),
+            "%s_rss_peak_kb=%d" % (label, max(row["rss_kb"] for row in picks))], True
+
+
+core_lines, core_ok = summarise("core", core_pid, core_token, core_problem)
+edge_lines, edge_ok = summarise("edge", edge_pid, edge_token, edge_problem)
+summary = ["--- daemon resource evidence (bidirectional overlay probe window) ---",
+           "resource_evidence_source=linux-proc-stat-read-only",
+           "resource_evidence_status=%s" % ("measured" if core_ok and edge_ok else "unmeasured")]
+if not (core_ok and edge_ok):
+    summary.append("resource_evidence_detail=see-per-daemon-detail")
+summary += ["resource_sampling_interval_ms=%d" % int(round(interval * 1000)),
+            "resource_clock_ticks_per_second=%s" % CLK_TCK,
+            "resource_page_size_bytes=%s" % PAGE_BYTES,
+            "resource_samples=%d" % len(rows)]
+if rows:
+    summary.append("resource_window_seconds=%.3f" % (rows[-1]["t"] - rows[0]["t"]))
+summary += core_lines + edge_lines
+summary += ["resource_cpu_scope=process-thread-group-aggregate",
+            "resource_rss_scope=sampled-window-peak-not-kernel-lifetime-peak",
+            "resource_threshold=none-asserted"]
+print("\n".join(summary))
+PY
+  RESOURCE_SAMPLER_PID=$!
+}
+
+# Stop through the sentinel and join the child: the sampler is never signalled,
+# so no PID that could have been reused (for example after daemon exit) is hit.
+stop_resource_sampler() {
+  [[ -n "$RESOURCE_SAMPLER_PID" ]] || return 0
+  : > "$RESOURCE_STOP_FILE" 2>/dev/null || true
+  wait "$RESOURCE_SAMPLER_PID" 2>/dev/null || true
+  RESOURCE_SAMPLER_PID=""
+}
+
+# Reported, never graded: no accepted CPU/RSS budget exists for this workload, so
+# missing or unverified resource evidence does not fail the functional smoke.
+report_resource_evidence() {
+  if [[ -s "$RESOURCE_SUMMARY" ]]; then
+    cat "$RESOURCE_SUMMARY"
+    return 0
+  fi
+  echo "--- daemon resource evidence (bidirectional overlay probe window) ---"
+  echo "resource_evidence_status=unmeasured"
+  echo "resource_evidence_detail=sampler-produced-no-summary"
+  echo "resource_sampling_interval_ms=$RESOURCE_INTERVAL_MS"
+  echo "resource_threshold=none-asserted"
+  if [[ -s "$RESOURCE_SAMPLER_ERR" ]]; then
+    echo "--- resource sampler diagnostics ---" >&2
+    cat "$RESOURCE_SAMPLER_ERR" >&2 || true
+  fi
+  return 0
+}
+
 WORK="$(mktemp -d /tmp/boreas-netns-e2e.XXXXXX)"
 chmod 0700 "$WORK"
 CORE_NS="boreas-core-$$"
@@ -82,6 +282,9 @@ VETH_CREATED=0
 
 cleanup() {
   set +e
+  # Stop the bounded resource sampler through its sentinel and join it; never
+  # signal a PID that could have been reused.
+  stop_resource_sampler
   # Only signal live child jobs, never stale PIDs from already-waited pidfiles.
   # Reap them before deleting WORK: their private mounts must be gone first.
   local pid
@@ -380,6 +583,14 @@ if (( PING_FAILED )); then
   report_daemon_state
 fi
 
+# The sampling window brackets the probe: it opens immediately before the four
+# probe workers start and closes after all four have been reaped. Only the
+# recorded `$!` PIDs (the wrapper chain that ends in `exec` of the daemon) are
+# candidates; the sampler verifies starttime and exe identity on every sample and
+# reports `unmeasured` when that evidence does not hold, so no wrapper, probe
+# worker or recycled PID can be reported as the daemon.
+start_resource_sampler "$(cat "$WORK/core.pid")" "$(cat "$WORK/edge.pid")"
+
 # Send 8 MiB in each direction at the same time and authenticate both payloads
 # with independent SHA-256 digests. This exercises full-duplex progress rather
 # than only a one-way throughput happy path; it is not a public-network SLA.
@@ -409,6 +620,10 @@ if ! wait "$(cat "$WORK/perf-receiver-edge.pid")"; then
   echo "ERROR: edge receiver exited nonzero" >&2
   PERF_WORKER_FAILED=1
 fi
+# Close the sampling window through the sentinel and join the child before any
+# later exit, then report the measured CPU/RSS evidence (no threshold applied).
+stop_resource_sampler
+report_resource_evidence
 if (( PERF_WORKER_FAILED )); then
   # Do not treat a sender's JSON as valid throughput when either worker in
   # that direction failed (for example on a digest or socket error).
