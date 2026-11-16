@@ -24,6 +24,19 @@ not assert that an encapsulated 1280-byte packet fits in a single underlay IP
 packet, or test blocked-PMTUD/firewall behavior. The existing full-duplex traffic
 is retained, with no reduced byte counts, throughput thresholds or failure skips.
 
+## Verified scoped result — 2026-11-16
+
+[Actions run 43873049802, routing job 133318972806](https://github.com/Lanlan13-14/Boreas/actions/runs/43873049802/job/133318972806) succeeded for all four cases. The workflow commit is `251372995f0039ab9231aff58788d7c45f8df099`; the validated binary **and checked-out test scripts** came from backend run `43870788773`, exact source `376da3d578e49e39554abd2f653a64d3c720bf5a`. Do not attribute this result to a newer source commit.
+
+| Case | Average ICMP RTT (ms) | Edge → Core / Core → Edge (Mbps) |
+| --- | ---: | ---: |
+| policy-1500 | 0.203 | 143.604 / 88.103 |
+| asymmetric-1500 | 0.261 | 93.997 / 96.163 |
+| policy-1280 | 0.248 | 65.248 / 101.087 |
+| asymmetric-1280 | 0.231 | 66.626 / 107.411 |
+
+This closes only the listed two-node harness cases. The same overall workflow **failed** its impaired-path matrix: one-way 50 ms / zero loss / 10 Mbps passed; 200 ms / 0.1% loss reached only 2.279 Mbps Edge→Core against the unchanged 3 Mbps floor; 200 ms / 3% loss recorded 9/10 ping replies and 1111.072 ms maximum RTT; 400 ms / 1% loss did not reach connected state within the harness window. These are unresolved failures, not waived TCP-over-TCP costs or production acceptance. Native dependency security review also remains blocking.
+
 ## Topology and assertions
 
 The original Core `192.0.2.1` and Edge `192.0.2.2` remain the daemon listen/connect
