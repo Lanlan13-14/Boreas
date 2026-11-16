@@ -560,9 +560,9 @@ mod tests {
     fn diagnostic_timing_requires_the_exact_opt_in_value() {
         // Pass the value in directly: tests must not mutate process env, which
         // is unsafe and racy across parallel tests.
-        assert!(diagnostic_timing_enabled_value(Some(
-            std::ffi::OsStr::new("1")
-        )));
+        assert!(diagnostic_timing_enabled_value(Some(std::ffi::OsStr::new(
+            "1"
+        ))));
         for disabled in [
             None,
             Some(std::ffi::OsStr::new("0")),
