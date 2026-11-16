@@ -97,7 +97,32 @@ impl LinkClient {
         policy: SessionPolicy,
         io_timeout: Duration,
     ) -> Result<EstablishedSession, TunnelError> {
-        let tcp = TcpStream::connect_timeout(&target.address, io_timeout)?;
+        let tcp = self.connect_tcp(target, io_timeout)?;
+        self.connect_preconnected(tcp, target, policy)
+    }
+
+    /// Establish only the TCP transport. Errors returned here are strictly
+    /// pre-TLS and pre-authentication; callers may safely classify dial failures.
+    pub fn connect_tcp(&self, target: &ClientTarget, io_timeout: Duration) -> io::Result<TcpStream> {
+        TcpStream::connect_timeout(&target.address, io_timeout)
+    }
+
+    /// Complete TLS/WSS/session negotiation on a TCP stream already connected
+    /// to `target.address`. The stream is consumed, ensuring callers can classify
+    /// TCP dial failures separately without probing one socket and reconnecting.
+    pub fn connect_preconnected(
+        &self,
+        tcp: TcpStream,
+        target: &ClientTarget,
+        policy: SessionPolicy,
+    ) -> Result<EstablishedSession, TunnelError> {
+        if tcp.peer_addr()? != target.address {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "preconnected TCP peer does not match client target",
+            )
+            .into());
+        }
         // The handshake budget belongs to the whole exchange, not to each
         // socket read. A public path can split one TLS record across several
         // RTTs; a per-read deadline makes that look like a handshake failure.
@@ -329,6 +354,80 @@ mod tests {
         let reply = session.recv_frame().expect("reply");
         assert_eq!(reply.body, [ControlType::Probe as u8, 0xBB]);
         assert_eq!(server.join().expect("server thread"), a);
+    }
+
+    #[test]
+    fn connect_tcp_reports_refusal_before_any_handshake() {
+        let (listener, address) = listener();
+        drop(listener);
+        let client = LinkClient::new(
+            Box::new(TestOnlyPlaintextOuter),
+            Box::new(TestOnlyPlaintextTls {
+                peer: identity(0x0201, NodeRole::Core),
+            }),
+        );
+        let error = match client.connect_tcp(&target(address), TIMEOUT) {
+            Err(error) => error,
+            Ok(_) => panic!("closed listener must fail during TCP dial"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn preconnected_api_reuses_the_supplied_tcp_stream() {
+        let (listener, address) = listener();
+        let a = identity(0x0101, NodeRole::Edge);
+        let b = identity(0x0201, NodeRole::Core);
+        let server = {
+            let policy = policy(b, a);
+            let admission = admission();
+            thread::spawn(move || {
+                let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
+                server
+                    .accept(&listener, policy, TIMEOUT, &admission)
+                    .expect("session");
+            })
+        };
+        let tcp = TcpStream::connect(address).expect("dial once");
+        let client = LinkClient::new(
+            Box::new(TestOnlyPlaintextOuter),
+            Box::new(TestOnlyPlaintextTls { peer: b }),
+        );
+        let session = client
+            .connect_preconnected(tcp, &target(address), policy(a, b))
+            .expect("session over supplied stream");
+        assert_eq!(session.peer(), b);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn preconnected_api_rejects_a_socket_for_another_target() {
+        let (listener_a, address_a) = listener();
+        let (_listener_b, address_b) = listener();
+        let accept = thread::spawn(move || listener_a.accept().expect("accept socket A"));
+        let tcp = TcpStream::connect(address_a).expect("connect socket A");
+        let (_server_socket, _) = accept.join().expect("server thread");
+        let client = LinkClient::new(
+            Box::new(TestOnlyPlaintextOuter),
+            Box::new(TestOnlyPlaintextTls {
+                peer: identity(0x0201, NodeRole::Core),
+            }),
+        );
+        let error = match client.connect_preconnected(
+            tcp,
+            &target(address_b),
+            policy(
+                identity(0x0101, NodeRole::Edge),
+                identity(0x0201, NodeRole::Core),
+            ),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("wrong-target socket must be rejected before handshake"),
+        };
+        assert!(matches!(
+            error,
+            TunnelError::Io(io::ErrorKind::InvalidInput)
+        ));
     }
 
     #[test]
