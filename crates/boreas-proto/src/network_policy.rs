@@ -212,21 +212,29 @@ mod tests {
             version: 1, seq: 1, issued_at: 10, expires: 20,
         }
     }
-    const POSITIVE_TBS: &str = "\
-        ab 00 01 01 07 02 50 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01\
-        03 4f 6e 65 74 77 6f 72 6b 2d 72 6f 6f 74 2d 76 31 04 01 05 81 03\
-        06 01 07 0a 08 14 09 a5 00 50 01 01 01 01 01 01 01 01 01 01 01 01\
-        01 01 01 01 01 44 0a 14 00 00 02 10 03 58 20 02 02 02 02 02 02 02\
-        02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02\
-        02 02 02 02 04 00 0a 80";
+    const POSITIVE_TBS: &str = concat!(
+        "ab 00 01 01 07 02 50 ",
+        "01 01 01 01 01 01 01 01 ",
+        "01 01 01 01 01 01 01 01 ",
+        "03 4f 6e 65 74 77 6f 72 6b 2d 72 6f 6f 74 2d 76 31 ",
+        "04 01 05 81 03 06 01 07 0a 08 14 09 a5 00 50 ",
+        "01 01 01 01 01 01 01 01 ",
+        "01 01 01 01 01 01 01 01 ",
+        "01 44 0a 14 00 00 02 10 03 58 20 ",
+        "02 02 02 02 02 02 02 02 ",
+        "02 02 02 02 02 02 02 02 ",
+        "02 02 02 02 02 02 02 02 ",
+        "02 02 02 02 02 02 02 02 ",
+        "04 00 0a 80",
+    );
 
     #[test]
     fn independent_fixed_tbs_and_signature_vector() {
         let raw = hex(POSITIVE_TBS);
-        assert_eq!(raw.len(), 119);
+        assert_eq!(raw.len(), 118);
         assert_eq!(NetworkPolicyCandidate::decode_tbs(&raw).unwrap(), sample());
         assert_eq!(sample().encode_tbs().unwrap(), raw);
-        let mut expected = b"BOREAS-MGMT-OBJECT\0\x00\x01\x07\0\0\0\0\0\0\0\x77".to_vec();
+        let mut expected = b"BOREAS-MGMT-OBJECT\0\x00\x01\x07\0\0\0\0\0\0\0\x76".to_vec();
         expected.extend_from_slice(&raw);
         assert_eq!(NetworkPolicyCandidate::signature_input(&raw).unwrap(), expected);
     }
@@ -241,8 +249,8 @@ mod tests {
         duplicate[5] = 0x01; // repeats key 1
         assert!(NetworkPolicyCandidate::decode_tbs(&duplicate).is_err());
         let mut unknown = base.clone();
-        assert_eq!(unknown[117], 0x0a); // final envelope key 10
-        unknown[117] = 0x0b; // unknown key; no truncation involved
+        assert_eq!(unknown[116], 0x0a); // final envelope key 10
+        unknown[116] = 0x0b; // unknown key; no truncation involved
         assert!(NetworkPolicyCandidate::decode_tbs(&unknown).is_err());
         // Contract's extensions field is an array and MUST be empty: real nonempty array item.
         let mut extension = base.clone();
