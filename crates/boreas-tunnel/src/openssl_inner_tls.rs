@@ -212,6 +212,8 @@ pub struct VerifiedNodeIdentity {
     node_id: u16,
     identity_generation: u64,
     role: NodeRole,
+    home_core_id: u8,
+    vip: [u8; 4],
     not_before: u64,
     expires: u64,
     public_key_spki: Vec<u8>,
@@ -225,6 +227,36 @@ impl VerifiedNodeIdentity {
         };
         if management.net_id != body.net_id || body.net_id == [0u8; 16] {
             return Err(TunnelError::Unsupported("identity network mismatch"));
+        }
+        let expected_vip = boreas_pki::expected_vip(
+            body.home_core_id,
+            body.vip[3],
+            match body.role {
+                boreas_proto::objects::NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                boreas_proto::objects::NodeRole::Core => boreas_pki::NodeRole::Core,
+                boreas_proto::objects::NodeRole::EnrollmentService => {
+                    boreas_pki::NodeRole::EnrollmentService
+                }
+            },
+        )
+        .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
+        if body.vip != expected_vip {
+            return Err(TunnelError::Unsupported("identity VIP mismatch"));
+        }
+        let expected_node_id = boreas_pki::node_id(
+            body.home_core_id,
+            body.vip[3],
+            match body.role {
+                boreas_proto::objects::NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                boreas_proto::objects::NodeRole::Core => boreas_pki::NodeRole::Core,
+                boreas_proto::objects::NodeRole::EnrollmentService => {
+                    boreas_pki::NodeRole::EnrollmentService
+                }
+            },
+        )
+        .map_err(|_| TunnelError::Unsupported("invalid identity node mapping"))?;
+        if body.node_id != expected_node_id {
+            return Err(TunnelError::Unsupported("identity node mapping mismatch"));
         }
         if body.node_id == 0 || body.identity_generation == 0 {
             return Err(TunnelError::Unsupported("invalid identity fields"));
@@ -241,6 +273,8 @@ impl VerifiedNodeIdentity {
             node_id: body.node_id,
             identity_generation: body.identity_generation,
             role: map_object_role(body.role),
+            home_core_id: body.home_core_id,
+            vip: body.vip,
             not_before: body.not_before,
             expires: body.expires,
             public_key_spki: ml_dsa_spki(oid, &body.identity_pub_mldsa),
@@ -261,6 +295,11 @@ impl VerifiedNodeIdentity {
 
     pub fn role(&self) -> NodeRole {
         self.role
+    }
+
+    /// IPv4 VIP authenticated by the verified signed NodeIdentity body.
+    pub fn vip(&self) -> [u8; 4] {
+        self.vip
     }
 
     pub fn not_before(&self) -> u64 {
@@ -378,6 +417,19 @@ impl PeerIdentityExtractor for PkiIdentityExtractor {
             }
         }
         let identity = matched?;
+        let expected_vip = boreas_pki::expected_vip(
+            identity.home_core_id,
+            identity.vip[3],
+            match identity.role {
+                NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                NodeRole::Core => boreas_pki::NodeRole::Core,
+                NodeRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
+            },
+        )
+        .ok()?;
+        if identity.vip != expected_vip {
+            return None;
+        }
         Some(PeerIdentity {
             net_id: identity.net_id,
             node_id: identity.node_id,

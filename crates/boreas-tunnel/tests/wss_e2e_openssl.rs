@@ -12,7 +12,11 @@ use boreas_pki::NodeRole as PkiNodeRole;
 use boreas_pki::management::{
     IdentityAuthority, IdentityTemplate, IssuerScope, ManagementTrust, VerifiedObject,
 };
-use boreas_proto::{SecurityMode, messages::PathRole, objects::NodeRole as ObjectRole};
+use boreas_proto::{
+    SecurityMode,
+    messages::PathRole,
+    objects::{NodeRole as ObjectRole, ObjectBody},
+};
 use boreas_tunnel::{
     ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
     OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
@@ -549,6 +553,32 @@ fn verified_identity(
 fn peer(object: &VerifiedObject) -> PeerIdentity {
     let value =
         VerifiedNodeIdentity::from_verified_object(object).expect("verified management identity");
+    let ObjectBody::NodeIdentity(body) = &object.object().body else {
+        unreachable!("verified helper returns NodeIdentity")
+    };
+    assert_eq!(value.vip(), body.vip);
+    assert_eq!(value.node_id(), boreas_pki::node_id(
+        body.home_core_id,
+        body.vip[3],
+        match body.role {
+            ObjectRole::Core => PkiNodeRole::Core,
+            ObjectRole::Edge => PkiNodeRole::Edge,
+            ObjectRole::EnrollmentService => PkiNodeRole::EnrollmentService,
+        },
+    ).expect("verified node mapping"));
+    assert_eq!(
+        value.vip(),
+        boreas_pki::expected_vip(
+            body.home_core_id,
+            value.vip()[3],
+            match value.role() {
+                NodeRole::Core => boreas_pki::NodeRole::Core,
+                NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                NodeRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
+            },
+        )
+        .expect("default overlay VIP")
+    );
     PeerIdentity {
         net_id: value.net_id(),
         node_id: value.node_id(),
