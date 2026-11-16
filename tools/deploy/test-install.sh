@@ -100,12 +100,13 @@ EOF
 
 cat > "$FAKE/stat" <<'EOF'
 #!/bin/sh
-# Reports a root-owned directory with a chosen mode so the installer's ownership
-# and permission gates can be exercised without root.
+# Model a safe root-owned hierarchy without inheriting the runner's uid or
+# writable /tmp mode. Targeted fault injection must affect only that path;
+# otherwise --bindir or an unrelated ancestor can mask the intended failure.
 target=
 for arg do target=$arg; done
 if [ -n "${TEST_STAT_PATH:-}" ] && [ "$target" != "$TEST_STAT_PATH" ]; then
-  "$TEST_REAL_STAT" -c '%u %a' -- "$target"
+  printf '0 700\n'
 else
   printf '%s %s\n' "${TEST_FAKE_UID:-0}" "${TEST_FAKE_MODE:-700}"
 fi
@@ -274,7 +275,7 @@ invoke() {
   TEST_HASH_CONST=${HASH_CONST-$GOOD} TEST_ELF_MODE=${ELF_MODE:-static} \
   TEST_ELF_MACHINE="$ELF_MACHINE" TEST_CAND_LOG="$CAND_LOG" \
   TEST_HASH_LOG="$HASH_LOG" TEST_SYSTEM_LOG="$SYSTEM_LOG" \
-  TEST_REAL_SHA="$REAL_SHA" TEST_REAL_STAT="$REAL_STAT" \
+  TEST_REAL_SHA="$REAL_SHA" \
   sh "$INSTALL" "$@"
 }
 
@@ -615,6 +616,10 @@ IP_LOG=$T/ip.log
 IP_COUNT=$T/ip.count
 
 run_wrapper() {
+  # Each invocation models a fresh host: no historical link probes or commands
+  # may turn a later policy case into a false pre-existing-TUN failure.
+  printf '0\n' > "$IP_COUNT"
+  : > "$IP_LOG"
   PATH="$FAKE:$PATH" TEST_IP_MODE=${IP_MODE:-free} TEST_IP_LOG="$IP_LOG" \
   TEST_IP_COUNT="$IP_COUNT" TEST_DAEMON_RC=${DAEMON_RC:-7} \
   BOREAS_ROLE=${ROLE:-core} BOREAS_VIP=${VIP-10.20.1.1} \
@@ -678,8 +683,6 @@ pass 'pre-existing TUN exits 78 (EX_CONFIG)'
 
 # Successful path: address before route, daemon status propagated, and only the
 # objects this invocation added are removed (route, then address).
-rm -f "$IP_COUNT"
-: > "$IP_LOG"
 IP_MODE=free DAEMON_RC=7
 set +e
 run_wrapper > /dev/null 2>&1
@@ -700,8 +703,6 @@ assert_not_contains "$IP_LOG" 'default'
 assert_not_contains "$IP_LOG" 'link del'
 
 # Route add failure: our address must be removed again, and no route deleted.
-rm -f "$IP_COUNT"
-: > "$IP_LOG"
 IP_MODE=add_fails DAEMON_RC=0
 set +e
 run_wrapper > /dev/null 2>&1
