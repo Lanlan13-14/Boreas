@@ -40,7 +40,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::readiness_protocol::{CHALLENGE_MAGIC, MAX_LINE_BYTES, MAX_SCHEMA_BYTES, MAX_WORKERS, RESPONSE_MAGIC};
+use crate::readiness_protocol::{
+    CHALLENGE_MAGIC, MAX_LINE_BYTES, MAX_SCHEMA_BYTES, MAX_WORKERS, RESPONSE_MAGIC,
+};
 
 /// Environment variable carrying the readiness socket path to the candidate.
 pub const SOCKET_ENV: &str = "BOREAS_READY_SOCKET";
