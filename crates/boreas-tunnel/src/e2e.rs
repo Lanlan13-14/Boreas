@@ -56,6 +56,7 @@ use crate::relay::{
     VerifiedE2eSession,
 };
 use crate::resource::Admission;
+use crate::runtime::{DiagnosticTimer, diagnostic_timing_enabled};
 use crate::session::EstablishedSession;
 use crate::stream::Duplex;
 use crate::tls::{InnerTlsSession, PeerIdentity};
@@ -808,6 +809,7 @@ fn finish_e2e<'a>(
     info: E2eInfo,
     expected_peer: PeerIdentity,
     policy: E2ePolicy,
+    diagnostics: bool,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
     let E2ePolicy {
         local,
@@ -822,7 +824,10 @@ fn finish_e2e<'a>(
     // Require the registered, strict TLS profile before exchanging even this
     // encrypted application-layer binding. Confirmation never replaces TLS auth.
     crate::tls::check_inner_tls(&tls, suite, allow_pq1024)?;
-    confirm_e2e_application(&mut *stream, info, local, expected_peer, suite)?;
+    {
+        let _timer = DiagnosticTimer::start("confirmation", diagnostics);
+        confirm_e2e_application(&mut *stream, info, local, expected_peer, suite)?;
+    }
     let token =
         VerifiedE2eSession::from_verified_e2e_tls(&tls, expected_peer, suite, allow_pq1024)?;
     Ok(E2eCircuit {
@@ -861,13 +866,20 @@ pub fn open_e2e<'a>(
     let allow_pq1024 = session.pq1024_enabled();
     let local = session.local();
     let mtu_cap = session.mtu_cap();
+    let diagnostics = diagnostic_timing_enabled();
     let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
     let destination = NodeRef {
         node_id: expected_peer.node_id,
         identity_generation: expected_peer.identity_generation,
     };
-    let (circuit, circuit_info) = open_circuit(session, destination, path_hops)?;
-    let established = run_e2e(circuit, backend, tls_role)?;
+    let (circuit, circuit_info) = {
+        let _timer = DiagnosticTimer::start("circuit_open", diagnostics);
+        open_circuit(session, destination, path_hops)?
+    };
+    let established = {
+        let _timer = DiagnosticTimer::start("e2e_tls", diagnostics);
+        run_e2e(circuit, backend, tls_role)?
+    };
     let info = E2eInfo {
         circuit_id: circuit_info.circuit_id,
         path_hops: circuit_info.path_hops,
@@ -885,6 +897,7 @@ pub fn open_e2e<'a>(
             allow_pq1024,
             mtu_cap,
         },
+        diagnostics,
     )
 }
 
@@ -899,9 +912,16 @@ pub fn accept_e2e<'a>(
     let allow_pq1024 = session.pq1024_enabled();
     let local = session.local();
     let mtu_cap = session.mtu_cap();
+    let diagnostics = diagnostic_timing_enabled();
     let tls_role = e2e_tls_role(local.node_id, expected_peer.node_id);
-    let (circuit, circuit_info) = accept_circuit(session)?;
-    let established = run_e2e(circuit, backend, tls_role)?;
+    let (circuit, circuit_info) = {
+        let _timer = DiagnosticTimer::start("circuit_accept", diagnostics);
+        accept_circuit(session)?
+    };
+    let established = {
+        let _timer = DiagnosticTimer::start("e2e_tls_accept", diagnostics);
+        run_e2e(circuit, backend, tls_role)?
+    };
     let info = E2eInfo {
         circuit_id: circuit_info.circuit_id,
         path_hops: circuit_info.path_hops,
@@ -919,6 +939,7 @@ pub fn accept_e2e<'a>(
             allow_pq1024,
             mtu_cap,
         },
+        diagnostics,
     )
 }
 

@@ -1,6 +1,13 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 17
+## Current handoff — 2026-11-17 round 19
+
+- PushedHEAD0007d30593d7c8af69c5605c74042398c2b525c0: recovered network_policy_store.rs481lines + libexport + VerifiedNetworkPolicy exactrawobject_hash/matches_raw. Parentreviewedallsource, backedup.local/network_policy_store-recovered-round18.rs before repair; changedtesthelperversion→lifetime so same-seqexpires1vs2 validdualverifiedrawconflict, nonLinuxunusedfields/importcfg, LinuxCLOEXECflags. NoCLI/daemon/prefixenablement. CandidateawaitsActions, notdurabilityacceptance. Separate read-onlyreview foundnoconcretebug but didnotreviewhashbinding; notsecurityproof.
+- Store drafttwiceaccidentallyoverwrittenbychildren(emptywrite)beforecommit, recoveredfromauthor/readtranscript, parentbackedup+reviewed; noactivechildmaytouchstore. Recordswatermarknotauthority; open_with_expected externalpriorseq/hash neededfordeletiondetection; full-diskrollbacknonclaim. Testscoverrestartrollback/equivocationfreeze/lockbusy/prefix/rawmismatch/expectedmissing/alltruncations; stillneedactualCI/faultinjection.
+- 3f8453d TLS43903504126/OpenWrt43903503970/Rust43903503593/TUN43903503505SUCCESS includingpinnedOpenSSLCLItestfixturedependencyrepair. Platforms43903503696runfailurehad4successandAppleSiliconcancelled, nofailedjoblog; don'tcallallplatformgreen. NativeSecurity43903503828blocked. Actionsfmt8b5702dffintegrated.
+- Active timing-finish19 DeepSeek exclusivelyruntime.rs/e2e.rs optinBOREAS_DIAGNOSTIC_TIMING=1 monotonicfixedphase stderr; defaultsilent/noenvtestmutation. Draftcurrentlyonlyhopstages+confirmation; parentrequestedcircuit_open+e2e_tls timers beforecommit. Readactualfinaldiff, noflush/protocol/budgetchange. Alltests/build/syntax/formattersActions-only. Restchildreninactive.
+
+## Previous checkpoint — 2026-11-16 round 17
 
 - CurrentHEAD02c958a(Actionspki_cmdformat)ffmergedfrom761a12a offlineCLI. Original761a12a Rust43901106556/TUN43901106915 SUCCESS; TLS43901106873/OpenWrt43901106551 pendingatlastsample; nativeSecurity43901106667blocked. ExactfullSHArequiredforAPIhead_shaquery(shortSHAreturnsnone). CLI accepts5separatefiles+netid, noimplicitroots/policycarrier, Unixnofollow/nonblock/cloexec+fdregularcheck, localclockdisclosure; no prefixenablement. Parentfixedtemporarytestborrow,symlinkexpectederror,UnixunusedFileimport andrestoredformattedPKIbaselineafterchildwholefilerewrite.
 - 8424b84 TLS43897875864 terminalSUCCESS confirmsrealdualSIGtests64PKIlib andreadinessclientrealserver+negative45supervisorbin; docpriorpendingstale.4ef5e37TLS43899414586SUCCESS; stage+ssperformance dispatchedusingthissuccessfulsource, getcurrentperformanceworkflowrunID forpending evidence. Strictthresholdsremainreduntilmeasuredpass.

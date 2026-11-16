@@ -12,9 +12,9 @@
 //! `boreas-crypto` OpenSSL backend. Tests use a `#[cfg(test)]` plaintext
 //! transport that performs no TLS and is not security evidence.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::TunnelError;
 use crate::resource::{
@@ -31,6 +31,58 @@ use crate::ws::{self, MAX_WS_FRAME_PAYLOAD};
 /// are not claimed to be bounded by this reservation (plan section 8.2 requires
 /// the three memory classes to be reported separately).
 pub const CONNECTION_BUFFER_BUDGET: usize = 2 * (MAX_WS_FRAME_PAYLOAD + 8 * 1024);
+
+/// Opt-in stage-timing diagnostics for controlled experiment runs. Only the
+/// exact value `1` enables output; an absent value or any other value is silent.
+pub(crate) const DIAGNOSTIC_TIMING_ENV: &str = "BOREAS_DIAGNOSTIC_TIMING";
+
+fn diagnostic_timing_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn diagnostic_timing_enabled() -> bool {
+    diagnostic_timing_enabled_value(std::env::var_os(DIAGNOSTIC_TIMING_ENV).as_deref())
+}
+
+/// Observation-only, opt-in monotonic timer for one handshake stage.
+///
+/// It emits one fixed-format line when the stage ends, including when the `?`
+/// operator returns early, so a failed stage still reports. Nothing is written
+/// and no clock is read unless the opt-in value is active. The write locks
+/// stderr and may briefly block while another writer holds that lock. This is
+/// instrumentation for controlled experiment runs, not a security or latency
+/// guarantee: it does not gate, retry, or rewrite the handshake or its errors.
+/// Only the static phase label and integer microseconds are emitted; target
+/// addresses, host names, keys, nonces, paths, and wire bodies never reach it.
+pub(crate) struct DiagnosticTimer {
+    phase: &'static str,
+    started: Option<Instant>,
+}
+
+impl DiagnosticTimer {
+    pub(crate) fn start(phase: &'static str, enabled: bool) -> Self {
+        Self {
+            phase,
+            // The default path must not even read the monotonic clock.
+            started: enabled.then(Instant::now),
+        }
+    }
+}
+
+impl Drop for DiagnosticTimer {
+    fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let line = diagnostic_timing_line(self.phase, started.elapsed().as_micros());
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(stderr, "{line}");
+    }
+}
+
+fn diagnostic_timing_line(phase: &'static str, elapsed_us: u128) -> String {
+    format!("boreas-diagnostic-timing phase={phase} elapsed_us={elapsed_us}")
+}
 
 /// Static build capabilities. These describe what this binary can do; they are
 /// not evidence that any Phase 0-5 gate is complete.
@@ -130,11 +182,22 @@ impl LinkClient {
         // The handshake budget belongs to the whole exchange, not to each
         // socket read. A public path can split one TLS record across several
         // RTTs; a per-read deadline makes that look like a handshake failure.
+        let diagnostics = diagnostic_timing_enabled();
         configure(&tcp)?;
-        let outer = self.outer.connect(tcp, &target.tls_server_name)?;
-        let websocket = ws::client_handshake(outer, &target.ws_host, &target.path)?;
-        let inner = self.inner.connect(Box::new(websocket))?;
+        let outer = {
+            let _timer = DiagnosticTimer::start("outer_tls", diagnostics);
+            self.outer.connect(tcp, &target.tls_server_name)?
+        };
+        let websocket = {
+            let _timer = DiagnosticTimer::start("ws_handshake", diagnostics);
+            ws::client_handshake(outer, &target.ws_host, &target.path)?
+        };
+        let inner = {
+            let _timer = DiagnosticTimer::start("inner_tls", diagnostics);
+            self.inner.connect(Box::new(websocket))?
+        };
         let (stream, tls) = inner.into_parts();
+        let _timer = DiagnosticTimer::start("session_handshake", diagnostics);
         session::client_handshake(stream, &tls, policy)
     }
 }
@@ -491,5 +554,41 @@ mod tests {
             capabilities.hop_inner_tls_backend,
             cfg!(feature = "openssl-inner-tls")
         );
+    }
+
+    #[test]
+    fn diagnostic_timing_requires_the_exact_opt_in_value() {
+        // Pass the value in directly: tests must not mutate process env, which
+        // is unsafe and racy across parallel tests.
+        assert!(diagnostic_timing_enabled_value(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        for disabled in [
+            None,
+            Some(std::ffi::OsStr::new("0")),
+            Some(std::ffi::OsStr::new("true")),
+            Some(std::ffi::OsStr::new(" 1")),
+            Some(std::ffi::OsStr::new("1 ")),
+        ] {
+            assert!(!diagnostic_timing_enabled_value(disabled));
+        }
+    }
+
+    #[test]
+    fn diagnostic_timing_line_has_a_fixed_non_secret_format() {
+        assert_eq!(
+            diagnostic_timing_line("outer_tls", 42),
+            "boreas-diagnostic-timing phase=outer_tls elapsed_us=42"
+        );
+        assert_eq!(
+            diagnostic_timing_line("session_handshake", 0),
+            "boreas-diagnostic-timing phase=session_handshake elapsed_us=0"
+        );
+    }
+
+    #[test]
+    fn disabled_diagnostic_timer_does_not_start_a_clock() {
+        let timer = DiagnosticTimer::start("outer_tls", false);
+        assert!(timer.started.is_none());
     }
 }
