@@ -817,31 +817,83 @@ impl ConsoleState {
         }
         match self.config_step {
             ConfigWizardStep::Menu => match cmd {
-                "q" | "quit" => { self.clear_config_wizard(); ConsoleEffect::Quit }
-                "b" | "" => { self.clear_config_wizard(); self.view = ConsoleView::Service; ConsoleEffect::None }
-                "1" => { self.config_step = ConfigWizardStep::Primary; ConsoleEffect::None }
-                "2" => { self.notice_rows = config_save_unavailable_rows(self.lang); self.view = ConsoleView::Notice; ConsoleEffect::None }
-                _ => { self.notice_rows = config_wizard_rows(self.lang); self.view = ConsoleView::Notice; ConsoleEffect::None }
+                "q" | "quit" => {
+                    self.clear_config_wizard();
+                    ConsoleEffect::Quit
+                }
+                "b" | "" => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::Service;
+                    ConsoleEffect::None
+                }
+                "1" => {
+                    self.config_step = ConfigWizardStep::Primary;
+                    ConsoleEffect::None
+                }
+                "2" => {
+                    self.notice_rows = config_save_unavailable_rows(self.lang);
+                    self.view = ConsoleView::Notice;
+                    ConsoleEffect::None
+                }
+                _ => {
+                    self.notice_rows = config_wizard_rows(self.lang);
+                    self.view = ConsoleView::Notice;
+                    ConsoleEffect::None
+                }
             },
             ConfigWizardStep::Primary => {
-                if cmd == "q" { self.clear_config_wizard(); return ConsoleEffect::Quit; }
-                if cmd == "b" { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; return ConsoleEffect::None; }
+                if cmd == "q" {
+                    self.clear_config_wizard();
+                    return ConsoleEffect::Quit;
+                }
+                if cmd == "b" {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::ConfigWizard;
+                    return ConsoleEffect::None;
+                }
                 self.config_primary = Some(cmd.trim().to_string());
                 self.config_step = ConfigWizardStep::Backup;
                 ConsoleEffect::None
             }
             ConfigWizardStep::Backup => {
-                if cmd == "q" { self.clear_config_wizard(); return ConsoleEffect::Quit; }
-                if cmd == "b" { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; return ConsoleEffect::None; }
-                self.config_backup = Some(if cmd.trim().is_empty() { None } else { Some(cmd.trim().to_string()) });
+                if cmd == "q" {
+                    self.clear_config_wizard();
+                    return ConsoleEffect::Quit;
+                }
+                if cmd == "b" {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::ConfigWizard;
+                    return ConsoleEffect::None;
+                }
+                self.config_backup = Some(if cmd.trim().is_empty() {
+                    None
+                } else {
+                    Some(cmd.trim().to_string())
+                });
                 self.config_step = ConfigWizardStep::Preview;
                 ConsoleEffect::None
             }
             ConfigWizardStep::Preview => match cmd {
-                "PREVIEW" => ConsoleEffect::ConfigWizardInput(format!("{}\n{}", self.config_primary.as_deref().unwrap_or(""), self.config_backup.as_ref().and_then(|b| b.as_deref()).unwrap_or(""))),
-                "q" | "b" => { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; ConsoleEffect::None }
-                _ => { self.clear_config_wizard(); self.view = ConsoleView::Notice; self.notice_rows = preview_cancelled_rows(self.lang); ConsoleEffect::None }
-            }
+                "PREVIEW" => ConsoleEffect::ConfigWizardInput(format!(
+                    "{}\n{}",
+                    self.config_primary.as_deref().unwrap_or(""),
+                    self.config_backup
+                        .as_ref()
+                        .and_then(|b| b.as_deref())
+                        .unwrap_or("")
+                )),
+                "q" | "b" => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::ConfigWizard;
+                    ConsoleEffect::None
+                }
+                _ => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::Notice;
+                    self.notice_rows = preview_cancelled_rows(self.lang);
+                    ConsoleEffect::None
+                }
+            },
         }
     }
 
@@ -850,9 +902,11 @@ impl ConsoleState {
             "q" | "quit" => {
                 self.clear_config_wizard();
                 ConsoleEffect::Quit
-            },
+            }
             _ => {
-                if self.config_step != ConfigWizardStep::Menu { self.clear_config_wizard(); }
+                if self.config_step != ConfigWizardStep::Menu {
+                    self.clear_config_wizard();
+                }
                 self.view = ConsoleView::Menu;
                 ConsoleEffect::None
             }
@@ -930,7 +984,7 @@ impl ConsoleState {
                     &rows,
                     config_wizard_hint(self.lang, &self.config_step),
                 )
-            },
+            }
         }
     }
 
@@ -992,7 +1046,9 @@ fn config_wizard_step_rows(lang: Lang, step: &ConfigWizardStep) -> Vec<String> {
         ConfigWizardStep::Preview => vec![match lang {
             Lang::ZhCn => "输入 exact PREVIEW 以验证并打印端点片段；其他输入取消".into(),
             Lang::ZhTw => "輸入 exact PREVIEW 以驗證並列印端點片段；其他輸入取消".into(),
-            Lang::En => "Type exact PREVIEW to validate and print endpoint-only TOML; else cancel".into(),
+            Lang::En => {
+                "Type exact PREVIEW to validate and print endpoint-only TOML; else cancel".into()
+            }
         }],
     }
 }
@@ -1066,11 +1122,13 @@ fn config_wizard_hint(lang: Lang, step: &ConfigWizardStep) -> &'static str {
             Lang::ZhTw => "[1] 編輯端點  [b] 返回  [q] 離開",
             Lang::En => "[1] Edit endpoints  [b] Back  [q] Quit",
         },
-        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview) => match lang {
-            Lang::ZhCn => "[q] 取消并退出",
-            Lang::ZhTw => "[q] 取消並離開",
-            Lang::En => "[q] Cancel and quit",
-        },
+        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview) => {
+            match lang {
+                Lang::ZhCn => "[q] 取消并退出",
+                Lang::ZhTw => "[q] 取消並離開",
+                Lang::En => "[q] Cancel and quit",
+            }
+        }
     }
 }
 
@@ -1510,7 +1568,12 @@ mod tests {
         assert!(screen.contains("primary/backup"));
         assert_eq!(state.apply("2"), ConsoleEffect::None);
         assert_eq!(state.view, ConsoleView::Notice);
-        assert!(state.notice_rows.iter().any(|row| row.contains("can be previewed but not saved")));
+        assert!(
+            state
+                .notice_rows
+                .iter()
+                .any(|row| row.contains("can be previewed but not saved"))
+        );
         // Neither a guessed save phrase nor arbitrary input can authorize writes.
         state.apply("SAVE");
         assert_eq!(state.view, ConsoleView::Menu);

@@ -656,15 +656,36 @@ impl ConsoleIo {
         match Config::read_file(&self.config, RuntimeCapabilities::NO_RUNTIME) {
             Ok(parsed) => {
                 let mut rows = match lang {
-                    Lang::ZhCn => vec!["已读取并验证当前配置。仅修改 uplink.primary / backup。".into()],
-                    Lang::ZhTw => vec!["已讀取並驗證目前設定。僅修改 uplink.primary / backup。".into()],
-                    Lang::En => vec!["Current config read and validated. Only uplink.primary/backup can change.".into()],
+                    Lang::ZhCn => {
+                        vec!["已读取并验证当前配置。仅修改 uplink.primary / backup。".into()]
+                    }
+                    Lang::ZhTw => {
+                        vec!["已讀取並驗證目前設定。僅修改 uplink.primary / backup。".into()]
+                    }
+                    Lang::En => vec![
+                        "Current config read and validated. Only uplink.primary/backup can change."
+                            .into(),
+                    ],
                 };
-                rows.push(format!("primary: {}", sanitize_line(&parsed.uplinks.primary)));
-                rows.push(format!("backup: {}", sanitize_line(parsed.uplinks.backup.as_deref().unwrap_or("(none)"))));
-                ConsoleOutcome { rows, endpoints: Some((parsed.uplinks.primary, parsed.uplinks.backup)), live: None, node: None }
+                rows.push(format!(
+                    "primary: {}",
+                    sanitize_line(&parsed.uplinks.primary)
+                ));
+                rows.push(format!(
+                    "backup: {}",
+                    sanitize_line(parsed.uplinks.backup.as_deref().unwrap_or("(none)"))
+                ));
+                ConsoleOutcome {
+                    rows,
+                    endpoints: Some((parsed.uplinks.primary, parsed.uplinks.backup)),
+                    live: None,
+                    node: None,
+                }
             }
-            Err(error) => ConsoleOutcome::rows(vec![format!("config rejected: {}", sanitize_line(&error.to_string()))]),
+            Err(error) => ConsoleOutcome::rows(vec![format!(
+                "config rejected: {}",
+                sanitize_line(&error.to_string())
+            )]),
         }
     }
 
@@ -672,17 +693,33 @@ impl ConsoleIo {
         let Some((primary, backup)) = values.split_once('\n') else {
             return ConsoleOutcome::rows(vec!["invalid candidate".into()]);
         };
-        if primary.len() > 253 || backup.len() > 253 || primary.chars().any(char::is_control) || backup.chars().any(char::is_control) {
+        if primary.len() > 253
+            || backup.len() > 253
+            || primary.chars().any(char::is_control)
+            || backup.chars().any(char::is_control)
+        {
             return ConsoleOutcome::rows(vec!["endpoint input rejected".into()]);
         }
         let mut config = match Config::read_file(&self.config, RuntimeCapabilities::NO_RUNTIME) {
             Ok(config) => config,
-            Err(error) => return ConsoleOutcome::rows(vec![format!("config rejected: {}", sanitize_line(&error.to_string()))]),
+            Err(error) => {
+                return ConsoleOutcome::rows(vec![format!(
+                    "config rejected: {}",
+                    sanitize_line(&error.to_string())
+                )]);
+            }
         };
         config.uplinks.primary = primary.to_string();
-        config.uplinks.backup = if backup.is_empty() { None } else { Some(backup.to_string()) };
+        config.uplinks.backup = if backup.is_empty() {
+            None
+        } else {
+            Some(backup.to_string())
+        };
         if let Err(error) = config.validate(RuntimeCapabilities::NO_RUNTIME) {
-            return ConsoleOutcome::rows(vec![format!("candidate rejected: {}", sanitize_line(&error.to_string()))]);
+            return ConsoleOutcome::rows(vec![format!(
+                "candidate rejected: {}",
+                sanitize_line(&error.to_string())
+            )]);
         }
         let quote = |value: &str| toml::Value::String(value.to_string()).to_string();
         let footer = match _lang {
@@ -690,7 +727,18 @@ impl ConsoleIo {
             Lang::ZhTw => "# 僅預覽：未保存、套用或重新載入。",
             Lang::En => "# Preview only: not saved, applied, or reloaded.",
         };
-        let fragment = format!("[uplink]\nprimary = {}\n{}paths = {}\nprobe_paths = {}\n\n{}", quote(primary), if backup.is_empty() { String::new() } else { format!("backup = {}\n", quote(backup)) }, config.uplinks.paths, config.uplinks.probe_paths, footer);
+        let fragment = format!(
+            "[uplink]\nprimary = {}\n{}paths = {}\nprobe_paths = {}\n\n{}",
+            quote(primary),
+            if backup.is_empty() {
+                String::new()
+            } else {
+                format!("backup = {}\n", quote(backup))
+            },
+            config.uplinks.paths,
+            config.uplinks.probe_paths,
+            footer
+        );
         ConsoleOutcome::rows(fragment.split('\n').map(str::to_string).collect::<Vec<_>>())
     }
 
@@ -1087,7 +1135,9 @@ fn doctor_json() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleEffect, ConsoleIo, ConsoleOutcome, ConsoleState, drive_console, run_console};
+    use super::{
+        ConsoleEffect, ConsoleIo, ConsoleOutcome, ConsoleState, drive_console, run_console,
+    };
     use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
     use crate::config::RuntimeCapabilities;
 
@@ -1728,11 +1778,19 @@ uplinks = ["wss://hub-us-c.example.net"]
         use std::io::BufReader;
         let original = config_source();
         let path = write_fixture("wizard", &original);
-        let mut io = ConsoleIo { socket: std::path::PathBuf::new(), config: path.clone(), service: None };
+        let mut io = ConsoleIo {
+            socket: std::path::PathBuf::new(),
+            config: path.clone(),
+            service: None,
+        };
         let mut state = ConsoleState::new(Lang::En, false);
-        let mut reader = BufReader::new(&b"8\n\n4\n1\nnew-hub.example.net:443\nbackup.example.net:443\nPREVIEW\nq\n"[..]);
+        let mut reader = BufReader::new(
+            &b"8\n\n4\n1\nnew-hub.example.net:443\nbackup.example.net:443\nPREVIEW\nq\n"[..],
+        );
         let mut out = Vec::new();
-        let result = drive_console(&mut state, &mut reader, &mut out, |effect, lang| io.perform(effect, lang));
+        let result = drive_console(&mut state, &mut reader, &mut out, |effect, lang| {
+            io.perform(effect, lang)
+        });
         result.expect("driver");
         let output = String::from_utf8(out).expect("utf8");
         assert!(output.contains("[uplink]"));
@@ -1740,7 +1798,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(output.contains("backup = \"backup.example.net:443\""));
         assert!(output.contains("paths = 4") && output.contains("probe_paths = 1"));
         assert!(output.contains("not saved, applied, or reloaded"));
-        assert_eq!(std::fs::read_to_string(&path).expect("config remains"), original);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("config remains"),
+            original
+        );
         let _ = std::fs::remove_file(&path);
         assert_eq!(state.config_primary, None);
         assert_eq!(state.config_backup, None);
