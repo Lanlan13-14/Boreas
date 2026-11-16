@@ -158,6 +158,55 @@ impl NetworkRootPin {
     }
 }
 
+/// Verify the fixed NetworkPolicy candidate against a separately provisioned root pin.
+/// This is crate-private and deliberately cannot authorize any root-authorization purpose.
+pub(crate) fn verify_network_policy_message(
+    raw_tbs: &[u8],
+    ed25519_signature: &[u8],
+    mldsa_signature: &[u8],
+    root: &NetworkRootPin,
+    expected_net_id: [u8; 16],
+    expected_fingerprint: [u8; 32],
+) -> Result<(), Error> {
+    if raw_tbs.len() > boreas_proto::network_policy::MAX_TBS_LEN {
+        return Err(Error::TooLarge);
+    }
+    let candidate = boreas_proto::network_policy::NetworkPolicyCandidate::decode_tbs(raw_tbs)
+        .map_err(|_| Error::InvalidCandidate)?;
+    if root.net_id != expected_net_id || candidate.net_id != expected_net_id {
+        return Err(Error::WrongNetwork);
+    }
+    if root.fingerprint()? != expected_fingerprint
+        || candidate.root_key_fingerprint != expected_fingerprint
+    {
+        return Err(Error::InvalidRootKey);
+    }
+    if root.mldsa_parameter_set != boreas_proto::objects::MldsaParameterSet::Mldsa65 {
+        return Err(Error::InvalidRootKey);
+    }
+    if ed25519_signature.len() != ED_SIG_LEN || mldsa_signature.len() != MLDSA65_SIG_LEN {
+        return Err(Error::InvalidSignatureLength);
+    }
+    let ed_root = PKey::public_key_from_der(&root.ed25519_public_key_der)
+        .map_err(|_| Error::InvalidRootKey)?;
+    let pq_root = PKey::public_key_from_der(&root.mldsa_public_key_der)
+        .map_err(|_| Error::InvalidRootKey)?;
+    if !ed_root.is_a(KeyType::ED25519) || !pq_root.is_a(KeyType::ML_DSA_65) {
+        return Err(Error::InvalidRootKey);
+    }
+    let msg = boreas_proto::network_policy::NetworkPolicyCandidate::signature_input(raw_tbs)
+        .map_err(|_| Error::InvalidCandidate)?;
+    let mut ev = Verifier::new_without_digest(&ed_root).map_err(|_| Error::Backend)?;
+    if !ev.verify_oneshot(ed25519_signature, &msg).map_err(|_| Error::Backend)? {
+        return Err(Error::InvalidEdSignature);
+    }
+    let mut pv = Verifier::new_without_digest(&pq_root).map_err(|_| Error::Backend)?;
+    if !pv.verify_oneshot(mldsa_signature, &msg).map_err(|_| Error::Backend)? {
+        return Err(Error::InvalidMlDsaSignature);
+    }
+    Ok(())
+}
+
 /// Private-field proof. The only constructor is successful verification against a root pin.
 #[derive(Clone, Debug)]
 pub struct VerifiedIssuerAuthorization {

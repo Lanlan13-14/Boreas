@@ -17,6 +17,11 @@ pub mod revoke_cleanup;
 /// Bounded NetworkRoot authorization candidate validation; requires the real crypto backend.
 #[cfg(feature = "openssl-backend")]
 pub mod root_authorization;
+/// Dual-signature verification of isolated NetworkPolicy candidates (not runtime enablement).
+#[cfg(feature = "openssl-backend")]
+mod network_policy;
+#[cfg(feature = "openssl-backend")]
+pub use network_policy::{NetworkPolicyError, VerifiedNetworkPolicy, verify_network_policy};
 /// Durable signed-status freshness store; Linux durability only, backend required.
 #[cfg(feature = "openssl-backend")]
 pub mod status_store;
