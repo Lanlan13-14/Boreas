@@ -1753,13 +1753,21 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     /// Live status is read from a real AF_UNIX socket in a temp directory. The
-    /// listener is nonblocking so a failing assert can never hang the suite.
+    /// fixture reads the complete `STATUS\n` request before answering, exactly
+    /// like the daemon: responding and closing without that read races the
+    /// client's write and surfaces as a spurious EPIPE ("control socket write
+    /// failed"). Accept, read, write, and join are all bounded.
     #[cfg(unix)]
     #[test]
     fn console_reports_live_when_the_socket_answers() {
-        use std::io::Write as _;
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixListener;
-        use std::time::{Duration, Instant};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
         // macOS TMPDIR can already exceed sockaddr_un.sun_path once a test
         // name is appended. Keep this Unix-socket fixture short on every Unix.
@@ -1778,30 +1786,52 @@ uplinks = ["wss://hub-us-c.example.net"]
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
 
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let body = concat!(
-                            "{\"command\":\"ctl.status\",\"node\":\"core-1\",",
-                            "\"daemon_connected\":true,\"inbound_on\":true,",
-                            "\"inbound_connections\":1,\"outbound_upstreams\":0,",
-                            "\"security_mode\":\"e2e-required\"}\n"
-                        );
-                        let _ = stream.write_all(body.as_bytes());
-                        let _ = stream.flush();
-                        return;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() > deadline {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => return,
-                }
-            }
+            let mut poll_fd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = FIXTURE_TIMEOUT.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: `poll_fd` is one initialized `pollfd`; `poll` only writes
+            // its `revents` field.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            assert_eq!(
+                ready, 1,
+                "the console did not connect within the fixture timeout"
+            );
+            assert_ne!(
+                poll_fd.revents & libc::POLLIN,
+                0,
+                "fixture listener was not readable"
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(FIXTURE_TIMEOUT))
+                .expect("fixture read timeout");
+            stream
+                .set_write_timeout(Some(FIXTURE_TIMEOUT))
+                .expect("fixture write timeout");
+
+            // Protocol order: read the whole request, then answer. This is the
+            // daemon's contract and removes the close-before-read race.
+            let mut request = String::new();
+            BufReader::new((&mut stream).take(64))
+                .read_line(&mut request)
+                .expect("fixture reads STATUS");
+            assert_eq!(request, "STATUS\n", "fixture read a partial request");
+
+            let body = concat!(
+                "{\"command\":\"ctl.status\",\"node\":\"core-1\",",
+                "\"daemon_connected\":true,\"inbound_on\":true,",
+                "\"inbound_connections\":1,\"outbound_upstreams\":0,",
+                "\"security_mode\":\"e2e-required\"}\n"
+            );
+            stream.write_all(body.as_bytes()).expect("status answer");
+            stream.flush().expect("status flush");
+            done_tx.send(()).expect("fixture done signal");
         });
 
         let (code, stdout, stderr) = run_console(
@@ -1809,8 +1839,20 @@ uplinks = ["wss://hub-us-c.example.net"]
             Lang::En,
             false,
         );
+
+        let finished = match done_rx.recv_timeout(JOIN_TIMEOUT) {
+            Ok(()) => {
+                handle.join().expect("fixture thread");
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("fixture thread");
+                false
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        };
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = handle.join();
+        assert!(finished, "fixture did not finish within {JOIN_TIMEOUT:?}");
 
         assert_eq!(code, 0, "{stderr}");
         assert!(stdout.contains("\"source\":\"live\""), "{stdout}");
