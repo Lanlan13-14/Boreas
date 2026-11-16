@@ -315,6 +315,46 @@ jobs:
             'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
             > hop-node-linux/README-DEVELOPMENT.txt
           (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
+      - name: Same-identity initial TCP backup E2E (closed primary, configured backup)
+        if: success()
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          variant_dir="$(mktemp -d "$RUNNER_TEMP/initial-backup-smoke.XXXXXX")"
+          trap 'rm -rf -- "$variant_dir"' EXIT
+          cp tools/release/netns_daemon_smoke.sh tools/release/netns_overlay_perf.py "$variant_dir"/
+          python3 - "$variant_dir/netns_daemon_smoke.sh" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text(encoding="utf-8")
+
+          edge_before = '''state_dir = "$EDGE_STATE"
+          [uplink]
+          primary = "wss.boreas.test:8443"
+          paths = 4
+          probe_paths = 1
+          '''
+          edge_after = '''state_dir = "$EDGE_STATE"
+          [uplink]
+          primary = "192.0.2.1:8444"
+          backup = "192.0.2.1:8443"
+          paths = 4
+          probe_paths = 1
+          '''
+          assert source.count(edge_before) == 1, "edge [uplink] block must occur exactly once"
+          source = source.replace(edge_before, edge_after)
+
+          connect_before = '  --connect "192.0.2.1:8443" \\\n'
+          assert source.count(connect_before) == 1, "edge --connect line must occur exactly once"
+          source = source.replace(connect_before, "")
+
+          path.write_text(source, encoding="utf-8")
+          PY
+          sudo -E bash "$variant_dir/netns_daemon_smoke.sh" hop-node-linux/boreas \
+            2>&1 | tee rust-tls-initial-backup.log
       - name: Upload hop-node development binary
         if: success()
         uses: actions/upload-artifact@v7
@@ -341,5 +381,6 @@ jobs:
             rust-tls-supervisor-tests.log
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
+            rust-tls-initial-backup.log
           if-no-files-found: warn
           retention-days: 14
