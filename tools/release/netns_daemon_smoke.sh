@@ -33,6 +33,43 @@ run_hook() {
   fi
 }
 
+FAILURES=()
+record_failure() {
+  FAILURES+=("$1")
+}
+report_daemon_state() {
+  local label socket status log
+  echo "--- daemon state ---" >&2
+  for spec in "Core:$CORE_STATE/control.sock" "Edge:$EDGE_STATE/control.sock"; do
+    label="${spec%%:*}"
+    socket="${spec#*:}"
+    if status="$("$BIN" ctl status --socket "$socket" 2>&1)"; then
+      echo "$label ctl status: $status" >&2
+    else
+      echo "$label ctl status unavailable: $status" >&2
+    fi
+  done
+  for log in "$WORK/core.out" "$WORK/core.err" "$WORK/edge.out" "$WORK/edge.err"; do
+    if [[ -s "$log" ]]; then
+      echo "--- $log ---" >&2
+      cat "$log" >&2 || true
+    fi
+  done
+  return 0
+}
+report_failure_evidence() {
+  local log
+  echo "--- failure evidence ---" >&2
+  report_daemon_state
+  for log in "$WORK/ping.log" "$WORK"/perf-*.log; do
+    if [[ -s "$log" ]]; then
+      echo "--- $log ---" >&2
+      cat "$log" >&2 || true
+    fi
+  done
+  return 0
+}
+
 WORK="$(mktemp -d /tmp/boreas-netns-e2e.XXXXXX)"
 chmod 0700 "$WORK"
 CORE_NS="boreas-core-$$"
@@ -285,16 +322,19 @@ for _ in $(seq 1 100); do
 done
 if [[ "$CONNECTED" -ne 1 ]]; then
   echo "ERROR: Edge daemon never reached connected state" >&2
-  cat "$WORK/core.err" >&2 || true
-  cat "$WORK/edge.err" >&2 || true
+  report_failure_evidence
   exit 1
 fi
 
 # Exercise sparse ICMP traffic and reject the former fixed 25 ms polling delay.
-# This threshold applies only to this isolated veth development environment.
-ip netns exec "$EDGE_NS" ping -c 10 -i 0.1 -W 2 -I 10.20.1.2 10.20.1.1 | tee "$WORK/ping.log"
-grep -q " 0% packet loss" "$WORK/ping.log"
-python3 - "$WORK/ping.log" <<'PY'
+# A packet-loss or latency failure is recorded but does not prevent the
+# full-duplex probe from running; the final exit remains nonzero.
+PING_FAILED=0
+if ! ip netns exec "$EDGE_NS" ping -c 10 -i 0.1 -W 2 -I 10.20.1.2 10.20.1.1 | tee "$WORK/ping.log"; then
+  PING_FAILED=1
+  echo "WARNING: overlay ping exited nonzero; preserving its output as failure evidence" >&2
+fi
+if ! python3 - "$WORK/ping.log" <<'PY'
 import os
 import re
 import sys
@@ -302,17 +342,43 @@ import sys
 limit = float(os.environ.get("BOREAS_MAX_PING_MS", "15.0"))
 
 text = open(sys.argv[1], encoding="utf-8").read()
+problems = []
+
+loss_match = re.search(r"([0-9]+(?:\.[0-9]+)?)% packet loss", text)
+if loss_match is None:
+    problems.append("could not parse ping packet-loss statistics")
+else:
+    loss = float(loss_match.group(1))
+    print(f"overlay_ping_loss_percent={loss:.3f}")
+    if loss != 0:
+        problems.append(f"overlay packet loss {loss:.3f}% exceeds 0%")
+
 match = re.search(r"= ([0-9.]+)/([0-9.]+)/([0-9.]+)/[0-9.]+ ms", text)
 if match is None:
-    raise SystemExit("could not parse ping RTT statistics")
-minimum, average, maximum = map(float, match.groups())
-print(f"overlay_ping_average_ms={average:.3f}")
-print(f"overlay_ping_max_ms={maximum:.3f}")
-if average > limit or maximum > limit:
-    raise SystemExit(
-        f"overlay RTT avg={average:.3f} ms max={maximum:.3f} ms exceeds {limit:.3f} ms regression bound"
-    )
+    print("overlay_ping_average_ms=unavailable")
+    print("overlay_ping_max_ms=unavailable")
+    problems.append("could not parse ping RTT statistics")
+else:
+    minimum, average, maximum = map(float, match.groups())
+    print(f"overlay_ping_average_ms={average:.3f}")
+    print(f"overlay_ping_max_ms={maximum:.3f}")
+    if average > limit or maximum > limit:
+        problems.append(
+            f"overlay RTT avg={average:.3f} ms max={maximum:.3f} ms exceeds {limit:.3f} ms regression bound"
+        )
+
+if problems:
+    for problem in problems:
+        print(f"overlay_ping_failure: {problem}", file=sys.stderr)
+    raise SystemExit(1)
 PY
+then
+  PING_FAILED=1
+fi
+if (( PING_FAILED )); then
+  record_failure "overlay ping: packet loss or latency regression bound failed"
+  report_daemon_state
+fi
 
 # Send 8 MiB in each direction at the same time and authenticate both payloads
 # with independent SHA-256 digests. This exercises full-duplex progress rather
@@ -326,39 +392,131 @@ ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" send 10.20.1.2 10.20.1.1 > "$WOR
 echo $! > "$WORK/perf-sender-edge.pid"
 ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" send 10.20.1.1 10.20.1.2 > "$WORK/perf-sender-core.log" 2>&1 &
 echo $! > "$WORK/perf-sender-core.pid"
-wait "$(cat "$WORK/perf-sender-edge.pid")"
-wait "$(cat "$WORK/perf-sender-core.pid")"
-wait "$(cat "$WORK/perf-receiver-core.pid")"
-wait "$(cat "$WORK/perf-receiver-edge.pid")"
-python3 - "$WORK/perf-sender-edge.log" "$WORK/perf-sender-core.log" <<'PY'
+PERF_WORKER_FAILED=0
+if ! wait "$(cat "$WORK/perf-sender-edge.pid")"; then
+  echo "ERROR: edge_to_core sender exited nonzero" >&2
+  PERF_WORKER_FAILED=1
+fi
+if ! wait "$(cat "$WORK/perf-sender-core.pid")"; then
+  echo "ERROR: core_to_edge sender exited nonzero" >&2
+  PERF_WORKER_FAILED=1
+fi
+if ! wait "$(cat "$WORK/perf-receiver-core.pid")"; then
+  echo "ERROR: core receiver exited nonzero" >&2
+  PERF_WORKER_FAILED=1
+fi
+if ! wait "$(cat "$WORK/perf-receiver-edge.pid")"; then
+  echo "ERROR: edge receiver exited nonzero" >&2
+  PERF_WORKER_FAILED=1
+fi
+if (( PERF_WORKER_FAILED )); then
+  # Do not treat a sender's JSON as valid throughput when either worker in
+  # that direction failed (for example on a digest or socket error).
+  echo "ERROR: overlay perf worker failed; measured throughput is not accepted" >&2
+  report_failure_evidence
+  exit 1
+fi
+
+PERF_RESULT=0
+python3 - "$WORK/perf-sender-edge.log" "$WORK/perf-sender-core.log" <<'PY' || PERF_RESULT=$?
 import json
+import math
 import os
 import sys
 
+labels = ("edge_to_core", "core_to_edge")
 minimum = float(os.environ.get("BOREAS_MIN_THROUGHPUT_MBPS", "3.0"))
 expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
+failures = []
 
-for label, path in zip(("edge_to_core", "core_to_edge"), sys.argv[1:]):
-    with open(path, encoding="utf-8") as source:
-        result = json.load(source)
-    if result["bytes"] != expected_bytes:
-        raise SystemExit(f"{label} transferred an unexpected byte count")
-    if result["throughput_mbps"] < minimum:
-        raise SystemExit(f"{label} throughput {result['throughput_mbps']} Mbps is below {minimum} Mbps regression bound")
-    print(f"overlay_throughput_{label}_mbps={result['throughput_mbps']:.3f}")
+for label, path in zip(labels, sys.argv[1:]):
+    try:
+        with open(path, encoding="utf-8") as source:
+            result = json.load(source)
+    except (OSError, ValueError) as exc:
+        print(f"overlay_throughput_{label}_mbps=unavailable")
+        failures.append(f"{label} has no complete sender result: {exc}")
+        continue
+    if not isinstance(result, dict):
+        print(f"overlay_throughput_{label}_mbps=unavailable")
+        failures.append(f"{label} sender result is not a JSON object")
+        continue
+
+    throughput = result.get("throughput_mbps")
+    measured = (
+        isinstance(throughput, (int, float))
+        and not isinstance(throughput, bool)
+        and math.isfinite(throughput)
+    )
+    if measured:
+        print(f"overlay_throughput_{label}_mbps={throughput:.3f}")
+    else:
+        print(f"overlay_throughput_{label}_mbps=unavailable")
+        failures.append(f"{label} has no valid throughput measurement")
+    if result.get("bytes") != expected_bytes:
+        failures.append(f"{label} transferred {result.get('bytes')} bytes, expected {expected_bytes}")
+    if measured and throughput < minimum:
+        failures.append(
+            f"{label} throughput {throughput:.3f} Mbps is below {minimum:.3f} Mbps regression bound"
+        )
+
+# Both direction lines above are printed before any threshold failure exits.
+if failures:
+    for failure in failures:
+        print(f"overlay_perf_failure: {failure}", file=sys.stderr)
+    raise SystemExit(1)
 PY
+if (( PERF_RESULT != 0 )); then
+  echo "ERROR: overlay full-duplex throughput/integrity assertion failed" >&2
+  report_failure_evidence
+  exit 1
+fi
 
-CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock")"
-EDGE_CTL="$("$BIN" ctl status --socket "$EDGE_STATE/control.sock")"
-echo "Core live ctl: $CORE_CTL"
-echo "Edge live ctl: $EDGE_CTL"
+CTL_FAILED=0
+if CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock" 2>&1)"; then
+  echo "Core live ctl: $CORE_CTL"
+else
+  CTL_FAILED=1
+  echo "ERROR: Core ctl status failed: $CORE_CTL" >&2
+fi
+if EDGE_CTL="$("$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>&1)"; then
+  echo "Edge live ctl: $EDGE_CTL"
+else
+  CTL_FAILED=1
+  echo "ERROR: Edge ctl status failed: $EDGE_CTL" >&2
+fi
+if (( CTL_FAILED )); then
+  record_failure "control status query failed"
+fi
 
-wait "$(cat "$WORK/edge.pid")" || { cat "$WORK/edge.err" >&2; exit 1; }
-wait "$(cat "$WORK/core.pid")" || { cat "$WORK/core.err" >&2; exit 1; }
+DAEMON_FAILED=0
+if ! wait "$(cat "$WORK/edge.pid")"; then
+  echo "ERROR: Edge daemon exited nonzero" >&2
+  DAEMON_FAILED=1
+fi
+if ! wait "$(cat "$WORK/core.pid")"; then
+  echo "ERROR: Core daemon exited nonzero" >&2
+  DAEMON_FAILED=1
+fi
+if (( DAEMON_FAILED )); then
+  record_failure "daemon process exited nonzero"
+fi
 
 echo " Core exit summary: $(cat "$WORK/core.out")"
 echo " Edge exit summary: $(cat "$WORK/edge.out")"
-grep -q '"status":"ok"' "$WORK/core.out"
-grep -q '"status":"ok"' "$WORK/edge.out"
+if ! grep -q '"status":"ok"' "$WORK/core.out"; then
+  record_failure "Core daemon did not report status ok"
+fi
+if ! grep -q '"status":"ok"' "$WORK/edge.out"; then
+  record_failure "Edge daemon did not report status ok"
+fi
+if (( ${#FAILURES[@]} > 0 )); then
+  echo "ERROR: netns smoke failed ${#FAILURES[@]} assertion(s):" >&2
+  for failure in "${FAILURES[@]}"; do
+    echo "  - $failure" >&2
+  done
+  report_failure_evidence
+  exit 1
+fi
 run_hook verify
 echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"
