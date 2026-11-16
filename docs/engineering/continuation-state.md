@@ -1,6 +1,14 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 21:15 +08
+## Current handoff — 2026-11-16 round 8
+
+- Rechecked authoritative external plan and repository copy during round8: both SHA25623969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA, no divergence.
+- Human explicitly corrected persisted objective: the full file C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md is the complete Phase0–5 implementation/acceptance baseline, not merely the feature shortlist. Goal revision18 now names it explicitly and requires per-item implementation/evidence/gap traceability. Do not reduce scope to recent CI fixes. No release until all applicable exact-final-commit checks pass; no production/independent-audit claims.
+- Pushed fbdfee127ecd41e26d7f69b146ed55ca46da4cab fixes missing role enum import in real WSS test from45ce1d8. 45ce1d8 Rust/TUN/deploy green but TLS/OpenWrt both failed compile E0433 in wss_e2e_openssl.rs:579-581, not runtime failure. fbdfee1 Rust43875749581,TUN43875749268,OpenWrt43875749249,platform43875749284,TLS43875749426 allSUCCESS. Native security gate stillblocks by policy. This verifies signedVIP retention/default mapping and console fixture repair at that exactSHA.
+- Local commit cbe903f adds same-signed-peer initialTCP primary→backup only ConnectionRefused/TimedOut, strict no fallback after TLS/WSS/session/E2E error and explicit--connect disables backup. DNSresolver still existingblocking and no steady-state reconnect/multiCore support. Not yet pushed/tested; test generics fixed after leadreview. Need actual same-peer backup E2E/TUN CI before claim.
+- Active DeepSeek scopes: perf-resource-evidence only smoke.sh + data-plane-design.md (large366-line firstdraft rejected pending simplification; require every sample starttime/exe identity, real sysconf units, no arbitrary RSS/CPU thresholds); backup-smoke-ci only rust-tls.yml adds real refused8444→backup8443 samepeer smoke with unchanged traffic/gates. Collect and review actual finaldiff before commit. Do not overwrite concurrent smoke edits.
+
+## Previous checkpoint — 2026-11-16 21:15 +08
 
 - Current pushed HEAD251372995f0039ab9231aff58788d7c45f8df099 includes reviewed Luna connect_tcp/connect_preconnected phase seam (fba8a7a), DeepSeek verifier fixture(0d13960), Actions rustfmt(d820bd6), and trusted source_run_id performance dispatch(2513729). No daemon backup/fallback enabled; API is groundwork only. Exact2513729 Rust43872995047/TUN43872994889/platform43872994868 succeeded, dependency native gate still intentionally blocked.
 - Verifier fixture23 scenarios(2pass21negative) job133317944864/run43872620976 succeeded. Lead caught missing fake CLI installation and CLI option spelling mismatch before commit; production verifier unchanged by fixture. Child later failed after file delivery; final reviewed files already committed.

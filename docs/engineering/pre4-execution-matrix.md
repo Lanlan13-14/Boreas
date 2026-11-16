@@ -2,6 +2,8 @@
 
 This is an implementation work list, not evidence of completion. The normative baseline is `docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md`. A check box may be marked verified only with an exact-commit Actions URL and, where applicable, a real-device report. Development prerelease status does not close any production gate in `gates.json`.
 
+The authoritative human-supplied original is `C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md`. Its SHA-256 was rechecked against the repository copy on 2026-11-16: both are `23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`. The entire Phase 0–5 plan remains in scope; the workstream table below is a prioritization aid, not a replacement or scope reduction. All 24 production gates remain open; short two-node CI successes are partial evidence only.
+
 ## Current integration line
 
 - Exact GitHub baseline before this work: `9dc1593` (`v0.1.0-pre.3` documentation).
