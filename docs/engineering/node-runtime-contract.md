@@ -1,6 +1,6 @@
 # P04/P05 双节点 NodeRuntime 纵切合同
 
-状态：仅为设计合同；本次没有新增任何 runtime 源文件/原语，也不是 daemon 已实现/可部署声明。本文按读取时工作树制定，合并后必须复查引用和冲突。合同目标是 P04/P05 最小纵切：离线受控预配的两个真实节点、单条 HTTP/1.1 WSS 路径、逐跳 TLS 1.3、强制 E2E、真实 `boreas_tun::PacketIo`（首先 VirtualTun，再 LinuxTun）、认证/状态失鲜即关闭。暂不扩展多 Core、CDN/h2、漫游/故障切换、子网路由、DNS、系统路由、热更新或生产能力声明。
+状态：历史设计基线（保留当时规划/缺口描述；不应视为当前实现清单）。当前 `crates/boreas-cli/src/daemon.rs` 已包含 Linux daemon 的 TCP→TLS/WSS→pq768 hop session→pq768 E2E→PacketPath 纵切；本次窄增量仅在初始 TCP 阶段允许 primary 被明确拒绝/超时后尝试配置 backup。两个端点共享已验证的单一 `peer.signed` / `remote_peer`，每个 endpoint 分别派生 TLS name 与 WS Host；显式 `--connect` 禁用隐式 backup，显式 `--tls-name` / `--ws-host` 继续覆盖。握手、身份/session、E2E、状态或任何非 TCP refused/timeout 失败均不 fallback；不会重连，不支持不同 Core 身份。若 backup 指向不同 Core，同身份验证将失败并停止。该行为不是多 Core、高可用/漫游或生产可部署声明。本文后续章节的历史缺口需结合代码复核；未完成的持久信任/业务 gate/生命周期/路由/确认等生产边界仍然成立。DNS解析沿用现有阻塞实现，不承诺严格总截止时间。
 
 ## 1. 安全成功条件
 

@@ -474,6 +474,69 @@ mod linux_daemon {
         })
     }
 
+    fn connect_endpoints<'a>(primary: &'a str, backup: Option<&'a str>) -> Vec<&'a str> {
+        match backup.filter(|backup| *backup != primary) {
+            Some(backup) => vec![primary, backup],
+            None => vec![primary],
+        }
+    }
+
+    fn attempt_endpoint<T, E>(
+        index: usize,
+        endpoint_count: usize,
+        dial: impl FnOnce() -> Result<T, E>,
+        is_retryable_tcp_error: impl FnOnce(&E) -> bool,
+    ) -> Result<T, EndpointAttemptError<E>> {
+        match dial() {
+            Ok(value) => Ok(value),
+            Err(error) if index == 0 && endpoint_count == 2 && is_retryable_tcp_error(&error) => {
+                Err(EndpointAttemptError::TryBackup(error))
+            }
+            Err(error) => Err(EndpointAttemptError::Stop(error)),
+        }
+    }
+
+    enum EndpointAttemptError<E> {
+        TryBackup(E),
+        Stop(E),
+    }
+
+    fn may_try_backup(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    fn endpoint_tls_name(endpoint: &str) -> Result<&str, String> {
+        if endpoint.starts_with('[') {
+            return Err("daemon: IPv6 endpoint TLS names are unsupported".to_string());
+        }
+        let (host, port) = endpoint
+            .rsplit_once(':')
+            .ok_or_else(|| "daemon: endpoint must be host:port".to_string())?;
+        if host.is_empty() || host.starts_with('[') || host.contains(':') || port.is_empty() {
+            return Err("daemon: endpoint host/port is invalid".to_string());
+        }
+        Ok(host)
+    }
+
+    fn client_target(
+        endpoint: &str,
+        tls_override: Option<&str>,
+        ws_override: Option<&str>,
+        path: &str,
+    ) -> Result<ClientTarget, String> {
+        Ok(ClientTarget {
+            address: resolve_addr(endpoint)?,
+            ws_host: ws_override.unwrap_or(endpoint).to_string(),
+            tls_server_name: tls_override
+                .map(str::to_string)
+                .unwrap_or(endpoint_tls_name(endpoint)?.to_string()),
+            path: path.to_string(),
+        })
+    }
+
     fn resolve_addr(spec: &str) -> Result<SocketAddr, String> {
         spec.to_socket_addrs()
             .map_err(|_| "daemon: cannot resolve endpoint address".to_string())?
@@ -734,18 +797,18 @@ mod linux_daemon {
                 &counters,
             ),
             Mode::Connect => {
-                let dial_str = connect_spec.unwrap_or_else(|| config.uplinks.primary.clone());
-                let default_host = dial_str
-                    .split(':')
-                    .next()
-                    .unwrap_or("wss.boreas.internal")
-                    .to_string();
-                let sni = tls_name.unwrap_or_else(|| default_host.clone());
-                let host_hdr = ws_host.unwrap_or(dial_str.clone());
+                let explicit_connect = connect_spec.is_some();
+                let primary = connect_spec.unwrap_or_else(|| config.uplinks.primary.clone());
+                let backup = if explicit_connect {
+                    None
+                } else {
+                    config.uplinks.backup.as_deref()
+                };
                 run_connect_loop(
-                    &dial_str,
-                    &sni,
-                    &host_hdr,
+                    &primary,
+                    backup,
+                    tls_name.as_deref(),
+                    ws_host.as_deref(),
                     &ws_path,
                     &mat_dir,
                     &roots_path,
@@ -1103,9 +1166,10 @@ mod linux_daemon {
 
     #[allow(clippy::too_many_arguments)]
     fn run_connect_loop(
-        dial_spec: &str,
-        tls_server_name: &str,
-        ws_host: &str,
+        primary_spec: &str,
+        backup_spec: Option<&str>,
+        tls_name_override: Option<&str>,
+        ws_host_override: Option<&str>,
         ws_path: &str,
         mat_dir: &Path,
         roots_path: &Path,
@@ -1122,7 +1186,6 @@ mod linux_daemon {
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
     ) -> Result<(), String> {
-        let target_addr = resolve_addr(dial_spec)?;
         let outer_ca_path = mat_dir.join("outer-ca.pem");
         let outer_conn = if outer_ca_path.exists() {
             let pem = fs::read(&outer_ca_path)
@@ -1143,17 +1206,46 @@ mod linux_daemon {
             Box::new(tracking_outer),
             Box::new(OpenSslInnerConnector::new(inner_conn, extractor)),
         );
-        let client_target = ClientTarget {
-            address: target_addr,
-            ws_host: ws_host.to_string(),
-            tls_server_name: tls_server_name.to_string(),
-            path: ws_path.to_string(),
-        };
-
-        let mut hop_session = link_client
-            .connect(&client_target, session_policy, HANDSHAKE_TIMEOUT)
-            .map_err(|e| format!("daemon connect: WSS + pq768 hop session rejected: {e}"))?;
-        let sock_fd = fd_slot.load(Ordering::SeqCst);
+        let endpoints = connect_endpoints(primary_spec, backup_spec);
+        let mut connected: Option<(boreas_tunnel::EstablishedSession, i32)> = None;
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let now_us = now_utc_us()?;
+            verify_status_freshness_from_roots(roots_path, status_path, expected_net_id, now_us)
+                .map_err(|e| format!("daemon connect: StatusSnapshot stale or invalid: {e}"))?;
+            let target = client_target(endpoint, tls_name_override, ws_host_override, ws_path)?;
+            match attempt_endpoint(
+                index,
+                endpoints.len(),
+                || link_client.connect_tcp(&target, HANDSHAKE_TIMEOUT),
+                may_try_backup,
+            ) {
+                Ok(tcp) => {
+                    let now_us = now_utc_us()?;
+                    verify_status_freshness_from_roots(
+                        roots_path,
+                        status_path,
+                        expected_net_id,
+                        now_us,
+                    )
+                    .map_err(|e| {
+                        format!("daemon connect: StatusSnapshot stale or invalid: {e}")
+                    })?;
+                    let session = link_client
+                        .connect_preconnected(tcp, &target, session_policy.clone())
+                        .map_err(|e| {
+                            format!("daemon connect: WSS + pq768 hop session rejected: {e}")
+                        })?;
+                    connected = Some((session, fd_slot.load(Ordering::SeqCst)));
+                    break;
+                }
+                Err(EndpointAttemptError::TryBackup(_error)) => continue,
+                Err(EndpointAttemptError::Stop(error)) => {
+                    return Err(format!("daemon connect: TCP connect failed: {error}"));
+                }
+            }
+        }
+        let (mut hop_session, sock_fd) = connected
+            .ok_or_else(|| "daemon connect: no endpoint connected".to_string())?;
 
         let e2e = open_e2e(&mut hop_session, &e2e_backend, remote_peer, 1)
             .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
@@ -1362,6 +1454,67 @@ mod linux_daemon {
     #[cfg(test)]
     mod watchdog_tests {
         use super::*;
+
+        #[test]
+        fn endpoint_selection_used_by_connect_loop_and_names_honor_overrides() {
+            assert_eq!(
+                connect_endpoints("primary:443", Some("backup:443")),
+                vec!["primary:443", "backup:443"]
+            );
+            assert_eq!(connect_endpoints("cli:9443", None), vec!["cli:9443"]);
+            assert_eq!(
+                endpoint_tls_name("backup.example:8443").unwrap(),
+                "backup.example"
+            );
+            assert!(endpoint_tls_name("[::1]:443").is_err());
+            let target = client_target(
+                "127.0.0.1:443",
+                Some("override.example"),
+                Some("override-host:8443"),
+                "/x",
+            )
+            .unwrap();
+            assert_eq!(target.ws_host, "override-host:8443");
+            assert_eq!(target.tls_server_name, "override.example");
+        }
+
+        #[test]
+        fn backup_gate_rejects_non_transport_errors_and_handshake_failures_stop() {
+            let mut calls = 0;
+            let result: Result<(), EndpointAttemptError<std::io::Error>> = attempt_endpoint(
+                0,
+                2,
+                || {
+                    calls += 1;
+                    Err(std::io::Error::from(
+                        std::io::ErrorKind::ConnectionRefused,
+                    ))
+                },
+                may_try_backup,
+            );
+            assert!(matches!(result, Err(EndpointAttemptError::TryBackup(_))));
+            assert_eq!(calls, 1);
+
+            let result: Result<(), _> = attempt_endpoint(
+                0,
+                2,
+                || Err("TLS rejected"),
+                |_| false,
+            );
+            assert!(matches!(result, Err(EndpointAttemptError::Stop("TLS rejected"))));
+
+            for kind in [
+                std::io::ErrorKind::ConnectionReset,
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidInput,
+            ] {
+                let error = std::io::Error::from(kind);
+                assert!(matches!(
+                    attempt_endpoint::<(), _>(0, 2, || Err(error), may_try_backup),
+                    Err(EndpointAttemptError::Stop(_))
+                ));
+            }
+        }
 
         fn counters() -> Arc<LiveCounters> {
             Arc::new(LiveCounters {
