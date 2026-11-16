@@ -6,6 +6,7 @@
 //! - `boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role core|edge --home-core <1..16> --vip-octet <1|2..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]`
 //! - `boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]`
 //! - `boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]`
+//! - `boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE>`
 
 #[cfg(not(feature = "openssl-inner-tls"))]
 pub fn run_pki_command(args: &[String]) -> Result<(), String> {
@@ -21,7 +22,8 @@ pub fn pki_usage() -> &'static str {
   boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--generation <N>] [--validity-days <1..3650>]
   boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role <core|edge> --home-core <1..16> --vip-octet <1..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]
   boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]
-  boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]"
+  boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]
+  boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE>"
 }
 
 #[cfg(feature = "openssl-inner-tls")]
@@ -36,6 +38,7 @@ pub fn run_pki_command(args: &[String]) -> Result<(), String> {
         "issue-node" => cmd_issue_node(&args[1..]),
         "sign-status" => cmd_sign_status(&args[1..]),
         "verify-bundle" => cmd_verify_bundle(&args[1..]),
+        "verify-policy" => cmd_verify_policy(&args[1..]),
         _ => Err("pki: unknown subcommand (run `boreas pki --help`)".to_string()),
     }
 }
@@ -273,6 +276,169 @@ fn cmd_sign_status(args: &[String]) -> Result<(), String> {
         summary.net_id_hex, summary.sequence, summary.issued_at_us, summary.next_update_us
     );
     Ok(())
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
+    use boreas_pki::{root_authorization::NetworkRootPin, verify_network_policy};
+    use boreas_pki::provisioning::{hex_encode, parse_net_id_hex};
+    use boreas_proto::objects::MldsaParameterSet;
+    use std::{collections::HashMap, io::Read, path::Path};
+
+    fn read_input(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>, String> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|_| format!("pki verify-policy: cannot inspect {label}"))?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > limit as u64 {
+            return Err(format!("pki verify-policy: invalid or oversized {label}"));
+        }
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|_| format!("pki verify-policy: cannot safely open {label}"))?
+        };
+        #[cfg(not(unix))]
+        let mut file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+            }
+            options.open(path).map_err(|_| format!("pki verify-policy: cannot safely open {label}"))?
+        };
+        let opened_meta = file.metadata()
+            .map_err(|_| format!("pki verify-policy: cannot inspect {label}"))?;
+        if !opened_meta.file_type().is_file() || opened_meta.len() > limit as u64 {
+            return Err(format!("pki verify-policy: invalid or oversized {label}"));
+        }
+        let mut bytes = Vec::with_capacity(opened_meta.len() as usize);
+        (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)
+            .map_err(|_| format!("pki verify-policy: cannot read {label}"))?;
+        if bytes.is_empty() || bytes.len() > limit {
+            return Err(format!("pki verify-policy: empty or oversized {label}"));
+        }
+        Ok(bytes)
+    }
+
+    let required = ["--tbs-file", "--ed25519-signature-file", "--mldsa65-signature-file",
+        "--net-id", "--root-ed25519-der", "--root-mldsa65-der"];
+    let mut values = HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if !required.contains(&flag) {
+            return Err(format!("pki verify-policy: unknown argument `{flag}`"));
+        }
+        if values.contains_key(flag) {
+            return Err(format!("pki verify-policy: duplicate argument `{flag}`"));
+        }
+        let value = args.get(i + 1).ok_or_else(|| format!("pki verify-policy: missing value for `{flag}`"))?;
+        if value.starts_with("--") {
+            return Err(format!("pki verify-policy: missing value for `{flag}`"));
+        }
+        values.insert(flag, value);
+        i += 2;
+    }
+    for flag in required {
+        if !values.contains_key(flag) {
+            return Err(format!("pki verify-policy: `{flag}` is required"));
+        }
+    }
+    let net_id = parse_net_id_hex(values["--net-id"])
+        .map_err(|e| format!("pki verify-policy: invalid --net-id: {e}"))?;
+    let tbs = read_input(Path::new(values["--tbs-file"]), 16 * 1024, "TBS")?;
+    let ed_sig = read_input(Path::new(values["--ed25519-signature-file"]), 64, "Ed25519 signature")?;
+    let pq_sig = read_input(Path::new(values["--mldsa65-signature-file"]), 3309, "ML-DSA-65 signature")?;
+    if ed_sig.len() != 64 || pq_sig.len() != 3309 {
+        return Err("pki verify-policy: signature has invalid length".to_string());
+    }
+    let ed_der = read_input(Path::new(values["--root-ed25519-der"]), 4096, "Ed25519 root key")?;
+    let pq_der = read_input(Path::new(values["--root-mldsa65-der"]), 4096, "ML-DSA-65 root key")?;
+    let pin = NetworkRootPin::provisioned(net_id, ed_der, MldsaParameterSet::Mldsa65, pq_der)
+        .map_err(|e| format!("pki verify-policy: invalid root pin: {e}"))?;
+    let now = now_utc_us()?;
+    let verified = verify_network_policy(&tbs, &ed_sig, &pq_sig, &pin, net_id, now)
+        .map_err(|e| format!("pki verify-policy failed: {e}"))?;
+    let overlay = verified.overlay_base();
+    let (issued, expires) = verified.validity();
+    println!("{{\"command\":\"pki.verify-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"overlay_base\":\"{}.{}.{}.{}\",\"version\":{},\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{},\"clock\":\"local-untrusted\",\"pin_provenance\":\"operator-supplied; verify independently\"}}",
+        hex_encode(&verified.net_id()), hex_encode(&verified.root_key_fingerprint()), overlay[0], overlay[1], overlay[2], overlay[3], verified.version(), verified.seq(), issued, expires);
+    Ok(())
+}
+
+#[cfg(all(test, feature = "openssl-inner-tls"))]
+mod verify_policy_cli_tests {
+    use super::*;
+    use std::{fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn temp_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("boreas-policy-cli-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+    fn run(args: &[&str]) -> Result<(), String> {
+        run_pki_command(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    }
+    fn baseline(dir: &std::path::Path) -> Vec<String> {
+        let mut args = Vec::new();
+        for (flag, file, bytes) in [
+            ("--tbs-file", "tbs", vec![1]),
+            ("--ed25519-signature-file", "ed", vec![0; 64]),
+            ("--mldsa65-signature-file", "pq", vec![0; 3309]),
+            ("--root-ed25519-der", "ed.der", vec![1]),
+            ("--root-mldsa65-der", "pq.der", vec![1]),
+        ] {
+            fs::write(dir.join(file), bytes).unwrap();
+            args.extend([flag.to_string(), dir.join(file).to_string_lossy().into_owned()]);
+        }
+        args.extend(["--net-id".to_string(), "03030303030303030303030303030303".to_string()]);
+        args
+    }
+    #[test]
+    fn verify_policy_rejects_unknown_duplicate_and_missing_flags() {
+        assert!(run(&["verify-policy", "--unknown", "x"]).unwrap_err().contains("unknown"));
+        let dir = temp_dir();
+        let args = baseline(&dir);
+        let mut duplicate = args.clone();
+        duplicate.extend(["--net-id".into(), "03030303030303030303030303030303".into()]);
+        let duplicate_args = std::iter::once("verify-policy".to_string())
+            .chain(duplicate)
+            .collect::<Vec<_>>();
+        assert!(run(&duplicate_args.iter().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_err().contains("duplicate"));
+        assert!(run(&["verify-policy", "--tbs-file", "x"]).unwrap_err().contains("required"));
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn verify_policy_rejects_oversized_and_symlink_inputs() {
+        let dir = temp_dir();
+        let args = baseline(&dir);
+        let tbs = dir.join("tbs");
+        fs::write(&tbs, vec![0; 16 * 1024 + 1]).unwrap();
+        let mut argv = vec!["verify-policy".to_string()];
+        argv.extend(args.clone());
+        let result = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(result.unwrap_err().contains("oversized"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = dir.join("tbs-link");
+            symlink(dir.join("ed"), &link).unwrap();
+            let mut linked = args;
+            let index = linked.iter().position(|s| s == "--tbs-file").unwrap() + 1;
+            linked[index] = link.to_string_lossy().into_owned();
+            let mut argv = vec!["verify-policy".to_string()];
+            argv.extend(linked);
+            assert!(run(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap_err().contains("invalid or oversized TBS"));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(feature = "openssl-inner-tls")]

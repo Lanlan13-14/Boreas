@@ -63,6 +63,13 @@ pub fn verify_network_policy(
     expected_net_id: [u8; 16],
     now: u64,
 ) -> Result<VerifiedNetworkPolicy, NetworkPolicyError> {
+    if raw_tbs.is_empty()
+        || raw_tbs.len() > boreas_proto::network_policy::MAX_TBS_LEN
+        || ed25519_signature.len() != 64
+        || mldsa65_signature.len() != 3309
+    {
+        return Err(NetworkPolicyError::InvalidCandidate);
+    }
     let candidate = NetworkPolicyCandidate::decode_tbs(raw_tbs)
         .map_err(|_| NetworkPolicyError::InvalidCandidate)?;
     if candidate.net_id != expected_net_id || pin.net_id() != expected_net_id {
