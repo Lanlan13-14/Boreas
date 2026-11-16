@@ -46,13 +46,13 @@ HASH=$(sudo sha256sum -- "$BIN" | awk '{print $1}')
 REL=gha-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}
 set -- --binary "$BIN" --sha256 "$HASH" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none
 sudo sh "$DEPLOY/install.sh" "$@"
-ACTIVE=$(sudo readlink "$P/active")
-[ "$ACTIVE" = "releases/$REL" ]
-[ "$(sudo sha256sum "$P/$ACTIVE/boreas" | awk '{print $1}')" = "$HASH" ]
-sudo readelf -h "$P/$ACTIVE/boreas" | grep -q ELF64
+ACTIVE=$(sudo sed -n '1p' "$P/active")
+[ "$ACTIVE" = "$REL" ]
+[ "$(sudo sha256sum "$P/releases/$ACTIVE/boreas" | awk '{print $1}')" = "$HASH" ]
+sudo readelf -h "$P/releases/$ACTIVE/boreas" | grep -q ELF64
 # Inspect program-header type fields, not the whole line (which always contains
 # the word INTERP in GNU readelf's column heading).
-PH=$(sudo readelf -l "$P/$ACTIVE/boreas")
+PH=$(sudo readelf -l "$P/releases/$ACTIVE/boreas")
 if printf '%s\n' "$PH" | awk '$1 == "INTERP" { found=1 } END { exit !found }'; then
   echo 'candidate unexpectedly has a PT_INTERP program header' >&2; exit 1
 fi
@@ -63,7 +63,7 @@ if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$(printf '%064d' 0)" -
   echo 'wrong hash unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'SHA-256 mismatch' "$BAD"
-[ "$(sudo readlink "$P/active")" = "releases/$REL" ]
+[ "$(sudo sed -n '1p' "$P/active")" = "$REL" ]
 # Same release with a different binary must reject a conflicting bundle. Change
 # one byte in a copied executable while retaining a valid ELF (tail append).
 sudo cp -- "$BIN" "$T/conflict"
@@ -73,6 +73,6 @@ if sudo sh "$DEPLOY/install.sh" --binary "$T/conflict" --sha256 "$CH" --release 
   echo 'conflicting existing release unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'already exists with a different bundle' "$BAD"
-[ "$(sudo readlink "$P/active")" = "releases/$REL" ]
+[ "$(sudo sed -n '1p' "$P/active")" = "$REL" ]
 [ ! -e /etc/systemd/system/boreas.service ] || { echo 'unexpected systemd unit on host' >&2; exit 1; }
 echo 'real installer integration passed (development candidate; no service start)'
