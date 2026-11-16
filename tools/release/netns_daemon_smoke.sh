@@ -33,6 +33,71 @@ run_hook() {
   fi
 }
 
+# --- Startup/handshake stage timing (diagnostic collection only) -------------
+# One monotonic timestamp is read per phase from `/proc/uptime` by a shell
+# builtin: no timer process is spawned per poll, so the existing wait loops and
+# their bounds are untouched. Values are harness observation latency from a
+# launch to an observed boundary, never crypto/CPU service time, and no budget
+# is asserted. `ctl` probes emit only an availability/connected classification:
+# raw status and error text are discarded, so no path list or key material is
+# dumped. Missing clock evidence is `unmeasured` and never turns a gate green.
+STARTUP_TIMING_LINES=()
+STARTUP_TIMINGS_REPORTED=0
+
+mono_ms() { # $1=destination variable; empty and nonzero on unreadable clock
+  local uptime fraction
+  if ! read -r uptime _ < /proc/uptime 2>/dev/null; then
+    printf -v "$1" '%s' ''
+    return 1
+  fi
+  if [[ ! "$uptime" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    printf -v "$1" '%s' ''
+    return 1
+  fi
+  [[ "$uptime" == *.* ]] || uptime="$uptime.0"
+  fraction="${uptime#*.}000"
+  printf -v "$1" '%d' "$(( 10#${uptime%%.*} * 1000 + 10#${fraction:0:3} ))"
+}
+
+record_stage() { # $1=stage $2=start ms $3=end ms $4=result|- (not asserted)
+  local elapsed=unmeasured
+  if [[ -n "$2" && -n "$3" ]] && (( $3 >= $2 )); then
+    elapsed=$(( $3 - $2 ))
+  fi
+  STARTUP_TIMING_LINES+=("stage_${1}_elapsed_ms=${elapsed}")
+  [[ "$4" == - ]] || STARTUP_TIMING_LINES+=("stage_${1}_result=${4}")
+}
+
+probe_ctl_state() { # $1=stage $2=label $3=socket; classification only
+  local output state rc=0
+  output="$("$BIN" ctl status --socket "$3" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then
+    state="unavailable:ctl-exit-${rc}"
+  elif [[ "$output" == *'"daemon_connected":true'* ]]; then
+    state=available-connected
+  else
+    state=available-not-connected
+  fi
+  STARTUP_TIMING_LINES+=("stage_${1}_${2}_ctl=${state}")
+}
+
+report_startup_timings() {
+  if (( STARTUP_TIMINGS_REPORTED )); then
+    return 0
+  fi
+  STARTUP_TIMINGS_REPORTED=1
+  local line
+  echo "--- startup/handshake stage timing (harness-observed boundaries) ---"
+  echo 'startup_timing_source=linux-proc-uptime-monotonic-shell-builtin'
+  echo 'startup_timing_scope=harness-observation-latency;not-crypto-or-cpu-service-time'
+  echo "startup_timing_stage_lines=${#STARTUP_TIMING_LINES[@]}"
+  for line in "${STARTUP_TIMING_LINES[@]}"; do
+    printf '%s\n' "$line"
+  done
+  echo 'startup_timing_connected_wait_scope=fixed-harness-poll-window;not-total-handshake-or-crypto-time'
+  echo 'startup_timing_threshold=none-asserted'
+}
+
 FAILURES=()
 record_failure() {
   FAILURES+=("$1")
@@ -379,6 +444,9 @@ report_ss_evidence() {
 
 cleanup() {
   set +e
+  # Emit any stage evidence not already reported (for example a signal-terminated
+  # run). Guarded, so normal and failed exits never duplicate the block.
+  report_startup_timings
   # Stop the bounded resource sampler through its sentinel and join it; never
   # signal a PID that could have been reused.
   stop_resource_sampler
@@ -400,7 +468,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-trap 'echo "ERROR: netns smoke failed at line $LINENO" >&2; for log in "$WORK/core.err" "$WORK/edge.err"; do if [[ -f "$log" ]]; then cat "$log" >&2; fi; done' ERR
+trap 'report_startup_timings; echo "ERROR: netns smoke failed at line $LINENO" >&2; for log in "$WORK/core.err" "$WORK/edge.err"; do if [[ -f "$log" ]]; then cat "$log" >&2; fi; done' ERR
 
 # Validate all mount destinations before either child starts. Never follow a
 # rootfs symlink into the host when preparing privileged bind-mount targets.
@@ -565,6 +633,7 @@ if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
 fi
 
 # Start Core daemon inside CORE_NS (creates real /dev/net/tun `btun0`).
+mono_ms CORE_LAUNCH_MS || CORE_LAUNCH_MS=''
 run_node "$CORE_NS" "$BIN" daemon serve \
   --config "$WORK/core.toml" \
   --material-dir "$CORE_MAT" \
@@ -576,17 +645,23 @@ run_node "$CORE_NS" "$BIN" daemon serve \
 echo $! > "$WORK/core.pid"
 
 # Wait for Core `btun0` to appear, then assign permanent VIP 10.20.1.1 and peer route.
+CORE_TUN_STATE=timeout
 for _ in $(seq 1 80); do
   if ip netns exec "$CORE_NS" ip link show btun0 >/dev/null 2>&1; then
+    CORE_TUN_STATE=observed
     break
   fi
   sleep 0.05
 done
+mono_ms CORE_TUN_MS || CORE_TUN_MS=''
+record_stage core_launch_to_tun_observed "$CORE_LAUNCH_MS" "$CORE_TUN_MS" "$CORE_TUN_STATE"
+probe_ctl_state core_tun_observed core "$CORE_STATE/control.sock"
 ip netns exec "$CORE_NS" ip addr add 10.20.1.1/32 dev btun0
 ip netns exec "$CORE_NS" ip link set btun0 up
 ip netns exec "$CORE_NS" ip route add 10.20.1.2/32 dev btun0
 
 # Start Edge daemon inside EDGE_NS (creates real /dev/net/tun `btun0` and dials 192.0.2.1:8443).
+mono_ms EDGE_LAUNCH_MS || EDGE_LAUNCH_MS=''
 run_node "$EDGE_NS" "$BIN" daemon connect \
   --config "$WORK/edge.toml" \
   --material-dir "$EDGE_MAT" \
@@ -599,12 +674,17 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &
 echo $! > "$WORK/edge.pid"
 
+EDGE_TUN_STATE=timeout
 for _ in $(seq 1 80); do
   if ip netns exec "$EDGE_NS" ip link show btun0 >/dev/null 2>&1; then
+    EDGE_TUN_STATE=observed
     break
   fi
   sleep 0.05
 done
+mono_ms EDGE_TUN_MS || EDGE_TUN_MS=''
+record_stage edge_launch_to_tun_observed "$EDGE_LAUNCH_MS" "$EDGE_TUN_MS" "$EDGE_TUN_STATE"
+probe_ctl_state edge_tun_observed edge "$EDGE_STATE/control.sock"
 ip netns exec "$EDGE_NS" ip addr add 10.20.1.2/32 dev btun0
 ip netns exec "$EDGE_NS" ip link set btun0 up
 ip netns exec "$EDGE_NS" ip route add 10.20.1.1/32 dev btun0
@@ -612,6 +692,11 @@ ip netns exec "$EDGE_NS" ip route add 10.20.1.1/32 dev btun0
 run_hook ready
 
 # Wait until `boreas ctl status` reports `daemon_connected:true` on both nodes.
+# Timing and ctl-state probes bracket this fixed loop at its boundaries only:
+# the poll count, interval and daemon deadlines stay exactly as before.
+probe_ctl_state connected_wait_start core "$CORE_STATE/control.sock"
+probe_ctl_state connected_wait_start edge "$EDGE_STATE/control.sock"
+mono_ms CONNECTED_WAIT_START_MS || CONNECTED_WAIT_START_MS=''
 CONNECTED=0
 for _ in $(seq 1 100); do
   if "$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>/dev/null | grep -q '"daemon_connected":true'; then
@@ -620,6 +705,17 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.05
 done
+mono_ms CONNECTED_WAIT_END_MS || CONNECTED_WAIT_END_MS=''
+CONNECTED_RESULT=failure
+if [[ "$CONNECTED" -eq 1 ]]; then
+  CONNECTED_RESULT=success
+fi
+record_stage edge_launch_to_connected "$EDGE_LAUNCH_MS" "$CONNECTED_WAIT_END_MS" "$CONNECTED_RESULT"
+record_stage edge_tun_to_connected "$EDGE_TUN_MS" "$CONNECTED_WAIT_END_MS" "$CONNECTED_RESULT"
+record_stage connected_wait "$CONNECTED_WAIT_START_MS" "$CONNECTED_WAIT_END_MS" "$CONNECTED_RESULT"
+probe_ctl_state connected_result core "$CORE_STATE/control.sock"
+probe_ctl_state connected_result edge "$EDGE_STATE/control.sock"
+report_startup_timings
 if [[ "$CONNECTED" -ne 1 ]]; then
   echo "ERROR: Edge daemon never reached connected state" >&2
   report_failure_evidence

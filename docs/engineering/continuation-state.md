@@ -1,6 +1,13 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 14
+## Current handoff — 2026-11-16 round 16
+
+- CurrentcodeHEAD37e1e47(Actionssupervisorfmt)ffmergedfrom8424b84; Rust43897876192/OpenWrt43897876171/TUN43897875912 success; TLS43897875864stillrunningatlastsample; platform43897876104queued; nativeSecurity43897876028blocked. Newreadinessclient five tests+realserverroundtrip andcandidatepolicydualverifymustawaitbackendterminalevidence. Do not reuse olderSHAgreens.
+- Expandedactualinstall43897688166 job133405608424SUCCESS: harness/installerac752d9, binarysource91acf0c/run43886308602. Realprivateinstall,wronghash/conflictingbundle andwritableancestor/nonrootancestor/symlinkprefixrefusal preservedgoodinstall. NoServicesstarted; notsystemd/procdrealdevice/physicalOpenWrt. master-plan-traceabilityupdatedwithscopedevidence.
+- Isolatedpolicyparser13428c3Rust43895908057/TLS43895908026/OpenWrt43895908751/TUN43895908252SUCCESS; platformcancelled. Fixedmanualvectorlength118(0x76),canonicalissuerbytesretained; exactfixedvector/encoderroundtripnowCIpassed, do notalterbasedonstalehandcounts. Prefixstillclosed.
+- Activewriters: handshake-time-diagnostics DeepSeeksmoke.sh+data-plane-design only, boundarymonotonicobservationsunchangedpollcounts/gates (additionalctlprobesperturblaunchmeasurement, mustnote). policy-sidecar-cli17 Luna pki_cmd.rs+pkipolicy only, additiveofflineverify-policywithseparateboundedrawTBS/sig/keyfileflags, independentpin/currentlocalclock, noBundle/allowlist/daemon/prefixwiring. readonlycontractsnetwork-policy-carrier-next/node-runtimecommittedede483e locallynotpushedyet. Allsyntax/tests/build/formattersActions-only.
+
+## Previous checkpoint — 2026-11-16 round 14
 
 - PushedHEAD5a51a1c (installer textactivepointer fix) afterff42bc3(independentcore/edge signedpeer fixture) and39474a2(TOML serializer quote-style assertion fix; decodedroundtrip hadpassed). Prior08d14e5Rust failedonly wizard escapedquotespell assertion; restoredCheckConfig deadcode alreadyfixed. Actualinstall43894183903 onff42bc3 successfullyinstalledrealbinary but harnessreadlink wronglyassumedactive symlink; productionactiveistextreleaseID, corrected5a51a1c. Pushdeploy43894768712 passedshellregressions but realjobSKIPPED; manual43894762746 cancelledbyconcurrency becausepushstartedlater. Redispatchedmanualafterpushcompletion, binds trustedbackend43886308602/source91acf0c candidate andcurrentinstaller/harness5a51a1c. Collect newmanualID/terminalresultbeforeclaim.
 - Currentparallelpending: untrackedproto/network_policy.rs + libexport + candidatecontractstatus; parserbyte7notexistingObjectType, noverifiedtoken/signatures/runtime/prefixenablement. Luna policy-vector-review ownsnewfile fixingpositiveCBOR44-vs4a/119byte-length/signature0x77 andnegativeoffsettests. Mustreadactualfinalfile, earlierDeepSeekdrafthexwrong. Do notcommitunreviewedvectors.
