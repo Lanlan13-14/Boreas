@@ -30,7 +30,8 @@
 
 - `13428c3`：Rust [43895908057](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908057)、TLS [43895908026](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908026)、OpenWrt [43895908751](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908751)、TUN [43895908252](https://github.com/Lanlan13-14/Boreas/actions/runs/43895908252) 成功，覆盖修复后的候选字节解析、端点预览与签名 VIP 查询桥；平台包被取消，不算通过。原生安全门仍失败。
 - 真实安装与新增权限负例：[43897688166 / job 133405608424](https://github.com/Lanlan13-14/Boreas/actions/runs/43897688166/job/133405608424) 成功。harness/installer 来源 `ac752d9`，被安装二进制来自后端 `43886308602`、source `91acf0c`。可写祖先、非 root 祖先、符号链接前缀均被拒，现有 active 与二进制保持不变。仅一次性 Ubuntu runner、`--service none`；不是 systemd/procd 真机、物理 OpenWrt 或发布验收。
-- `8424b84` 的共享就绪客户端与候选策略双签尚在精确 Actions 验收中，不得复用上述绿色结果。候选策略即使验签成功也未接入材料包/持久防回滚/运行时，自定义前缀仍拒绝。
+- `8424b84` 的 [TLS 43897875864](https://github.com/Lanlan13-14/Boreas/actions/runs/43897875864) 成功：共享 readiness 客户端真实服务端往返及负例、候选策略双签与 ML-DSA-87 pin 拒绝已执行。客户端尚未接入 daemon，nonce 不证明工件真实性。
+- `d6ddb19` 的 Rust [43969887681](https://github.com/Lanlan13-14/Boreas/actions/runs/43969887681)、TLS [43969887087](https://github.com/Lanlan13-14/Boreas/actions/runs/43969887087)、OpenWrt [43969886981](https://github.com/Lanlan13-14/Boreas/actions/runs/43969886981)、平台包 [43969886959](https://github.com/Lanlan13-14/Boreas/actions/runs/43969886959)、TUN [43969886965](https://github.com/Lanlan13-14/Boreas/actions/runs/43969886965) 成功。后端日志确认策略水位的重开／回滚／冲突冻结、原始字节绑定、截断拒绝及真实 CLI 签名文件测试执行通过。这仍不含掉电／满盘矩阵或运行时策略应用；依赖安全门未绿，自定义前缀仍拒绝。后续新增磁盘负例需要其自身精确提交验收。
 
 ## 24 门禁逐行映射
 
