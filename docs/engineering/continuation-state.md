@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 16
+## Current handoff — 2026-11-16 round 17
+
+- CurrentHEAD02c958a(Actionspki_cmdformat)ffmergedfrom761a12a offlineCLI. Original761a12a Rust43901106556/TUN43901106915 SUCCESS; TLS43901106873/OpenWrt43901106551 pendingatlastsample; nativeSecurity43901106667blocked. ExactfullSHArequiredforAPIhead_shaquery(shortSHAreturnsnone). CLI accepts5separatefiles+netid, noimplicitroots/policycarrier, Unixnofollow/nonblock/cloexec+fdregularcheck, localclockdisclosure; no prefixenablement. Parentfixedtemporarytestborrow,symlinkexpectederror,UnixunusedFileimport andrestoredformattedPKIbaselineafterchildwholefilerewrite.
+- 8424b84 TLS43897875864 terminalSUCCESS confirmsrealdualSIGtests64PKIlib andreadinessclientrealserver+negative45supervisorbin; docpriorpendingstale.4ef5e37TLS43899414586SUCCESS; stage+ssperformance dispatchedusingthissuccessfulsource, getcurrentperformanceworkflowrunID forpending evidence. Strictthresholdsremainreduntilmeasuredpass.
+- Activewriters: verify-policy-e2e Luna pki_cmdtests only, realgenerateddualkeys→CLI5filespositive/badsig/wrongpin/time, nosecretartifact. policy-durable-binding Luna newnetwork_policy_store.rs+libexport+narrownetwork_policy.rs privateobjecthash; LinuxwatermarkisNOTauthorization, openmustnotmintverifiedtoken, equivocationpersistfreeze, externalexpectedbindingtocatchmissingstate, whole-diskrollbackexplicitnonclaim. netem-evidence-assess DeepSeek newnetem-next-experiment.md only, actualstage/ssdataanalysisnotthresholdlowering. Nootherwriters; tests/build/syntax/formattersActions-only.
+
+## Previous checkpoint — 2026-11-16 round 16
 
 - CurrentcodeHEAD37e1e47(Actionssupervisorfmt)ffmergedfrom8424b84; Rust43897876192/OpenWrt43897876171/TUN43897875912 success; TLS43897875864stillrunningatlastsample; platform43897876104queued; nativeSecurity43897876028blocked. Newreadinessclient five tests+realserverroundtrip andcandidatepolicydualverifymustawaitbackendterminalevidence. Do not reuse olderSHAgreens.
 - Expandedactualinstall43897688166 job133405608424SUCCESS: harness/installerac752d9, binarysource91acf0c/run43886308602. Realprivateinstall,wronghash/conflictingbundle andwritableancestor/nonrootancestor/symlinkprefixrefusal preservedgoodinstall. NoServicesstarted; notsystemd/procdrealdevice/physicalOpenWrt. master-plan-traceabilityupdatedwithscopedevidence.

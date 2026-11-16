@@ -417,9 +417,11 @@ mod verify_policy_cli_tests {
     use super::*;
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
+    use boreas_proto::network_policy::NetworkPolicyCandidate;
+    use openssl::{pkey::{KeyType, PKey, Private}, sign::Signer};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn temp_dir() -> PathBuf {
@@ -455,6 +457,112 @@ mod verify_policy_cli_tests {
         ]);
         args
     }
+    fn keys(seed: u8) -> (PKey<Private>, PKey<Private>) {
+        (
+            PKey::generate_ed25519().unwrap(),
+            PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[seed; 32]).unwrap(),
+        )
+    }
+
+    fn sign(ed: &PKey<Private>, pq: &PKey<Private>, tbs: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let input = NetworkPolicyCandidate::signature_input(tbs).unwrap();
+        let mut signer = Signer::new_without_digest(ed).unwrap();
+        let ed_sig = signer.sign_oneshot_to_vec(&input).unwrap();
+        let mut signer = Signer::new_without_digest(pq).unwrap();
+        (ed_sig, signer.sign_oneshot_to_vec(&input).unwrap())
+    }
+
+    fn policy(now: u64, fingerprint: [u8; 32]) -> Vec<u8> {
+        NetworkPolicyCandidate {
+            net_id: [3; 16],
+            root_key_fingerprint: fingerprint,
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 4,
+            issued_at: now.saturating_sub(60_000_000),
+            expires: now.saturating_add(60_000_000),
+        }
+        .encode_tbs()
+        .unwrap()
+    }
+
+    fn write_material(dir: &Path, tbs: &[u8], ed_sig: &[u8], pq_sig: &[u8], ed_der: &[u8], pq_der: &[u8]) -> Vec<String> {
+        let mut args = Vec::new();
+        for (flag, name, bytes) in [
+            ("--tbs-file", "tbs", tbs),
+            ("--ed25519-signature-file", "ed.sig", ed_sig),
+            ("--mldsa65-signature-file", "pq.sig", pq_sig),
+            ("--root-ed25519-der", "ed.der", ed_der),
+            ("--root-mldsa65-der", "pq.der", pq_der),
+        ] {
+            fs::write(dir.join(name), bytes).unwrap();
+            args.extend([flag.to_string(), dir.join(name).to_string_lossy().into_owned()]);
+        }
+        args.extend(["--net-id".to_string(), "03030303030303030303030303030303".to_string()]);
+        args
+    }
+
+    fn invoke(args: &[String]) -> Result<(), String> {
+        let argv = std::iter::once("verify-policy".to_string()).chain(args.iter().cloned()).collect::<Vec<_>>();
+        run_pki_command(&argv)
+    }
+
+    #[test]
+    fn verify_policy_cli_accepts_real_dual_signed_candidate_and_rejects_tampering() {
+        let dir = temp_dir();
+        let (ed, pq) = keys(7);
+        let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
+            [3; 16], ed.public_key_to_der().unwrap(), boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        ).unwrap();
+        let tbs = policy(now_utc_us().unwrap(), pin.fingerprint().unwrap());
+        let (ed_sig, pq_sig) = sign(&ed, &pq, &tbs);
+        let mut args = write_material(&dir, &tbs, &ed_sig, &pq_sig, &ed.public_key_to_der().unwrap(), &pq.public_key_to_der().unwrap());
+        let original = ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"].map(|name| fs::read(dir.join(name)).unwrap());
+        assert!(invoke(&args).is_ok(), "valid signatures and current local time window should pass");
+        for (name, expected) in ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"].into_iter().zip(&original) {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), *expected, "verifier must not mutate local input files");
+        }
+
+        let mut bad_ed = ed_sig.clone(); bad_ed[0] ^= 1;
+        fs::write(dir.join("ed.sig"), &bad_ed).unwrap();
+        assert!(invoke(&args).is_err());
+        fs::write(dir.join("ed.sig"), &ed_sig).unwrap();
+        let mut bad_pq = pq_sig.clone(); bad_pq[0] ^= 1;
+        fs::write(dir.join("pq.sig"), &bad_pq).unwrap();
+        assert!(invoke(&args).is_err());
+        fs::write(dir.join("pq.sig"), &pq_sig).unwrap();
+
+        let (wrong_ed, wrong_pq) = keys(8);
+        fs::write(dir.join("ed.der"), wrong_ed.public_key_to_der().unwrap()).unwrap();
+        fs::write(dir.join("pq.der"), wrong_pq.public_key_to_der().unwrap()).unwrap();
+        assert!(invoke(&args).is_err(), "a pin for the wrong root must fail");
+        fs::write(dir.join("ed.der"), ed.public_key_to_der().unwrap()).unwrap();
+        fs::write(dir.join("pq.der"), pq.public_key_to_der().unwrap()).unwrap();
+
+        let expired = NetworkPolicyCandidate {
+            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(), overlay_base: [10, 20, 0, 0],
+            version: 1, seq: 5, issued_at: 1, expires: 2,
+        }.encode_tbs().unwrap();
+        let (expired_ed, expired_pq) = sign(&ed, &pq, &expired);
+        args = write_material(&dir, &expired, &expired_ed, &expired_pq, &ed.public_key_to_der().unwrap(), &pq.public_key_to_der().unwrap());
+
+        let expired_snapshot = ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
+            .map(|name| fs::read(dir.join(name)).unwrap());
+        assert!(invoke(&args).is_err(), "a correctly signed expired candidate must fail");
+        for (name, expected) in ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
+            .into_iter()
+            .zip(expired_snapshot)
+        {
+            assert_eq!(
+                fs::read(dir.join(name)).unwrap(),
+                expected,
+                "verifier must not mutate local input files on failure",
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn verify_policy_rejects_unknown_duplicate_and_missing_flags() {
         assert!(
