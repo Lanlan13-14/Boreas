@@ -415,13 +415,13 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
 #[cfg(all(test, feature = "openssl-inner-tls"))]
 mod verify_policy_cli_tests {
     use super::*;
+    use boreas_proto::network_policy::NetworkPolicyCandidate;
+    use std::process::Command;
     use std::{
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
-    use boreas_proto::network_policy::NetworkPolicyCandidate;
-    use std::process::Command;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn temp_dir() -> PathBuf {
@@ -474,7 +474,12 @@ mod verify_policy_cli_tests {
             .current_dir(dir)
             .output()
             .expect("run pinned BOREAS_OPENSSL_BIN");
-        assert!(output.status.success(), "openssl {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "openssl {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn keys(dir: &Path, suffix: &str) -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
@@ -482,23 +487,91 @@ mod verify_policy_cli_tests {
         let pq_key = dir.join(format!("{suffix}.pq.key"));
         let ed_pub = dir.join(format!("{suffix}.ed.der"));
         let pq_pub = dir.join(format!("{suffix}.pq.der"));
-        openssl(dir, &["genpkey", "-algorithm", "ED25519", "-out", ed_key.to_str().unwrap()]);
-        openssl(dir, &["genpkey", "-algorithm", "ML-DSA-65", "-out", pq_key.to_str().unwrap()]);
-        openssl(dir, &["pkey", "-in", ed_key.to_str().unwrap(), "-pubout", "-outform", "DER", "-out", ed_pub.to_str().unwrap()]);
-        openssl(dir, &["pkey", "-in", pq_key.to_str().unwrap(), "-pubout", "-outform", "DER", "-out", pq_pub.to_str().unwrap()]);
-        (ed_key, pq_key, fs::read(ed_pub).unwrap(), fs::read(pq_pub).unwrap())
+        openssl(
+            dir,
+            &[
+                "genpkey",
+                "-algorithm",
+                "ED25519",
+                "-out",
+                ed_key.to_str().unwrap(),
+            ],
+        );
+        openssl(
+            dir,
+            &[
+                "genpkey",
+                "-algorithm",
+                "ML-DSA-65",
+                "-out",
+                pq_key.to_str().unwrap(),
+            ],
+        );
+        openssl(
+            dir,
+            &[
+                "pkey",
+                "-in",
+                ed_key.to_str().unwrap(),
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                ed_pub.to_str().unwrap(),
+            ],
+        );
+        openssl(
+            dir,
+            &[
+                "pkey",
+                "-in",
+                pq_key.to_str().unwrap(),
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                pq_pub.to_str().unwrap(),
+            ],
+        );
+        (
+            ed_key,
+            pq_key,
+            fs::read(ed_pub).unwrap(),
+            fs::read(pq_pub).unwrap(),
+        )
     }
 
-    fn sign(dir: &Path, keys: &(PathBuf, PathBuf, Vec<u8>, Vec<u8>), tbs: &[u8], suffix: &str) -> (Vec<u8>, Vec<u8>) {
+    fn sign(
+        dir: &Path,
+        keys: &(PathBuf, PathBuf, Vec<u8>, Vec<u8>),
+        tbs: &[u8],
+        suffix: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
         let input = NetworkPolicyCandidate::signature_input(tbs).unwrap();
         let input_path = dir.join(format!("{suffix}.input"));
         let ed_sig_path = dir.join(format!("{suffix}.ed.sig"));
         let pq_sig_path = dir.join(format!("{suffix}.pq.sig"));
         fs::write(&input_path, input).unwrap();
         for (key, sig) in [(&keys.0, &ed_sig_path), (&keys.1, &pq_sig_path)] {
-            openssl(dir, &["pkeyutl", "-sign", "-rawin", "-inkey", key.to_str().unwrap(), "-in", input_path.to_str().unwrap(), "-out", sig.to_str().unwrap()]);
+            openssl(
+                dir,
+                &[
+                    "pkeyutl",
+                    "-sign",
+                    "-rawin",
+                    "-inkey",
+                    key.to_str().unwrap(),
+                    "-in",
+                    input_path.to_str().unwrap(),
+                    "-out",
+                    sig.to_str().unwrap(),
+                ],
+            );
         }
-        (fs::read(ed_sig_path).unwrap(), fs::read(pq_sig_path).unwrap())
+        (
+            fs::read(ed_sig_path).unwrap(),
+            fs::read(pq_sig_path).unwrap(),
+        )
     }
 
     fn policy(now: u64, fingerprint: [u8; 32]) -> Vec<u8> {
@@ -515,7 +588,14 @@ mod verify_policy_cli_tests {
         .unwrap()
     }
 
-    fn write_material(dir: &Path, tbs: &[u8], ed_sig: &[u8], pq_sig: &[u8], ed_der: &[u8], pq_der: &[u8]) -> Vec<String> {
+    fn write_material(
+        dir: &Path,
+        tbs: &[u8],
+        ed_sig: &[u8],
+        pq_sig: &[u8],
+        ed_der: &[u8],
+        pq_der: &[u8],
+    ) -> Vec<String> {
         let mut args = Vec::new();
         for (flag, name, bytes) in [
             ("--tbs-file", "tbs", tbs),
@@ -525,14 +605,22 @@ mod verify_policy_cli_tests {
             ("--root-mldsa65-der", "pq.der", pq_der),
         ] {
             fs::write(dir.join(name), bytes).unwrap();
-            args.extend([flag.to_string(), dir.join(name).to_string_lossy().into_owned()]);
+            args.extend([
+                flag.to_string(),
+                dir.join(name).to_string_lossy().into_owned(),
+            ]);
         }
-        args.extend(["--net-id".to_string(), "03030303030303030303030303030303".to_string()]);
+        args.extend([
+            "--net-id".to_string(),
+            "03030303030303030303030303030303".to_string(),
+        ]);
         args
     }
 
     fn invoke(args: &[String]) -> Result<(), String> {
-        let argv = std::iter::once("verify-policy".to_string()).chain(args.iter().cloned()).collect::<Vec<_>>();
+        let argv = std::iter::once("verify-policy".to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
         run_pki_command(&argv)
     }
 
@@ -541,23 +629,39 @@ mod verify_policy_cli_tests {
         let dir = temp_dir();
         let root = keys(&dir, "root");
         let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
-            [3; 16], root.2.clone(), boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            [3; 16],
+            root.2.clone(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
             root.3.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         let tbs = policy(now_utc_us().unwrap(), pin.fingerprint().unwrap());
         let (ed_sig, pq_sig) = sign(&dir, &root, &tbs, "valid");
         let mut args = write_material(&dir, &tbs, &ed_sig, &pq_sig, &root.2, &root.3);
-        let original = ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"].map(|name| fs::read(dir.join(name)).unwrap());
-        assert!(invoke(&args).is_ok(), "valid signatures and current local time window should pass");
-        for (name, expected) in ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"].into_iter().zip(&original) {
-            assert_eq!(fs::read(dir.join(name)).unwrap(), *expected, "verifier must not mutate local input files");
+        let original = ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
+            .map(|name| fs::read(dir.join(name)).unwrap());
+        assert!(
+            invoke(&args).is_ok(),
+            "valid signatures and current local time window should pass"
+        );
+        for (name, expected) in ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
+            .into_iter()
+            .zip(&original)
+        {
+            assert_eq!(
+                fs::read(dir.join(name)).unwrap(),
+                *expected,
+                "verifier must not mutate local input files"
+            );
         }
 
-        let mut bad_ed = ed_sig.clone(); bad_ed[0] ^= 1;
+        let mut bad_ed = ed_sig.clone();
+        bad_ed[0] ^= 1;
         fs::write(dir.join("ed.sig"), &bad_ed).unwrap();
         assert!(invoke(&args).is_err());
         fs::write(dir.join("ed.sig"), &ed_sig).unwrap();
-        let mut bad_pq = pq_sig.clone(); bad_pq[0] ^= 1;
+        let mut bad_pq = pq_sig.clone();
+        bad_pq[0] ^= 1;
         fs::write(dir.join("pq.sig"), &bad_pq).unwrap();
         assert!(invoke(&args).is_err());
         fs::write(dir.join("pq.sig"), &pq_sig).unwrap();
@@ -570,15 +674,25 @@ mod verify_policy_cli_tests {
         fs::write(dir.join("pq.der"), &root.3).unwrap();
 
         let expired = NetworkPolicyCandidate {
-            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(), overlay_base: [10, 20, 0, 0],
-            version: 1, seq: 5, issued_at: 1, expires: 2,
-        }.encode_tbs().unwrap();
+            net_id: [3; 16],
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 5,
+            issued_at: 1,
+            expires: 2,
+        }
+        .encode_tbs()
+        .unwrap();
         let (expired_ed, expired_pq) = sign(&dir, &root, &expired, "expired");
         args = write_material(&dir, &expired, &expired_ed, &expired_pq, &root.2, &root.3);
 
         let expired_snapshot = ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
             .map(|name| fs::read(dir.join(name)).unwrap());
-        assert!(invoke(&args).is_err(), "a correctly signed expired candidate must fail");
+        assert!(
+            invoke(&args).is_err(),
+            "a correctly signed expired candidate must fail"
+        );
         for (name, expected) in ["tbs", "ed.sig", "pq.sig", "ed.der", "pq.der"]
             .into_iter()
             .zip(expired_snapshot)
