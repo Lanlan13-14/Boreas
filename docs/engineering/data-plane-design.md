@@ -10,6 +10,14 @@ CPU seconds are the process thread group's user+system tick delta divided by the
 
 This short two-node observation does **not** satisfy the full plan's `G-RESOURCE`: 195/291-connection load, admission attacks, stopped readers, TLS/HTTP2 costs, 30-minute endurance, RSS/PSS/cgroup/sockstat/credit/queue accounting and unexplained growth analysis remain open. No CPU/RSS improvement or budget acceptance is claimed until actual exact-commit evidence is reviewed. Syntax/build/test execution remains GitHub Actions-only.
 
+## Underlay TCP kernel telemetry (`ss -tin`)
+
+The same netns smoke brackets its concurrent bidirectional transfer with two namespace-scoped snapshots: one immediately before the first probe worker starts and one after all four workers are reaped. Inside each disposable Core/Edge namespace it runs `ss -tin` and keeps only sockets of the fixed underlay pair (Core `192.0.2.1:8443`; Edge `192.0.2.2:<ephemeral>` → `192.0.2.1:8443`), together with that socket's raw `TCP_INFO` continuation line: rtt/rttvar, retransmits, cwnd, bytes_acked/bytes_received, delivery rate and the remaining fields. The output is emitted next to the daemon resource sample. Each capture is bounded to five seconds; absent `ss` or `timeout` yields unavailable evidence. The before/after capture overhead lies inside the resource sampling window, so CPU-window percentages include this timing overhead.
+
+This is collection only, scoped to the disposable namespaces and read-only over their own `/proc`: no host sysctl, qdisc, route or interface change, and no change to transfer, ping, deadline, byte-count, key-material or security state. No threshold is asserted and nothing is retried; a partial, failed or unmatched capture is reported as `unmeasured`/`no-matching-socket` and never turns a failed functional, security or performance assertion green.
+
+**Field scope:** these numbers describe the underlay TCP connection that carries the outer TLS transport. They are **not** cross-layer latency attribution: WSS, hop/`RelayCircuit` forwarding, overlay TUN encapsulation and the pq768 inner E2E mTLS all sit outside the measured socket, so an `rtt` sample here is neither an end-to-end nor an application latency and cannot be decomposed across those layers. This telemetry also does not satisfy `G-RESOURCE`, `G-PERF`, `G-DATA` or `G-E2E`.
+
 ## Resource admission (`resource.rs`)
 
 - `Admission` is a cloneable global ledger with mutex-protected counters and RAII guards.

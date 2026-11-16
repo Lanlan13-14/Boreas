@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 11
+## Current handoff — 2026-11-16 round 12
+
+- Current codeHEAD cc0586f5bdb85f6aca01263eb6350933a79d298e (Actionsrustfmt integratedff from b6418b6). b6418b6 actualwizard preview+driver happytest passed118Linux/112Windows tests, but Rust43887596189 FAILEDClippy CheckConfig variantneverconstructed (oldService4replaced), logs.local/round12-133369834{013,521}.log. Luna wizard-adversarial-tests owns main.rs/tui.rs exclusively, restoring realCheckConfig menuaction, longpreviewnottruncated, exacttoken/injection/invalid/nonTTY tests. No allow(deadcode)/checkweakening.
+- 91acf0c TLS43886308602 SUCCESS incl negativeouterTLS rejected,backupaccepts0,edgeexit2,controlthroughsamebackupcount1/exit0; cleanupcompletedwithouttimeout. Verified childonlywait fix. b6ead95 pairednetem workflow43886347643(defined91acf0c) FAILEDdiagnostic133365499986:1MiB1.264/1.303Mbps,8MiB3.472/2.588Mbps,3Mbpsfloorunchanged. Longerhelpedonedirectionbutnotall; no solebiasrootcauseclaim. Strict200ms0.1%2.298/2.179failed;400ms1%notconnected. docs/routing-matrix.md records sourcevsworkflowSHA.
+- Active DeepSeek trust-genesis-binding onlynewdocs/protocol/network-policy-binding-candidate.md; exactsignednetworkpolicycontract/independentrootpin/migrationdesign, noRust/prefixenablement. FullPhase0–5/24gatesremainopen. Builds/tests/formattersActions-only.
+
+## Previous checkpoint — 2026-11-16 round 11
 
 - 9c5c3e9 TLS43881225757 job133347336861 FAILED by negative-step10min timeout AFTER all actual assertions passed: .local/round11-133347336861.log6351–6358 primary accepts1,backup0,edgeexit2,core disconnected; controlconnect exit0,backupcount1,passmarker. Cleanup barewait after `exec > >(tee...)` likely waits tee while tee waits stdoutclose. Do not report overallpass. DeepSeek negative-cleanup-fix owns onlyrust-tls.yml, must wait only capturedmock/proxy/core children, no barewait/stalePIDkill/timeoutincrease.
 - Local72c7f1b adds performance1MiB/8MiB diagnostic keepingstrict gates,PIPESTATUS bothsmoke+tee and finalnonzero. Notpushed at checkpoint. Need push withcleanupfix,then dispatch performance using trusted successfulbackend43879991003/sourceb6ead95 to obtain actualwindowcomparison; don't substitute latestbinary mismatchedSHA.

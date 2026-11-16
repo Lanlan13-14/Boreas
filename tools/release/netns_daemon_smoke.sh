@@ -67,6 +67,7 @@ report_failure_evidence() {
       cat "$log" >&2 || true
     fi
   done
+  report_ss_evidence
   return 0
 }
 
@@ -279,6 +280,102 @@ HOST_EDGE="be-$$"
 CORE_NS_CREATED=0
 EDGE_NS_CREATED=0
 VETH_CREATED=0
+
+# --- Underlay TCP kernel telemetry (read-only `ss -tin`, collection only) -----
+# Brackets the bidirectional probe with two namespace-scoped snapshots. `ss`
+# runs inside each already-created disposable namespace, so it reads that
+# namespace's own /proc and cannot observe the host or the other namespace.
+# Only sockets of the fixed underlay pair are kept (Core listens on
+# 192.0.2.1:8443; Edge dials it from 192.0.2.2) together with their raw TCP_INFO
+# continuation line: rtt/rttvar, retransmits, cwnd, bytes_acked/bytes_received,
+# delivery rate and the remaining kernel fields. This adds no sysctl, qdisc,
+# route or interface change, changes no transfer/ping/deadline/byte/key/security
+# state, retries nothing and asserts no threshold. A partial or failed capture is
+# still emitted and never turns an assertion green.
+SS_UNDERLAY_FILTER='192\.0\.2\.[12]:8443'
+SS_CAPTURE_ERR="$WORK/ss-capture.err"
+SS_REPORTED=0
+
+capture_ss_snapshot() { # $1=phase: before|after
+  local phase="$1" spec label ns raw out rc kept status
+  for spec in "core:$CORE_NS" "edge:$EDGE_NS"; do
+    label="${spec%%:*}"
+    ns="${spec#*:}"
+    raw="$WORK/ss-$phase-$label.raw"
+    out="$WORK/ss-$phase-$label.log"
+    : > "$raw"
+    : > "$out"
+    rc=0
+    if ! command -v ss >/dev/null 2>&1; then
+      rc=127
+    elif command -v timeout >/dev/null 2>&1; then
+      # `ss` is kernel-backed and normally returns immediately, but the call is
+      # bounded anyway so a wedged netlink read cannot stall the probe window.
+      timeout 5 ip netns exec "$ns" ss -tin >"$raw" 2>>"$SS_CAPTURE_ERR" || rc=$?
+    else
+      # Never make an optional diagnostic an unbounded wait.
+      rc=127
+    fi
+    kept="$(SS_UNDERLAY_FILTER="$SS_UNDERLAY_FILTER" awk '
+        /^[[:space:]]/ { if (keep) print; next }
+        { keep = ($0 ~ ENVIRON["SS_UNDERLAY_FILTER"]) }
+        keep { print }
+      ' "$raw" 2>>"$SS_CAPTURE_ERR")" || kept=""
+    if [[ -n "$kept" ]]; then
+      printf '%s\n' "$kept" > "$out"
+      status=measured
+    elif (( rc == 0 )); then
+      # ss succeeded but no socket matched the fixed underlay pair.
+      status=no-matching-socket
+    else
+      status="unmeasured:ss-exit-$rc"
+    fi
+    printf '%s\n' "$status" > "$WORK/ss-$phase-$label.status"
+  done
+  return 0
+}
+
+report_ss_evidence() {
+  local phase label path status_file status count line
+  if (( SS_REPORTED )); then
+    return 0
+  fi
+  SS_REPORTED=1
+  echo "--- underlay TCP kernel telemetry (ss -tin, namespace scoped) ---"
+  echo "ss_evidence_source=linux-iproute2-ss-tin-read-only-proc"
+  echo "ss_underlay_peer_filter=core-192.0.2.1:8443,edge-192.0.2.2->192.0.2.1:8443"
+  echo "ss_field_scope=kernel-tcpinfo-of-underlay-outer-tls;not-cross-tls-layer-latency-attribution"
+  for phase in before after; do
+    for label in core edge; do
+      path="$WORK/ss-$phase-$label.log"
+      status_file="$WORK/ss-$phase-$label.status"
+      status=unmeasured:no-snapshot
+      if [[ -s "$status_file" ]]; then
+        status="$(<"$status_file")"
+      fi
+      count=0
+      if [[ -s "$path" ]]; then
+        count="$(awk 'END { print NR }' "$path")"
+      fi
+      echo "ss_${phase}_${label}_status=$status"
+      echo "ss_${phase}_${label}_captured_lines=$count"
+      if (( count > 0 )); then
+        echo "--- ss $phase $label (raw kernel lines: socket line + TCP_INFO) ---"
+        while IFS= read -r line; do
+          printf '  %s\n' "$line"
+        done < "$path"
+      fi
+    done
+  done
+  if [[ -s "$SS_CAPTURE_ERR" ]]; then
+    echo "--- ss capture diagnostics ---"
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done < "$SS_CAPTURE_ERR"
+  fi
+  echo "ss_threshold=none-asserted"
+  return 0
+}
 
 cleanup() {
   set +e
@@ -591,6 +688,10 @@ fi
 # worker or recycled PID can be reported as the daemon.
 start_resource_sampler "$(cat "$WORK/core.pid")" "$(cat "$WORK/edge.pid")"
 
+# The kernel TCP telemetry window opens on the same established underlay pair and
+# is captured before the first probe worker starts.
+capture_ss_snapshot before
+
 # Send 8 MiB in each direction at the same time and authenticate both payloads
 # with independent SHA-256 digests. This exercises full-duplex progress rather
 # than only a one-way throughput happy path; it is not a public-network SLA.
@@ -620,10 +721,14 @@ if ! wait "$(cat "$WORK/perf-receiver-edge.pid")"; then
   echo "ERROR: edge receiver exited nonzero" >&2
   PERF_WORKER_FAILED=1
 fi
-# Close the sampling window through the sentinel and join the child before any
-# later exit, then report the measured CPU/RSS evidence (no threshold applied).
+# All four probe workers are reaped, so the transfer is complete: snapshot the
+# same underlay sockets again, then close the sampling window through the
+# sentinel and join the child before any later exit, and report the measured
+# CPU/RSS evidence (no threshold applied).
+capture_ss_snapshot after
 stop_resource_sampler
 report_resource_evidence
+report_ss_evidence
 if (( PERF_WORKER_FAILED )); then
   # Do not treat a sender's JSON as valid throughput when either worker in
   # that direction failed (for example on a digest or socket error).
