@@ -589,6 +589,8 @@ pub enum ConsoleView {
     Confirm,
     /// Read-only result screen (telemetry, config check, command output).
     Notice,
+    /// Interactive, read-only configuration guide; it never applies changes.
+    ConfigWizard,
 }
 
 /// A mutating service action. Neither variant is performed by this module;
@@ -619,7 +621,7 @@ impl ServiceAction {
 }
 
 /// Work the driver must perform outside the reducer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConsoleEffect {
     None,
     /// Re-query the control socket; stays on the menu.
@@ -630,6 +632,10 @@ pub enum ConsoleEffect {
     ServiceStart,
     ServiceStop,
     CheckConfig,
+    /// Open the endpoint-only config wizard.
+    ConfigWizard,
+    /// Process a field or exact PREVIEW confirmation.
+    ConfigWizardInput(String),
     Quit,
 }
 
@@ -652,6 +658,18 @@ pub struct ConsoleState {
     pub narrow: bool,
     pub no_color: bool,
     pub notice_rows: Vec<String>,
+    /// Candidate endpoint values for the read-only preview flow.
+    pub config_primary: Option<String>,
+    pub config_backup: Option<Option<String>>,
+    pub config_step: ConfigWizardStep,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigWizardStep {
+    Menu,
+    Primary,
+    Backup,
+    Preview,
 }
 
 impl ConsoleState {
@@ -668,6 +686,9 @@ impl ConsoleState {
             narrow: false,
             no_color: false,
             notice_rows: Vec::new(),
+            config_primary: None,
+            config_backup: None,
+            config_step: ConfigWizardStep::Menu,
         }
     }
 
@@ -681,6 +702,7 @@ impl ConsoleState {
             ConsoleView::Service => self.apply_service(line.trim()),
             ConsoleView::Confirm => self.apply_confirm(line),
             ConsoleView::Notice => self.apply_notice(line.trim()),
+            ConsoleView::ConfigWizard => self.apply_config_wizard(line),
         }
     }
 
@@ -739,7 +761,10 @@ impl ConsoleState {
                 self.view = ConsoleView::Confirm;
                 ConsoleEffect::None
             }
-            "4" => ConsoleEffect::CheckConfig,
+            "4" => {
+                self.view = ConsoleView::ConfigWizard;
+                ConsoleEffect::ConfigWizard
+            }
             "5" | "b" | "" => {
                 self.view = ConsoleView::Menu;
                 ConsoleEffect::None
@@ -770,10 +795,64 @@ impl ConsoleState {
         }
     }
 
+    fn clear_config_wizard(&mut self) {
+        self.config_primary = None;
+        self.config_backup = None;
+        self.config_step = ConfigWizardStep::Menu;
+    }
+
+    fn apply_config_wizard(&mut self, line: &str) -> ConsoleEffect {
+        let cmd = line;
+        if cmd.len() > 253 {
+            self.view = ConsoleView::Notice;
+            self.notice_rows = vec![wizard_input_error(self.lang).to_string()];
+            self.clear_config_wizard();
+            return ConsoleEffect::None;
+        }
+        if cmd.chars().any(char::is_control) {
+            self.view = ConsoleView::Notice;
+            self.notice_rows = vec![wizard_input_error(self.lang).to_string()];
+            self.clear_config_wizard();
+            return ConsoleEffect::None;
+        }
+        match self.config_step {
+            ConfigWizardStep::Menu => match cmd {
+                "q" | "quit" => { self.clear_config_wizard(); ConsoleEffect::Quit }
+                "b" | "" => { self.clear_config_wizard(); self.view = ConsoleView::Service; ConsoleEffect::None }
+                "1" => { self.config_step = ConfigWizardStep::Primary; ConsoleEffect::None }
+                "2" => { self.notice_rows = config_save_unavailable_rows(self.lang); self.view = ConsoleView::Notice; ConsoleEffect::None }
+                _ => { self.notice_rows = config_wizard_rows(self.lang); self.view = ConsoleView::Notice; ConsoleEffect::None }
+            },
+            ConfigWizardStep::Primary => {
+                if cmd == "q" { self.clear_config_wizard(); return ConsoleEffect::Quit; }
+                if cmd == "b" { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; return ConsoleEffect::None; }
+                self.config_primary = Some(cmd.trim().to_string());
+                self.config_step = ConfigWizardStep::Backup;
+                ConsoleEffect::None
+            }
+            ConfigWizardStep::Backup => {
+                if cmd == "q" { self.clear_config_wizard(); return ConsoleEffect::Quit; }
+                if cmd == "b" { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; return ConsoleEffect::None; }
+                self.config_backup = Some(if cmd.trim().is_empty() { None } else { Some(cmd.trim().to_string()) });
+                self.config_step = ConfigWizardStep::Preview;
+                ConsoleEffect::None
+            }
+            ConfigWizardStep::Preview => match cmd {
+                "PREVIEW" => ConsoleEffect::ConfigWizardInput(format!("{}\n{}", self.config_primary.as_deref().unwrap_or(""), self.config_backup.as_ref().and_then(|b| b.as_deref()).unwrap_or(""))),
+                "q" | "b" => { self.clear_config_wizard(); self.view = ConsoleView::ConfigWizard; ConsoleEffect::None }
+                _ => { self.clear_config_wizard(); self.view = ConsoleView::Notice; self.notice_rows = preview_cancelled_rows(self.lang); ConsoleEffect::None }
+            }
+        }
+    }
+
     fn apply_notice(&mut self, cmd: &str) -> ConsoleEffect {
         match cmd {
-            "q" | "quit" => ConsoleEffect::Quit,
+            "q" | "quit" => {
+                self.clear_config_wizard();
+                ConsoleEffect::Quit
+            },
             _ => {
+                if self.config_step != ConfigWizardStep::Menu { self.clear_config_wizard(); }
                 self.view = ConsoleView::Menu;
                 ConsoleEffect::None
             }
@@ -842,6 +921,16 @@ impl ConsoleState {
                 &self.notice_rows,
                 text(self.lang, Msg::HintNotice),
             ),
+            ConsoleView::ConfigWizard => {
+                let mut rows = config_wizard_step_rows(self.lang, &self.config_step);
+                rows.extend(self.notice_rows.iter().cloned());
+                render_detail(
+                    &base,
+                    config_wizard_title(self.lang),
+                    &rows,
+                    config_wizard_hint(self.lang, &self.config_step),
+                )
+            },
         }
     }
 
@@ -879,6 +968,112 @@ impl ConsoleState {
 
 /// Warning shown before a stop: stopping the daemon drops the tunnel, and
 /// §10.4 requires the screen to say so instead of implying a graceful pause.
+fn config_wizard_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "配置检查与说明（只读）",
+        Lang::ZhTw => "設定檢查與說明（唯讀）",
+        Lang::En => "Config check & guide (read-only)",
+    }
+}
+
+fn config_wizard_step_rows(lang: Lang, step: &ConfigWizardStep) -> Vec<String> {
+    match step {
+        ConfigWizardStep::Menu => config_wizard_rows(lang),
+        ConfigWizardStep::Primary => vec![match lang {
+            Lang::ZhCn => "输入新的 primary host:port（q 取消）".into(),
+            Lang::ZhTw => "輸入新的 primary host:port（q 取消）".into(),
+            Lang::En => "Enter primary host:port (q cancels)".into(),
+        }],
+        ConfigWizardStep::Backup => vec![match lang {
+            Lang::ZhCn => "输入 backup host:port；留空表示不配置（q 取消）".into(),
+            Lang::ZhTw => "輸入 backup host:port；留白表示不設定（q 取消）".into(),
+            Lang::En => "Enter backup host:port; blank means none (q cancels)".into(),
+        }],
+        ConfigWizardStep::Preview => vec![match lang {
+            Lang::ZhCn => "输入 exact PREVIEW 以验证并打印端点片段；其他输入取消".into(),
+            Lang::ZhTw => "輸入 exact PREVIEW 以驗證並列印端點片段；其他輸入取消".into(),
+            Lang::En => "Type exact PREVIEW to validate and print endpoint-only TOML; else cancel".into(),
+        }],
+    }
+}
+
+fn wizard_input_error(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "输入拒绝：不允许控制字符；已取消此字段。",
+        Lang::ZhTw => "輸入拒絕：不允許控制字元；已取消此欄位。",
+        Lang::En => "Input rejected: control characters are not allowed; field cancelled.",
+    }
+}
+
+fn preview_cancelled_rows(lang: Lang) -> Vec<String> {
+    vec![match lang {
+        Lang::ZhCn => "预览已取消；没有应用或写入。".into(),
+        Lang::ZhTw => "預覽已取消；沒有套用或寫入。".into(),
+        Lang::En => "Preview cancelled; nothing was applied or written.".into(),
+    }]
+}
+
+fn config_wizard_rows(lang: Lang) -> Vec<String> {
+    match lang {
+        Lang::ZhCn => vec![
+            "[1] 编辑并预览端点（不连接、不启动）".into(),
+            "primary/backup 是运行时使用的端点字段".into(),
+            "不编辑身份、安全模式、私钥或自定义网段".into(),
+            "本切片不保存候选，也不应用或重载".into(),
+            "按 1 检查；按 2 查看保存限制；b 返回".into(),
+        ],
+        Lang::ZhTw => vec![
+            "[1] 編輯並預覽端點（不連線、不啟動）".into(),
+            "primary/backup 是執行階段使用的端點欄位".into(),
+            "不編輯身分、安全模式、私鑰或自訂網段".into(),
+            "此切片不保存候選，也不套用或重新載入".into(),
+            "按 1 檢查；按 2 查看保存限制；b 返回".into(),
+        ],
+        Lang::En => vec![
+            "[1] Edit and preview endpoints (no connect/start)".into(),
+            "primary/backup are the runtime endpoint fields".into(),
+            "Identity, security, keys and custom prefixes stay locked".into(),
+            "This slice cannot save, apply or reload a candidate".into(),
+            "Press 1 to check; 2 for save limits; b to return".into(),
+        ],
+    }
+}
+
+fn config_save_unavailable_rows(lang: Lang) -> Vec<String> {
+    match lang {
+        Lang::ZhCn => vec![
+            "可预览端点 TOML 候选；本控制台不提供保存".into(),
+            "原配置与私钥不变；不会启动、应用或重载".into(),
+            "请在控制台外复制预览并自行审阅".into(),
+        ],
+        Lang::ZhTw => vec![
+            "可預覽端點 TOML 候選；此控制台不提供保存".into(),
+            "原設定與私鑰不變；不會啟動、套用或重新載入".into(),
+            "請在控制台外複製預覽並自行審閱".into(),
+        ],
+        Lang::En => vec![
+            "Endpoint TOML candidate can be previewed but not saved by this console".into(),
+            "Original config and keys stay untouched; nothing starts/applies/reloads".into(),
+            "Copy the preview and review it manually outside this console".into(),
+        ],
+    }
+}
+
+fn config_wizard_hint(lang: Lang, step: &ConfigWizardStep) -> &'static str {
+    match (lang, step) {
+        (_, ConfigWizardStep::Menu) => match lang {
+            Lang::ZhCn => "[1] 编辑端点  [b] 返回  [q] 退出",
+            Lang::ZhTw => "[1] 編輯端點  [b] 返回  [q] 離開",
+            Lang::En => "[1] Edit endpoints  [b] Back  [q] Quit",
+        },
+        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview) => match lang {
+            Lang::ZhCn => "[q] 取消并退出",
+            Lang::ZhTw => "[q] 取消並離開",
+            Lang::En => "[q] Cancel and quit",
+        },
+    }
+}
+
 fn stop_warning(lang: Lang) -> &'static str {
     match lang {
         Lang::ZhCn => "警告: 停止后本机隧道立即中断",
@@ -1304,6 +1499,56 @@ mod tests {
     // --- line-mode console ---
 
     #[test]
+    fn config_wizard_is_reachable_and_stays_read_only() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 8;
+        state.apply("");
+        assert_eq!(state.apply("4"), ConsoleEffect::ConfigWizard);
+        assert_eq!(state.view, ConsoleView::ConfigWizard);
+        let screen = state.screen("test").unwrap();
+        assert!(screen.contains("Config check & guide (read-only)"));
+        assert!(screen.contains("primary/backup"));
+        assert_eq!(state.apply("2"), ConsoleEffect::None);
+        assert_eq!(state.view, ConsoleView::Notice);
+        assert!(state.notice_rows.iter().any(|row| row.contains("can be previewed but not saved")));
+        // Neither a guessed save phrase nor arbitrary input can authorize writes.
+        state.apply("SAVE");
+        assert_eq!(state.view, ConsoleView::Menu);
+        assert!(state.config_primary.is_none());
+        assert!(state.config_backup.is_none());
+    }
+
+    #[test]
+    fn config_wizard_cancel_and_non_tty_eof_are_harmless() {
+        let mut state = ConsoleState::new(Lang::ZhCn, false);
+        state.selected = 8;
+        state.apply("");
+        assert_eq!(state.apply("4"), ConsoleEffect::ConfigWizard);
+        assert_eq!(state.apply("b"), ConsoleEffect::None);
+        assert_eq!(state.view, ConsoleView::Service);
+        assert!(state.config_primary.is_none());
+        assert!(state.config_backup.is_none());
+    }
+
+    #[test]
+    fn config_wizard_copy_is_trilingual_and_rejects_escape_in_rows() {
+        for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
+            let mut state = ConsoleState::new(lang, false);
+            state.view = ConsoleView::ConfigWizard;
+            let rendered = state.screen("test").unwrap();
+            assert!(rendered.contains("primary/backup"));
+            assert!(!rendered.as_bytes().contains(&0x1b));
+        }
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.view = ConsoleView::ConfigWizard;
+        let _ = state.apply("\u{1b}[31mSAVE");
+        assert_eq!(state.view, ConsoleView::Notice);
+        assert!(state.notice_rows.iter().all(|row| !row.contains('\u{1b}')));
+        assert_eq!(state.config_primary, None);
+        assert_eq!(state.config_backup, None);
+    }
+
+    #[test]
     fn console_starts_on_the_menu_with_entry_one() {
         let state = ConsoleState::new(Lang::En, false);
         assert_eq!(state.view, ConsoleView::Menu);
@@ -1464,6 +1709,7 @@ mod tests {
             ConsoleView::Service,
             ConsoleView::Confirm,
             ConsoleView::Notice,
+            ConsoleView::ConfigWizard,
         ] {
             let mut state = ConsoleState::new(Lang::En, false);
             state.view = view;
@@ -1505,6 +1751,7 @@ mod tests {
                 ConsoleView::Service,
                 ConsoleView::Confirm,
                 ConsoleView::Notice,
+                ConsoleView::ConfigWizard,
             ] {
                 let mut state = ConsoleState::new(lang, true);
                 state.view = view;
