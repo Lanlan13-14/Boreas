@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 8
+## Current handoff — 2026-11-16 round 9
+
+- Pushed same-peer initialbackup cbe903f+realTLS/TUN positive workflow1880da2; Rust43878657701 and TUN43878657668 succeeded, OpenWrt43878657570 succeeded; TLS43878657864 still building musl before backup step at last sample. Remote Actions formatting4f70b04 reviewed (only Rust formatting), local resource commit rebased to6799a13, not yet pushed to avoid cancelling actualbackup run.
+- Resource sampler reviewed/fixed by lead after DeepSeek delivery: only recordedexecPIDs, executable inode must equal testedbinary, eachsample checks starttime+exe identity, real sysconf ticks/pages with no fallback units.100ms/500samples/45s bounded, sentinel+join, missing/windowinvalid reportsunmeasured with no functionality waiver. Rootfs installedcopy intentionallyunmeasured due distinctinode. No30min/PSS/cgroup/sockstat/195/291load or completedG-RESOURCE claim. Pending Actions.
+- Active children: backup-negative-ci DeepSeek onlyrust-tls.yml realTLS rejection must not touchbackup (do not accept error-only fake proof); full-plan-trace DeepSeek newmaster-plan-traceability.md only24gates/Phase0–5 mapping; dns-runtime-slice Luna read-only finished. DNS requires trustedgenesis/status/sourcecapability and real smoltcp Interface/Device; current PacketPath drops DNSVIP as third-party. Do not wire by trusting packetIP or callerbool.
+
+## Previous checkpoint — 2026-11-16 round 8
 
 - Rechecked authoritative external plan and repository copy during round8: both SHA25623969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA, no divergence.
 - Human explicitly corrected persisted objective: the full file C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md is the complete Phase0–5 implementation/acceptance baseline, not merely the feature shortlist. Goal revision18 now names it explicitly and requires per-item implementation/evidence/gap traceability. Do not reduce scope to recent CI fixes. No release until all applicable exact-final-commit checks pass; no production/independent-audit claims.
