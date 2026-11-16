@@ -177,3 +177,128 @@ jobs:
           path: routing-matrix-artifacts/
           if-no-files-found: warn
           retention-days: 14
+
+  window-diagnostic:
+    # Independent read-only diagnostic: same validated source binary, same
+    # one-way 200 ms / 0.1% loss / 100 Mbit profile as the strict netem gate,
+    # with the original 1 MiB probe and a longer 8 MiB probe. Both samples run
+    # even if the first fails; the job fails if either sample fails. A single
+    # short window is not steady state and is not an SLA.
+    needs: source
+    name: Diagnostic 1 MiB vs 8 MiB (one-way 200 ms, loss 0.1%, 100 Mbps)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ needs.source.outputs.run }}
+          run-id: ${{ needs.source.outputs.run }}
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Validate the single validated-source binary
+        run: |
+          set -euo pipefail
+          test -s artifact/boreas-linux-x86_64-musl-pq768
+          (cd artifact && sha256sum --check --strict SHA256SUMS)
+          chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Measure 1 MiB then 8 MiB without masking either result
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+          SOURCE_RUN: ${{ needs.source.outputs.run }}
+          BOREAS_NETEM_RTT_MS: '200'
+          BOREAS_NETEM_LOSS_PERCENT: '0.1'
+          BOREAS_NETEM_RATE_MBIT: '100'
+          # Same regression bounds as the strict 200 ms / 0.1% / 100 Mbps gate.
+          BOREAS_MAX_PING_MS: '415'
+          BOREAS_MIN_THROUGHPUT_MBPS: '3'
+        run: |
+          set +e
+          set -u
+          set -o pipefail
+          {
+            echo "diagnostic_source_sha=${SOURCE_SHA}"
+            echo "diagnostic_source_run=${SOURCE_RUN}"
+            echo 'diagnostic_profile=one-way-200ms-loss-0.1pct-rate-100mbit'
+            echo 'diagnostic_scope=single-paired-short-window-not-steady-state'
+          } > diagnostic-status.txt
+          overall=0
+          run_sample() {
+            local label="$1"
+            local bytes="$2"
+            local log="diagnostic-${label}.log"
+            local rc
+            local -a pipe_status
+            echo "=== ${label}: ${bytes} bytes ==="
+            BOREAS_PERF_BYTES="$bytes" sudo -E bash tools/release/netns_daemon_smoke.sh \
+              "$PWD/artifact/boreas-linux-x86_64-musl-pq768" 2>&1 | tee "$log"
+            pipe_status=("${PIPESTATUS[@]}")
+            rc="${pipe_status[0]}"
+            if (( pipe_status[1] != 0 )); then
+              echo "ERROR: tee failed to write ${log}" >&2
+              rc=1
+            fi
+            {
+              echo "diagnostic_sample_${label}_bytes=${bytes}"
+              echo "diagnostic_sample_${label}_smoke_exit=${rc}"
+              if (( rc != 0 )); then
+                echo "diagnostic_sample_${label}_result=failed"
+              else
+                echo "diagnostic_sample_${label}_result=smoke-passed"
+              fi
+            } >> diagnostic-status.txt
+            if (( rc != 0 )); then
+              overall=1
+            fi
+          }
+          run_sample original_1mib 1048576
+          run_sample longer_8mib 8388608
+          cat diagnostic-status.txt
+          exit "$overall"
+      - name: Report raw evidence and failure reasons
+        if: always()
+        run: |
+          set +e
+          set -u
+          echo 'diagnostic_caveat=single short window, not steady state and not an SLA'
+          if [[ -f diagnostic-status.txt ]]; then
+            cat diagnostic-status.txt
+          else
+            echo 'diagnostic_status=unavailable'
+          fi
+          for label in original_1mib longer_8mib; do
+            log="diagnostic-${label}.log"
+            echo "--- ${label} raw throughput / CPU / RSS ---"
+            if [[ ! -f "$log" ]]; then
+              echo "${label}_evidence=missing"
+              continue
+            fi
+            grep -E '^(overlay_throughput_(edge_to_core|core_to_edge)_mbps|overlay_ping_(loss_percent|average_ms|max_ms)|resource_(evidence_status|window_seconds|samples)|(core|edge)_(evidence_status|window_seconds|samples|cpu_[a-z_]+|rss_peak_kb))=' "$log" || true
+            reasons="$(grep -E '(^ERROR:|^  - |overlay_perf_failure:|overlay_ping_failure:|resource_evidence_detail=|^Traceback)' "$log" | tail -n 40)"
+            echo "--- ${label} failure reasons ---"
+            if [[ -n "$reasons" ]]; then
+              printf '%s\n' "$reasons"
+            else
+              echo "${label}_failure_reasons=none-in-log"
+            fi
+          done
+      - name: Upload diagnostic logs and raw evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: window-diagnostic-${{ needs.source.outputs.run }}
+          path: |
+            diagnostic-*.log
+            diagnostic-status.txt
+          if-no-files-found: warn
+          retention-days: 14

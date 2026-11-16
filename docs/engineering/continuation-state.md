@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-16 round 9
+## Current handoff — 2026-11-16 round 10
+
+- Current pushed9c5c3e986e0cd70cd09676936a844fa290481705 includes full master-plan-traceability.md(all24gates open) and400-line real outerTLS failure/no-backup negative harness. Rust43881225795,TUN43881226060,platform43881225852 succeeded; native dependency43881225790 blocked; TLS43881225757 running negative step at last sample. Need collect log/artifact/terminal result before claim or newpush; do not cancel longcheck unnecessarily.
+- Positive samepeer initialbackup1880da2 TLS43878657864 SUCCESS; onlyinitialdial refusal→backup not multCore/steadyfailover. All applicable nonsecurity codechecks at1880da2 succeeded. Resource candidateb6ead95 TLS43879991003 SUCCESS and OpenWrt43879991224 SUCCESS. Host glibc 0.3s window core/edge56.67%CPU sampledRSS10648/10564KiB; musl0.4s core50%edge52.5%,RSS8520/8520KiB; initialbackup0.4s45/47.5%,10420/10420KiB. These are tiny sampled windows, no budget acceptance. Rootfs both architectures reportunmeasured as intended(binarycopy inode mismatch); no fake numbers.
+- Active writers: easy-config-wizard Luna main.rs/tui.rs only. First169-line draft was explanation-only; lead rejected incompletegoal and asked actualprimary/backup input→Configclone.validate→exactPREVIEW→TOML-escaped uplink-only fragment, nofilewrite/apply/privatepaths, nonTTY unchanged. perf-window-diagnostic DeepSeek performance.yml only adds1MiB/8MiB controlled200ms0.1%100Mbps comparison preservingallstrictgates/finalnonzero. Collect actualfinaldiff beforeintegration.
+
+## Previous checkpoint — 2026-11-16 round 9
 
 - Pushed same-peer initialbackup cbe903f+realTLS/TUN positive workflow1880da2; Rust43878657701 and TUN43878657668 succeeded, OpenWrt43878657570 succeeded; TLS43878657864 still building musl before backup step at last sample. Remote Actions formatting4f70b04 reviewed (only Rust formatting), local resource commit rebased to6799a13, not yet pushed to avoid cancelling actualbackup run.
 - Resource sampler reviewed/fixed by lead after DeepSeek delivery: only recordedexecPIDs, executable inode must equal testedbinary, eachsample checks starttime+exe identity, real sysconf ticks/pages with no fallback units.100ms/500samples/45s bounded, sentinel+join, missing/windowinvalid reportsunmeasured with no functionality waiver. Rootfs installedcopy intentionallyunmeasured due distinctinode. No30min/PSS/cgroup/sockstat/195/291load or completedG-RESOURCE claim. Pending Actions.
