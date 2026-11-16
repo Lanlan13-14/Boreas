@@ -394,13 +394,26 @@ jobs:
           PRIMARY_PORT=18445
           BACKUP_PORT=18446
           CORE_PORT=18447
+          # Only the processes this step starts are ever signalled and waited
+          # for. A bare `wait` must not be used here: the `exec > >(tee ...)`
+          # above makes `tee` a shell child that is not in this array, and a
+          # bare `wait` would also wait for it while `tee` waits for this shell
+          # to close the pipe, i.e. it deadlocks until the step timeout.
+          CHILD_PIDS=()
           cleanup() {
             set +e
-            # Only signal live child jobs, never stale PIDs recorded earlier.
-            for pid in $(jobs -pr); do
-              kill -KILL "$pid" 2>/dev/null || true
+            local live_pids pid
+            live_pids=" $(jobs -pr | tr '\n' ' ') "
+            for pid in "${CHILD_PIDS[@]}"; do
+              # Intersect with live jobs so a recycled (stale) PID is never killed.
+              if [[ "$live_pids" == *" $pid "* ]]; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
             done
-            wait 2>/dev/null || true
+            # Wait only for captured children, never for `tee`.
+            for pid in "${CHILD_PIDS[@]}"; do
+              wait "$pid" 2>/dev/null || true
+            done
             rm -rf -- "$NEG_ROOT"
           }
           trap cleanup EXIT
@@ -611,8 +624,10 @@ jobs:
 
           python3 "$NEG/mock_primary.py" "$PRIMARY_PORT" "$NEG/primary-accepts.log" \
             > "$NEG/mock-primary.out" 2>&1 &
+          CHILD_PIDS+=("$!")
           python3 "$NEG/counting_proxy.py" "$BACKUP_PORT" "$CORE_PORT" "$NEG/backup-accepts.log" \
             > "$NEG/proxy.out" 2>&1 &
+          CHILD_PIDS+=("$!")
 
           # The backup itself is the real core daemon (usable by construction).
           "$BIN" daemon serve \
@@ -622,6 +637,7 @@ jobs:
             --virtual-tun \
             --max-seconds 120 \
             > "$NEG/core.out" 2> "$NEG/core.err" &
+          CHILD_PIDS+=("$!")
 
           LISTENING=0
           for _ in $(seq 1 200); do
