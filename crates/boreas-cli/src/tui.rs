@@ -1295,8 +1295,8 @@ mod tests {
         confirm_dangerous, display_width, is_emoji, render_menu,
     };
     use super::{
-        ConsoleEffect, ConsoleState, ConsoleView, ConfigWizardStep, DETAIL_ROWS, ServiceAction, render_detail,
-        sanitize_line,
+        ConfigWizardStep, ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, ServiceAction,
+        render_detail, sanitize_line,
     };
     use crate::i18n::Lang;
 
