@@ -6,6 +6,14 @@
 
 **版本最新不等于无已知漏洞；查询零结果也不是安全证明。** 本页是有日期的情报快照，真正持续门禁由 GitHub Actions 每日刷新数据执行。
 
+## 2026-11-16 迁移进度（覆盖下文历史 pin 描述）
+
+三个原生构建工作流已统一迁移候选 OpenSSL **4.1.0**，官方归档 SHA-256 `50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd`，使用 `no-quic no-cms no-siv`。这不是修复版，也不自动构成 CVE 豁免；审查记录仍为 `PENDING_ACTIONS_AND_HUMAN_REVIEW_NOT_A_WAIVER`，已知受影响范围继续阻断安全门。
+
+精确提交 `546d5ad` 的 [CLI PoC](https://github.com/Lanlan13-14/Boreas/actions/runs/43870282311) 已完成 hybrid ML-DSA mTLS 正例及无证书、经典 KEX、AEAD 不匹配、过期证书负例，但随后新增构建验证器失败，因此整个检查仍失败。失败原因是验证器把 CLI 列出 `-quic` 当成实现仍存在；[上游标记源码](https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/apps/s_client.c) 无条件注册此选项，实际实现受 `OPENSSL_NO_QUIC` 条件编译控制。修正提交 `376da3d` 改查静态 libssl 定义符号，并保留头宏、configdata、运行时禁用列表及算法正反检查；[新的 PoC](https://github.com/Lanlan13-14/Boreas/actions/runs/43870788395) 已成功（包含修正后的构建检查）；[产品 TLS 检查](https://github.com/Lanlan13-14/Boreas/actions/runs/43870788773) 也已成功（包含真实 WSS/hop/E2E、glibc 与 musl TUN smoke）。[独立安全检查](https://github.com/Lanlan13-14/Boreas/actions/runs/43870788644) 中完整锁 RustSec job 成功，原生报告 job 仍因待审配置及 4.1.0 已知受影响版本失败；没有隐藏或忽略这些阻断。不能把 CLI PoC 当作产品运行时或全二进制安全证明。
+
+下文的 2026-11-15 版本和审计说明为历史快照，不表示当前工作流仍固定 3.6.5。所有适用检查仍须绑定最终精确提交；没有发布 `pre4`。
+
 ## 直接依赖快照
 
 从 `crates/*/Cargo.toml` 收集普通、dev、build、target-specific 和 optional 依赖，排除 workspace path 包；并与根 `Cargo.lock` 对照。最新指 crates.io API 中非 yanked、非 prerelease 的最高数值 SemVer，不误把 `+spec-1.1.0` 的 build metadata 当 prerelease，也不使用可能滞后的默认版本字段。
