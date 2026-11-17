@@ -38,9 +38,14 @@ pub const MAX_WS_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum number of fragments in one binary message.
 pub const MAX_WS_FRAGMENTS: usize = 64;
-/// Absolute wall-clock budget for reading one frame after the read call
-/// begins. A peer dripping one byte per read cannot extend it: the deadline is
-/// re-checked before every blocking read, not only by the socket timeout.
+/// Absolute wall-clock budget for one `Read` call to obtain payload after it
+/// begins. It is an overall budget for all fragments and TLS records consumed
+/// by that call, not a per-record or per-RTT allowance. A peer dripping one
+/// byte per read cannot extend it: the deadline is re-checked before and after
+/// every blocking read. A completely silent peer is bounded only when the
+/// surrounding runtime installs a transport timeout; the generic `Read` seam
+/// cannot interrupt a blocked syscall by itself, and the data plane deliberately
+/// runs without a per-read timeout once the handshake deadline is disarmed.
 pub const MAX_WS_FRAME_DEADLINE: Duration = Duration::from_secs(30);
 /// Absolute budget for the whole HTTP/1.1 upgrade handshake.
 pub const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
@@ -343,6 +348,29 @@ impl<T: crate::stream::Duplex> WsStream<T> {
     pub fn has_buffered_input(&self) -> bool {
         self.pending_pos < self.pending.len() || self.io.has_buffered_input()
     }
+
+    /// Forward a transport timeout to the wrapped byte stream.
+    ///
+    /// The runtime's handshake deadline wrapper lives below this type, so the
+    /// `Duplex` forwarding impl in `stream.rs` cannot touch the private `io`
+    /// field directly. This is crate-internal plumbing; it does not alter
+    /// WebSocket framing or the frame budget.
+    pub(crate) fn set_transport_timeout(
+        &self,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        self.io.set_io_timeout(timeout)
+    }
+
+    /// Forward a handshake-deadline clear to the wrapped byte stream.
+    ///
+    /// Clearing is a distinct operation from installing `None`: the runtime's
+    /// deadline wrapper must also disarm its own absolute deadline state.
+    /// Forwarding through this private field keeps every layer's clear explicit
+    /// instead of relying on a blanket `set_io_timeout(None)` translation.
+    pub(crate) fn clear_transport_deadline(&self) -> io::Result<()> {
+        self.io.clear_handshake_deadline()
+    }
 }
 
 fn poisoned() -> io::Error {
@@ -460,8 +488,11 @@ struct RawFrame {
     payload: Vec<u8>,
 }
 
-/// Fill uf, re-checking an absolute deadline before every blocking read.
-/// The socket read timeout alone would let a peer drip one byte per timeout.
+/// Fill `buf`, re-checking an absolute deadline before and after every blocking
+/// read. The socket read timeout alone would let a peer drip one byte per
+/// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
+/// handshake the runtime supplies that transport timeout; the data plane
+/// deliberately has none, so this check bounds progress between reads there.
 fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<(), WsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -473,6 +504,12 @@ fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<
             return Err(WsError::Closed);
         }
         filled += read;
+        // A single blocking read can return after the budget has expired. Do
+        // not accept that byte just because it completed the buffer: the
+        // deadline is absolute, not an idle timeout between reads.
+        if Instant::now() >= deadline {
+            return Err(WsError::Timeout);
+        }
     }
     Ok(())
 }
@@ -653,6 +690,12 @@ fn read_http_head<T: Read>(io: &mut T, deadline: Instant) -> Result<HttpHead, Ws
         let read = io.read(&mut byte).map_err(map_io)?;
         if read == 0 {
             return Err(WsError::Closed);
+        }
+        // Check after the read as well: a blocking read may return exactly the
+        // terminating byte after the budget expired. The whole upgrade, not
+        // just the time spent waiting before each read, must fit the deadline.
+        if Instant::now() >= deadline {
+            return Err(WsError::Timeout);
         }
         if byte[0] == b'\n' && raw.last().is_none_or(|last| *last != b'\r') {
             return Err(WsError::HeadMalformed);
@@ -847,14 +890,64 @@ fn expected_accept_key(key: &str) -> String {
     base64_encode(&sha1::sha1(&material))
 }
 
+/// Clamp a caller's absolute handshake deadline to the protocol's upgrade
+/// budget. A tighter end-to-end budget is never widened here; a longer caller
+/// budget still cannot make the HTTP upgrade exceed [`MAX_HANDSHAKE_DEADLINE`].
+fn handshake_deadline(caller: Instant) -> Instant {
+    caller.min(Instant::now() + MAX_HANDSHAKE_DEADLINE)
+}
+
+/// Write one handshake message under a single absolute deadline.
+///
+/// A bare `write_all` would reset any per-syscall timeout on every partial
+/// write. The runtime transport also installs a per-operation timeout, but this
+/// loop keeps the bound explicit for every `Write` implementation, including
+/// in-memory ones used by tests.
+fn write_all_until<T: Write>(
+    io: &mut T,
+    buf: &[u8],
+    deadline: Instant,
+) -> Result<(), WsError> {
+    let mut written = 0usize;
+    while written < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(WsError::Timeout);
+        }
+        match io.write(&buf[written..]) {
+            Ok(0) => return Err(WsError::Io(io::ErrorKind::WriteZero)),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io(error)),
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(WsError::Timeout);
+    }
+    io.flush().map_err(map_io)
+}
+
 /// Perform the client side of the RFC 6455 handshake over an established
 /// transport (normally a fresh `TcpStream`).
 pub fn client_handshake<T: Read + Write>(
-    mut io: T,
+    io: T,
     host: &str,
     path: &str,
 ) -> Result<WsStream<T>, WsError> {
-    let deadline = Instant::now() + MAX_HANDSHAKE_DEADLINE;
+    client_handshake_until(io, host, path, Instant::now() + MAX_HANDSHAKE_DEADLINE)
+}
+
+/// Client handshake under a caller-supplied absolute deadline.
+///
+/// The runtime passes the overall hop-handshake deadline here, so the WebSocket
+/// upgrade cannot silently receive a fresh ten-second allowance after outer TLS
+/// has already consumed most of the caller's budget.
+pub(crate) fn client_handshake_until<T: Read + Write>(
+    mut io: T,
+    host: &str,
+    path: &str,
+    deadline: Instant,
+) -> Result<WsStream<T>, WsError> {
+    let deadline = handshake_deadline(deadline);
     validate_host(host)?;
     validate_path(path)?;
     let key_bytes: [u8; 16] = csprng::random_array().map_err(|_| WsError::Entropy)?;
@@ -868,8 +961,7 @@ pub fn client_handshake<T: Read + Write>(
     request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
     request.push_str(&key);
     request.push_str("\r\nSec-WebSocket-Version: 13\r\n\r\n");
-    io.write_all(request.as_bytes()).map_err(map_io)?;
-    io.flush().map_err(map_io)?;
+    write_all_until(&mut io, request.as_bytes(), deadline)?;
 
     let head = read_http_head(&mut io, deadline)?;
     if parse_status_line(head.start_line())? != 101 {
@@ -905,8 +997,16 @@ pub fn client_handshake<T: Read + Write>(
 
 /// Perform the server side of the RFC 6455 handshake over an accepted
 /// transport.
-pub fn server_handshake<T: Read + Write>(mut io: T) -> Result<WsStream<T>, WsError> {
-    let deadline = Instant::now() + MAX_HANDSHAKE_DEADLINE;
+pub fn server_handshake<T: Read + Write>(io: T) -> Result<WsStream<T>, WsError> {
+    server_handshake_until(io, Instant::now() + MAX_HANDSHAKE_DEADLINE)
+}
+
+/// Server handshake under a caller-supplied absolute deadline.
+pub(crate) fn server_handshake_until<T: Read + Write>(
+    mut io: T,
+    deadline: Instant,
+) -> Result<WsStream<T>, WsError> {
+    let deadline = handshake_deadline(deadline);
     let head = read_http_head(&mut io, deadline)?;
     let (method, target) = parse_request_line(head.start_line())?;
     if method != "GET" {
@@ -945,8 +1045,7 @@ pub fn server_handshake<T: Read + Write>(mut io: T) -> Result<WsStream<T>, WsErr
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    io.write_all(response.as_bytes()).map_err(map_io)?;
-    io.flush().map_err(map_io)?;
+    write_all_until(&mut io, response.as_bytes(), deadline)?;
     Ok(WsStream::new(io, WsRole::Server, WsLimits::default()))
 }
 
@@ -1289,5 +1388,51 @@ mod tests {
         assert!(!close_payload_valid(&[0x03, 0xe8, 0xff]));
         assert!(!close_payload_valid(&[0x03, 0xed]));
         assert!(close_payload_valid(&[0x0f, 0xa0]));
+    }
+
+    struct SlowFirstRead {
+        slept: bool,
+    }
+
+    impl Read for SlowFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.slept {
+                self.slept = true;
+                thread::sleep(Duration::from_millis(50));
+            }
+            buf[0] = 0x82;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn frame_deadline_is_not_restarted_after_each_read() {
+        // The first byte arrives only after the budget has expired. The next
+        // loop check must fail instead of granting a fresh deadline for the
+        // remaining header/payload bytes or for a TLS record split.
+        let mut io = SlowFirstRead { slept: false };
+        let error = read_frame(
+            &mut io,
+            WsRole::Client,
+            &WsLimits::default(),
+            Instant::now() + Duration::from_millis(20),
+        )
+        .err();
+        assert_eq!(error, Some(WsError::Timeout));
+    }
+
+    #[test]
+    fn handshake_until_honors_a_caller_deadline_that_already_expired() {
+        let response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n";
+        assert_eq!(
+            client_handshake_until(
+                memory(response.as_bytes()),
+                "hub.example.net",
+                "/tunnel",
+                Instant::now(),
+            )
+            .err(),
+            Some(WsError::Timeout)
+        );
     }
 }

@@ -233,6 +233,22 @@ impl FrameIo {
             || self.stream.has_buffered_input()
     }
 
+    /// Disarm the bounded handshake transport deadline now that authorization
+    /// is complete.
+    ///
+    /// The runtime arms one absolute deadline across outer TLS, the WebSocket
+    /// upgrade, the inner TLS handshake and this session exchange. Leaving that
+    /// deadline armed would make a legitimately idle data-plane read fail with
+    /// `TimedOut`, so it is explicitly removed before the session is returned.
+    ///
+    /// The call is forwarded by every wrapper down to the raw transport. Every
+    /// real transport layer overrides the timeout installer and the clear, so a
+    /// missing forward cannot leave the socket timeout armed.
+    fn end_handshake(&mut self) -> Result<(), TunnelError> {
+        self.stream.clear_handshake_deadline()?;
+        Ok(())
+    }
+
     fn send_inner(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
@@ -461,6 +477,10 @@ fn encode_session_accept(params: SessionParams) -> Result<Vec<u8>, TunnelError> 
 
 /// Connector side: send `SessionHello`, require a mirroring `SessionAccept`,
 /// then re-authorize the accepted parameters through the same checks.
+///
+/// `transport` is expected to carry the runtime's bounded handshake deadline.
+/// This function does not invent one; it disarms that deadline after the peer is
+/// authorized so the data plane does not inherit a handshake timeout.
 pub fn client_handshake(
     transport: Box<dyn Duplex>,
     tls: &InnerTlsSession,
@@ -511,6 +531,7 @@ pub fn client_handshake(
     }
     let accept = decode_session_accept(&frame.body, hello, local_identity(policy.expected_peer))?;
     let authorized = policy.authorize_hello(tls, &accept)?;
+    io.end_handshake()?;
     let ctx = accepted_context(&policy, &authorized);
     Ok(EstablishedSession {
         io,
@@ -522,6 +543,9 @@ pub fn client_handshake(
 
 /// Acceptor side: require `SessionHello` as the first frame, authorize it, then
 /// send the mirroring `SessionAccept`.
+///
+/// `transport` is expected to carry the runtime's bounded handshake deadline;
+/// this function disarms it after sending the accept.
 pub fn server_handshake(
     transport: Box<dyn Duplex>,
     tls: &InnerTlsSession,
@@ -546,6 +570,7 @@ pub fn server_handshake(
     // swapped, all shared fields echoed) and validates the destination binding.
     let accept = SessionParams::accept_for(&hello, local_identity(policy.local))?;
     io.send(Kind::Control, &encode_session_accept(accept)?)?;
+    io.end_handshake()?;
 
     let ctx = accepted_context(&policy, &authorized);
     Ok(EstablishedSession {
