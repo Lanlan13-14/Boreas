@@ -1464,7 +1464,8 @@ mod tests {
 
         // A multi-hop cipher stream is still one endpoint pair: `path_hops` may be
         // above 1, and the adapter is not a forwarder.
-        assert!(bind([0x11; 16], 3, peer, local).is_ok());
+        let bound_local = identity(0x0201, NodeRole::Core);
+        assert!(bind([0x11; 16], 3, peer, bound_local).is_ok());
 
         // MTU bounds and the circuit's negotiated cap.
         let pair = VirtualTun::try_pair(1, 1, DEFAULT_MTU).expect("bounded pair");

@@ -39,5 +39,7 @@ boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"
 
-[dev-dependencies]
+[target.'cfg(all(target_os = "linux", feature = "openssl-inner-tls"))'.dev-dependencies]
+# Only real backend tests generate/sign fixtures. An unconditional dev dependency
+# would make default-feature cross-platform tests require an uninstalled OpenSSL.
 openssl = "=0.10.82"

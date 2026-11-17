@@ -13,7 +13,6 @@ use boreas_pki::management::{
     IdentityAuthority, IdentityTemplate, IssuerScope, ManagementTrust, VerifiedObject,
 };
 use boreas_pki::{VerifiedNetworkContext, verify_network_policy};
-use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_proto::{
     SecurityMode,
     messages::PathRole,

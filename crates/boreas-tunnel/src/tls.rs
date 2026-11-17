@@ -84,10 +84,6 @@ impl PeerIdentity {
     pub(crate) fn policy(&self) -> Option<VerifiedNetworkContext> {
         self.policy
     }
-    #[cfg(feature = "openssl-inner-tls")]
-    pub(crate) fn policy_digest(&self) -> Option<[u8; 32]> {
-        self.policy.map(|policy| policy.policy_digest())
-    }
     pub(crate) fn crypto_expected(self) -> ExpectedPeer {
         ExpectedPeer {
             net_id: self.net_id,

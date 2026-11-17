@@ -280,7 +280,7 @@ mod tests {
         let ok = verify_network_policy(&raw, &es, &ps, &pin, [3; 16], 10).unwrap();
         assert_eq!(ok.seq(), 4);
         assert_eq!(ok.validity(), (10, 20));
-        assert_eq!(ok.policy_digest(), openssl::sha::sha256(&raw).unwrap());
+        assert_eq!(ok.policy_digest(), openssl::sha::sha256(&raw));
         let context = ok.require_default_runtime().unwrap();
         assert_eq!(context.net_id(), [3; 16]);
         assert_eq!(context.overlay_base(), [10, 20, 0, 0]);
