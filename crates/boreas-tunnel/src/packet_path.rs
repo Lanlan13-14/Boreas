@@ -1515,27 +1515,17 @@ mod tests {
             Err(other) => panic!("unexpected mtu error: {other:?}"),
             Ok(_) => panic!("mtu above the circuit cap must be refused"),
         }
-        let capped = AuthorizedEndpoints::bind(
-            [0x11; 16],
-            1,
-            with_policy(peer),
-            with_policy(local),
-            1400,
-        )
-        .expect("capped permanent pair");
+        let capped =
+            AuthorizedEndpoints::bind([0x11; 16], 1, with_policy(peer), with_policy(local), 1400)
+                .expect("capped permanent pair");
         match PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1401) {
             Err(PacketPathError::MtuAboveCircuitCap) => {}
             Err(other) => panic!("unexpected mtu error: {other:?}"),
             Ok(_) => panic!("mtu above the circuit cap must be refused"),
         }
-        let capped = AuthorizedEndpoints::bind(
-            [0x11; 16],
-            1,
-            with_policy(peer),
-            with_policy(local),
-            1400,
-        )
-        .expect("capped permanent pair");
+        let capped =
+            AuthorizedEndpoints::bind([0x11; 16], 1, with_policy(peer), with_policy(local), 1400)
+                .expect("capped permanent pair");
         assert!(PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1400).is_ok());
     }
 
