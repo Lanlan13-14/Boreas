@@ -82,12 +82,7 @@ fn stderr(output: &Output) -> String {
 fn run_child(case: &str, inherited_fd: Option<RawFd>) -> Output {
     let mut command = Command::new(env::current_exe().expect("current test executable"));
     command
-        .args([
-            "child_worker",
-            "--exact",
-            "--test-threads=1",
-            "--nocapture",
-        ])
+        .args(["child_worker", "--exact", "--test-threads=1", "--nocapture"])
         .env(CHILD_CASE, case)
         .env_remove(CHILD_FD)
         .stdout(Stdio::piped())
@@ -490,26 +485,24 @@ fn child_worker() {
     emit("CHILD_INSTALLED\n");
 
     match case.as_str() {
-        "allow_af_unix_stream" => expect_allowed(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-        ),
+        "allow_af_unix_stream" => {
+            expect_allowed(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC)
+        }
         "deny_inet_udp_v4" => expect_denied_eperm(libc::AF_INET, libc::SOCK_DGRAM, 0),
         "deny_inet_udp_v6" => expect_denied_eperm(libc::AF_INET6, libc::SOCK_DGRAM, 0),
         "deny_inet_raw_v4" => expect_denied_eperm(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_TCP),
-        "deny_inet_raw_v6" => expect_denied_eperm(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_TCP),
-        "deny_inet_stream_v4" => expect_denied_eperm(
-            libc::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-        ),
+        "deny_inet_raw_v6" => {
+            expect_denied_eperm(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_TCP)
+        }
+        "deny_inet_stream_v4" => {
+            expect_denied_eperm(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+        }
         "deny_unix_dgram" => expect_denied_eperm(libc::AF_UNIX, libc::SOCK_DGRAM, 0),
         "deny_unix_seqpacket" => expect_denied_eperm(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0),
         "kill_io_uring_setup" => {
             emit("CHILD_PRE_SYSCALL\n");
             let mut params = [0u8; 120];
-            let result =
-                unsafe { libc::syscall(IO_URING_SETUP, 2, params.as_mut_ptr()) };
+            let result = unsafe { libc::syscall(IO_URING_SETUP, 2, params.as_mut_ptr()) };
             emit("RESULT RETURNED\n");
             let _ = result;
             finish(EXIT_UNEXPECTED);
@@ -564,8 +557,7 @@ fn child_worker() {
         }
         "kill_number_102" => {
             emit("CHILD_PRE_SYSCALL\n");
-            let result =
-                unsafe { libc::syscall(X86_32_SOCKETCALL, 1, 0, 0, 0, 0, 0) };
+            let result = unsafe { libc::syscall(X86_32_SOCKETCALL, 1, 0, 0, 0, 0, 0) };
             emit("RESULT RETURNED\n");
             let _ = result;
             finish(EXIT_UNEXPECTED);
@@ -580,7 +572,8 @@ fn child_worker() {
                 finish(EXIT_UNEXPECTED);
             }
             emit("INHERITED_WRITE_OK\n");
-            let new_fd = unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            let new_fd =
+                unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0) };
             if new_fd >= 0 {
                 unsafe { libc::close(i32::try_from(new_fd).expect("socket fd fits i32")) };
                 emit("NEW_SOCKET_ALLOWED\n");

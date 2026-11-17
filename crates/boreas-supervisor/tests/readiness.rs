@@ -126,9 +126,7 @@ impl Fixture {
 
     fn supervise_with_timeout(&self, ready_timeout_ms: u64, max_trial_attempts: u32) -> Command {
         let mut cmd = self.supervise_with(ready_timeout_ms, max_trial_attempts);
-        cmd.arg("--ready-expected-schema")
-            .arg("state-v1")
-            .arg("--");
+        cmd.arg("--ready-expected-schema").arg("state-v1").arg("--");
         cmd
     }
 
@@ -438,7 +436,11 @@ fn sigkill_mid_trial_is_not_confirmed_and_next_boot_recovers_old_version() {
         "SIGKILL must leave the unconfirmed journal for recovery"
     );
     assert_eq!(f.store.active_version().unwrap().as_deref(), Some("2.0.0"));
-    let trial = f.store.trial_state().unwrap().expect("surviving reservation");
+    let trial = f
+        .store
+        .trial_state()
+        .unwrap()
+        .expect("surviving reservation");
     assert_eq!(trial.attempts, 1);
     assert!(trial.in_flight);
 
@@ -469,8 +471,14 @@ fn sigkill_mid_trial_is_not_confirmed_and_next_boot_recovers_old_version() {
     );
     assert_eq!(f.store.journal().unwrap().unwrap().phase, Phase::Prepared);
     let trial = f.store.trial_state().unwrap().expect("trial ledger");
-    assert_eq!(trial.attempts, 1, "recovery must not invent or drop attempts");
-    assert!(!trial.in_flight, "the recovered attempt is recorded as failed");
+    assert_eq!(
+        trial.attempts, 1,
+        "recovery must not invent or drop attempts"
+    );
+    assert!(
+        !trial.in_flight,
+        "the recovered attempt is recorded as failed"
+    );
     assert!(
         f.store.version_dir("1.0.0").unwrap().is_dir(),
         "rollback must retain the old version directory"
