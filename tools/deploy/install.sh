@@ -74,8 +74,9 @@ Requirements and limits:
     the invoking user with no group/other access. The two NetworkRoot pins are
     separate mandatory files. The policy directory and each pin's directory must
     also be owned by the invoking user and not group/other writable, and every
-    path component is checked: no symlinks and no non-sticky group/other-writable
-    ancestor (a root-0700 directory under sticky /tmp is accepted). This prevents
+    path component is checked: no symlinks, no ancestor owned by another user,
+    and no non-sticky group/other-writable ancestor (a root-0700 directory under
+    sticky /tmp is accepted). This prevents
     swapping verified bytes between the checks and the later copy. Pins are trust
     anchors, not release assets: obtain them through a channel independent of the
     binary/URL, never from the same download.
@@ -233,8 +234,9 @@ check_secure_file() { # $1=description, $2=path
 # before the later copy, so a writable ancestor or symlink could otherwise
 # redirect or replace the verified bytes. Every component is walked: no symlinks,
 # no group/other-writable ancestor unless the sticky bit prevents renaming a
-# private child (a root-0700 directory under /tmp is acceptable). The final
-# directory itself must belong to the invoking user and be closed to group/other.
+# private child (a root-0700 directory under /tmp is acceptable), and no ancestor
+# owned by anyone other than root or the invoking user. The final directory itself
+# must belong to the invoking user and be closed to group/other.
 check_private_dir() { # $1=description, $2=absolute directory path
   _cpd=$2
   case "$_cpd" in /*) ;; *) fail "$1 must be an absolute path: $_cpd" ;; esac
@@ -255,14 +257,18 @@ check_private_dir() { # $1=description, $2=absolute directory path
     _cpd_state=$(stat -c '%u %a' -- "$_cpd_prefix") || fail "cannot stat $1: $_cpd_prefix"
     _cpd_mode=$((0${_cpd_state##* }))
     _cpd_owner=${_cpd_state%% *}
-    if [ "$_cpd_owner" != 0 ] && [ "$_cpd_owner" != "$(id -u)" ]; then
-      fail "$1 has an ancestor owned by another user: $_cpd_prefix"
-    fi
     if [ "$_cpd_last" -eq 1 ]; then
-      [ "${_cpd_state%% *}" = "$(id -u)" ] || fail "$1 must be owned by the invoking user: $_cpd_prefix"
+      # The final directory is the one the operator names: report it with the
+      # final-directory message before any ancestor rule can claim it.
+      [ "$_cpd_owner" = "$(id -u)" ] || fail "$1 must be owned by the invoking user: $_cpd_prefix"
       [ $((_cpd_mode & 0022)) -eq 0 ] || fail "$1 must not be group/other writable: $_cpd_prefix"
-    elif [ $((_cpd_mode & 0022)) -ne 0 ] && [ $((_cpd_mode & 01000)) -eq 0 ]; then
-      fail "$1 has a group/other-writable ancestor without the sticky bit: $_cpd_prefix"
+    else
+      if [ "$_cpd_owner" != 0 ] && [ "$_cpd_owner" != "$(id -u)" ]; then
+        fail "$1 has an ancestor owned by another user: $_cpd_prefix"
+      fi
+      if [ $((_cpd_mode & 0022)) -ne 0 ] && [ $((_cpd_mode & 01000)) -eq 0 ]; then
+        fail "$1 has a group/other-writable ancestor without the sticky bit: $_cpd_prefix"
+      fi
     fi
   done
 }

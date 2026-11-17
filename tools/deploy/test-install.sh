@@ -443,6 +443,11 @@ expect_fail_msg 'group/other-writable --policy-dir is refused' 'must not be grou
   mode_case "$POLICY" 777 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
 expect_fail_msg '--policy-dir owned by another user is refused' 'owned by the invoking user' \
   owner_case "$POLICY" 1000 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+# Ancestors keep the strict owner rule but must not be misreported as the final
+# directory: they get their own diagnostic.
+expect_fail_msg 'an input ancestor owned by another user is refused' \
+  'has an ancestor owned by another user' \
+  owner_case "$T" 1000 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
 expect_fail_msg 'group/other-writable NetworkRoot pin directory is refused' \
   'must not be group/other writable' \
   mode_case "$PIN_DIR" 777 "$POLICY" "$PIN_DIR/root.ed25519.der" "$PIN_DIR/root.mldsa65.der"
