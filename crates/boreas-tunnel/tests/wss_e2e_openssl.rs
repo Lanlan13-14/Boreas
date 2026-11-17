@@ -9,11 +9,11 @@ use boreas_crypto::{
     backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
 };
 use boreas_pki::NodeRole as PkiNodeRole;
-use boreas_pki::{VerifiedNetworkContext, verify_network_policy};
-use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_pki::management::{
     IdentityAuthority, IdentityTemplate, IssuerScope, ManagementTrust, VerifiedObject,
 };
+use boreas_pki::{VerifiedNetworkContext, verify_network_policy};
+use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_proto::{
     SecurityMode,
     messages::PathRole,
@@ -53,30 +53,39 @@ const NET: [u8; 16] = [0x39; 16];
 fn verified_default_policy() -> VerifiedNetworkContext {
     static POLICY: std::sync::OnceLock<VerifiedNetworkContext> = std::sync::OnceLock::new();
     *POLICY.get_or_init(|| {
-    use boreas_proto::network_policy::NetworkPolicyCandidate;
-    use boreas_proto::objects::MldsaParameterSet;
-    use openssl::sign::Signer;
-    let ed = PKey::private_key_from_raw_bytes(&[0x39; 32], openssl::pkey::Id::ED25519)
-        .expect("policy Ed root");
-    let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[0x73; 32])
-        .expect("policy ML-DSA root");
-    let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
-        NET, ed.public_key_to_der().unwrap(), MldsaParameterSet::Mldsa65,
-        pq.public_key_to_der().unwrap(),
-    ).unwrap();
-    let candidate = NetworkPolicyCandidate {
-        net_id: NET, root_key_fingerprint: pin.fingerprint().unwrap(),
-        overlay_base: [10, 20, 0, 0], version: 1, seq: 1,
-        issued_at: 1, expires: u64::MAX,
-    };
-    let raw = candidate.encode_tbs().unwrap();
-    let message = NetworkPolicyCandidate::signature_input(&raw).unwrap();
-    let mut signer = Signer::new_without_digest(&ed).unwrap();
-    let ed_sig = signer.sign_oneshot_to_vec(&message).unwrap();
-    let mut signer = Signer::new_without_digest(&pq).unwrap();
-    let pq_sig = signer.sign_oneshot_to_vec(&message).unwrap();
-    verify_network_policy(&raw, &ed_sig, &pq_sig, &pin, NET, 2).unwrap()
-        .require_default_runtime().unwrap()
+        use boreas_proto::network_policy::NetworkPolicyCandidate;
+        use boreas_proto::objects::MldsaParameterSet;
+        use openssl::sign::Signer;
+        let ed = PKey::private_key_from_raw_bytes(&[0x39; 32], openssl::pkey::Id::ED25519)
+            .expect("policy Ed root");
+        let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[0x73; 32])
+            .expect("policy ML-DSA root");
+        let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
+            NET,
+            ed.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        )
+        .unwrap();
+        let candidate = NetworkPolicyCandidate {
+            net_id: NET,
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 1,
+            issued_at: 1,
+            expires: u64::MAX,
+        };
+        let raw = candidate.encode_tbs().unwrap();
+        let message = NetworkPolicyCandidate::signature_input(&raw).unwrap();
+        let mut signer = Signer::new_without_digest(&ed).unwrap();
+        let ed_sig = signer.sign_oneshot_to_vec(&message).unwrap();
+        let mut signer = Signer::new_without_digest(&pq).unwrap();
+        let pq_sig = signer.sign_oneshot_to_vec(&message).unwrap();
+        verify_network_policy(&raw, &ed_sig, &pq_sig, &pin, NET, 2)
+            .unwrap()
+            .require_default_runtime()
+            .unwrap()
     })
 }
 const MINIMAL_CNF: &str = "openssl_conf = openssl_init\n\n[openssl_init]\nproviders = provider_sect\n\n[provider_sect]\ndefault = default_sect\n\n[default_sect]\nactivate = 1\n";
@@ -620,8 +629,10 @@ fn peer(object: &VerifiedObject) -> PeerIdentity {
 fn extractor(a: &VerifiedObject, b: &VerifiedObject) -> Arc<PkiIdentityExtractor> {
     Arc::new(
         PkiIdentityExtractor::new(vec![
-            VerifiedNodeIdentity::from_verified_object(a, &verified_default_policy()).expect("verified A"),
-            VerifiedNodeIdentity::from_verified_object(b, &verified_default_policy()).expect("verified B"),
+            VerifiedNodeIdentity::from_verified_object(a, &verified_default_policy())
+                .expect("verified A"),
+            VerifiedNodeIdentity::from_verified_object(b, &verified_default_policy())
+                .expect("verified B"),
         ])
         .expect("unique trusted SPKIs"),
     )
@@ -681,9 +692,13 @@ fn signed_vip_lookup_requires_exact_verified_peer_and_certificate_owner() {
     // ambiguous; even an otherwise valid cert must not select one VIP record.
     let duplicate_peer_object = verified_identity(&t, "unknown", 2, 4, ObjectRole::Edge);
     let ambiguous_extractor = PkiIdentityExtractor::new(vec![
-        VerifiedNodeIdentity::from_verified_object(&edge_object, &verified_default_policy()).expect("verified Edge"),
-        VerifiedNodeIdentity::from_verified_object(&duplicate_peer_object, &verified_default_policy())
-            .expect("verified duplicate peer tuple"),
+        VerifiedNodeIdentity::from_verified_object(&edge_object, &verified_default_policy())
+            .expect("verified Edge"),
+        VerifiedNodeIdentity::from_verified_object(
+            &duplicate_peer_object,
+            &verified_default_policy(),
+        )
+        .expect("verified duplicate peer tuple"),
     ])
     .expect("different SPKIs are individually unique");
     assert_eq!(

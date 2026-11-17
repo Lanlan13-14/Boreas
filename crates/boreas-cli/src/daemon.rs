@@ -633,10 +633,9 @@ mod linux_daemon {
                             status_state_file = Some(PathBuf::from(val));
                         }
                         "--status-state-owner-uid" => {
-                            status_state_owner_uid = Some(
-                                val.parse::<u32>()
-                                    .map_err(|_| "daemon: invalid --status-state-owner-uid".to_string())?,
-                            );
+                            status_state_owner_uid = Some(val.parse::<u32>().map_err(|_| {
+                                "daemon: invalid --status-state-owner-uid".to_string()
+                            })?);
                         }
                         "--network-policy-tbs" => policy_tbs = Some(PathBuf::from(val)),
                         "--network-policy-ed25519-signature" => {
@@ -696,16 +695,18 @@ mod linux_daemon {
         // Business forwarding is never allowed without an explicit durable
         // status binding. There is no flag combination that silently falls
         // back to the old path-only watchdog.
-        let (status_state_file, status_state_owner_uid) =
-            match (status_state_file, status_state_owner_uid) {
-                (Some(file), Some(owner)) => (file, owner),
-                _ => {
-                    return Err(
+        let (status_state_file, status_state_owner_uid) = match (
+            status_state_file,
+            status_state_owner_uid,
+        ) {
+            (Some(file), Some(owner)) => (file, owner),
+            _ => {
+                return Err(
                         "daemon: `--status-state-file <ABS>` and `--status-state-owner-uid <UID>` are required for durable, fail-closed status"
                             .to_string(),
                     );
-                }
-            };
+            }
+        };
         if !status_state_file.is_absolute() || status_state_file.file_name().is_none() {
             return Err("daemon: `--status-state-file` must be an absolute file path".to_string());
         }
@@ -771,8 +772,9 @@ mod linux_daemon {
         )
         .map_err(|error| format!("daemon network policy rejected: {error}"))?;
 
-        let local_vn = VerifiedNodeIdentity::from_verified_object(&verified.local, &network_context)
-            .map_err(|_| "daemon: invalid local VerifiedNodeIdentity".to_string())?;
+        let local_vn =
+            VerifiedNodeIdentity::from_verified_object(&verified.local, &network_context)
+                .map_err(|_| "daemon: invalid local VerifiedNodeIdentity".to_string())?;
         let peer_obj = verified
             .peer
             .as_ref()
@@ -912,9 +914,7 @@ mod linux_daemon {
             Instant::now(),
         )
         .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
-        counters
-            .status_sequence
-            .store(gate_seq, Ordering::SeqCst);
+        counters.status_sequence.store(gate_seq, Ordering::SeqCst);
 
         let session_policy = SessionPolicy {
             local: local_peer,
@@ -1314,7 +1314,9 @@ mod linux_daemon {
             now_utc_us()?,
             Instant::now(),
         )
-        .map_err(|e| format!("daemon serve: durable status gate failed after hop handshake: {e}"))?;
+        .map_err(|e| {
+            format!("daemon serve: durable status gate failed after hop handshake: {e}")
+        })?;
 
         let e2e = accept_e2e(&mut accepted.session, &e2e_backend, remote_peer)
             .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?;
@@ -1433,7 +1435,9 @@ mod linux_daemon {
                         Instant::now(),
                     )
                     .map_err(|e| {
-                        format!("daemon connect: durable status gate failed after hop handshake: {e}")
+                        format!(
+                            "daemon connect: durable status gate failed after hop handshake: {e}"
+                        )
                     })?;
                     connected = Some((session, fd_slot.load(Ordering::SeqCst)));
                     break;
@@ -1666,10 +1670,8 @@ mod linux_daemon {
         /// Real Linux durable-store fixture for watchdog tests. The caller owns
         /// the returned directory and removes it after dropping the watchdog.
         fn store_fixture(label: &str) -> (PathBuf, StatusStore) {
-            let dir = std::env::temp_dir().join(format!(
-                "boreas-watchdog-{label}-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("boreas-watchdog-{label}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("create watchdog store dir");
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
@@ -1827,10 +1829,7 @@ mod linux_daemon {
                 uid,
                 ManagementTrust::new([0x2a; 16]),
             );
-            assert!(matches!(
-                second,
-                Err(boreas_pki::status_store::Error::Busy)
-            ));
+            assert!(matches!(second, Err(boreas_pki::status_store::Error::Busy)));
             drop(store);
             let _ = fs::remove_dir_all(dir);
         }

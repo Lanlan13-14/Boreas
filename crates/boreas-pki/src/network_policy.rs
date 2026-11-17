@@ -93,14 +93,27 @@ pub struct VerifiedNetworkContext {
     expires: u64,
 }
 impl VerifiedNetworkContext {
-    pub fn net_id(&self) -> [u8; 16] { self.net_id }
-    pub fn root_key_fingerprint(&self) -> [u8; 32] { self.root_key_fingerprint }
-    pub fn overlay_base(&self) -> [u8; 4] { self.overlay_base }
-    pub fn policy_digest(&self) -> [u8; 32] { self.policy_digest }
-    pub fn version(&self) -> u64 { self.version }
-    pub fn seq(&self) -> u64 { self.seq }
-    pub fn validity(&self) -> (u64, u64) { (self.issued_at, self.expires) }
-
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+    pub fn root_key_fingerprint(&self) -> [u8; 32] {
+        self.root_key_fingerprint
+    }
+    pub fn overlay_base(&self) -> [u8; 4] {
+        self.overlay_base
+    }
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+    pub fn validity(&self) -> (u64, u64) {
+        (self.issued_at, self.expires)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,11 +178,12 @@ pub fn verify_network_policy(
         }
         _ => NetworkPolicyError::InvalidRootOrSignature,
     })?;
-    let policy_digest: [u8; 32] = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), raw_tbs)
-        .map_err(|_| NetworkPolicyError::InvalidCandidate)?
-        .as_ref()
-        .try_into()
-        .map_err(|_| NetworkPolicyError::InvalidCandidate)?;
+    let policy_digest: [u8; 32] =
+        openssl::hash::hash(openssl::hash::MessageDigest::sha256(), raw_tbs)
+            .map_err(|_| NetworkPolicyError::InvalidCandidate)?
+            .as_ref()
+            .try_into()
+            .map_err(|_| NetworkPolicyError::InvalidCandidate)?;
     Ok(VerifiedNetworkPolicy {
         net_id: candidate.net_id,
         root_key_fingerprint: candidate.root_key_fingerprint,
@@ -296,13 +310,20 @@ mod tests {
         let (ed, pq) = keys(11);
         let pin = make_pin(&ed, &pq);
         let candidate = NetworkPolicyCandidate {
-            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(),
-            overlay_base: [10, 21, 0, 0], version: 1, seq: 1,
-            issued_at: 10, expires: 20,
+            net_id: [3; 16],
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 21, 0, 0],
+            version: 1,
+            seq: 1,
+            issued_at: 10,
+            expires: 20,
         };
         let raw = candidate.encode_tbs().unwrap();
         let (es, ps) = sign(&ed, &pq, &raw);
         let verified = verify_network_policy(&raw, &es, &ps, &pin, [3; 16], 10).unwrap();
-        assert_eq!(verified.require_default_runtime().unwrap_err(), NetworkPolicyError::UnsupportedRuntimePrefix);
+        assert_eq!(
+            verified.require_default_runtime().unwrap_err(),
+            NetworkPolicyError::UnsupportedRuntimePrefix
+        );
     }
 }

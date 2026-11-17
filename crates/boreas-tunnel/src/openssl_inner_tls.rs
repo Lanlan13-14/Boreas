@@ -230,14 +230,18 @@ impl VerifiedNodeIdentity {
             return Err(TunnelError::Unsupported("identity network mismatch"));
         }
         if policy.overlay_base() != [10, 20, 0, 0] {
-            return Err(TunnelError::Unsupported("unsupported runtime network prefix"));
+            return Err(TunnelError::Unsupported(
+                "unsupported runtime network prefix",
+            ));
         }
         Self::from_validated_body(body, Some(*policy))
     }
 
     /// Explicitly unbound compatibility path for hop-only diagnostics. The
     /// resulting identity cannot authorize an E2E packet path.
-    pub fn from_verified_object_legacy_for_hop_only(object: &VerifiedObject) -> Result<Self, TunnelError> {
+    pub fn from_verified_object_legacy_for_hop_only(
+        object: &VerifiedObject,
+    ) -> Result<Self, TunnelError> {
         let body = verified_node_body(object)?;
         Self::from_validated_body(body, None)
     }
@@ -324,10 +328,18 @@ impl VerifiedNodeIdentity {
     pub fn peer_identity(&self) -> PeerIdentity {
         match self.policy {
             Some(policy) => PeerIdentity::policy_bound(
-                self.net_id, self.node_id, self.identity_generation, self.role, policy,
-            ).expect("validated identity and policy share network id"),
+                self.net_id,
+                self.node_id,
+                self.identity_generation,
+                self.role,
+                policy,
+            )
+            .expect("validated identity and policy share network id"),
             None => PeerIdentity::legacy_default(
-                self.net_id, self.node_id, self.identity_generation, self.role,
+                self.net_id,
+                self.node_id,
+                self.identity_generation,
+                self.role,
             ),
         }
     }
@@ -341,7 +353,9 @@ impl VerifiedNodeIdentity {
     }
 }
 
-fn verified_node_body(object: &VerifiedObject) -> Result<&boreas_proto::objects::NodeIdentity, TunnelError> {
+fn verified_node_body(
+    object: &VerifiedObject,
+) -> Result<&boreas_proto::objects::NodeIdentity, TunnelError> {
     let management = object.object();
     let ObjectBody::NodeIdentity(body) = &management.body else {
         return Err(TunnelError::Unsupported("not a NodeIdentity object"));
