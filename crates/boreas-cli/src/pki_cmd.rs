@@ -820,6 +820,97 @@ mod verify_policy_cli_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn verify_policy_cli_persists_equivocation_freeze_and_rejects_stale_state() {
+        use boreas_pki::network_policy_store::NetworkPolicyStore;
+
+        let dir = temp_dir();
+        let state = dir.join("policy.state");
+        let root = keys(&dir, "equiv-root");
+        let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
+            [3; 16],
+            root.2.clone(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            root.3.clone(),
+        )
+        .unwrap();
+        let fingerprint = pin.fingerprint().unwrap();
+        let now = now_utc_us().unwrap();
+        let candidate = |seq, expires| {
+            NetworkPolicyCandidate {
+                net_id: [3; 16],
+                root_key_fingerprint: fingerprint,
+                overlay_base: [10, 20, 0, 0],
+                version: 1,
+                seq,
+                issued_at: now.saturating_sub(60_000_000),
+                expires,
+            }
+            .encode_tbs()
+            .unwrap()
+        };
+        let run_candidate = |raw: &[u8], suffix: &str, extra: &[&str]| -> Result<(), String> {
+            let (ed, pq) = sign(&dir, &root, raw, suffix);
+            let mut args = write_material(&dir, raw, &ed, &pq, &root.2, &root.3);
+            args.extend([
+                "--record-state".into(),
+                "--state-file".into(),
+                state.to_string_lossy().into_owned(),
+            ]);
+            args.extend(extra.iter().map(|s| (*s).to_string()));
+            invoke(&args)
+        };
+
+        let first = candidate(7, now.saturating_add(60_000_000));
+        let (first_ed, first_pq) = sign(&dir, &root, &first, "equiv-first-readonly");
+        let readonly_args = write_material(&dir, &first, &first_ed, &first_pq, &root.2, &root.3);
+        assert!(invoke(&readonly_args).is_ok(), "default verification remains read-only");
+        assert!(!state.exists(), "default verification must not create durable state");
+        assert!(run_candidate(&first, "equiv-first", &["--expect-first-use"]).is_ok());
+        let hash = NetworkPolicyStore::open(&state, [3; 16], fingerprint, unsafe { libc::geteuid() })
+            .unwrap()
+            .current_object_hash()
+            .unwrap();
+        let hash_hex = boreas_pki::provisioning::hex_encode(&hash);
+
+        // Same sequence and prefix, but a different valid expiry produces a distinct signed TBS.
+        let conflicting = candidate(7, now.saturating_add(90_000_000));
+        assert!(run_candidate(
+            &conflicting,
+            "equiv-second",
+            &["--expect-seq", "7", "--expect-hash", &hash_hex]
+        )
+        .unwrap_err()
+        .contains("Equivocation"));
+        let frozen = NetworkPolicyStore::open(&state, [3; 16], fingerprint, unsafe { libc::geteuid() })
+            .unwrap();
+        assert!(frozen.is_frozen(), "equivocation freeze must survive reopen");
+        drop(frozen);
+        let higher = candidate(8, now.saturating_add(120_000_000));
+        assert!(run_candidate(
+            &higher,
+            "equiv-higher",
+            &["--expect-seq", "7", "--expect-hash", &hash_hex]
+        )
+        .is_err(), "a higher sequence must not clear the persisted freeze");
+
+        // A stale expected watermark must not initialize a deleted state file.
+        fs::remove_file(&state).unwrap();
+        assert!(run_candidate(
+            &first,
+            "equiv-deleted-state",
+            &["--expect-seq", "7", "--expect-hash", &hash_hex]
+        )
+        .is_err());
+        assert!(!state.exists(), "failed expected-watermark open must not recreate state");
+
+        // Missing expectation flags are rejected before any durable state is created.
+        assert!(run_candidate(&first, "equiv-no-expectation", &[]).is_err());
+        assert!(!state.exists(), "missing expectation must fail without writing state");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn verify_policy_cli_records_only_verified_candidates_against_expected_watermark() {
         use boreas_pki::network_policy_store::NetworkPolicyStore;
         let dir = temp_dir();
