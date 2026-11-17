@@ -283,7 +283,11 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
     use boreas_pki::provisioning::{hex_encode, parse_net_id_hex};
     use boreas_pki::{root_authorization::NetworkRootPin, verify_network_policy};
     use boreas_proto::objects::MldsaParameterSet;
-    use std::{collections::HashMap, io::Read, path::{Path, PathBuf}};
+    use std::{
+        collections::HashMap,
+        io::Read,
+        path::{Path, PathBuf},
+    };
 
     fn read_input(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>, String> {
         let meta = std::fs::symlink_metadata(path)
@@ -339,7 +343,13 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
         "--root-ed25519-der",
         "--root-mldsa65-der",
     ];
-    let record_flags = ["--record-state", "--state-file", "--expect-first-use", "--expect-seq", "--expect-hash"];
+    let record_flags = [
+        "--record-state",
+        "--state-file",
+        "--expect-first-use",
+        "--expect-seq",
+        "--expect-hash",
+    ];
     let mut values = HashMap::new();
     let mut record_state = false;
     let mut first_use = false;
@@ -347,10 +357,16 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
     while i < args.len() {
         let flag = args[i].as_str();
         if flag == "--record-state" || flag == "--expect-first-use" {
-            if (flag == "--record-state" && record_state) || (flag == "--expect-first-use" && first_use) {
+            if (flag == "--record-state" && record_state)
+                || (flag == "--expect-first-use" && first_use)
+            {
                 return Err(format!("pki verify-policy: duplicate argument `{flag}`"));
             }
-            if flag == "--record-state" { record_state = true; } else { first_use = true; }
+            if flag == "--record-state" {
+                record_state = true;
+            } else {
+                first_use = true;
+            }
             i += 1;
             continue;
         }
@@ -377,23 +393,47 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
     let state_path = values.get("--state-file").map(|s| PathBuf::from(*s));
     let seq_text = values.get("--expect-seq");
     let hash_text = values.get("--expect-hash");
-    let has_any_record = record_state || first_use || state_path.is_some() || seq_text.is_some() || hash_text.is_some();
-    if has_any_record && !record_state { return Err("pki verify-policy: record options require --record-state".into()); }
+    let has_any_record = record_state
+        || first_use
+        || state_path.is_some()
+        || seq_text.is_some()
+        || hash_text.is_some();
+    if has_any_record && !record_state {
+        return Err("pki verify-policy: record options require --record-state".into());
+    }
     let expected = if record_state {
-        let path = state_path.as_ref().ok_or("pki verify-policy: --state-file is required")?;
-        if !path.is_absolute() { return Err("pki verify-policy: --state-file must be absolute".into()); }
+        let path = state_path
+            .as_ref()
+            .ok_or("pki verify-policy: --state-file is required")?;
+        if !path.is_absolute() {
+            return Err("pki verify-policy: --state-file must be absolute".into());
+        }
         if first_use {
-            if seq_text.is_some() || hash_text.is_some() { return Err("pki verify-policy: --expect-first-use cannot mix with seq/hash".into()); }
+            if seq_text.is_some() || hash_text.is_some() {
+                return Err(
+                    "pki verify-policy: --expect-first-use cannot mix with seq/hash".into(),
+                );
+            }
             None
         } else {
-            let seq = seq_text.ok_or("pki verify-policy: expected watermark required")?.parse::<u64>().map_err(|_| "pki verify-policy: invalid --expect-seq")?;
+            let seq = seq_text
+                .ok_or("pki verify-policy: expected watermark required")?
+                .parse::<u64>()
+                .map_err(|_| "pki verify-policy: invalid --expect-seq")?;
             let hash = hash_text.ok_or("pki verify-policy: expected watermark required")?;
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("pki verify-policy: invalid --expect-hash".into()); }
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("pki verify-policy: invalid --expect-hash".into());
+            }
             let mut bytes = [0u8; 32];
-            for (i, pair) in hash.as_bytes().chunks_exact(2).enumerate() { bytes[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(|_| "pki verify-policy: invalid --expect-hash")?; }
+            for (i, pair) in hash.as_bytes().chunks_exact(2).enumerate() {
+                bytes[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .map_err(|_| "pki verify-policy: invalid --expect-hash")?;
+            }
             Some((seq, bytes))
         }
-    } else { None };
+    } else {
+        None
+    };
     let net_id = parse_net_id_hex(values["--net-id"])
         .map_err(|e| format!("pki verify-policy: invalid --net-id: {e}"))?;
     let tbs = read_input(Path::new(values["--tbs-file"]), 16 * 1024, "TBS")?;
@@ -431,22 +471,55 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
             let owner = unsafe { libc::geteuid() };
-            if !state_path.as_ref().unwrap().is_absolute() { return Err("pki verify-policy: state path must be absolute".into()); }
-            let mut store = boreas_pki::network_policy_store::NetworkPolicyStore::open_with_expected(state_path.as_ref().unwrap(), net_id, verified.root_key_fingerprint(), owner, expected)
+            if !state_path.as_ref().unwrap().is_absolute() {
+                return Err("pki verify-policy: state path must be absolute".into());
+            }
+            let mut store =
+                boreas_pki::network_policy_store::NetworkPolicyStore::open_with_expected(
+                    state_path.as_ref().unwrap(),
+                    net_id,
+                    verified.root_key_fingerprint(),
+                    owner,
+                    expected,
+                )
                 .map_err(|e| format!("pki verify-policy: state open failed: {e}"))?;
-            let result = store.commit(&verified, &tbs).map_err(|e| format!("pki verify-policy: state commit failed: {e}"))?;
-            let status = match result { boreas_pki::network_policy_store::CommitResult::Committed => "recorded", boreas_pki::network_policy_store::CommitResult::Duplicate => "duplicate" };
+            let result = store
+                .commit(&verified, &tbs)
+                .map_err(|e| format!("pki verify-policy: state commit failed: {e}"))?;
+            let status = match result {
+                boreas_pki::network_policy_store::CommitResult::Committed => "recorded",
+                boreas_pki::network_policy_store::CommitResult::Duplicate => "duplicate",
+            };
             let seq = store.sequence().unwrap_or(verified.seq());
-            let hash = hex_encode(&store.current_object_hash().ok_or("pki verify-policy: committed state has no hash")?);
+            let hash = hex_encode(
+                &store
+                    .current_object_hash()
+                    .ok_or("pki verify-policy: committed state has no hash")?,
+            );
             Some((status, seq, hash))
         }
         #[cfg(not(target_os = "linux"))]
-        { let _ = (expected, state_path); return Err("pki verify-policy: durable recording unsupported on this platform".into()); }
-    } else { None };
+        {
+            let _ = (expected, state_path);
+            return Err("pki verify-policy: durable recording unsupported on this platform".into());
+        }
+    } else {
+        None
+    };
     let durable_json = durable.map(|(status, seq, hash)| format!(",\"durable_record\":\"{status}\",\"durable_sequence\":{seq},\"object_hash\":\"{hash}\",\"prefix_active\":false")).unwrap_or_default();
     println!(
         "{{\"command\":\"pki.verify-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"overlay_base\":\"{}.{}.{}.{}\",\"version\":{},\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{},\"clock\":\"local-untrusted\",\"pin_provenance\":\"operator-supplied; verify independently\"{}}}",
-        hex_encode(&verified.net_id()), hex_encode(&verified.root_key_fingerprint()), overlay[0], overlay[1], overlay[2], overlay[3], verified.version(), verified.seq(), issued, expires, durable_json
+        hex_encode(&verified.net_id()),
+        hex_encode(&verified.root_key_fingerprint()),
+        overlay[0],
+        overlay[1],
+        overlay[2],
+        overlay[3],
+        verified.version(),
+        verified.seq(),
+        issued,
+        expires,
+        durable_json
     );
     Ok(())
 }
@@ -753,40 +826,101 @@ mod verify_policy_cli_tests {
         let state = dir.join("policy.state");
         let root = keys(&dir, "record-root");
         let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
-            [3; 16], root.2.clone(), boreas_proto::objects::MldsaParameterSet::Mldsa65, root.3.clone()
-        ).unwrap();
+            [3; 16],
+            root.2.clone(),
+            boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            root.3.clone(),
+        )
+        .unwrap();
         let now = now_utc_us().unwrap();
-        let candidate = |seq, issued, prefix, version| NetworkPolicyCandidate {
-            net_id: [3; 16], root_key_fingerprint: pin.fingerprint().unwrap(), overlay_base: prefix,
-            version, seq, issued_at: issued, expires: now + 60_000_000,
-        }.encode_tbs().unwrap();
+        let candidate = |seq, issued, prefix, version| {
+            NetworkPolicyCandidate {
+                net_id: [3; 16],
+                root_key_fingerprint: pin.fingerprint().unwrap(),
+                overlay_base: prefix,
+                version,
+                seq,
+                issued_at: issued,
+                expires: now + 60_000_000,
+            }
+            .encode_tbs()
+            .unwrap()
+        };
         let run_candidate = |raw: &[u8], suffix: &str, expected: &[&str]| -> Result<(), String> {
             let (ed, pq) = sign(&dir, &root, raw, suffix);
             let mut args = write_material(&dir, raw, &ed, &pq, &root.2, &root.3);
-            args.extend(["--record-state".into(), "--state-file".into(), state.to_string_lossy().into_owned()]);
+            args.extend([
+                "--record-state".into(),
+                "--state-file".into(),
+                state.to_string_lossy().into_owned(),
+            ]);
             args.extend(expected.iter().map(|x| (*x).to_string()));
             invoke(&args)
         };
-        let first = candidate(4, now.saturating_sub(60_000_000), [10,20,0,0], 1);
+        let first = candidate(4, now.saturating_sub(60_000_000), [10, 20, 0, 0], 1);
         assert!(run_candidate(&first, "record-first", &["--expect-first-use"]).is_ok());
         let fingerprint = pin.fingerprint().unwrap();
-        let store = NetworkPolicyStore::open(&state, [3;16], fingerprint, unsafe { libc::geteuid() }).unwrap();
+        let store =
+            NetworkPolicyStore::open(&state, [3; 16], fingerprint, unsafe { libc::geteuid() })
+                .unwrap();
         let hash = store.current_object_hash().unwrap();
-        assert_ne!(hash, [0u8; 32], "committed state exposes a nonzero object hash");
+        assert_ne!(
+            hash, [0u8; 32],
+            "committed state exposes a nonzero object hash"
+        );
         assert_eq!(store.sequence(), Some(4));
         drop(store);
         let hash_hex = boreas_pki::provisioning::hex_encode(&hash);
-        assert!(run_candidate(&first, "record-duplicate", &["--expect-seq", "4", "--expect-hash", &hash_hex]).is_ok());
-        let higher = candidate(5, now.saturating_sub(30_000_000), [10,20,0,0], 1);
-        assert!(run_candidate(&higher, "record-higher", &["--expect-seq", "4", "--expect-hash", &hash_hex]).is_ok());
-        let higher_hash = boreas_pki::provisioning::hex_encode(&NetworkPolicyStore::open(&state, [3;16], fingerprint, unsafe { libc::geteuid() }).unwrap().current_object_hash().unwrap());
-        let lower = candidate(3, now.saturating_sub(20_000_000), [10,20,0,0], 1);
-        assert!(run_candidate(&lower, "record-lower", &["--expect-seq", "5", "--expect-hash", &higher_hash]).is_err());
-        let conflict = candidate(6, now.saturating_sub(10_000_000), [10,21,0,0], 1);
-        assert!(run_candidate(&conflict, "record-conflict", &["--expect-seq", "5", "--expect-hash", &higher_hash]).is_err());
+        assert!(
+            run_candidate(
+                &first,
+                "record-duplicate",
+                &["--expect-seq", "4", "--expect-hash", &hash_hex]
+            )
+            .is_ok()
+        );
+        let higher = candidate(5, now.saturating_sub(30_000_000), [10, 20, 0, 0], 1);
+        assert!(
+            run_candidate(
+                &higher,
+                "record-higher",
+                &["--expect-seq", "4", "--expect-hash", &hash_hex]
+            )
+            .is_ok()
+        );
+        let higher_hash = boreas_pki::provisioning::hex_encode(
+            &NetworkPolicyStore::open(&state, [3; 16], fingerprint, unsafe { libc::geteuid() })
+                .unwrap()
+                .current_object_hash()
+                .unwrap(),
+        );
+        let lower = candidate(3, now.saturating_sub(20_000_000), [10, 20, 0, 0], 1);
+        assert!(
+            run_candidate(
+                &lower,
+                "record-lower",
+                &["--expect-seq", "5", "--expect-hash", &higher_hash]
+            )
+            .is_err()
+        );
+        let conflict = candidate(6, now.saturating_sub(10_000_000), [10, 21, 0, 0], 1);
+        assert!(
+            run_candidate(
+                &conflict,
+                "record-conflict",
+                &["--expect-seq", "5", "--expect-hash", &higher_hash]
+            )
+            .is_err()
+        );
         assert!(run_candidate(&higher, "record-missing-expect", &[]).is_err());
-        let final_store = NetworkPolicyStore::open(&state, [3;16], fingerprint, unsafe { libc::geteuid() }).unwrap();
-        assert_eq!(final_store.sequence(), Some(5), "refusals must not advance durable state");
+        let final_store =
+            NetworkPolicyStore::open(&state, [3; 16], fingerprint, unsafe { libc::geteuid() })
+                .unwrap();
+        assert_eq!(
+            final_store.sequence(),
+            Some(5),
+            "refusals must not advance durable state"
+        );
         drop(final_store);
         let _ = fs::remove_dir_all(dir);
     }
