@@ -370,6 +370,13 @@ impl StatusStore {
         if raw_signed.is_empty() || raw_signed.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::TooLarge);
         }
+        // Reject an unsupported revocation payload before the owned
+        // ManagementTrust records replay state. Otherwise a signed object we
+        // must refuse could still advance the verifier's replay slot and make a
+        // later legitimate snapshot look like equivocation.
+        if has_nonempty_revocation_payload(raw_signed) {
+            return Err(Error::BadStatus);
+        }
         let now = self.observe_trusted_utc(trusted_utc_us)?;
         let old = self.state.snapshot.clone();
 
@@ -811,6 +818,19 @@ struct ConflictCandidate {
     seq: u64,
     issued: u64,
     object_id: [u8; 32],
+}
+
+fn has_nonempty_revocation_payload(raw_signed: &[u8]) -> bool {
+    let Ok(signed) = SignedObject::decode(raw_signed) else {
+        return false;
+    };
+    let Ok(object) = objects::decode_tbs(&signed.raw_tbs) else {
+        return false;
+    };
+    matches!(
+        object.body,
+        ObjectBody::StatusSnapshot(body) if !body.revocations.is_empty()
+    )
 }
 
 fn decode_conflict_candidate(raw_signed: &[u8], net: [u8; 16]) -> Result<ConflictCandidate, Error> {
@@ -1439,6 +1459,14 @@ mod tests {
             store.current_fresh(1_500_000, Instant::now()),
             Err(Error::NotFresh)
         ));
+        // The rejected object must not have advanced the verifier replay slot:
+        // a valid empty-revocation snapshot at the same sequence is accepted.
+        let valid = signer.sign_snapshot(1_000_000, 2_000_000, 1, b"");
+        assert!(matches!(
+            store.accept_signed_snapshot(&valid, 1_500_000, Instant::now()),
+            Ok(SnapshotResult::Accepted)
+        ));
+        assert_eq!(store.sequence(), Some(1));
         fs::remove_dir_all(directory).unwrap();
     }
 

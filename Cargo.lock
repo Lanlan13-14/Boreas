@@ -24,6 +24,7 @@ dependencies = [
  "boreas-tun",
  "boreas-tunnel",
  "libc",
+ "openssl",
  "serde",
  "toml",
 ]

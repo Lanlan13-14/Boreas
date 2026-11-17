@@ -199,7 +199,7 @@ impl E2eTlsBackend for OpenSslE2eBackend {
 /// `boreas-pki`'s `ManagementTrust` already verified.
 ///
 /// There is deliberately no unchecked constructor: [`Self::from_verified_object`]
-/// accepts only a [`VerifiedObject`], rejects any other object body, and derives
+/// accepts only a [`VerifiedObject`] plus a [`boreas_pki::VerifiedNetworkContext`], rejects any other object body, and derives
 /// the expected SubjectPublicKeyInfo from the object's ML-DSA public key. An
 /// arbitrary `key + role` pair cannot be labelled "verified" through this API.
 ///
