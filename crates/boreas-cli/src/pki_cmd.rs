@@ -425,7 +425,7 @@ fn cmd_verify_policy(args: &[String]) -> Result<(), String> {
                 return Err("pki verify-policy: invalid --expect-hash".into());
             }
             let mut bytes = [0u8; 32];
-            for (i, pair) in hash.as_bytes().chunks_exact(2).enumerate() {
+            for (i, pair) in hash.as_bytes().as_chunks::<2>().0.iter().enumerate() {
                 bytes[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
                     .map_err(|_| "pki verify-policy: invalid --expect-hash")?;
             }
