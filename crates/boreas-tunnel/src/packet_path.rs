@@ -335,7 +335,7 @@ impl EndpointFacts {
             role: identity.role,
             vip,
             #[cfg(feature = "openssl-inner-tls")]
-            policy_digest: policy.policy_digest(),
+            policy_digest: identity.policy().ok_or(PacketPathError::PolicyMismatch)?.policy_digest(),
         })
     }
 }
@@ -357,6 +357,21 @@ fn permanent_vip(base: [u8; 4], node_id: u16, role: NodeRole) -> Option<Ipv4Addr
         return None;
     }
     Some(Ipv4Addr::new(base[0], base[1], home_core, vip_octet))
+}
+
+/// Derive a common private /16 from two policy-model endpoints. This pure
+/// helper grants no authentication; the business path obtains both addresses
+/// from the circuit's verified identities before calling it.
+fn base_from_endpoints(local: Ipv4Addr, peer: Ipv4Addr) -> Result<[u8; 4], PacketPathError> {
+    if !is_permanent_vip(local) || !is_permanent_vip(peer) {
+        return Err(PacketPathError::InvalidEndpointVip);
+    }
+    let local = local.octets();
+    let peer = peer.octets();
+    if local[..2] != peer[..2] {
+        return Err(PacketPathError::InvalidEndpointVip);
+    }
+    Ok([local[0], local[1], 0, 0])
 }
 
 /// Whether the address is a canonical private overlay node slot, independent
@@ -395,7 +410,7 @@ impl PointToPoint {
     ///
     /// Both addresses must be canonical permanent overlay VIPs and must differ:
     /// there is no way to express a subnet, a default route or a third address.
-    fn try_new(local: Ipv4Addr, peer: Ipv4Addr, mtu: usize) -> Result<Self, PacketPathError> {
+    pub fn try_new(local: Ipv4Addr, peer: Ipv4Addr, mtu: usize) -> Result<Self, PacketPathError> {
         Self::try_new_in(base_from_endpoints(local, peer)?, local, peer, mtu)
     }
 

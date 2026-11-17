@@ -351,10 +351,10 @@ impl VerifiedNodeIdentity {
     }
 }
 
-fn verified_node_body(
-    object: &VerifiedObject,
+fn verified_node_body<'a>(
+    object: &'a VerifiedObject,
     policy: Option<&boreas_pki::VerifiedNetworkContext>,
-) -> Result<&boreas_proto::objects::NodeIdentity, TunnelError> {
+) -> Result<&'a boreas_proto::objects::NodeIdentity, TunnelError> {
     let management = object.object();
     let ObjectBody::NodeIdentity(body) = &management.body else {
         return Err(TunnelError::Unsupported("not a NodeIdentity object"));

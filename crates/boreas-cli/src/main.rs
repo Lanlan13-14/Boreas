@@ -322,6 +322,7 @@ fn extract_lang_flag(raw_args: &[String]) -> Result<(Option<String>, Vec<String>
     Ok((lang, rest))
 }
 
+#[cfg(test)]
 fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
     run_with_columns(args, lang, stdout_tty, measured_columns(stdout_tty))
 }
