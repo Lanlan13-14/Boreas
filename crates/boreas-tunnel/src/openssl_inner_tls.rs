@@ -225,16 +225,13 @@ impl VerifiedNodeIdentity {
         object: &VerifiedObject,
         policy: &boreas_pki::VerifiedNetworkContext,
     ) -> Result<Self, TunnelError> {
-        let body = verified_node_body(object)?;
+        let body = verified_node_body(object, Some(policy))?;
         if body.net_id != policy.net_id() {
             return Err(TunnelError::Unsupported("identity network mismatch"));
         }
-        if policy.overlay_base() != [10, 20, 0, 0] {
-            return Err(TunnelError::Unsupported(
-                "unsupported runtime network prefix",
-            ));
-        }
-        Self::from_validated_body(body, Some(*policy))
+        let overlay = boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16)
+            .map_err(|_| TunnelError::Unsupported("non-private runtime network prefix"))?;
+        Self::from_validated_body(body, Some(*policy), overlay)
     }
 
     /// Explicitly unbound compatibility path for hop-only diagnostics. The
@@ -242,15 +239,16 @@ impl VerifiedNodeIdentity {
     pub fn from_verified_object_legacy_for_hop_only(
         object: &VerifiedObject,
     ) -> Result<Self, TunnelError> {
-        let body = verified_node_body(object)?;
-        Self::from_validated_body(body, None)
+        let body = verified_node_body(object, None)?;
+        Self::from_validated_body(body, None, boreas_pki::OverlayPrefix::DEFAULT)
     }
 
     fn from_validated_body(
         body: &boreas_proto::objects::NodeIdentity,
         policy: Option<boreas_pki::VerifiedNetworkContext>,
+        overlay: boreas_pki::OverlayPrefix,
     ) -> Result<Self, TunnelError> {
-        let expected_vip = boreas_pki::expected_vip(
+        let expected_vip = overlay.vip(
             body.home_core_id,
             body.vip[3],
             match body.role {
@@ -355,6 +353,7 @@ impl VerifiedNodeIdentity {
 
 fn verified_node_body(
     object: &VerifiedObject,
+    policy: Option<&boreas_pki::VerifiedNetworkContext>,
 ) -> Result<&boreas_proto::objects::NodeIdentity, TunnelError> {
     let management = object.object();
     let ObjectBody::NodeIdentity(body) = &management.body else {
@@ -368,7 +367,10 @@ fn verified_node_body(
         ObjectRole::Core => boreas_pki::NodeRole::Core,
         ObjectRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
     };
-    let vip = boreas_pki::expected_vip(body.home_core_id, body.vip[3], role)
+    let overlay = policy
+        .and_then(|policy| boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok())
+        .unwrap_or(boreas_pki::OverlayPrefix::DEFAULT);
+    let vip = overlay.vip(body.home_core_id, body.vip[3], role)
         .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
     if body.vip != vip {
         return Err(TunnelError::Unsupported("identity VIP mismatch"));

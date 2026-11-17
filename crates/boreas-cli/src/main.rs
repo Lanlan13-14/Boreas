@@ -22,13 +22,17 @@
 //! `boreas-easy` / `boreas console` is a **line-oriented** console: it prints
 //! the §10.4.1 box, prints a prompt, and reads one line per screen. There is no
 //! raw mode and no key-level input, so an abnormal exit cannot leave a terminal
-//! in a raw state (§10.4: `SIGKILL` cannot be made to run `Drop`). Non-TTY
-//! output stays JSON. Live status comes from the authorized Unix control
-//! socket; when that fails the screen says `offline` and shows the reason
-//! instead of inventing a mesh. Service start/stop run `systemctl` or
-//! `/etc/init.d/boreas` with an argument vector (no shell) and only after an
-//! exact typed phrase; security-mode changes, revocation and uninstall are
-//! refused. **G-UI is still not passed.**
+//! in a raw state (§10.4: `SIGKILL` cannot be made to run `Drop`). The box is
+//! 77 columns wide, so it is only drawn when the *measured* terminal width
+//! allows it: the width comes from `TIOCGWINSZ` / `GetConsoleScreenBufferInfo`,
+//! never from a Device Status Report (`ESC [ 6 n`) probe, so nothing is left in
+//! the operator's input queue. A narrower terminal gets the plain list instead
+//! of a ragged frame. Non-TTY output stays JSON. Live status comes from the
+//! authorized Unix control socket; when that fails the screen says `offline`
+//! and shows the reason instead of inventing a mesh. Service start/stop run
+//! `systemctl` or `/etc/init.d/boreas` with an argument vector (no shell) and
+//! only after an exact typed phrase; security-mode changes, revocation and
+//! uninstall are refused. **G-UI is still not passed.**
 
 mod config;
 mod daemon;
@@ -46,7 +50,9 @@ use std::process::ExitCode;
 
 use config::{Config, NodeRole, RuntimeCapabilities};
 use i18n::{Lang, Msg, lang_from_env, parse_lang, text};
-use render::{DaemonState, StatusSnapshot, render_status};
+use render::{
+    BOX_WIDTH, DaemonState, StatusSnapshot, fits_boxed, render_status, render_status_narrow,
+};
 use tui::{
     ConfigWizardStep, ConsoleEffect, ConsoleState, ConsoleView, DETAIL_ROWS, DangerAction,
     MenuModel, confirm_dangerous, render_menu, sanitize_line,
@@ -78,6 +84,127 @@ fn stdout_is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// Width of the terminal stdout is attached to, in columns, measured from the
+/// platform console itself.
+///
+/// Unix uses `TIOCGWINSZ` and Windows uses `GetConsoleScreenBufferInfo`; both
+/// report the size in kernel/driver state. No bytes are written to the terminal
+/// and no reply is parsed, so this never emits a Device Status Report
+/// (`ESC [ 6 n`) and cannot leave an unread reply in the operator's input
+/// queue. When stdout is not a terminal (or the probe fails) the answer is
+/// `None` and the caller keeps the fixed 77-column frame rather than guessing a
+/// narrower one (§10.4: no terminal is ever told it has 77 columns when it does
+/// not).
+#[cfg(unix)]
+fn terminal_columns() -> Option<usize> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = std::io::stdout().as_raw_fd();
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `TIOCGWINSZ` writes exactly one `struct winsize` through the
+    // pointer and reads nothing else; `size` is a live, properly aligned local.
+    let status = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
+    if status != 0 {
+        return None;
+    }
+    let columns = usize::from(size.ws_col);
+    (columns > 0).then_some(columns)
+}
+
+/// Windows: the visible window rectangle, not the scrollback buffer, is the
+/// width the operator can see. The two kernel32 imports are declared locally so
+/// this crate keeps its existing dependency set.
+#[cfg(windows)]
+fn terminal_columns() -> Option<usize> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(
+        dead_code,
+        reason = "layout mirror of COORD; kept only so the record size matches the SDK"
+    )]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(
+        dead_code,
+        reason = "layout mirror of SMALL_RECT; only left/right (the visible width) are read"
+    )]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+
+    /// `CONSOLE_SCREEN_BUFFER_INFO`, in the order and layout of the SDK header.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(
+        dead_code,
+        reason = "layout mirror of CONSOLE_SCREEN_BUFFER_INFO; only the window rect is read"
+    )]
+    struct ScreenBufferInfo {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: SmallRect,
+        maximum_window: Coord,
+    }
+
+    /// `(DWORD)-11`, the documented value of `STD_OUTPUT_HANDLE`.
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetConsoleScreenBufferInfo(
+            console: *mut c_void,
+            info: *mut ScreenBufferInfo,
+        ) -> i32;
+    }
+
+    // SAFETY: `GetStdHandle` takes a constant selector and returns a handle this
+    // code only null-checks and hands back to the console API, which validates
+    // it. `GetConsoleScreenBufferInfo` writes exactly one
+    // `CONSOLE_SCREEN_BUFFER_INFO` into the out-pointer; the local `#[repr(C)]`
+    // mirror above has the SDK layout and size, so the write stays in bounds.
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() {
+            return None;
+        }
+        let mut info = ScreenBufferInfo::default();
+        if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+            return None;
+        }
+        let width = i32::from(info.window.right) - i32::from(info.window.left) + 1;
+        usize::try_from(width).ok().filter(|columns| *columns > 0)
+    }
+}
+
+/// Neither Unix nor Windows: the width is unknown, so the caller keeps the
+/// fixed frame. No probe is attempted.
+#[cfg(not(any(unix, windows)))]
+fn terminal_columns() -> Option<usize> {
+    None
+}
+
+/// Measured columns, but only when stdout really is a terminal: a redirected
+/// stream has no size and must stay on the JSON path.
+fn measured_columns(stdout_tty: bool) -> Option<usize> {
+    if stdout_tty { terminal_columns() } else { None }
+}
+
 /// True when argv[0]'s file name is `boreas-easy` (the console symlink of
 /// §10.5). Directory components and a trailing `.exe` are ignored.
 fn is_easy_entrypoint(argv0: &str) -> bool {
@@ -98,7 +225,8 @@ fn runtime_capabilities() -> RuntimeCapabilities {
 }
 
 /// Testable entry point: resolves the `boreas-easy` argv[0] alias, strips
-/// the global `--lang` option, then hands off to [`run`].
+/// the global `--lang` option, then hands off to [`run_with_columns`] with the
+/// terminal width measured once (see [`terminal_columns`]).
 ///
 /// `boreas-easy` with no subcommand enters the line-mode console, which is
 /// interactive on a TTY and JSON otherwise (see [`run_console`]).
@@ -107,6 +235,25 @@ fn dispatch(
     raw_args: &[String],
     lang_probe: impl Fn(Option<&str>) -> Lang,
     stdout_tty: bool,
+) -> (u8, String, String) {
+    dispatch_with_columns(
+        argv0,
+        raw_args,
+        lang_probe,
+        stdout_tty,
+        measured_columns(stdout_tty),
+    )
+}
+
+/// [`dispatch`] with the terminal width supplied by the caller, so the whole
+/// entry path (including the `boreas-easy` alias) is testable without a real
+/// terminal.
+fn dispatch_with_columns(
+    argv0: &str,
+    raw_args: &[String],
+    lang_probe: impl Fn(Option<&str>) -> Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
 ) -> (u8, String, String) {
     let (cli_lang, args) = match extract_lang_flag(raw_args) {
         Ok(pair) => pair,
@@ -122,9 +269,18 @@ fn dispatch(
     {
         let mut console_args = vec!["console".to_string()];
         console_args.extend(args);
-        return run(&console_args, lang, stdout_tty);
+        return run_with_columns(&console_args, lang, stdout_tty, columns);
     }
-    run(&args, lang, stdout_tty)
+    run_with_columns(&args, lang, stdout_tty, columns)
+}
+
+/// Echo an operator-supplied argv value into a diagnostic without letting a
+/// control character reach the terminal. `?` replaces every control, exactly
+/// as [`sanitize_line`] does for screen fields (§10.4 terminal-injection
+/// defense): a hostile argument must never be able to emit `ESC [ 31 m` into
+/// stderr just because it was rejected.
+fn sanitize_arg(value: &str) -> String {
+    sanitize_line(value)
 }
 
 /// Extract a global `--lang <tag>` / `--lang=<tag>` option (at most one).
@@ -159,13 +315,26 @@ fn extract_lang_flag(raw_args: &[String]) -> Result<(Option<String>, Vec<String>
         && parse_lang(tag).is_none()
     {
         return Err(format!(
-            "error: unsupported language `{tag}`; expected zh-CN, zh-TW or en"
+            "error: unsupported language `{}`; expected zh-CN, zh-TW or en",
+            sanitize_arg(tag)
         ));
     }
     Ok((lang, rest))
 }
 
 fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+    run_with_columns(args, lang, stdout_tty, measured_columns(stdout_tty))
+}
+
+/// [`run`] with the measured terminal width supplied by the caller. Every
+/// screen decision (77-column frame, narrow list, JSON) is made from these two
+/// facts, which is what makes the degraded paths testable without a terminal.
+fn run_with_columns(
+    args: &[String],
+    lang: Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
+) -> (u8, String, String) {
     match args.first().map(String::as_str) {
         None | Some("doctor") | Some("self-check") if args.len() <= 1 => {
             (0, doctor_json(), String::new())
@@ -175,9 +344,9 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
             String::new(),
             "error: unexpected argument; run `boreas help`".into(),
         ),
-        Some("status") => run_status(&args[1..], lang, stdout_tty),
-        Some("menu") => run_menu(&args[1..], lang, stdout_tty),
-        Some("console") => run_console(&args[1..], lang, stdout_tty),
+        Some("status") => run_status(&args[1..], lang, stdout_tty, columns),
+        Some("menu") => run_menu(&args[1..], lang, stdout_tty, columns),
+        Some("console") => run_console(&args[1..], lang, stdout_tty, columns),
         Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
@@ -218,15 +387,24 @@ fn run(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
         Some(command) => (
             2,
             String::new(),
-            format!("error: unknown or unavailable command `{command}`; no daemon was started"),
+            format!(
+                "error: unknown or unavailable command `{}`; no daemon was started",
+                sanitize_arg(command)
+            ),
         ),
     }
 }
 
 /// `status [--json]`: render the offline status snapshot. There is no
 /// daemon to ask yet, so the snapshot is [`StatusSnapshot::offline`] and
-/// says so. Non-TTY output (or an explicit `--json`) is JSON (§10.4).
-fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+/// says so. Non-TTY output (or an explicit `--json`) is JSON (§10.4); a
+/// terminal measured narrower than the 77-column frame gets the plain list.
+fn run_status(
+    args: &[String],
+    lang: Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
+) -> (u8, String, String) {
     let mut json = false;
     let mut socket_path: Option<std::path::PathBuf> = None;
     let mut i = 0;
@@ -251,7 +429,10 @@ fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Str
                 return (
                     2,
                     String::new(),
-                    format!("error: unexpected argument `{other}`; run `boreas help`"),
+                    format!(
+                        "error: unexpected argument `{}`; run `boreas help`",
+                        sanitize_arg(other)
+                    ),
                 );
             }
         }
@@ -267,17 +448,26 @@ fn run_status(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Str
     };
     if json || !stdout_tty {
         (0, snapshot.to_json(lang), String::new())
-    } else {
+    } else if fits_boxed(columns) {
         (0, render_status(&snapshot, lang), String::new())
+    } else {
+        let width = columns.unwrap_or(BOX_WIDTH).min(BOX_WIDTH);
+        (0, render_status_narrow(&snapshot, lang, width), String::new())
     }
 }
 
 /// `menu [--json] [--narrow]`: render the §10.4.1 nine-entry screen from an
 /// offline model. Non-TTY or `--json` prints JSON with `"daemon": false`.
-/// `--narrow` prints the degraded list. A non-empty `NO_COLOR` is read only
+/// `--narrow` prints the degraded list, and so does a terminal measured
+/// narrower than the 77-column frame. A non-empty `NO_COLOR` is read only
 /// here and only sets `no_color`; this command never emits color either way.
 /// No control socket is opened and no live mesh is invented.
-fn run_menu(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+fn run_menu(
+    args: &[String],
+    lang: Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
+) -> (u8, String, String) {
     let mut json = false;
     let mut narrow = false;
     for arg in args {
@@ -288,13 +478,16 @@ fn run_menu(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, Strin
                 return (
                     2,
                     String::new(),
-                    format!("error: unexpected argument `{other}`; run `boreas help`"),
+                    format!(
+                        "error: unexpected argument `{}`; run `boreas help`",
+                        sanitize_arg(other)
+                    ),
                 );
             }
         }
     }
     let mut model = MenuModel::offline(env!("CARGO_PKG_VERSION"), lang);
-    model.narrow = narrow;
+    model.narrow = narrow || !fits_boxed(columns);
     model.no_color = no_color_set();
     if json || !stdout_tty {
         return (0, model.to_json(), String::new());
@@ -348,8 +541,38 @@ fn take_flag_value(args: &[String], index: usize, flag: &str) -> Result<String, 
 ///
 /// On a TTY this reads one line per screen from stdin; otherwise (`--json` or
 /// no TTY) it prints one JSON object and returns, so scripts and pipes never
-/// hang waiting for input.
-fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, String) {
+/// hang waiting for input. The 77-column frame is only drawn when the measured
+/// terminal width allows it (see [`terminal_columns`]); a narrower terminal
+/// gets the plain list and a one-line notice.
+fn run_console(
+    args: &[String],
+    lang: Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
+) -> (u8, String, String) {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+    run_console_with(args, lang, stdout_tty, columns, &mut reader, &mut writer)
+}
+
+/// [`run_console`] with the streams supplied by the caller. This is the same
+/// production path (argument parsing, control-socket probe, width decision,
+/// `drive_console`); tests hand it a byte reader and a buffer so the painted
+/// screens can be asserted without a terminal.
+fn run_console_with<R, W>(
+    args: &[String],
+    lang: Lang,
+    stdout_tty: bool,
+    columns: Option<usize>,
+    reader: &mut R,
+    writer: &mut W,
+) -> (u8, String, String)
+where
+    R: BufRead,
+    W: Write,
+{
     let mut options = ConsoleOptions {
         socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
         config: PathBuf::from(DEFAULT_CONFIG_PATH),
@@ -386,7 +609,10 @@ fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, St
                 return (
                     2,
                     String::new(),
-                    format!("error: unexpected argument `{other}`; run `boreas help`"),
+                    format!(
+                        "error: unexpected argument `{}`; run `boreas help`",
+                        sanitize_arg(other)
+                    ),
                 );
             }
         }
@@ -406,11 +632,20 @@ fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, St
         return (0, body, String::new());
     }
 
+    // The measured width decides the layout; an explicit `--narrow` always
+    // wins, and an unmeasured width keeps the frame. Only the width-forced
+    // degradation is announced, so an explicit `--narrow` stays silent.
+    let narrowed_by_width = !options.narrow && !fits_boxed(columns);
+
     let mut state = ConsoleState::new(lang, live);
     state.node_name = sanitize_line(&snapshot.node_name);
-    state.narrow = options.narrow;
+    state.narrow = options.narrow || narrowed_by_width;
     state.no_color = no_color_set();
     state.service_name = sanitize_line(&preview_unit(&options));
+
+    if narrowed_by_width && writeln!(writer, "{}", text(lang, Msg::NarrowNotice)).is_err() {
+        return (2, String::new(), "error: console write failed".into());
+    }
 
     let mut io = ConsoleIo {
         socket: options.socket,
@@ -418,18 +653,11 @@ fn run_console(args: &[String], lang: Lang, stdout_tty: bool) -> (u8, String, St
         service: options.service,
     };
 
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-    let outcome = drive_console(
-        &mut state,
-        &mut reader,
-        &mut writer,
-        |effect, effect_lang| io.perform(effect, effect_lang),
-    );
+    let outcome = drive_console(&mut state, reader, &mut *writer, |effect, effect_lang| {
+        io.perform(effect, effect_lang)
+    });
     // Leave the shell prompt on a fresh line; no terminal mode was changed.
-    let _ = writeln!(&mut writer);
+    let _ = writeln!(writer);
 
     match outcome {
         Ok(()) => (0, String::new(), String::new()),
@@ -1130,11 +1358,13 @@ fn parse_danger_action(raw: &str) -> Result<DangerAction, String> {
             return Ok(DangerAction::Revoke { node_id });
         }
         return Err(format!(
-            "error: revoke id must be a decimal integer; got `{id}`"
+            "error: revoke id must be a decimal integer; got `{}`",
+            sanitize_arg(id)
         ));
     }
     Err(format!(
-        "error: unknown confirm action `{raw}`; expected hop-only, revoke:<id> or uninstall"
+        "error: unknown confirm action `{}`; expected hop-only, revoke:<id> or uninstall",
+        sanitize_arg(raw)
     ))
 }
 
@@ -1260,6 +1490,7 @@ fn help_text() -> String {
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\
      \x20 boreas menu [--narrow]    offline 9-entry screen (JSON when not a TTY)\n\
+     \x20                          a terminal under 77 columns gets the plain list anyway\n\
      \x20 boreas console           line-mode console on a TTY; one JSON object otherwise\n\
      \x20   --socket <PATH>        control socket (default /run/boreas/control.sock)\n\
      \x20   --config <FILE>        config to validate (default /etc/boreas/config.toml)\n\
@@ -1316,10 +1547,14 @@ fn doctor_json() -> String {
 mod tests {
     use super::{
         ConfigWizardStep, ConsoleEffect, ConsoleIo, ConsoleOutcome, ConsoleState, drive_console,
-        run_console,
+        run_console, run_console_with,
     };
-    use super::{Lang, dispatch, extract_lang_flag, is_easy_entrypoint, run};
+    use super::{
+        Lang, dispatch, dispatch_with_columns, extract_lang_flag, is_easy_entrypoint, run,
+        run_with_columns,
+    };
     use crate::config::RuntimeCapabilities;
+    use crate::render::{BOX_WIDTH, display_width};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).into()).collect()
@@ -1722,7 +1957,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         // NO_COLOR (§10.4) is honored by construction: this slice never
         // emits ANSI escapes, with or without the variable set.
         for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
-            let (code, stdout, stderr) = run(&args(&["status"]), lang, true);
+            // Explicit width: the assertion must not depend on the width of
+            // whatever terminal happens to run the test.
+            let (code, stdout, stderr) =
+                run_with_columns(&args(&["status"]), lang, true, Some(80));
             assert_eq!(code, 0);
             assert!(stderr.is_empty());
             assert!(stdout.contains("BOREAS CONSOLE"));
@@ -1824,7 +2062,8 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn menu_tty_is_boxed_and_narrow_is_not() {
-        let (code, stdout, stderr) = run(&args(&["menu"]), Lang::En, true);
+        let (code, stdout, stderr) =
+            run_with_columns(&args(&["menu"]), Lang::En, true, Some(80));
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert!(stdout.contains("BOREAS CONSOLE"));
@@ -1832,7 +2071,8 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(!stdout.as_bytes().contains(&0x1B));
         assert_eq!(stdout.split('\n').count(), 18);
 
-        let (code, narrow, _) = run(&args(&["menu", "--narrow"]), Lang::En, true);
+        let (code, narrow, _) =
+            run_with_columns(&args(&["menu", "--narrow"]), Lang::En, true, Some(80));
         assert_eq!(code, 0);
         assert!(!narrow.contains('┌'));
         assert!(narrow.contains("[1]"));
@@ -1847,6 +2087,87 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(stdout.contains("\"narrow\":true"));
         assert!(stdout.contains("\"daemon\":false"));
         assert!(stdout.contains("\"lang\":\"zh-TW\""));
+    }
+
+    /// The 77x18 frame is only produced when the measured width allows it.
+    /// This drives the real `menu` entry point (`run_with_columns`) rather
+    /// than the render model, so the width decision itself is under test.
+    #[test]
+    fn menu_frame_requires_a_measured_width_of_77_columns_in_three_languages() {
+        for (lang, label, entry) in [
+            (Lang::ZhCn, "[L] 简中", "实时链路遥测"),
+            (Lang::ZhTw, "[L] 繁中", "即時鏈路遙測"),
+            (Lang::En, "[L] EN", "Live Telemetry"),
+        ] {
+            let (code, stdout, stderr) = run_with_columns(&args(&["menu"]), lang, true, Some(80));
+            assert_eq!(code, 0, "{stderr}");
+            let lines: Vec<&str> = stdout.split('\n').collect();
+            assert_eq!(lines.len(), 18, "{lang:?}: {stdout}");
+            for line in &lines {
+                assert_eq!(display_width(line), BOX_WIDTH, "{lang:?}: {line:?}");
+                assert!(!line.as_bytes().contains(&0x1B), "{lang:?}");
+            }
+            assert!(stdout.contains(label), "{lang:?}: {stdout}");
+            assert!(stdout.contains(entry), "{lang:?}: {stdout}");
+        }
+
+        // Exactly 77 columns is enough; one column less is not.
+        let (_, at_boundary, _) = run_with_columns(&args(&["menu"]), Lang::En, true, Some(77));
+        assert_eq!(at_boundary.split('\n').count(), 18);
+        assert!(at_boundary.contains('┌'));
+
+        for narrow_width in [76usize, 60, 40, 20] {
+            let (code, stdout, stderr) =
+                run_with_columns(&args(&["menu"]), Lang::En, true, Some(narrow_width));
+            assert_eq!(code, 0, "{stderr}");
+            assert!(!stdout.contains('┌'), "{narrow_width}: {stdout}");
+            assert!(!stdout.contains('│'), "{narrow_width}: {stdout}");
+            assert!(stdout.contains("[1] Live Telemetry"), "{narrow_width}");
+            assert!(stdout.lines().count() < 18, "{narrow_width}");
+            assert!(!stdout.as_bytes().contains(&0x1B));
+        }
+    }
+
+    #[test]
+    fn menu_json_reports_the_same_width_decision_as_the_screen() {
+        let (code, wide, _) =
+            run_with_columns(&args(&["menu", "--json"]), Lang::En, true, Some(80));
+        assert_eq!(code, 0);
+        assert!(wide.starts_with('{'));
+        assert!(wide.contains("\"narrow\":false"), "{wide}");
+        assert!(wide.contains("\"daemon\":false"));
+
+        let (code, narrow, _) =
+            run_with_columns(&args(&["menu", "--json"]), Lang::En, true, Some(40));
+        assert_eq!(code, 0);
+        assert!(narrow.contains("\"narrow\":true"), "{narrow}");
+    }
+
+    #[test]
+    fn status_frame_requires_a_measured_width_of_77_columns() {
+        let (code, wide, stderr) = run_with_columns(&args(&["status"]), Lang::En, true, Some(80));
+        assert_eq!(code, 0, "{stderr}");
+        assert!(wide.contains('┌'));
+        assert!(wide.contains("daemon: not connected"));
+        for line in wide.split('\n') {
+            assert_eq!(display_width(line), BOX_WIDTH, "{line:?}");
+        }
+
+        for narrow_width in [76usize, 40] {
+            let (code, narrow, stderr) =
+                run_with_columns(&args(&["status"]), Lang::En, true, Some(narrow_width));
+            assert_eq!(code, 0, "{stderr}");
+            assert!(!narrow.contains('┌'), "{narrow_width}");
+            assert!(narrow.contains("BOREAS CONSOLE"));
+            assert!(narrow.contains("daemon: not connected"));
+            for line in narrow.split('\n') {
+                assert!(
+                    display_width(line) <= narrow_width,
+                    "{narrow_width}: {line:?}"
+                );
+            }
+            assert!(!narrow.as_bytes().contains(&0x1B));
+        }
     }
 
     #[test]
@@ -1900,6 +2221,43 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     #[test]
+    fn rejected_arguments_never_echo_control_characters() {
+        // Rejecting a hostile argument must not paint it: the diagnostic that
+        // names the argument is sanitized exactly like a screen field (§10.4).
+        let hostile = "\u{1b}[31m";
+        for argv in [
+            args(&["status", hostile]),
+            args(&["menu", hostile]),
+            args(&["console", hostile]),
+            args(&["confirm", hostile, "x"]),
+            args(&["confirm", "revoke:", "REVOKE 1"]),
+            args(&["confirm", "revoke:\u{1b}[31m", "REVOKE 1"]),
+            args(&[hostile]),
+        ] {
+            let (code, stdout, stderr) = run(&argv, Lang::En, false);
+            assert_eq!(code, 2, "{argv:?}");
+            assert!(stderr.starts_with("error:"), "{argv:?}: {stderr:?}");
+            assert!(
+                !stderr.as_bytes().contains(&0x1B),
+                "stderr echoed an escape for {argv:?}: {stderr:?}"
+            );
+            assert!(!stdout.as_bytes().contains(&0x1B), "{argv:?}");
+        }
+
+        // `--lang` is stripped before dispatch; its error path echoes the tag.
+        let (code, stdout, stderr) = dispatch(
+            "boreas",
+            &args(&["--lang", "\u{1b}[31m", "status"]),
+            probe_en,
+            false,
+        );
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(!stderr.as_bytes().contains(&0x1B), "{stderr:?}");
+        assert!(stderr.contains("unsupported language"), "{stderr:?}");
+    }
+
+    #[test]
     fn easy_still_accepts_explicit_commands() {
         let (code, stdout, _) = dispatch("boreas-easy", &args(&["doctor"]), probe_en, false);
         assert_eq!(code, 0);
@@ -1921,7 +2279,7 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn console_non_tty_is_json_and_does_not_read_any_stdin() {
-        let (code, stdout, stderr) = run_console(&[], Lang::En, false);
+        let (code, stdout, stderr) = run_console(&[], Lang::En, false, None);
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert!(stdout.starts_with("{\"command\":\"console\""));
@@ -1940,6 +2298,7 @@ uplinks = ["wss://hub-us-c.example.net"]
             &args(&["--socket", missing.to_str().expect("utf8 temp path")]),
             Lang::En,
             false,
+            None,
         );
         assert_eq!(code, 0, "{stderr}");
         assert!(stdout.contains("\"command\":\"console\""));
@@ -1955,18 +2314,18 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn console_rejects_unknown_and_valueless_arguments() {
-        let (code, stdout, stderr) = run_console(&args(&["--socket"]), Lang::En, false);
+        let (code, stdout, stderr) = run_console(&args(&["--socket"]), Lang::En, false, None);
         assert_eq!(code, 2);
         assert!(stdout.is_empty());
         assert!(stderr.contains("requires a value"), "{stderr}");
 
         for flag in ["--config", "--service"] {
-            let (code, _, stderr) = run_console(&args(&[flag]), Lang::En, false);
+            let (code, _, stderr) = run_console(&args(&[flag]), Lang::En, false, None);
             assert_eq!(code, 2, "{flag}");
             assert!(stderr.contains("requires a value"), "{flag}");
         }
 
-        let (code, stdout, stderr) = run_console(&args(&["--nope"]), Lang::En, false);
+        let (code, stdout, stderr) = run_console(&args(&["--nope"]), Lang::En, false, None);
         assert_eq!(code, 2);
         assert!(stdout.is_empty());
         assert!(stderr.contains("unexpected argument"), "{stderr}");
@@ -1979,12 +2338,211 @@ uplinks = ["wss://hub-us-c.example.net"]
             &args(&["--socket", weird.to_str().expect("utf8 temp path")]),
             Lang::En,
             false,
+            None,
         );
         assert_eq!(code, 0);
         assert!(
             stdout.contains("\\\"q\\\""),
             "socket path must be JSON-escaped: {stdout}"
         );
+    }
+
+    /// Reader that fails the test if anything reads it: the JSON paths must
+    /// never consume stdin, and `--json` on a TTY must never enter the loop.
+    struct NeverRead;
+
+    impl std::io::Read for NeverRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin must not be read for JSON output");
+        }
+    }
+
+    impl std::io::BufRead for NeverRead {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            panic!("stdin must not be read for JSON output");
+        }
+
+        fn consume(&mut self, _amount: usize) {
+            panic!("stdin must not be read for JSON output");
+        }
+    }
+
+    /// Absent socket path under the temp dir: the console must report
+    /// `offline` and still paint, instead of pretending a daemon answered.
+    fn absent_socket_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "boreas-console-{tag}-{}-{}.sock",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Paint the console through the real entry point with a scripted reader.
+    /// Returns `(exit code, stdout JSON half, painted screen bytes, stderr)`.
+    fn run_scripted_console(
+        argv: &[&str],
+        lang: Lang,
+        columns: Option<usize>,
+        input: &[u8],
+    ) -> (u8, String, String, String) {
+        use std::io::BufReader;
+        let mut reader = BufReader::new(input);
+        let mut out = Vec::new();
+        let (code, stdout, stderr) =
+            run_console_with(&args(argv), lang, true, columns, &mut reader, &mut out);
+        let painted = String::from_utf8(out).unwrap_or_else(|error| panic!("utf8: {error}"));
+        (code, stdout, painted, stderr)
+    }
+
+    /// Painted screen bytes for a successful run.
+    fn painted_screen(argv: &[&str], lang: Lang, columns: Option<usize>, input: &[u8]) -> String {
+        let (code, stdout, painted, stderr) = run_scripted_console(argv, lang, columns, input);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.is_empty(), "the TTY path paints instead of printing JSON");
+        painted
+    }
+
+    #[test]
+    fn console_paints_the_77_by_18_frame_when_the_width_allows_it() {
+        let socket = absent_socket_path("frame");
+        let painted = painted_screen(
+            &["--socket", socket.to_str().expect("utf8 temp path")],
+            Lang::En,
+            Some(80),
+            b"q\n",
+        );
+        let screen: Vec<&str> = painted.lines().take(18).collect();
+        assert_eq!(screen.len(), 18, "{painted}");
+        for line in &screen {
+            assert_eq!(display_width(line), BOX_WIDTH, "{line:?}");
+        }
+        assert!(painted.contains("BOREAS CONSOLE"));
+        assert!(painted.contains("> [1] Live Telemetry"));
+        assert!(
+            !painted.as_bytes().contains(&0x1B),
+            "no ANSI, so no DSR/CPR probe can be written"
+        );
+        assert!(!painted.contains("[6n"), "no Device Status Report is issued");
+        assert!(!painted.contains("narrow list"), "the frame needs no notice");
+    }
+
+    #[test]
+    fn console_announces_the_narrow_list_below_77_columns() {
+        let painted = painted_screen(&[], Lang::ZhCn, Some(40), b"q\n");
+        assert!(
+            painted.starts_with("终端宽度不足 77 列"),
+            "the degradation must say why: {painted}"
+        );
+        assert!(!painted.contains('┌'), "{painted}");
+        assert!(!painted.contains('│'), "{painted}");
+        assert!(painted.contains("[1] 实时链路遥测"), "{painted}");
+        assert!(!painted.as_bytes().contains(&0x1B));
+
+        // An explicit --narrow needs no notice: the operator asked for it.
+        let explicit = painted_screen(&["--narrow"], Lang::ZhCn, Some(80), b"q\n");
+        assert!(!explicit.contains("窄列表"), "{explicit}");
+        assert!(!explicit.contains('┌'), "{explicit}");
+    }
+
+    #[test]
+    fn console_keeps_the_frame_when_the_width_was_never_measured() {
+        // No width and no terminal size: the fixed frame is kept instead of
+        // silently replacing every screen with a list.
+        let painted = painted_screen(&[], Lang::En, None, b"q\n");
+        assert!(painted.contains('┌'), "{painted}");
+        assert!(painted.contains("> [1] Live Telemetry"));
+        assert!(
+            painted.lines().nth(17).is_some_and(|line| line.ends_with('┘')),
+            "the 18th line must be the bottom border: {painted}"
+        );
+    }
+
+    #[test]
+    fn console_cycles_through_three_languages_in_the_real_flow() {
+        let painted = painted_screen(&[], Lang::ZhCn, Some(80), b"L\nL\nq\n");
+        assert_eq!(painted.matches("BOREAS CONSOLE").count(), 3, "{painted}");
+        assert!(painted.contains("[L] 简中"), "{painted}");
+        assert!(painted.contains("[L] 繁中"), "{painted}");
+        assert!(painted.contains("[L] EN"), "{painted}");
+        assert!(painted.contains("实时链路遥测"));
+        assert!(painted.contains("即時鏈路遙測"));
+        assert!(painted.contains("Live Telemetry"));
+        assert!(!painted.as_bytes().contains(&0x1B));
+        for line in painted.lines().take(54) {
+            if line.starts_with(['│', '┌', '├', '└']) {
+                assert_eq!(display_width(line), BOX_WIDTH, "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn console_json_paths_never_read_stdin_nor_paint() {
+        let mut out = Vec::new();
+        let (code, stdout, stderr) =
+            run_console_with(&[], Lang::En, false, None, &mut NeverRead, &mut out);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.starts_with("{\"command\":\"console\""), "{stdout}");
+        assert!(out.is_empty());
+
+        // `--json` on a TTY takes the same path: JSON out, no screen, no read.
+        let mut tty_out = Vec::new();
+        let (code, stdout, stderr) = run_console_with(
+            &args(&["--json"]),
+            Lang::En,
+            true,
+            Some(80),
+            &mut NeverRead,
+            &mut tty_out,
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.starts_with("{\"command\":\"console\""), "{stdout}");
+        assert!(stdout.contains("\"lang\":\"en\""));
+        assert!(tty_out.is_empty(), "JSON mode must not paint a screen");
+    }
+
+    #[test]
+    fn easy_alias_routes_the_console_through_the_width_aware_path() {
+        let easy = dispatch_with_columns(
+            "boreas-easy",
+            &args(&["--json"]),
+            probe_en,
+            true,
+            Some(80),
+        );
+        assert_eq!(easy.0, 0);
+        assert!(easy.1.starts_with("{\"command\":\"console\""), "{:?}", easy.1);
+        // The alias must resolve to the same path as the explicit subcommand.
+        assert_eq!(
+            easy,
+            run_with_columns(
+                &args(&["console", "--json"]),
+                Lang::En,
+                true,
+                Some(80)
+            )
+        );
+    }
+
+    #[test]
+    fn console_rejects_injected_wizard_input_without_echoing_it() {
+        let path = write_fixture("wizard-inject", &config_source());
+        let (code, stdout, painted, stderr) = run_scripted_console(
+            &["--config", path.to_str().expect("utf8 fixture")],
+            Lang::En,
+            Some(80),
+            b"8\n\n4\n1\nhost\x1b[31m.example:443\nq\n",
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.is_empty());
+        assert!(painted.contains("Input rejected"), "{painted}");
+        assert!(
+            !painted.as_bytes().contains(&0x1B),
+            "the escape must not be echoed: {painted:?}"
+        );
+        assert!(!painted.contains("31m"), "{painted}");
     }
 
     #[test]
@@ -2353,6 +2911,7 @@ uplinks = ["wss://hub-us-c.example.net"]
             &args(&["--socket", socket_path.to_str().expect("utf8 socket")]),
             Lang::En,
             false,
+            None,
         );
 
         let finished = match done_rx.recv_timeout(JOIN_TIMEOUT) {
@@ -2374,5 +2933,117 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(stdout.contains("\"daemon\":\"connected\""), "{stdout}");
         assert!(stdout.contains("\"node_name\":\"core-1\""), "{stdout}");
         assert!(stdout.contains("\"error\":null"), "{stdout}");
+    }
+
+    /// A hostile, very long node name from the control socket must reach the
+    /// painted screen only through the sanitizing/truncating path: 18 lines of
+    /// 77 columns, no ESC byte, and no extra line. This drives the real console
+    /// entry point (`run_console_with`) against a real AF_UNIX fixture.
+    #[cfg(unix)]
+    #[test]
+    fn console_paints_a_long_hostile_node_name_without_injection_or_ragged_lines() {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let dir = std::path::Path::new("/tmp").join(format!(
+            "bcw-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir(&dir).expect("unique temp dir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("private socket directory");
+        }
+        let socket_path = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let mut poll_fd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = FIXTURE_TIMEOUT.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: `poll_fd` is one initialized `pollfd`; `poll` only writes
+            // its `revents` field.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            assert_eq!(
+                ready, 1,
+                "the console did not connect within the fixture timeout"
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(FIXTURE_TIMEOUT))
+                .expect("fixture read timeout");
+            stream
+                .set_write_timeout(Some(FIXTURE_TIMEOUT))
+                .expect("fixture write timeout");
+            let mut request = String::new();
+            BufReader::new((&mut stream).take(64))
+                .read_line(&mut request)
+                .expect("fixture reads STATUS");
+            assert_eq!(request, "STATUS\n", "fixture read a partial request");
+
+            let hostile = format!("{}\u{1b}[31m", "测".repeat(200));
+            let body = format!(
+                "{{\"command\":\"ctl.status\",\"node\":\"{hostile}\",\
+                 \"daemon_connected\":true,\"inbound_on\":true,\
+                 \"inbound_connections\":1,\"outbound_upstreams\":0,\
+                 \"security_mode\":\"e2e-required\"}}\n"
+            );
+            stream.write_all(body.as_bytes()).expect("status answer");
+            stream.flush().expect("status flush");
+            done_tx.send(()).expect("fixture done signal");
+        });
+
+        let (code, stdout, painted, stderr) = run_scripted_console(
+            &["--socket", socket_path.to_str().expect("utf8 socket")],
+            Lang::En,
+            Some(80),
+            b"q\n",
+        );
+
+        let finished = match done_rx.recv_timeout(JOIN_TIMEOUT) {
+            Ok(()) => {
+                handle.join().expect("fixture thread");
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("fixture thread");
+                false
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(finished, "fixture did not finish within {JOIN_TIMEOUT:?}");
+
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.is_empty(), "the TTY path paints instead of printing JSON");
+        let screen: Vec<&str> = painted.lines().take(18).collect();
+        assert_eq!(screen.len(), 18, "no injected line: {painted}");
+        for line in &screen {
+            assert_eq!(display_width(line), BOX_WIDTH, "{line:?}");
+        }
+        assert!(
+            !painted.as_bytes().contains(&0x1B),
+            "a control character must not reach the terminal: {painted:?}"
+        );
+        assert!(painted.contains('测'), "the readable part still shows");
+        assert!(
+            !painted.contains(&"测".repeat(60)),
+            "the name must be truncated to the cell, not painted in full"
+        );
+        assert!(painted.contains("live"), "the live source token is shown");
     }
 }

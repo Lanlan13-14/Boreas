@@ -308,8 +308,8 @@ impl EndpointFacts {
 
     /// Derive the endpoint from authenticated identity facts.
     ///
-    /// The VIP is a deterministic function of `(node_id, role)` for the sole
-    /// runtime-supported default policy prefix, `10.20.<home_core>.<vip_octet>`, with
+    /// The VIP is a deterministic function of the verified signed policy base,
+    /// `(node_id, role)`: `<base>.<home_core>.<vip_octet>`, with
     /// `node_id = ((home_core - 1) << 8) | vip_octet`, Core `vip_octet = 1` and
     /// Edge `vip_octet` in `2..=251`. This reproduces `boreas-pki`'s permanent
     /// slot rule so the L3 binding can be checked in a build without the PKI
@@ -321,15 +321,12 @@ impl EndpointFacts {
         {
             return Err(PacketPathError::InvalidIdentity);
         }
+        let base = identity.policy_base().ok_or(PacketPathError::PolicyMismatch)?;
         #[cfg(feature = "openssl-inner-tls")]
-        let policy = identity.policy().ok_or(PacketPathError::PolicyMismatch)?;
-        #[cfg(feature = "openssl-inner-tls")]
-        if policy.net_id() != identity.net_id || policy.overlay_base() != [10, 20, 0, 0] {
+        if identity.policy().is_none_or(|policy| policy.net_id() != identity.net_id) {
             return Err(PacketPathError::PolicyMismatch);
         }
-        #[cfg(not(feature = "openssl-inner-tls"))]
-        return Err(PacketPathError::PolicyMismatch);
-        let vip = permanent_vip(identity.node_id, identity.role)
+        let vip = permanent_vip(base, identity.node_id, identity.role)
             .ok_or(PacketPathError::InvalidPermanentSlot)?;
         Ok(Self {
             net_id: identity.net_id,
@@ -345,7 +342,7 @@ impl EndpointFacts {
 
 /// The permanent IPv4 slot for a verified `(node_id, role)`, or `None` when the
 /// pair is not a canonical permanent slot.
-fn permanent_vip(node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
+fn permanent_vip(base: [u8; 4], node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
     let home_core = u8::try_from(node_id >> 8).ok()?.checked_add(1)?;
     let vip_octet = u8::try_from(node_id & 0xff).ok()?;
     if home_core > 16 {
@@ -359,14 +356,17 @@ fn permanent_vip(node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
     if !octet_valid {
         return None;
     }
-    Some(Ipv4Addr::new(10, 20, home_core, vip_octet))
+    Some(Ipv4Addr::new(base[0], base[1], home_core, vip_octet))
 }
 
-/// Whether the address is a canonical permanent overlay VIP, without reference to
-/// a role: `10.20.<1..=16>.<1..=251>`.
+/// Whether the address is a canonical private overlay node slot, independent
+/// of one deployment's network prefix. The circuit binds the actual base.
 fn is_permanent_vip(address: Ipv4Addr) -> bool {
     let [first, second, home_core, vip_octet] = address.octets();
-    first == 10 && second == 20 && (1..=16).contains(&home_core) && (1..=251).contains(&vip_octet)
+    let private = first == 10
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168);
+    private && (1..=16).contains(&home_core) && (1..=251).contains(&vip_octet)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -395,11 +395,23 @@ impl PointToPoint {
     ///
     /// Both addresses must be canonical permanent overlay VIPs and must differ:
     /// there is no way to express a subnet, a default route or a third address.
-    pub fn try_new(local: Ipv4Addr, peer: Ipv4Addr, mtu: usize) -> Result<Self, PacketPathError> {
+    fn try_new(local: Ipv4Addr, peer: Ipv4Addr, mtu: usize) -> Result<Self, PacketPathError> {
+        Self::try_new_in(base_from_endpoints(local, peer)?, local, peer, mtu)
+    }
+
+    fn try_new_in(
+        base: [u8; 4],
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        mtu: usize,
+    ) -> Result<Self, PacketPathError> {
         if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
             return Err(PacketPathError::MtuOutOfRange);
         }
         if !is_permanent_vip(local) || !is_permanent_vip(peer) {
+            return Err(PacketPathError::InvalidEndpointVip);
+        }
+        if local.octets()[..2] != base[..2] || peer.octets()[..2] != base[..2] {
             return Err(PacketPathError::InvalidEndpointVip);
         }
         if local == peer {
@@ -784,7 +796,12 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         if mtu > usize::from(endpoints.mtu_cap) {
             return Err(PacketPathError::MtuAboveCircuitCap);
         }
-        let policy = PointToPoint::try_new(endpoints.local.vip, endpoints.peer.vip, mtu)?;
+        let policy = PointToPoint::try_new_in(
+            base_from_endpoints(endpoints.local.vip, endpoints.peer.vip)?,
+            endpoints.local.vip,
+            endpoints.peer.vip,
+            mtu,
+        )?;
         Ok(Self {
             io,
             circuit: Some(circuit),
@@ -1052,7 +1069,7 @@ impl PacketPathError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "openssl-inner-tls")))]
 mod unbound_default_tests {
     use super::*;
 
@@ -1191,6 +1208,35 @@ mod tests {
             .unwrap()
             .require_default_runtime()
             .unwrap()
+    }
+
+    #[test]
+    fn private_prefix_binding_and_public_address_rejection() {
+        let private = PointToPoint::try_new(
+            Ipv4Addr::new(172, 19, 1, 1),
+            Ipv4Addr::new(172, 19, 1, 2),
+            1400,
+        )
+        .expect("canonical private slots");
+        assert_eq!(private.local_vip(), Ipv4Addr::new(172, 19, 1, 1));
+        assert_eq!(
+            PointToPoint::try_new(
+                Ipv4Addr::new(1, 1, 1, 1),
+                Ipv4Addr::new(10, 20, 1, 2),
+                1400,
+            )
+            .unwrap_err(),
+            PacketPathError::InvalidEndpointVip
+        );
+        assert_eq!(
+            PointToPoint::try_new(
+                Ipv4Addr::new(10, 21, 1, 1),
+                Ipv4Addr::new(10, 20, 1, 2),
+                1400,
+            )
+            .unwrap_err(),
+            PacketPathError::InvalidEndpointVip
+        );
     }
 
     fn assert_unbound_rejected(local: PeerIdentity, peer: PeerIdentity) {

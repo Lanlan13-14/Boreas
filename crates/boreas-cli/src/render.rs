@@ -231,6 +231,93 @@ pub fn render_status(snapshot: &StatusSnapshot, lang: Lang) -> String {
     lines.join("\n")
 }
 
+/// True when a terminal measured `columns` wide can host the 77-column frame.
+///
+/// `None` means the width was never measured (stdout is not a terminal, or the
+/// platform probe failed); the frame is kept rather than silently replacing
+/// every screen with a degraded list. A measured width below [`BOX_WIDTH`]
+/// fails here, so the console never claims 77 columns on a narrower terminal
+/// (§10.4).
+pub fn fits_boxed(columns: Option<usize>) -> bool {
+    columns.is_none_or(|columns| columns >= BOX_WIDTH)
+}
+
+/// Render the status facts as plain lines for a terminal measured narrower
+/// than [`BOX_WIDTH`]: one `KEY  value` line per fact, no box drawing, and
+/// every line truncated to `columns` display columns so the degraded screen
+/// cannot claim the 77-column frame (§10.4). Field order matches
+/// [`render_status`], and untrusted fields are sanitized exactly as there.
+pub fn render_status_narrow(snapshot: &StatusSnapshot, lang: Lang, columns: usize) -> String {
+    let columns = columns.min(BOX_WIDTH);
+    let version = truncate(&sanitize(&snapshot.version), VERSION_COLS);
+    let node = if snapshot.node_name.is_empty() {
+        text(lang, Msg::UnknownNode).to_string()
+    } else {
+        sanitize(&snapshot.node_name)
+    };
+    let daemon = text(
+        lang,
+        match snapshot.daemon {
+            DaemonState::Connected => Msg::DaemonConnected,
+            DaemonState::NotConnected => Msg::DaemonNotConnected,
+        },
+    );
+    let trust = match snapshot.security_mode {
+        SecurityMode::HopOnly => {
+            format!("! PLAINTEXT AT CORE: {}", text(lang, Msg::PlaintextWarning))
+        }
+        SecurityMode::E2eRequired => format!("* {}", text(lang, Msg::E2eNote)),
+    };
+    let note = text(
+        lang,
+        match snapshot.daemon {
+            DaemonState::Connected => Msg::LiveNote,
+            DaemonState::NotConnected => Msg::OfflineNote,
+        },
+    );
+    let lines = [
+        format!(
+            "{} v{version} / [L] {}",
+            text(lang, Msg::ConsoleTitle),
+            text(lang, Msg::LangLabel)
+        ),
+        format!("{}  {node}", text(lang, Msg::NodeLabel)),
+        format!(
+            "{}  {}",
+            text(lang, Msg::ModeLabel),
+            snapshot.security_mode.as_str()
+        ),
+        daemon.to_string(),
+        format!(
+            "{}  {} {} {}",
+            text(lang, Msg::InboundLabel),
+            text(
+                lang,
+                if snapshot.inbound_on {
+                    Msg::On
+                } else {
+                    Msg::Off
+                }
+            ),
+            snapshot.inbound_connections,
+            text(lang, Msg::ConnectionsUnit)
+        ),
+        format!(
+            "{}  {} {}",
+            text(lang, Msg::OutboundLabel),
+            snapshot.outbound_upstreams,
+            text(lang, Msg::UpstreamsUnit)
+        ),
+        trust,
+        note.to_string(),
+    ];
+    lines
+        .iter()
+        .map(|line| truncate(line, columns))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
 /// Display width in terminal columns, simplified East Asian Width with
 /// Ambiguous = 1 (§10.4.1): ASCII = 1, box-drawing = 1, CJK unified
 /// ideographs and their fullwidth neighbours = 2, control characters = 0,
@@ -365,7 +452,8 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOX_WIDTH, DaemonState, SecurityMode, StatusSnapshot, display_width, fit, render_status,
+        BOX_WIDTH, DaemonState, SecurityMode, StatusSnapshot, display_width, fit, fits_boxed,
+        render_status, render_status_narrow,
     };
     use crate::i18n::Lang;
 
@@ -542,6 +630,56 @@ mod tests {
         for line in rendered.split('\n') {
             assert_eq!(display_width(line), BOX_WIDTH, "line: {line:?}");
         }
+    }
+
+    #[test]
+    fn fits_boxed_requires_a_measured_width_of_at_least_77() {
+        assert!(fits_boxed(None), "an unmeasured width keeps the frame");
+        assert!(fits_boxed(Some(77)));
+        assert!(fits_boxed(Some(80)));
+        assert!(fits_boxed(Some(200)));
+        assert!(!fits_boxed(Some(76)));
+        assert!(!fits_boxed(Some(40)));
+        assert!(!fits_boxed(Some(1)));
+        assert!(!fits_boxed(Some(0)));
+    }
+
+    #[test]
+    fn narrow_status_has_no_box_and_fits_the_measured_width() {
+        for lang in Lang::ALL {
+            for columns in [40usize, 20, 8, 1] {
+                let mut snap = snapshot(true, SecurityMode::HopOnly);
+                snap.node_name = "测".repeat(60);
+                let rendered = render_status_narrow(&snap, lang, columns);
+                assert!(!rendered.contains('┌'), "{lang:?}/{columns}");
+                assert!(!rendered.contains('│'), "{lang:?}/{columns}");
+                assert!(!rendered.as_bytes().contains(&0x1B));
+                for line in rendered.split('\n') {
+                    assert!(
+                        display_width(line) <= columns,
+                        "{lang:?}/{columns}: {line:?} is {}",
+                        display_width(line)
+                    );
+                }
+            }
+            // A width that still fits the whole title line keeps it readable.
+            let rendered = render_status_narrow(&snapshot(true, SecurityMode::HopOnly), lang, 40);
+            assert!(rendered.contains("BOREAS CONSOLE"), "{lang:?}");
+            assert!(rendered.contains("PLAINTEXT AT CORE"), "{lang:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_status_reports_the_same_facts_and_sanitizes_names() {
+        let mut snap = snapshot(false, SecurityMode::E2eRequired);
+        snap.node_name = "evil\u{1b}[31m\nline2".to_string();
+        let rendered = render_status_narrow(&snap, Lang::En, 77);
+        assert!(rendered.contains("Offline snapshot"), "{rendered}");
+        assert!(rendered.contains("daemon: not connected"));
+        assert!(rendered.contains("e2e-required"));
+        assert!(!rendered.as_bytes().contains(&0x1B));
+        assert_eq!(rendered.split('\n').count(), 8, "one line per status fact");
+        assert!(rendered.contains("evil?"));
     }
 
     #[test]

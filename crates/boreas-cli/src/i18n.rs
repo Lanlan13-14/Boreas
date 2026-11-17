@@ -84,12 +84,15 @@ pub enum Msg {
     SvcBack,
     ConfirmPrompt,
     CancelHint,
+    /// Shown when the measured terminal width is below 77 columns, so the
+    /// operator knows why the framed screen was replaced by a plain list.
+    NarrowNotice,
 }
 
 impl Msg {
     /// Every key, for the dictionary-completeness test.
     #[cfg(test)]
-    pub(crate) const ALL: [Msg; 40] = [
+    pub(crate) const ALL: [Msg; 41] = [
         Msg::ConsoleTitle,
         Msg::LangLabel,
         Msg::NodeLabel,
@@ -130,6 +133,7 @@ impl Msg {
         Msg::SvcBack,
         Msg::ConfirmPrompt,
         Msg::CancelHint,
+        Msg::NarrowNotice,
     ];
 }
 
@@ -268,6 +272,11 @@ pub fn text(lang: Lang, msg: Msg) -> &'static str {
         (Lang::ZhCn, Msg::CancelHint) => "直接回车取消",
         (Lang::ZhTw, Msg::CancelHint) => "直接回車取消",
         (Lang::En, Msg::CancelHint) => "Bare Enter cancels",
+        // Degraded-width notice: the frame needs 77 columns (§10.4.1); below
+        // that the console prints the narrow list instead and says why.
+        (Lang::ZhCn, Msg::NarrowNotice) => "终端宽度不足 77 列; 已改用窄列表",
+        (Lang::ZhTw, Msg::NarrowNotice) => "終端寬度不足 77 欄; 已改用窄清單",
+        (Lang::En, Msg::NarrowNotice) => "Terminal is narrower than 77 columns; using the narrow list",
     }
 }
 
