@@ -321,9 +321,14 @@ impl EndpointFacts {
         {
             return Err(PacketPathError::InvalidIdentity);
         }
-        let base = identity.policy_base().ok_or(PacketPathError::PolicyMismatch)?;
+        let base = identity
+            .policy_base()
+            .ok_or(PacketPathError::PolicyMismatch)?;
         #[cfg(feature = "openssl-inner-tls")]
-        if identity.policy().is_none_or(|policy| policy.net_id() != identity.net_id) {
+        if identity
+            .policy()
+            .is_none_or(|policy| policy.net_id() != identity.net_id)
+        {
             return Err(PacketPathError::PolicyMismatch);
         }
         let vip = permanent_vip(base, identity.node_id, identity.role)
@@ -1220,12 +1225,8 @@ mod tests {
         .expect("canonical private slots");
         assert_eq!(private.local_vip(), Ipv4Addr::new(172, 19, 1, 1));
         assert_eq!(
-            PointToPoint::try_new(
-                Ipv4Addr::new(1, 1, 1, 1),
-                Ipv4Addr::new(10, 20, 1, 2),
-                1400,
-            )
-            .unwrap_err(),
+            PointToPoint::try_new(Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(10, 20, 1, 2), 1400,)
+                .unwrap_err(),
             PacketPathError::InvalidEndpointVip
         );
         assert_eq!(

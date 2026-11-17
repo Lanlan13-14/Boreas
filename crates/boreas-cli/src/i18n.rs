@@ -276,7 +276,9 @@ pub fn text(lang: Lang, msg: Msg) -> &'static str {
         // that the console prints the narrow list instead and says why.
         (Lang::ZhCn, Msg::NarrowNotice) => "终端宽度不足 77 列; 已改用窄列表",
         (Lang::ZhTw, Msg::NarrowNotice) => "終端寬度不足 77 欄; 已改用窄清單",
-        (Lang::En, Msg::NarrowNotice) => "Terminal is narrower than 77 columns; using the narrow list",
+        (Lang::En, Msg::NarrowNotice) => {
+            "Terminal is narrower than 77 columns; using the narrow list"
+        }
     }
 }
 

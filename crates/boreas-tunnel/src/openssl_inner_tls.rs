@@ -248,18 +248,19 @@ impl VerifiedNodeIdentity {
         policy: Option<boreas_pki::VerifiedNetworkContext>,
         overlay: boreas_pki::OverlayPrefix,
     ) -> Result<Self, TunnelError> {
-        let expected_vip = overlay.vip(
-            body.home_core_id,
-            body.vip[3],
-            match body.role {
-                boreas_proto::objects::NodeRole::Edge => boreas_pki::NodeRole::Edge,
-                boreas_proto::objects::NodeRole::Core => boreas_pki::NodeRole::Core,
-                boreas_proto::objects::NodeRole::EnrollmentService => {
-                    boreas_pki::NodeRole::EnrollmentService
-                }
-            },
-        )
-        .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
+        let expected_vip = overlay
+            .vip(
+                body.home_core_id,
+                body.vip[3],
+                match body.role {
+                    boreas_proto::objects::NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                    boreas_proto::objects::NodeRole::Core => boreas_pki::NodeRole::Core,
+                    boreas_proto::objects::NodeRole::EnrollmentService => {
+                        boreas_pki::NodeRole::EnrollmentService
+                    }
+                },
+            )
+            .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
         if body.vip != expected_vip {
             return Err(TunnelError::Unsupported("identity VIP mismatch"));
         }
@@ -370,7 +371,8 @@ fn verified_node_body(
     let overlay = policy
         .and_then(|policy| boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok())
         .unwrap_or(boreas_pki::OverlayPrefix::DEFAULT);
-    let vip = overlay.vip(body.home_core_id, body.vip[3], role)
+    let vip = overlay
+        .vip(body.home_core_id, body.vip[3], role)
         .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
     if body.vip != vip {
         return Err(TunnelError::Unsupported("identity VIP mismatch"));
