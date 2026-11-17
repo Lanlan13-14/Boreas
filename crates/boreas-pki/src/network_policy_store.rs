@@ -256,6 +256,14 @@ impl NetworkPolicyStore {
     pub fn sequence(&self) -> Option<u64> {
         self.state.record.as_ref().map(|record| record.seq)
     }
+    /// Read the hash of the currently durable raw policy object, if present.
+    #[cfg(target_os = "linux")]
+    pub fn current_object_hash(&self) -> Option<[u8; 32]> {
+        if self.poisoned {
+            return None;
+        }
+        self.state.record.as_ref().map(|record| record.object_hash)
+    }
     #[cfg(target_os = "linux")]
     pub fn is_frozen(&self) -> bool {
         self.state.frozen

@@ -1,6 +1,13 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-17 round 20
+## Current handoff — 2026-11-17 round 22
+
+- PushedHEADfcc179a(contractdoc) after0295cf86b08261aa57a8fecd3c21fb17be618692. Exact0295cf8 Rust43972354816/TUN43972354786/OpenWrt43972354953/platform43972354825/TLS43972354900ALLSUCCESS; nativeSecurity43972354797failure, noallgreenrelease. Thisverifiescandidate-save/private-disktests andextra watermarknegatives atthatSHA. NoPhase0–5gateclosed.
+- d6ddb19TLS43969887087SUCCESS inclwatermarktests, baselinepriorpendingstale. f24c1a3Rust43971849286failedonlyLinuxdeadcodeCandidateSaveUnsupported; fixedtargetcfgenum+match0295cf8 (WindowsunusedLinuxerrorscfgtoo). ActualsaveCLIverifiedcode; sourceHOMEconfigrootmustexist, explicitunsafeXDGdoesnotfallbackbydesign, Linuxonly, neverapply.
+- Newperformance dispatchusesTLS43972354900/source0295cf8 (fullfilteredstagetimings) andcurrentworkflowfcc179a; collectrunID/results. Previous43971162046source d6ddb19hadoldsmoke(nooutputfilter) so lookformissingphaseevidencenotfakevalues. Active stage-log-recover22 DeepSeekonlynewhandshake-stage-evidence.md; flush-experiment-review22 Lunareadonlypacketflushscopedanalysis; watermark-cli-impl22 Lunaonlypki_cmd.rs explicitrecordstate+expectedflags, realCLItests; nootherwriters. Allsyntax/tests/build/formattersActions-only.
+- Previouscandidate-saveagentviolatedexplicitpolicywithlocalcargoofflinemissingcacheandrustfmt; stopped, resultsNOTacceptance. Parentreviewedscope, laterindependenttestfixagentrespectedpolicy. ContinuewithstrictCI-onlyexecution.
+
+## Previous checkpoint — 2026-11-17 round 20
 
 - CurrentHEAD3f1195f(durable-storeextra tests, localnotpushed) ontopab1020a(Actionstunnelruntimefmt), d6ddb19pushedbase. d6ddb19 Rust43969887681/TUN43969886965/OpenWrt43969886981/platform43969886959SUCCESS; TLS43969887087runningatlastsample,security43969886968runningblockedexpected. Don'tcancelbackendunnecessarily; collectterminalbeforepushbatch.
 - Store3f1195f addsactual0644unsafe-statefixture restore0600,sym/hardlink/stagingrefusal,duplicatebyteidentity,persistfailurePoisoned,restartFrozenhigherseq. Noimplementationchanges. Testsnotexecutedyet, cannotclaimnewnegativespassed.
