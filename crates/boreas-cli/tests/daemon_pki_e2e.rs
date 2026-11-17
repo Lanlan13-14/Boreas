@@ -344,7 +344,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     // before a daemon process can start forwarding.
     let complete_policy_args = policy_args(&edge_state);
     let mut incomplete_policy_args = Vec::new();
-    for pair in complete_policy_args.chunks_exact(2) {
+    for pair in complete_policy_args.as_chunks::<2>().0 {
         if pair[0] != "--network-root-mldsa65-der" {
             incomplete_policy_args.extend_from_slice(pair);
         }
