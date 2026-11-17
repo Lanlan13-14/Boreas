@@ -757,13 +757,27 @@ mod linux_daemon {
         fn required_policy_input(value: Option<PathBuf>, flag: &str) -> Result<PathBuf, String> {
             value.ok_or_else(|| format!("daemon: `{flag}` is required for policy-bound runtime"))
         }
+        let policy_tbs_path = required_policy_input(policy_tbs, "--network-policy-tbs")?;
+        let policy_ed_sig_path =
+            required_policy_input(policy_ed_sig, "--network-policy-ed25519-signature")?;
+        let policy_pq_sig_path =
+            required_policy_input(policy_pq_sig, "--network-policy-mldsa65-signature")?;
+        let policy_root_ed_path =
+            required_policy_input(policy_root_ed, "--network-root-ed25519-der")?;
+        let policy_root_pq_path =
+            required_policy_input(policy_root_pq, "--network-root-mldsa65-der")?;
+        let policy_state_path =
+            required_policy_input(policy_state_file, "--network-policy-state-file")?;
+        let policy_inputs = crate::network_policy_runtime::PolicyInputPaths {
+            tbs: &policy_tbs_path,
+            ed25519_signature: &policy_ed_sig_path,
+            mldsa65_signature: &policy_pq_sig_path,
+            root_ed25519_der: &policy_root_ed_path,
+            root_mldsa65_der: &policy_root_pq_path,
+        };
         let network_context = crate::network_policy_runtime::verify_and_record_default_policy(
-            &required_policy_input(policy_tbs, "--network-policy-tbs")?,
-            &required_policy_input(policy_ed_sig, "--network-policy-ed25519-signature")?,
-            &required_policy_input(policy_pq_sig, "--network-policy-mldsa65-signature")?,
-            &required_policy_input(policy_root_ed, "--network-root-ed25519-der")?,
-            &required_policy_input(policy_root_pq, "--network-root-mldsa65-der")?,
-            &required_policy_input(policy_state_file, "--network-policy-state-file")?,
+            policy_inputs,
+            &policy_state_path,
             &config.paths.state_dir,
             cfg_net_id,
             policy_state_owner_uid.ok_or_else(|| {

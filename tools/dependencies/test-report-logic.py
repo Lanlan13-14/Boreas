@@ -51,6 +51,13 @@ def main():
     check('patch letters order monotonically', parsed == sorted(parsed), str(parsed))
     check('4.1.0 sorts after 3.6.5', report.openssl_version('4.1.0') > report.openssl_version('3.6.5'))
     check('draft names stay uncomparable', report.openssl_version('4.1.1-dev') is None)
+    branches = report.supported_release_branches({'4.1.0', '4.0.3', '3.5.9', 'draft'})
+    check('supported releases normalize to two-component branch keys',
+          branches == {(4, 1), (4, 0), (3, 5)}, str(branches))
+    check('a supported pinned release is not mislabeled unsupported',
+          report.openssl_version('4.1.0')[:2] in branches)
+    check('an unlisted branch remains unsupported',
+          report.openssl_version('3.6.5')[:2] not in branches)
 
     # 3. Every reviewed range bound must be orderable, otherwise the gate would
     #    fall back to manual review on every run.

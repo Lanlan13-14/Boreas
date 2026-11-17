@@ -99,9 +99,12 @@ def validate_review(review):
     for entry in review['crates']:
         crate = entry.get('crate', '<unnamed>')
         decision = entry.get('decision')
+        decision_text = decision if isinstance(decision, str) else ''
         if decision not in decisions:
+            # Report the unknown enum but keep checking the rest of the entry:
+            # one bad field must not hide independent defects such as an
+            # unparseable candidate or a missing justification.
             errors.append('{}: unknown decision {!r}'.format(crate, decision))
-            continue
         if not str(entry.get('adopted', '')).startswith('='):
             errors.append('{}: adopted pin must be an exact `=version` requirement'.format(crate))
         candidate = parse_semver(entry.get('candidate', ''))
@@ -109,7 +112,7 @@ def validate_review(review):
             errors.append('{}: candidate {!r} is not a stable x.y.z release; record BLOCKED/CANDIDATE_UPSTREAM_UNAVAILABLE with the reason instead of an unpinned name'.format(crate, entry.get('candidate')))
         if decision != 'ADOPTED' and len(entry.get('reason', '').strip()) < 40:
             errors.append('{}: a non-adopted decision needs a substantive recorded reason'.format(crate))
-        if decision.startswith('BLOCKED') and not entry.get('blocking_evidence'):
+        if decision_text.startswith('BLOCKED') and not entry.get('blocking_evidence'):
             errors.append('{}: a blocking decision needs machine-checkable blocking_evidence, otherwise the block cannot be re-verified'.format(crate))
         if decision == 'ADOPTED' and entry.get('candidate') != entry.get('adopted', '').lstrip('='):
             notes.append('{}: ADOPTED but candidate {!r} differs from the adopted pin'.format(crate, entry.get('candidate')))
@@ -244,6 +247,18 @@ def self_test():
         print('FAIL - broken review fixture did not report {}: {}'.format(missing, errors))
     else:
         print('ok - broken review fixture is rejected on every documented ground')
+
+    unknown_only = {'decisions': review['decisions'], 'crates': [
+        {'crate': 'example3', 'manifest': 'crates/boreas-tun/Cargo.toml', 'adopted': '0.1.0', 'candidate': 'next', 'decision': 'MADE_UP', 'reason': 'x' * 64},
+    ]}
+    errors, _ = validate_review(unknown_only)
+    expected_fragments = ['unknown decision', 'is not a stable x.y.z']
+    missing = [fragment for fragment in expected_fragments if not any(fragment in error for error in errors)]
+    if missing:
+        failures += 1
+        print('FAIL - unknown decision suppressed independent findings {}: {}'.format(missing, errors))
+    else:
+        print('ok - unknown decision does not suppress independent candidate errors')
 
     if failures:
         print('FAIL - {} crate-review fixture case(s) failed'.format(failures))

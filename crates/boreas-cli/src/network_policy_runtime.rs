@@ -21,11 +21,29 @@ pub enum PolicyRuntimeError {
 #[cfg(feature = "openssl-inner-tls")]
 impl fmt::Display for PolicyRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Input(label) => write!(f, "policy input rejected: {label}"),
+            Self::Pin(reason) => write!(f, "policy root pin rejected: {reason}"),
+            Self::Verify(reason) => write!(f, "policy verification failed: {reason}"),
+            Self::Store(reason) => write!(f, "policy store rejected: {reason}"),
+            Self::UnsupportedPrefix => f.write_str("policy prefix is not the default runtime prefix"),
+            Self::Clock => f.write_str("policy wall clock is unavailable"),
+        }
     }
 }
 #[cfg(feature = "openssl-inner-tls")]
 impl std::error::Error for PolicyRuntimeError {}
+
+/// The five explicit raw policy inputs, all required directly inside the configured
+/// state directory. Paths are borrowed for the duration of verification only.
+#[cfg(feature = "openssl-inner-tls")]
+pub struct PolicyInputPaths<'a> {
+    pub tbs: &'a Path,
+    pub ed25519_signature: &'a Path,
+    pub mldsa65_signature: &'a Path,
+    pub root_ed25519_der: &'a Path,
+    pub root_mldsa65_der: &'a Path,
+}
 
 #[cfg(feature = "openssl-inner-tls")]
 fn read_bounded_regular(
@@ -87,11 +105,7 @@ fn read_bounded_regular(
 /// verification and successful anti-replay commit.
 #[cfg(feature = "openssl-inner-tls")]
 pub fn verify_and_record_default_policy(
-    tbs_path: &Path,
-    ed25519_signature_path: &Path,
-    mldsa65_signature_path: &Path,
-    root_ed25519_der_path: &Path,
-    root_mldsa65_der_path: &Path,
+    inputs: PolicyInputPaths<'_>,
     state_path: &Path,
     configured_state_dir: &Path,
     expected_net_id: [u8; 16],
@@ -101,6 +115,14 @@ pub fn verify_and_record_default_policy(
         NetworkRootPin, network_policy_store::NetworkPolicyStore, verify_network_policy,
     };
     use boreas_proto::objects::MldsaParameterSet;
+
+    let PolicyInputPaths {
+        tbs: tbs_path,
+        ed25519_signature: ed25519_signature_path,
+        mldsa65_signature: mldsa65_signature_path,
+        root_ed25519_der: root_ed25519_der_path,
+        root_mldsa65_der: root_mldsa65_der_path,
+    } = inputs;
 
     let canonical_state_dir = configured_state_dir
         .canonicalize()
@@ -207,12 +229,6 @@ pub fn verify_and_record_default_policy(
     Ok(context)
 }
 
-#[cfg(feature = "openssl-inner-tls")]
-pub fn parse_expected_net_id(text: &str) -> Result<[u8; 16], PolicyRuntimeError> {
-    boreas_pki::provisioning::parse_net_id_hex(text)
-        .map_err(|_| PolicyRuntimeError::Input("invalid network id"))
-}
-
 #[cfg(all(test, feature = "openssl-inner-tls"))]
 mod tests {
     use super::*;
@@ -255,12 +271,9 @@ mod tests {
             net: [u8; 16],
             prefix: [u8; 4],
             seq: u64,
-            issued_delta: u64,
+            window: (u64, u64),
         ) -> Vec<PathBuf> {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64;
+            let (issued, expires) = window;
             let pin = NetworkRootPin::provisioned(
                 net,
                 ed.public_key_to_der().unwrap(),
@@ -274,8 +287,8 @@ mod tests {
                 overlay_base: prefix,
                 version: 1,
                 seq,
-                issued_at: now.saturating_sub(1_000_000).saturating_add(issued_delta),
-                expires: now + 3_600_000_000,
+                issued_at: issued,
+                expires,
             };
             let raw = c.encode_tbs().unwrap();
             let msg = NetworkPolicyCandidate::signature_input(&raw).unwrap();
@@ -302,9 +315,14 @@ mod tests {
             net: [u8; 16],
             uid: u32,
         ) -> Result<boreas_pki::VerifiedNetworkContext, PolicyRuntimeError> {
-            verify_and_record_default_policy(
-                &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], state, state_dir, net, uid,
-            )
+            let inputs = PolicyInputPaths {
+                tbs: paths[0].as_path(),
+                ed25519_signature: paths[1].as_path(),
+                mldsa65_signature: paths[2].as_path(),
+                root_ed25519_der: paths[3].as_path(),
+                root_mldsa65_der: paths[4].as_path(),
+            };
+            verify_and_record_default_policy(inputs, state, state_dir, net, uid)
         }
         let root = dir();
         let state_dir = root.join("state");
@@ -314,19 +332,94 @@ mod tests {
         let net = [8; 16];
         let (ed, pq) = keys();
         let uid = fs::metadata(&state_dir).unwrap().uid();
-        let paths = setup(&state_dir, &ed, &pq, net, [10, 20, 0, 0], 2, 0);
+        let fingerprint = NetworkRootPin::provisioned(
+            net,
+            ed.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        )
+        .unwrap()
+        .fingerprint()
+        .unwrap();
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let t0 = now_micros.saturating_sub(1_000_000);
+        let validity = 3_600_000_000;
+        let paths = setup(
+            &state_dir,
+            &ed,
+            &pq,
+            net,
+            [10, 20, 0, 0],
+            2,
+            (t0, t0 + validity),
+        );
         assert!(invoke(&paths, &state, &state_dir, [9; 16], uid).is_err());
         assert!(invoke(&paths, &state, &root, net, uid).is_err());
         assert_eq!(
             invoke(&paths, &state, &state_dir, net, uid).unwrap().seq(),
             2
         );
-        let rollback = setup(&state_dir, &ed, &pq, net, [10, 20, 0, 0], 1, 0);
-        assert!(invoke(&rollback, &state, &state_dir, net, uid).is_err());
-        let equivocation = setup(&state_dir, &ed, &pq, net, [10, 20, 0, 0], 2, 2_000_000);
-        assert!(invoke(&equivocation, &state, &state_dir, net, uid).is_err());
-        let missing_state = state_dir.join("missing");
-        assert!(invoke(&paths, &missing_state, &state_dir, net, uid).is_err());
+        let anchor = {
+            let store = boreas_pki::network_policy_store::NetworkPolicyStore::open(
+                &state,
+                net,
+                fingerprint,
+                uid,
+            )
+            .unwrap();
+            (
+                store.sequence().unwrap(),
+                store.current_object_hash().unwrap(),
+            )
+        };
+        let rollback = setup(
+            &state_dir,
+            &ed,
+            &pq,
+            net,
+            [10, 20, 0, 0],
+            1,
+            (t0, t0 + validity),
+        );
+        assert!(matches!(
+            invoke(&rollback, &state, &state_dir, net, uid),
+            Err(PolicyRuntimeError::Store(reason)) if reason.contains("SequenceRollback")
+        ));
+        // Same sequence, same valid issue time, different expiry: a real
+        // equivocation rather than a future-dated policy that fails verification.
+        let equivocation = setup(
+            &state_dir,
+            &ed,
+            &pq,
+            net,
+            [10, 20, 0, 0],
+            2,
+            (t0, t0 + validity + 1_000_000),
+        );
+        assert!(matches!(
+            invoke(&equivocation, &state, &state_dir, net, uid),
+            Err(PolicyRuntimeError::Store(reason)) if reason.contains("Equivocation")
+        ));
+        // This helper has no external anchor: a missing state file is
+        // indistinguishable from first use and is accepted. Deletion detection
+        // requires the independent expected anchor below; this is not a claim of
+        // whole-disk rollback detection.
+        let fresh = state_dir.join("fresh");
+        assert!(invoke(&equivocation, &fresh, &state_dir, net, uid).is_ok());
+        let deleted = state_dir.join("deleted");
+        assert!(matches!(
+            boreas_pki::network_policy_store::NetworkPolicyStore::open_with_expected(
+                &deleted,
+                net,
+                fingerprint,
+                uid,
+                Some(anchor),
+            ),
+            Err(boreas_pki::network_policy_store::Error::Corrupt)
+        ));
         let (wrong_ed, _) = keys();
         fs::write(&paths[3], wrong_ed.public_key_to_der().unwrap()).unwrap();
         assert!(
@@ -340,7 +433,15 @@ mod tests {
             .is_err()
         );
         fs::write(&paths[3], ed.public_key_to_der().unwrap()).unwrap();
-        let private = setup(&state_dir, &ed, &pq, net, [172, 19, 0, 0], 3, 0);
+        let private = setup(
+            &state_dir,
+            &ed,
+            &pq,
+            net,
+            [172, 19, 0, 0],
+            3,
+            (t0, t0 + validity),
+        );
         assert_eq!(
             invoke(
                 &private,

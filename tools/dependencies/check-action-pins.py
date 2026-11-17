@@ -27,21 +27,38 @@ INVENTORY = ROOT / 'tools/dependencies/action-pins-inventory.json'
 OUT = ROOT / 'dependency-reports'
 
 USES = re.compile(r'^\s*(?:-\s+)?uses:\s*(?P<target>[^\s#]+)(?:\s+#\s*(?P<comment>.*?))?\s*$')
+USES_KEY = re.compile(r'^\s*(?:-\s+)?uses\s*:')
+FLOW_USES = re.compile(r'^\s*-\s*\{[^}]*\buses\s*:')
+BLOCK_SCALAR = re.compile(r'^\s*(?:-\s+)?(?!uses\s*:)[A-Za-z0-9_.-]+:\s*[|>][-+]?\d?\s*(?:#.*)?$')
 COMMIT = re.compile(r'^[0-9a-f]{40}$')
 
 
 def parse_workflow(path):
     """Return every `uses:` entry of one workflow file with its 1-based line.
 
-    A line that mentions `uses:` but cannot be parsed is returned separately: a
-    flow-style mapping would otherwise smuggle an unaudited reference past this
-    audit, so it is a blocking error instead of a silent skip.
+    A line that starts a malformed `uses:` key, or a flow-style mapping that
+    carries one, is returned separately: such a reference would otherwise
+    smuggle an unaudited action past this audit. Text inside a YAML block
+    scalar (`run: |`, `script: >-`, ...) is deliberately skipped -- a shell or
+    script line that merely contains `uses:` is not an action reference, and
+    treating it as one produced both false `unparseable` failures and false
+    unreviewed-action findings.
     """
     entries, unparsed = [], []
+    block_indent = None
     for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.lstrip(' ')
+        indent = len(line) - len(stripped)
+        if block_indent is not None:
+            if not stripped or indent > block_indent:
+                continue
+            block_indent = None
+        if BLOCK_SCALAR.match(line):
+            block_indent = indent
+            continue
         match = USES.match(line)
         if not match:
-            if 'uses:' in line and not line.lstrip().startswith('#'):
+            if USES_KEY.match(line) or FLOW_USES.match(line):
                 unparsed.append(number)
             continue
         target = match.group('target')
@@ -200,6 +217,10 @@ def self_test():
         ('missing_comment', ['      - uses: actions/checkout@' + 'a' * 40], ['lacks a comment starting with v7']),
         ('short_sha', ['      - uses: actions/checkout@3d3c42e'], ['absent from action-pins-inventory.json']),
         ('local_action_ignored', ['      - uses: ./.github/actions/local'], []),
+        ('pinned_comment_with_pipe', ['      - uses: actions/checkout@' + 'a' * 40 + ' # v7: |'], []),
+        ('script_text_ignored', ['      - name: note', '        run: |', '          echo "uses: actions/checkout@v7"', '          uses: evil/action@' + 'e' * 40], []),
+        ('malformed_uses_key', ['      - uses:'], ['unparseable `uses:` reference']),
+        ('uses_block_value_rejected', ['      - uses: |'], ['absent from action-pins-inventory.json']),
         ('flow_style_ref', ['      - {uses: actions/checkout@v7}'], ['unparseable `uses:` reference']),
     ]
     failures = 0

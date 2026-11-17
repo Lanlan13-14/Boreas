@@ -663,12 +663,15 @@ else
   POLICY_FIXTURE_DIR="$WORK/policy-operator"
   mkdir -p "$POLICY_FIXTURE_DIR"
   chmod 0700 "$POLICY_FIXTURE_DIR"
-  command -v openssl >/dev/null 2>&1 || {
+  POLICY_OPENSSL_BIN="${BOREAS_OPENSSL_BIN:-openssl}"
+  command -v "$POLICY_OPENSSL_BIN" >/dev/null 2>&1 || {
     echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
     exit 1
   }
-  openssl genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
-  openssl genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+  "$POLICY_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
+  "$POLICY_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+  chmod 0600 "$POLICY_FIXTURE_DIR/root-ed25519.pem" "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+  export BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN"
   POLICY_NOW_US="$(($(date +%s) * 1000000))"
   python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
     --out-dir "$POLICY_FIXTURE_DIR" \

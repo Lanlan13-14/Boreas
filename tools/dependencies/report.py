@@ -57,6 +57,12 @@ def openssl_version(value):
     return (int(major), int(minor), int(patch), rank)
 
 
+def supported_release_branches(releases):
+    """Normalize release versions to branch keys used for support comparison."""
+    return {parsed[:2] for release in releases
+            if (parsed := openssl_version(release)) is not None}
+
+
 def affected_range_findings(pin, ranges):
     # One blocking finding per reviewed range that contains `pin`. A bound this
     # tool cannot order is reported as a blocking finding instead of raising:
@@ -139,7 +145,7 @@ def check_openssl(policy, errors):
         errors.append('Native OpenSSL supported-release query failed: ' + describe(exc))
     outcome['supported_releases'] = sorted(supported)
 
-    supported_branches = {branch for branch in (openssl_version(release) for release in supported) if branch is not None}
+    supported_branches = supported_release_branches(supported)
     for pin in sorted({v for values in pins.values() for v in values}):
         parsed = openssl_version(pin)
         if parsed is None:
