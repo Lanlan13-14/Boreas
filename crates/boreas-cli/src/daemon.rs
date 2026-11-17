@@ -244,8 +244,8 @@ mod linux_daemon {
     };
     use boreas_tunnel::{
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
-        OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
-        PeerIdentity, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
+        OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
+        PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{accept_e2e, open_e2e},
         packet_path::{PacketPath, PacketPathError},
         resource::{Admission, Limits},
