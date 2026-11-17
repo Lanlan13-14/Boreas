@@ -178,9 +178,7 @@ impl HandshakeGuard {
     }
 
     fn fired(&self) -> bool {
-        self.state
-            .fired
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.state.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Stop the watchdog and wait for it. Always joins; safe to call twice.
@@ -216,11 +214,7 @@ impl Drop for HandshakeGuard {
     }
 }
 
-fn handshake_guard_watch(
-    socket: TcpStream,
-    deadline: Instant,
-    state: std::sync::Arc<GuardState>,
-) {
+fn handshake_guard_watch(socket: TcpStream, deadline: Instant, state: std::sync::Arc<GuardState>) {
     let cancelled = state
         .cancelled
         .lock()
@@ -233,9 +227,7 @@ fn handshake_guard_watch(
     if *cancelled {
         return;
     }
-    state
-        .fired
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.fired.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = socket.shutdown(std::net::Shutdown::Both);
 }
 
@@ -307,11 +299,7 @@ impl LinkClient {
         self.connect_tcp_until(target, deadline)
     }
 
-    fn connect_tcp_until(
-        &self,
-        target: &ClientTarget,
-        deadline: Instant,
-    ) -> io::Result<TcpStream> {
+    fn connect_tcp_until(&self, target: &ClientTarget, deadline: Instant) -> io::Result<TcpStream> {
         let dial_timeout = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
@@ -528,11 +516,9 @@ impl LinkServer {
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
         let mut guard = HandshakeGuard::arm(&tcp, deadline)?;
-        let result = outer
-            .accept(tcp)
-            .and_then(|outer| {
-                self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline)
-            });
+        let result = outer.accept(tcp).and_then(|outer| {
+            self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline)
+        });
         guard.finish(result)
     }
 
@@ -556,8 +542,7 @@ impl LinkServer {
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
         let mut guard = HandshakeGuard::arm(&tcp, deadline)?;
         let outer: Box<dyn Duplex> = Box::new(tcp);
-        let result =
-            self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline);
+        let result = self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline);
         guard.finish(result)
     }
 
@@ -651,8 +636,8 @@ mod tests {
     use boreas_proto::{ControlType, Kind, SecurityMode};
     use std::io::Read;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -910,8 +895,8 @@ mod tests {
         let accept = thread::spawn(move || listener.accept().expect("accept"));
         let mut tcp = TcpStream::connect(address).expect("connect");
         let (_server, _) = accept.join().expect("server thread");
-        let mut guard = HandshakeGuard::arm(&tcp, Instant::now() + Duration::from_secs(10))
-            .expect("arm guard");
+        let mut guard =
+            HandshakeGuard::arm(&tcp, Instant::now() + Duration::from_secs(10)).expect("arm guard");
         let started = Instant::now();
         guard.disarm();
         assert!(
@@ -955,13 +940,7 @@ mod tests {
             let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
             let admission = admission();
             server
-                .accept_tls_stream(
-                    tcp,
-                    &TimeoutProbeOuter,
-                    policy(b, a),
-                    TIMEOUT,
-                    &admission,
-                )
+                .accept_tls_stream(tcp, &TimeoutProbeOuter, policy(b, a), TIMEOUT, &admission)
                 .expect("server session");
         });
         let client = LinkClient::new(
@@ -1041,13 +1020,7 @@ mod tests {
                 let observer = tcp.try_clone().expect("clone");
                 let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
                 let session = server
-                    .accept_tls_stream(
-                        tcp,
-                        &TestOnlyPlaintextOuter,
-                        policy,
-                        TIMEOUT,
-                        &admission,
-                    )
+                    .accept_tls_stream(tcp, &TestOnlyPlaintextOuter, policy, TIMEOUT, &admission)
                     .expect("server session");
                 assert_eq!(observer.read_timeout().expect("read timeout"), None);
                 assert_eq!(observer.write_timeout().expect("write timeout"), None);
@@ -1059,9 +1032,7 @@ mod tests {
             Box::new(TestOnlyPlaintextOuter),
             Box::new(TestOnlyPlaintextTls { peer: b }),
         );
-        let tcp = client
-            .connect_tcp(&target(address), TIMEOUT)
-            .expect("dial");
+        let tcp = client.connect_tcp(&target(address), TIMEOUT).expect("dial");
         let observer = tcp.try_clone().expect("clone");
         assert!(
             observer.read_timeout().expect("read timeout").is_some(),
@@ -1096,9 +1067,7 @@ mod tests {
             Box::new(ClearDroppingOuter),
             Box::new(TestOnlyPlaintextTls { peer: b }),
         );
-        let tcp = client
-            .connect_tcp(&target(address), TIMEOUT)
-            .expect("dial");
+        let tcp = client.connect_tcp(&target(address), TIMEOUT).expect("dial");
         let observer = tcp.try_clone().expect("clone");
         let session = client
             .connect_preconnected(tcp, &target(address), policy(a, b))
