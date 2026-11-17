@@ -1,6 +1,13 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-17 round 22
+## Current handoff — 2026-11-17 round 23
+
+- LocalHEADf1a1095 (probephaseinstrumentation+375linePythonunittests) ontop78376af(usercandidate-saveguide),03d63c5(actualCLIequivocation/deletedexpectedstate negatives),pushedfb9e675e8d6197258425bc1e73b6c1f706194363. fb9e675 fixesactualfeatureClippy chunks_exact_to_as_chunks from4f3e54d TLS44086350870failure; don'tsuppresslint. Rust44087391801/TUN44087391907success, TLS44087391960/OpenWrt44087391792/platform44087391970pendingatlastsample; nativeSecurityblocked. Waitbackendterminalbeforepushbatchtoreducecancellations.
+- f1a1095 preservesoriginalthroughput denominatorconnect→digest and originalgates; addsoptionalnullableconnect/send/digestseconds+payload_send_mbps. ReceiverJSONstderr only, no wirehashchange. Parentaddedallowlistednumericphaseprintinsmokesendersummarysofieldsvisibleonsuccess/failure; invaliddiagnosticnullneverchangespass. ci.yml unittestdiscovertools/releasealreadyincludesnewtests; NOlocalexecution. NeedrealActionsandthenperformancevalidatedsourceartifactcontainsnewprobe.
+- Packetoptimization4f3e54dRust44086350886/OpenWrt44086350923/platform44086350864/TUN44086350838success; TLSfailedonlynewhashparserlint, notframing. Exactwiretest coverscallerstackbuffer/MTU/tail; removesoneframeheapallocbutstillcopiesPacketIoVec, nozero-copy/syscall/throughputclaim. Productionflushultimatelynoop, don'tinventflushbatchperformancebenefit.
+- Performance44085204578/source0295cf8 actual9phase labels recordedinhandshake-stage-evidence.md(9c6e150localdoc).1MiB1.737/1.437failed,8MiB6.015/6.010passedonediagnostictrial; notsteadySLA. FullPhase0–5/24gatesstillopen,nativelibsecurityblocked, pre4notcreated. Allchildreninactive, nofileownershippending.
+
+## Previous checkpoint — 2026-11-17 round 22
 
 - PushedHEADfcc179a(contractdoc) after0295cf86b08261aa57a8fecd3c21fb17be618692. Exact0295cf8 Rust43972354816/TUN43972354786/OpenWrt43972354953/platform43972354825/TLS43972354900ALLSUCCESS; nativeSecurity43972354797failure, noallgreenrelease. Thisverifiescandidate-save/private-disktests andextra watermarknegatives atthatSHA. NoPhase0–5gateclosed.
 - d6ddb19TLS43969887087SUCCESS inclwatermarktests, baselinepriorpendingstale. f24c1a3Rust43971849286failedonlyLinuxdeadcodeCandidateSaveUnsupported; fixedtargetcfgenum+match0295cf8 (WindowsunusedLinuxerrorscfgtoo). ActualsaveCLIverifiedcode; sourceHOMEconfigrootmustexist, explicitunsafeXDGdoesnotfallbackbydesign, Linuxonly, neverapply.
