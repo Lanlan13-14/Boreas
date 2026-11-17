@@ -897,6 +897,13 @@ for label, path in zip(labels, sys.argv[1:]):
         failures.append(f"{label} sender result is not a JSON object")
         continue
 
+    # Optional diagnostic fields never replace the end-to-end regression bound.
+    for field in ("connect_seconds", "send_seconds", "digest_seconds", "payload_send_mbps"):
+        value = result.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            print(f"overlay_{label}_{field}={value:.6f}")
+        elif field in result:
+            print(f"overlay_{label}_{field}=unavailable")
     throughput = result.get("throughput_mbps")
     measured = (
         isinstance(throughput, (int, float))
