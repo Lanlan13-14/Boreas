@@ -536,15 +536,36 @@ pub fn encode_packet_frame(packet: &[u8], mtu: usize) -> Result<Vec<u8>, PacketP
     if packet.is_empty() {
         return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
     }
-    if packet.len() > mtu || packet.len() > MAX_FRAME_BYTES - FRAME_PREFIX_LEN {
+    if packet.len() > mtu || packet.len() > MAX_MTU {
+        return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
+    }
+    let mut frame = vec![0u8; FRAME_PREFIX_LEN + packet.len()];
+    let frame_len = encode_packet_frame_into(packet, mtu, &mut frame)?;
+    frame.truncate(frame_len);
+    Ok(frame)
+}
+
+/// Encode one packet into caller-provided storage and return its exact frame size.
+fn encode_packet_frame_into(
+    packet: &[u8],
+    mtu: usize,
+    frame: &mut [u8],
+) -> Result<usize, PacketPathError> {
+    if packet.is_empty() {
+        return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
+    }
+    if packet.len() > mtu || packet.len() > MAX_MTU {
         return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
     }
     let length = u16::try_from(packet.len())
         .map_err(|_| PacketPathError::Denied(PacketDeny::MtuExceeded))?;
-    let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + packet.len());
-    frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(packet);
-    Ok(frame)
+    let frame_len = FRAME_PREFIX_LEN + packet.len();
+    if frame.len() < frame_len {
+        return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
+    }
+    frame[..FRAME_PREFIX_LEN].copy_from_slice(&length.to_be_bytes());
+    frame[FRAME_PREFIX_LEN..frame_len].copy_from_slice(packet);
+    Ok(frame_len)
 }
 
 /// Decode exactly one length-prefixed frame back to its single packet.
@@ -912,8 +933,12 @@ fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         .authorize_outbound(&packet)
         .map_err(PacketPathError::Denied)?
         .packet_len;
-    let frame = encode_packet_frame(&packet, policy.mtu())?;
-    write_all_bounded(circuit, &frame)?;
+    // `read_packet` returns the host-owned packet Vec. Assemble the complete
+    // bounded frame on the stack to avoid a second heap allocation. The packet
+    // is still copied once into contiguous bytes for the stream writer.
+    let mut frame = [0u8; MAX_FRAME_BYTES];
+    let frame_len = encode_packet_frame_into(&packet, policy.mtu(), &mut frame)?;
+    write_all_bounded(circuit, &frame[..frame_len])?;
     circuit
         .flush()
         .map_err(|error| PacketPathError::CircuitIo(error.kind()))?;
@@ -1027,6 +1052,24 @@ mod tests {
 
     const NET: [u8; 16] = [0x2a; 16];
     const GENERATION: u64 = 7;
+
+    #[test]
+    fn caller_buffer_frame_matches_wire_bytes_and_preserves_tail() {
+        for length in [1, MIN_MTU, MAX_MTU] {
+            let packet = vec![0x5a; length];
+            let mut storage = [0xa5; MAX_FRAME_BYTES];
+            let used = encode_packet_frame_into(&packet, MAX_MTU, &mut storage).unwrap();
+            assert_eq!(used, FRAME_PREFIX_LEN + length);
+            assert_eq!(&storage[..2], &(length as u16).to_be_bytes());
+            assert_eq!(&storage[2..used], packet.as_slice());
+            assert!(storage[used..].iter().all(|byte| *byte == 0xa5));
+            assert_eq!(encode_packet_frame(&packet, MAX_MTU).unwrap(), storage[..used]);
+        }
+        let mut storage = [0u8; MAX_FRAME_BYTES];
+        assert!(encode_packet_frame_into(&[], MAX_MTU, &mut storage).is_err());
+        assert!(encode_packet_frame_into(&vec![0; MAX_MTU + 1], MAX_MTU, &mut storage).is_err());
+        assert!(encode_packet_frame_into(&[1, 2], MAX_MTU, &mut [0; 3]).is_err());
+    }
 
     fn identity(node_id: u16, role: NodeRole) -> PeerIdentity {
         PeerIdentity {
