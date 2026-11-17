@@ -1,6 +1,12 @@
 # Full-plan execution state
 
-## Current handoff — 2026-11-17 round 23
+## Current handoff — 2026-11-17 round 24
+
+- CurrentpushedHEAD7be5abff064229980c99420b6ccac735de6dcf7e, newphaseprobe+Pythoncontracttests+CLIfreeze/deletedstate test+userdocs. Rust44088534748/TUN44088534783/platform44088535065SUCCESS, TLS44088534961/OpenWrt44088534801runningatlastsample; nativeSecurity44088534807blocked. Baselinefb9e675TLS44087391960SUCCESS beforepush. Do notcancelnextbackendunnecessarily.
+- Currentactiveconsole-save-connect24 Lunaonlymain.rs/tui.rs: actualsafeconfigwriter invokedonlyvalidPREVIEW→SaveOffer→s→exactSAVE; notbareSAVE/directsfromunvalidatedPreview, stateclearedoncancel. ParentcaughtdrafttestsusingrealHOMEwriter+wrongsourcecandidatepath+escapednewlines+double-save; requiredmockeffectdriver tests instead. Existingconfig.rsactualdisktestsalreadycoverwriter, don'twriteuserHOMEinunitfixture. Newconsolebehaviorpending, nofalsecompletion.
+- readonlyprefix-execution-next24 docnewprefix-runtime-next.md delivered; parentcorrectedlegacycompatibility: onlyexplicitpolicy-boundmodewithmissingpinrefuses, doNOTbreakexistingdefaultdaemon. status-runtime-gap24 DeepSeekonlynewstatus-runtime-next.md readingdurablestatus/watchdog exactgap (mustsingleownerstore notnewlockeach500ms); stillactive. Alltests/syntax/build/formatterActions-only.
+
+## Previous checkpoint — 2026-11-17 round 23
 
 - LocalHEADf1a1095 (probephaseinstrumentation+375linePythonunittests) ontop78376af(usercandidate-saveguide),03d63c5(actualCLIequivocation/deletedexpectedstate negatives),pushedfb9e675e8d6197258425bc1e73b6c1f706194363. fb9e675 fixesactualfeatureClippy chunks_exact_to_as_chunks from4f3e54d TLS44086350870failure; don'tsuppresslint. Rust44087391801/TUN44087391907success, TLS44087391960/OpenWrt44087391792/platform44087391970pendingatlastsample; nativeSecurityblocked. Waitbackendterminalbeforepushbatchtoreducecancellations.
 - f1a1095 preservesoriginalthroughput denominatorconnect→digest and originalgates; addsoptionalnullableconnect/send/digestseconds+payload_send_mbps. ReceiverJSONstderr only, no wirehashchange. Parentaddedallowlistednumericphaseprintinsmokesendersummarysofieldsvisibleonsuccess/failure; invaliddiagnosticnullneverchangespass. ci.yml unittestdiscovertools/releasealreadyincludesnewtests; NOlocalexecution. NeedrealActionsandthenperformancevalidatedsourceartifactcontainsnewprobe.
