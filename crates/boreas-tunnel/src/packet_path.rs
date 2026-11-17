@@ -1063,7 +1063,10 @@ mod tests {
             assert_eq!(&storage[..2], &(length as u16).to_be_bytes());
             assert_eq!(&storage[2..used], packet.as_slice());
             assert!(storage[used..].iter().all(|byte| *byte == 0xa5));
-            assert_eq!(encode_packet_frame(&packet, MAX_MTU).unwrap(), storage[..used]);
+            assert_eq!(
+                encode_packet_frame(&packet, MAX_MTU).unwrap(),
+                storage[..used]
+            );
         }
         let mut storage = [0u8; MAX_FRAME_BYTES];
         assert!(encode_packet_frame_into(&[], MAX_MTU, &mut storage).is_err());
