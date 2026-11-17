@@ -636,6 +636,8 @@ pub enum ConsoleEffect {
     ConfigWizard,
     /// Process a field or exact PREVIEW confirmation.
     ConfigWizardInput(String),
+    /// Save the validated candidate after exact SAVE confirmation.
+    ConfigWizardSave(String),
     Quit,
 }
 
@@ -670,6 +672,8 @@ pub enum ConfigWizardStep {
     Primary,
     Backup,
     Preview,
+    SaveOffer,
+    SaveConfirm,
 }
 
 impl ConsoleState {
@@ -874,6 +878,41 @@ impl ConsoleState {
                 self.config_step = ConfigWizardStep::Preview;
                 ConsoleEffect::None
             }
+            ConfigWizardStep::SaveOffer => match cmd {
+                "s" => {
+                    self.config_step = ConfigWizardStep::SaveConfirm;
+                    ConsoleEffect::None
+                }
+                _ => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::Notice;
+                    self.notice_rows = preview_cancelled_rows(self.lang);
+                    ConsoleEffect::None
+                }
+            },
+            ConfigWizardStep::SaveConfirm => match cmd {
+                "SAVE" => ConsoleEffect::ConfigWizardSave(format!(
+                    "{}\n{}",
+                    self.config_primary.as_deref().unwrap_or(""),
+                    self.config_backup.as_ref().and_then(|b| b.as_deref()).unwrap_or("")
+                )),
+                "q" | "quit" => {
+                    self.clear_config_wizard();
+                    ConsoleEffect::Quit
+                }
+                "b" => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::Notice;
+                    self.notice_rows = preview_cancelled_rows(self.lang);
+                    ConsoleEffect::None
+                }
+                _ => {
+                    self.clear_config_wizard();
+                    self.view = ConsoleView::Notice;
+                    self.notice_rows = preview_cancelled_rows(self.lang);
+                    ConsoleEffect::None
+                }
+            },
             ConfigWizardStep::Preview => match cmd {
                 "PREVIEW" => ConsoleEffect::ConfigWizardInput(format!(
                     "{}\n{}",
@@ -1048,6 +1087,16 @@ fn config_wizard_step_rows(lang: Lang, step: &ConfigWizardStep) -> Vec<String> {
             Lang::ZhTw => "輸入 backup host:port；留白表示不設定（q 取消）".into(),
             Lang::En => "Enter backup host:port; blank means none (q cancels)".into(),
         }],
+        ConfigWizardStep::SaveOffer => vec![match lang {
+            Lang::ZhCn => "预览验证成功；输入 s 选择保存候选，之后还需 exact SAVE 确认".into(),
+            Lang::ZhTw => "預覽驗證成功；輸入 s 選擇保存候選，之後仍需 exact SAVE 確認".into(),
+            Lang::En => "Preview validated; type s to choose saving, then exact SAVE is still required".into(),
+        }],
+        ConfigWizardStep::SaveConfirm => vec![match lang {
+            Lang::ZhCn => "将写入仅含端点变更的候选文件；不改原配置/身份/安全/网段，不应用重载。输入 exact SAVE".into(),
+            Lang::ZhTw => "將寫入僅含端點變更的候選檔；不改原設定/身分/安全/網段，不套用重載。輸入 exact SAVE".into(),
+            Lang::En => "Writes endpoint-only candidate; original/identity/security/prefix untouched, no apply/reload. Exact SAVE; q quits, b cancels".into(),
+        }],
         ConfigWizardStep::Preview => vec![match lang {
             Lang::ZhCn => "输入 exact PREVIEW 以验证并打印端点片段；其他输入取消".into(),
             Lang::ZhTw => "輸入 exact PREVIEW 以驗證並列印端點片段；其他輸入取消".into(),
@@ -1080,21 +1129,21 @@ fn config_wizard_rows(lang: Lang) -> Vec<String> {
             "[1] 编辑并预览端点（不连接、不启动）".into(),
             "primary/backup 是运行时使用的端点字段".into(),
             "不编辑身份、安全模式、私钥或自定义网段".into(),
-            "本切片不保存候选，也不应用或重载".into(),
+            "可在 Linux 私有用户配置目录安全保存端点候选；不应用或重载".into(),
             "按 1 编辑；按 2 查看保存限制；按 3 检查配置；b 返回".into(),
         ],
         Lang::ZhTw => vec![
             "[1] 編輯並預覽端點（不連線、不啟動）".into(),
             "primary/backup 是執行階段使用的端點欄位".into(),
             "不編輯身分、安全模式、私鑰或自訂網段".into(),
-            "此切片不保存候選，也不套用或重新載入".into(),
+            "可在 Linux 私有使用者設定目錄安全保存端點候選；不套用或重新載入".into(),
             "按 1 編輯；按 2 查看保存限制；按 3 檢查設定；b 返回".into(),
         ],
         Lang::En => vec![
             "[1] Edit and preview endpoints (no connect/start)".into(),
             "primary/backup are the runtime endpoint fields".into(),
             "Identity, security, keys and custom prefixes stay locked".into(),
-            "This slice cannot save, apply or reload a candidate".into(),
+            "Linux saves endpoint candidates under a private user config root; no apply/reload".into(),
             "Press 1 to edit; 2 for save limits; 3 to check config; b to return".into(),
         ],
     }
@@ -1103,17 +1152,17 @@ fn config_wizard_rows(lang: Lang) -> Vec<String> {
 fn config_save_unavailable_rows(lang: Lang) -> Vec<String> {
     match lang {
         Lang::ZhCn => vec![
-            "可预览端点 TOML 候选；本控制台不提供保存".into(),
+            "保存候选仅支持 Linux，并要求安全的私有用户配置目录".into(),
             "原配置与私钥不变；不会启动、应用或重载".into(),
             "请在控制台外复制预览并自行审阅".into(),
         ],
         Lang::ZhTw => vec![
-            "可預覽端點 TOML 候選；此控制台不提供保存".into(),
+            "保存候選僅支援 Linux，且需要安全的私有使用者設定目錄".into(),
             "原設定與私鑰不變；不會啟動、套用或重新載入".into(),
             "請在控制台外複製預覽並自行審閱".into(),
         ],
         Lang::En => vec![
-            "Endpoint TOML candidate can be previewed but not saved by this console".into(),
+            "Candidate saving requires Linux and a safe private user config root".into(),
             "Original config and keys stay untouched; nothing starts/applies/reloads".into(),
             "Copy the preview and review it manually outside this console".into(),
         ],
@@ -1127,7 +1176,7 @@ fn config_wizard_hint(lang: Lang, step: &ConfigWizardStep) -> &'static str {
             Lang::ZhTw => "[1] 編輯端點  [b] 返回  [q] 離開",
             Lang::En => "[1] Edit endpoints  [b] Back  [q] Quit",
         },
-        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview) => {
+        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview | ConfigWizardStep::SaveOffer | ConfigWizardStep::SaveConfirm) => {
             match lang {
                 Lang::ZhCn => "[q] 取消并退出",
                 Lang::ZhTw => "[q] 取消並離開",
@@ -1577,7 +1626,7 @@ mod tests {
             state
                 .notice_rows
                 .iter()
-                .any(|row| row.contains("can be previewed but not saved"))
+                .any(|row| row.contains("requires Linux"))
         );
         // Neither a guessed save phrase nor arbitrary input can authorize writes.
         state.apply("SAVE");
@@ -1782,6 +1831,29 @@ mod tests {
         state.apply("3");
         let rows = state.confirm_rows();
         assert!(rows[0].contains("(unknown)"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn saving_requires_preview_then_offer_then_exact_confirmation() {
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.view = ConsoleView::ConfigWizard;
+        state.config_step = ConfigWizardStep::Preview;
+        state.config_primary = Some("host.example:443".into());
+        assert_eq!(state.apply("s"), ConsoleEffect::None);
+        assert_ne!(state.config_step, ConfigWizardStep::SaveConfirm);
+        for phrase in ["save", "SAVE ", " SAVE", "SAV"] {
+            state.view = ConsoleView::ConfigWizard;
+            state.config_step = ConfigWizardStep::SaveConfirm;
+            state.config_primary = Some("host.example:443".into());
+            assert_eq!(state.apply(phrase), ConsoleEffect::None);
+            assert!(state.config_primary.is_none());
+        }
+        state.view = ConsoleView::ConfigWizard;
+        state.config_step = ConfigWizardStep::SaveOffer;
+        state.config_primary = Some("host.example:443".into());
+        assert_eq!(state.apply("s"), ConsoleEffect::None);
+        assert_eq!(state.config_step, ConfigWizardStep::SaveConfirm);
+        assert_eq!(state.apply("SAVE"), ConsoleEffect::ConfigWizardSave("host.example:443\n".into()));
     }
 
     #[test]

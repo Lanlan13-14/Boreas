@@ -587,6 +587,7 @@ impl ConsoleIo {
             ConsoleEffect::CheckConfig => self.config_check(),
             ConsoleEffect::ConfigWizard => self.config_wizard_start(lang),
             ConsoleEffect::ConfigWizardInput(values) => self.config_wizard_preview(values, lang),
+            ConsoleEffect::ConfigWizardSave(values) => self.config_wizard_save(values, lang),
             ConsoleEffect::None | ConsoleEffect::Quit => ConsoleOutcome::none(),
         }
     }
@@ -749,6 +750,37 @@ impl ConsoleIo {
             )]);
         }
         ConsoleOutcome::rows(fragment.split('\n').map(str::to_string).collect::<Vec<_>>())
+    }
+
+    fn config_wizard_save(&self, values: String, _lang: Lang) -> ConsoleOutcome {
+        let Some((primary, backup)) = values.split_once('\n') else {
+            return ConsoleOutcome::rows(vec!["invalid candidate".into()]);
+        };
+        if primary.len() > 253 || backup.len() > 253 || primary.chars().any(char::is_control) || backup.chars().any(char::is_control) {
+            return ConsoleOutcome::rows(vec!["endpoint input rejected".into()]);
+        }
+        let current = match Config::read_file(&self.config, RuntimeCapabilities::NO_RUNTIME) {
+            Ok(config) => config,
+            Err(error) => return ConsoleOutcome::rows(vec![format!("config rejected: {}", sanitize_line(&error.to_string()))]),
+        };
+        let mut candidate = current;
+        candidate.uplinks.primary = primary.to_string();
+        candidate.uplinks.backup = if backup.is_empty() { None } else { Some(backup.to_string()) };
+        if let Err(error) = candidate.validate(RuntimeCapabilities::NO_RUNTIME) {
+            return ConsoleOutcome::rows(vec![format!("candidate rejected: {}", sanitize_line(&error.to_string()))]);
+        }
+        match candidate.save_endpoint_candidate(primary, if backup.is_empty() { None } else { Some(backup) }) {
+            Ok(name) => ConsoleOutcome::rows(vec![match _lang {
+                Lang::ZhCn => format!("候选已保存为 {}；未应用或重载。", sanitize_line(&name)),
+                Lang::ZhTw => format!("候選已保存為 {}；未套用或重新載入。", sanitize_line(&name)),
+                Lang::En => format!("Candidate saved as {}; not applied or reloaded.", sanitize_line(&name)),
+            }]),
+            Err(error) => ConsoleOutcome::rows(vec![match _lang {
+                Lang::ZhCn => format!("候选未保存：{}", sanitize_line(&error.to_string())),
+                Lang::ZhTw => format!("候選未保存：{}", sanitize_line(&error.to_string())),
+                Lang::En => format!("Candidate not saved: {}", sanitize_line(&error.to_string())),
+            }]),
+        }
     }
 
     /// Read-only static validation. Prints identifiers and policy switches but
@@ -950,6 +982,7 @@ where
         let is_refresh = matches!(step, ConsoleEffect::RefreshStatus);
         let is_wizard_start = matches!(step, ConsoleEffect::ConfigWizard);
         let is_wizard_preview = matches!(step, ConsoleEffect::ConfigWizardInput(_));
+        let is_wizard_save = matches!(step, ConsoleEffect::ConfigWizardSave(_));
         let outcome = perform(step, state.lang);
         if is_wizard_start {
             // Retain loaded endpoints for the reducer's next field transitions.
@@ -989,21 +1022,27 @@ where
                     writeln!(out, "{row}").map_err(|_| "console write failed".to_string())?;
                 }
             }
-            // Candidate is one-shot; do not retain any endpoint data in UI state.
+            if valid_candidate {
+                state.config_step = ConfigWizardStep::SaveOffer;
+                state.notice_rows = match state.lang {
+                    Lang::ZhCn => vec!["输入 s 选择保存候选；确认页面说明写入范围。未选择则取消。".into()],
+                    Lang::ZhTw => vec!["輸入 s 選擇保存候選；確認頁面說明寫入範圍。未選擇則取消。".into()],
+                    Lang::En => vec!["Type s to choose saving; the confirmation page explains the write scope.".into()],
+                };
+            } else {
+                state.config_primary = None;
+                state.config_backup = None;
+                state.config_step = ConfigWizardStep::Menu;
+                state.notice_rows = outcome.rows;
+            }
+            state.view = ConsoleView::ConfigWizard;
+            continue;
+        }
+        if is_wizard_save {
             state.config_primary = None;
             state.config_backup = None;
             state.config_step = ConfigWizardStep::Menu;
-            state.notice_rows = if valid_candidate {
-                match state.lang {
-                    Lang::ZhCn => vec!["候选片段已原样输出；未保存、应用或重载。".into()],
-                    Lang::ZhTw => vec!["候選片段已原樣輸出；未保存、套用或重新載入。".into()],
-                    Lang::En => vec![
-                        "Candidate emitted verbatim above; not saved, applied, or reloaded.".into(),
-                    ],
-                }
-            } else {
-                outcome.rows
-            };
+            state.notice_rows = outcome.rows;
             state.view = ConsoleView::Notice;
             continue;
         }
@@ -1938,7 +1977,7 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(output.contains("primary = \"new-hub.example.net:443\""));
         assert!(output.contains("backup = \"backup.example.net:443\""));
         assert!(output.contains("paths = 4") && output.contains("probe_paths = 1"));
-        assert!(output.contains("Candidate emitted verbatim above"));
+        assert!(output.contains("Preview validated"));
         assert!(output.contains("# BEGIN endpoint-only TOML preview"));
         assert!(output.contains("not saved/applied"));
         assert!(!output.contains("identity.key"));
@@ -1950,6 +1989,34 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(state.config_primary, None);
         assert_eq!(state.config_backup, None);
         assert_eq!(state.config_step, ConfigWizardStep::Menu);
+    }
+
+    #[test]
+    fn console_driver_saves_only_after_valid_preview_and_exact_save() {
+        use std::io::BufReader;
+        let original = config_source();
+        let path = write_fixture("wizard-save", &original);
+        let mut state = ConsoleState::new(Lang::En, false);
+        let mut reader = BufReader::new(&b"8\n\n4\n1\nnew-hub.example.net:443\nbackup.example.net:443\nPREVIEW\ns\nSAVE\nq\n"[..]);
+        let mut output = Vec::new();
+        let effects = std::cell::RefCell::new(Vec::new());
+        drive_console(&mut state, &mut reader, &mut output, |effect, _lang| {
+            let captured = effect.clone();
+            effects.borrow_mut().push(effect);
+            match captured {
+                ConsoleEffect::ConfigWizard => ConsoleOutcome { rows: vec![], live: None, node: None, endpoints: Some(("old.example.net:443".into(), None)) },
+                ConsoleEffect::ConfigWizardInput(_) => ConsoleOutcome::rows(vec!["[uplink]".into()]),
+                ConsoleEffect::ConfigWizardSave(payload) => {
+                    assert_eq!(payload, "new-hub.example.net:443\nbackup.example.net:443");
+                    ConsoleOutcome::rows(vec!["candidate saved: mock.toml".into()])
+                }
+                _ => ConsoleOutcome::none(),
+            }
+        }).expect("driver");
+        assert_eq!(effects.borrow().iter().filter(|effect| matches!(effect, ConsoleEffect::ConfigWizardSave(_))).count(), 1);
+        assert!(effects.borrow().iter().any(|effect| matches!(effect, ConsoleEffect::ConfigWizardInput(_))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
