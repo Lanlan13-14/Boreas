@@ -368,9 +368,11 @@ fn verified_node_body<'a>(
         ObjectRole::Core => boreas_pki::NodeRole::Core,
         ObjectRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
     };
-    let overlay = policy
-        .and_then(|policy| boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok())
-        .unwrap_or(boreas_pki::OverlayPrefix::DEFAULT);
+    let overlay = match policy {
+        Some(policy) => boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16)
+            .map_err(|_| TunnelError::Unsupported("invalid verified policy prefix"))?,
+        None => boreas_pki::OverlayPrefix::DEFAULT,
+    };
     let vip = overlay
         .vip(body.home_core_id, body.vip[3], role)
         .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;

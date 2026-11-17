@@ -131,6 +131,32 @@ fn point_to_point_model_refuses_anything_but_two_permanent_vips() {
 }
 
 #[test]
+fn pure_policy_supports_shared_private_prefixes_but_rejects_public_or_mixed_pairs() {
+    // This constructs only a pure model; the production path still requires
+    // an authenticated E2E circuit and matching signed-policy digests.
+    for (a, b) in [(10, 21), (172, 19), (192, 168)] {
+        let local = Ipv4Addr::new(a, b, 3, 1);
+        let peer = Ipv4Addr::new(a, b, 3, 9);
+        let model = PointToPoint::try_new(local, peer, DEFAULT_MTU).unwrap();
+        assert_eq!(model.local_vip(), local);
+        assert_eq!(model.peer_vip(), peer);
+        let packet = ipv4(local.octets(), peer.octets(), b"private-policy");
+        assert!(model.authorize_outbound(&packet).is_ok());
+    }
+    for (local, peer) in [
+        (Ipv4Addr::new(1, 1, 1, 1), PEER),
+        (LOCAL, Ipv4Addr::new(8, 8, 3, 9)),
+        (LOCAL, Ipv4Addr::new(10, 21, 3, 9)),
+        (Ipv4Addr::new(100, 64, 3, 1), Ipv4Addr::new(100, 64, 3, 9)),
+    ] {
+        assert_eq!(
+            PointToPoint::try_new(local, peer, DEFAULT_MTU),
+            Err(PacketPathError::InvalidEndpointVip)
+        );
+    }
+}
+
+#[test]
 fn real_virtual_tun_transports_one_authorized_packet_with_valid_checksum() {
     let mtu = DEFAULT_MTU;
     let policy = policy();
