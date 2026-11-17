@@ -26,7 +26,9 @@ impl fmt::Display for PolicyRuntimeError {
             Self::Pin(reason) => write!(f, "policy root pin rejected: {reason}"),
             Self::Verify(reason) => write!(f, "policy verification failed: {reason}"),
             Self::Store(reason) => write!(f, "policy store rejected: {reason}"),
-            Self::UnsupportedPrefix => f.write_str("policy prefix is not the default runtime prefix"),
+            Self::UnsupportedPrefix => {
+                f.write_str("policy prefix is not the default runtime prefix")
+            }
             Self::Clock => f.write_str("policy wall clock is unavailable"),
         }
     }
