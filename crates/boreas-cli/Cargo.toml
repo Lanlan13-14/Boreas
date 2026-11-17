@@ -33,14 +33,12 @@ boreas-pki = { path = "../boreas-pki" }
 boreas-proto = { path = "../boreas-proto", optional = true }
 boreas-tun = { path = "../boreas-tun", optional = true }
 boreas-tunnel = { path = "../boreas-tunnel", optional = true }
+# This optional normal dependency also serves real backend test fixtures.
+# Dev-dependencies cannot be optional; the feature is the only activation point.
+openssl = { version = "=0.10.82", optional = true }
 
 # Unix-only: O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC for the safe config open and
 # geteuid for the owner check. Already present in Cargo.lock via other crates,
 # so this adds no new locked package.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"
-
-[dev-dependencies]
-# Optional dev-only fixture signer: target OS selects the dependency, while this
-# feature selects availability. Default-feature targets do not link OpenSSL.
-openssl = { version = "=0.10.82", optional = true }
