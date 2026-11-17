@@ -756,24 +756,50 @@ impl ConsoleIo {
         let Some((primary, backup)) = values.split_once('\n') else {
             return ConsoleOutcome::rows(vec!["invalid candidate".into()]);
         };
-        if primary.len() > 253 || backup.len() > 253 || primary.chars().any(char::is_control) || backup.chars().any(char::is_control) {
+        if primary.len() > 253
+            || backup.len() > 253
+            || primary.chars().any(char::is_control)
+            || backup.chars().any(char::is_control)
+        {
             return ConsoleOutcome::rows(vec!["endpoint input rejected".into()]);
         }
         let current = match Config::read_file(&self.config, RuntimeCapabilities::NO_RUNTIME) {
             Ok(config) => config,
-            Err(error) => return ConsoleOutcome::rows(vec![format!("config rejected: {}", sanitize_line(&error.to_string()))]),
+            Err(error) => {
+                return ConsoleOutcome::rows(vec![format!(
+                    "config rejected: {}",
+                    sanitize_line(&error.to_string())
+                )]);
+            }
         };
         let mut candidate = current;
         candidate.uplinks.primary = primary.to_string();
-        candidate.uplinks.backup = if backup.is_empty() { None } else { Some(backup.to_string()) };
+        candidate.uplinks.backup = if backup.is_empty() {
+            None
+        } else {
+            Some(backup.to_string())
+        };
         if let Err(error) = candidate.validate(RuntimeCapabilities::NO_RUNTIME) {
-            return ConsoleOutcome::rows(vec![format!("candidate rejected: {}", sanitize_line(&error.to_string()))]);
+            return ConsoleOutcome::rows(vec![format!(
+                "candidate rejected: {}",
+                sanitize_line(&error.to_string())
+            )]);
         }
-        match candidate.save_endpoint_candidate(primary, if backup.is_empty() { None } else { Some(backup) }) {
+        match candidate.save_endpoint_candidate(
+            primary,
+            if backup.is_empty() {
+                None
+            } else {
+                Some(backup)
+            },
+        ) {
             Ok(name) => ConsoleOutcome::rows(vec![match _lang {
                 Lang::ZhCn => format!("候选已保存为 {}；未应用或重载。", sanitize_line(&name)),
                 Lang::ZhTw => format!("候選已保存為 {}；未套用或重新載入。", sanitize_line(&name)),
-                Lang::En => format!("Candidate saved as {}; not applied or reloaded.", sanitize_line(&name)),
+                Lang::En => format!(
+                    "Candidate saved as {}; not applied or reloaded.",
+                    sanitize_line(&name)
+                ),
             }]),
             Err(error) => ConsoleOutcome::rows(vec![match _lang {
                 Lang::ZhCn => format!("候选未保存：{}", sanitize_line(&error.to_string())),
@@ -1025,9 +1051,16 @@ where
             if valid_candidate {
                 state.config_step = ConfigWizardStep::SaveOffer;
                 state.notice_rows = match state.lang {
-                    Lang::ZhCn => vec!["输入 s 选择保存候选；确认页面说明写入范围。未选择则取消。".into()],
-                    Lang::ZhTw => vec!["輸入 s 選擇保存候選；確認頁面說明寫入範圍。未選擇則取消。".into()],
-                    Lang::En => vec!["Type s to choose saving; the confirmation page explains the write scope.".into()],
+                    Lang::ZhCn => {
+                        vec!["输入 s 选择保存候选；确认页面说明写入范围。未选择则取消。".into()]
+                    }
+                    Lang::ZhTw => {
+                        vec!["輸入 s 選擇保存候選；確認頁面說明寫入範圍。未選擇則取消。".into()]
+                    }
+                    Lang::En => vec![
+                        "Type s to choose saving; the confirmation page explains the write scope."
+                            .into(),
+                    ],
                 };
             } else {
                 state.config_primary = None;
@@ -1997,24 +2030,46 @@ uplinks = ["wss://hub-us-c.example.net"]
         let original = config_source();
         let path = write_fixture("wizard-save", &original);
         let mut state = ConsoleState::new(Lang::En, false);
-        let mut reader = BufReader::new(&b"8\n\n4\n1\nnew-hub.example.net:443\nbackup.example.net:443\nPREVIEW\ns\nSAVE\nq\n"[..]);
+        let mut reader = BufReader::new(
+            &b"8\n\n4\n1\nnew-hub.example.net:443\nbackup.example.net:443\nPREVIEW\ns\nSAVE\nq\n"[..],
+        );
         let mut output = Vec::new();
         let effects = std::cell::RefCell::new(Vec::new());
         drive_console(&mut state, &mut reader, &mut output, |effect, _lang| {
             let captured = effect.clone();
             effects.borrow_mut().push(effect);
             match captured {
-                ConsoleEffect::ConfigWizard => ConsoleOutcome { rows: vec![], live: None, node: None, endpoints: Some(("old.example.net:443".into(), None)) },
-                ConsoleEffect::ConfigWizardInput(_) => ConsoleOutcome::rows(vec!["[uplink]".into()]),
+                ConsoleEffect::ConfigWizard => ConsoleOutcome {
+                    rows: vec![],
+                    live: None,
+                    node: None,
+                    endpoints: Some(("old.example.net:443".into(), None)),
+                },
+                ConsoleEffect::ConfigWizardInput(_) => {
+                    ConsoleOutcome::rows(vec!["[uplink]".into()])
+                }
                 ConsoleEffect::ConfigWizardSave(payload) => {
                     assert_eq!(payload, "new-hub.example.net:443\nbackup.example.net:443");
                     ConsoleOutcome::rows(vec!["candidate saved: mock.toml".into()])
                 }
                 _ => ConsoleOutcome::none(),
             }
-        }).expect("driver");
-        assert_eq!(effects.borrow().iter().filter(|effect| matches!(effect, ConsoleEffect::ConfigWizardSave(_))).count(), 1);
-        assert!(effects.borrow().iter().any(|effect| matches!(effect, ConsoleEffect::ConfigWizardInput(_))));
+        })
+        .expect("driver");
+        assert_eq!(
+            effects
+                .borrow()
+                .iter()
+                .filter(|effect| matches!(effect, ConsoleEffect::ConfigWizardSave(_)))
+                .count(),
+            1
+        );
+        assert!(
+            effects
+                .borrow()
+                .iter()
+                .any(|effect| matches!(effect, ConsoleEffect::ConfigWizardInput(_)))
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let _ = std::fs::remove_file(&path);
     }

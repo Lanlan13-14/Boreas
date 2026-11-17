@@ -894,7 +894,10 @@ impl ConsoleState {
                 "SAVE" => ConsoleEffect::ConfigWizardSave(format!(
                     "{}\n{}",
                     self.config_primary.as_deref().unwrap_or(""),
-                    self.config_backup.as_ref().and_then(|b| b.as_deref()).unwrap_or("")
+                    self.config_backup
+                        .as_ref()
+                        .and_then(|b| b.as_deref())
+                        .unwrap_or("")
                 )),
                 "q" | "quit" => {
                     self.clear_config_wizard();
@@ -1143,7 +1146,8 @@ fn config_wizard_rows(lang: Lang) -> Vec<String> {
             "[1] Edit and preview endpoints (no connect/start)".into(),
             "primary/backup are the runtime endpoint fields".into(),
             "Identity, security, keys and custom prefixes stay locked".into(),
-            "Linux saves endpoint candidates under a private user config root; no apply/reload".into(),
+            "Linux saves endpoint candidates under a private user config root; no apply/reload"
+                .into(),
             "Press 1 to edit; 2 for save limits; 3 to check config; b to return".into(),
         ],
     }
@@ -1176,13 +1180,18 @@ fn config_wizard_hint(lang: Lang, step: &ConfigWizardStep) -> &'static str {
             Lang::ZhTw => "[1] 編輯端點  [b] 返回  [q] 離開",
             Lang::En => "[1] Edit endpoints  [b] Back  [q] Quit",
         },
-        (_, ConfigWizardStep::Primary | ConfigWizardStep::Backup | ConfigWizardStep::Preview | ConfigWizardStep::SaveOffer | ConfigWizardStep::SaveConfirm) => {
-            match lang {
-                Lang::ZhCn => "[q] 取消并退出",
-                Lang::ZhTw => "[q] 取消並離開",
-                Lang::En => "[q] Cancel and quit",
-            }
-        }
+        (
+            _,
+            ConfigWizardStep::Primary
+            | ConfigWizardStep::Backup
+            | ConfigWizardStep::Preview
+            | ConfigWizardStep::SaveOffer
+            | ConfigWizardStep::SaveConfirm,
+        ) => match lang {
+            Lang::ZhCn => "[q] 取消并退出",
+            Lang::ZhTw => "[q] 取消並離開",
+            Lang::En => "[q] Cancel and quit",
+        },
     }
 }
 
@@ -1853,7 +1862,10 @@ mod tests {
         state.config_primary = Some("host.example:443".into());
         assert_eq!(state.apply("s"), ConsoleEffect::None);
         assert_eq!(state.config_step, ConfigWizardStep::SaveConfirm);
-        assert_eq!(state.apply("SAVE"), ConsoleEffect::ConfigWizardSave("host.example:443\n".into()));
+        assert_eq!(
+            state.apply("SAVE"),
+            ConsoleEffect::ConfigWizardSave("host.example:443\n".into())
+        );
     }
 
     #[test]
