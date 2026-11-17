@@ -335,12 +335,7 @@ mod tests {
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn identity(node_id: u16, role: NodeRole) -> PeerIdentity {
-        PeerIdentity {
-            net_id: [7; 16],
-            node_id,
-            identity_generation: 1,
-            role,
-        }
+        PeerIdentity::legacy_default([7; 16], node_id, 1, role)
     }
 
     fn policy(local: PeerIdentity, peer: PeerIdentity) -> SessionPolicy {

@@ -19,6 +19,8 @@
 use boreas_crypto::{
     ExpectedPeer, NegotiatedParameters, NodeRole, Policy, PresentedPeer, Suite as CryptoSuite,
 };
+#[cfg(feature = "openssl-inner-tls")]
+use boreas_pki::VerifiedNetworkContext;
 use boreas_proto::messages::Suite as MessageSuite;
 
 use crate::error::{SessionReject, TunnelError};
@@ -32,9 +34,41 @@ pub struct PeerIdentity {
     pub node_id: u16,
     pub identity_generation: u64,
     pub role: NodeRole,
+    #[cfg(feature = "openssl-inner-tls")]
+    policy: Option<VerifiedNetworkContext>,
 }
 
 impl PeerIdentity {
+    /// Construct the policy-bound identity used by the runtime packet path.
+    /// Callers cannot supply a raw digest or prefix; they must hold the opaque
+    /// context produced by successful NetworkRoot-pinned verification.
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn policy_bound(
+        net_id: [u8; 16], node_id: u16, identity_generation: u64, role: NodeRole,
+        policy: VerifiedNetworkContext,
+    ) -> Option<Self> {
+        if net_id != policy.net_id() { return None; }
+        Some(Self { net_id, node_id, identity_generation, role, policy: Some(policy) })
+    }
+
+    /// Explicit compatibility identity for old non-packet session/control paths.
+    /// It is not evidence of signed policy and packet path rejects it.
+    pub(crate) fn legacy_default(
+        net_id: [u8; 16], node_id: u16, identity_generation: u64, role: NodeRole,
+    ) -> Self {
+        Self {
+            net_id, node_id, identity_generation, role,
+            #[cfg(feature = "openssl-inner-tls")]
+            policy: None,
+        }
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn policy(&self) -> Option<VerifiedNetworkContext> { self.policy }
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn policy_digest(&self) -> Option<[u8; 32]> {
+        self.policy.map(|policy| policy.policy_digest())
+    }
     pub(crate) fn crypto_expected(self) -> ExpectedPeer {
         ExpectedPeer {
             net_id: self.net_id,
@@ -282,12 +316,7 @@ mod tests {
     use boreas_crypto::PolicyError;
 
     fn peer() -> PeerIdentity {
-        PeerIdentity {
-            net_id: [7; 16],
-            node_id: 0x0102,
-            identity_generation: 3,
-            role: NodeRole::Core,
-        }
+        PeerIdentity::legacy_default([7; 16], 0x0102, 3, NodeRole::Core)
     }
 
     fn session(peer: PeerIdentity) -> InnerTlsSession {

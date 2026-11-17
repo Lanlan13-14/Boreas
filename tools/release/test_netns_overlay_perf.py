@@ -14,7 +14,9 @@ import hashlib
 import io
 import json
 import math
+import os
 import socket
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -369,6 +371,316 @@ class ProtocolConstantsTests(unittest.TestCase):
         self.assertEqual(netns_overlay_perf.TIMEOUT_SECONDS, 30)
         self.assertGreater(netns_overlay_perf.TOTAL_BYTES, 0)
         self.assertLessEqual(netns_overlay_perf.TOTAL_BYTES, 64 * 1024 * 1024)
+
+
+class UnderlayTcpInfoParserTests(unittest.TestCase):
+    def test_parses_socket_and_continuation_fields(self):
+        text = "\n".join(
+            [
+                "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
+                "ESTAB 0 0 192.0.2.1:8443 192.0.2.2:41234",
+                "\t cubic wscale:7,7 rto:204 rtt:0.5/0.1 ato:40 mss:1360 cwnd:10 "
+                "bytes_acked:12345 bytes_received:678 retrans:0/1 unacked:3 "
+                "ssthresh:1846 app_limited delivery_rate 25473600bps",
+                "ESTAB 0 0 192.0.2.1:8443 192.0.2.2:41235",
+                "\t cubic rto:201 rtt:1.5/0.3 cwnd:27 bytes_acked:1 "
+                "bytes_received:2 retrans:2/28 delivery_rate 24.6Mbps",
+            ]
+        )
+        records = netns_overlay_perf.parse_ss_tcpinfo(text)
+        self.assertEqual(len(records), 2)
+        first = records[0]
+        self.assertEqual(first["state"], "ESTAB")
+        self.assertEqual(first["local"], "192.0.2.1:8443")
+        self.assertEqual(first["peer"], "192.0.2.2:41234")
+        self.assertEqual(first["rtt_ms"], 0.5)
+        self.assertEqual(first["rttvar_ms"], 0.1)
+        self.assertEqual(first["rto_ms"], 204.0)
+        self.assertEqual(first["cwnd"], 10)
+        self.assertEqual(first["ssthresh"], 1846)
+        self.assertEqual(first["retrans_current"], 0)
+        self.assertEqual(first["retrans_total"], 1)
+        self.assertEqual(first["bytes_acked"], 12345)
+        self.assertEqual(first["bytes_received"], 678)
+        self.assertEqual(first["unacked"], 3)
+        self.assertIs(first["app_limited"], True)
+        self.assertEqual(first["delivery_rate_bps"], 25_473_600.0)
+        self.assertEqual(records[1]["retrans_total"], 28)
+        self.assertAlmostEqual(records[1]["delivery_rate_bps"], 24_600_000.0)
+
+    def test_headers_and_stray_text_never_create_sockets(self):
+        header = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process"
+        self.assertEqual(netns_overlay_perf.parse_ss_tcpinfo(header), [])
+        self.assertEqual(netns_overlay_perf.parse_ss_tcpinfo(""), [])
+        self.assertEqual(netns_overlay_perf.parse_ss_tcpinfo("ss: warning"), [])
+
+    def test_syn_sent_socket_keeps_state_without_tcpinfo(self):
+        text = "SYN-SENT 0 1 192.0.2.2:40123 192.0.2.1:8443\n"
+        records = netns_overlay_perf.parse_ss_tcpinfo(text)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["state"], "SYN-SENT")
+        self.assertEqual(records[0]["local"], "192.0.2.2:40123")
+        self.assertEqual(records[0]["peer"], "192.0.2.1:8443")
+        self.assertNotIn("cwnd", records[0])
+
+
+class UnderlayCounterParserTests(unittest.TestCase):
+    def test_parses_netem_qdisc_counters(self):
+        text = (
+            "qdisc netem 8001: root refcnt 2 limit 1000 delay 200ms "
+            "loss 0.1% rate 100Mbit\n"
+            " Sent 1048576 bytes 8123 pkt (dropped 4, overlimits 7 requeues 2)\n"
+            " backlog 2048b 3p requeues 2\n"
+        )
+        stats = netns_overlay_perf.parse_qdisc(text)
+        self.assertEqual(stats["sent_bytes"], 1048576)
+        self.assertEqual(stats["sent_packets"], 8123)
+        self.assertEqual(stats["dropped"], 4)
+        self.assertEqual(stats["overlimits"], 7)
+        self.assertEqual(stats["requeues"], 2)
+        self.assertEqual(stats["backlog_bytes"], 2048)
+        self.assertEqual(stats["backlog_packets"], 3)
+
+    def test_parses_tun_link_counters(self):
+        text = (
+            "2: btun0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1360 qdisc noqueue "
+            "state UNKNOWN\n"
+            "    link/none\n"
+            "    RX:  bytes    packets errors dropped  missed   mcast\n"
+            "      1048576     8123      0       3       0       0\n"
+            "    TX:  bytes    packets errors dropped carrier collsns\n"
+            "      2097152     9123      0       5       0       0\n"
+        )
+        stats = netns_overlay_perf.parse_link(text)
+        self.assertEqual(stats["rx_bytes"], 1048576)
+        self.assertEqual(stats["rx_packets"], 8123)
+        self.assertEqual(stats["rx_dropped"], 3)
+        self.assertEqual(stats["tx_bytes"], 2097152)
+        self.assertEqual(stats["tx_packets"], 9123)
+        self.assertEqual(stats["tx_dropped"], 5)
+
+    def test_missing_device_output_yields_no_counters(self):
+        self.assertEqual(netns_overlay_perf.parse_link(""), {})
+        self.assertEqual(netns_overlay_perf.parse_qdisc(""), {})
+
+
+class UnderlaySummarizeTests(unittest.TestCase):
+    def _write_rows(self, rows):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".ndjson", delete=False, encoding="utf-8"
+        )
+        with handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    @staticmethod
+    def _parse(lines):
+        return dict(line.split("=", 1) for line in lines)
+
+    def test_reports_per_socket_deltas_and_counter_trends(self):
+        address = ("192.0.2.1:8443", "192.0.2.2:41234")
+        samples = [(1000, 500, 10, 0), (2000, 1500, 20, 1), (4000, 2500, 40, 5)]
+        rows = []
+        for index, (acked, received, cwnd, retrans) in enumerate(samples):
+            rows.append(
+                {
+                    "t": float(index),
+                    "ss": [
+                        {
+                            "state": "ESTAB",
+                            "local": address[0],
+                            "peer": address[1],
+                            "bytes_acked": acked,
+                            "bytes_received": received,
+                            "cwnd": cwnd,
+                            "rto_ms": 200.0,
+                            "retrans_total": retrans,
+                            "delivery_rate_bps": 24_600_000.0,
+                        }
+                    ],
+                    "ss_error": None,
+                    "qdisc": {
+                        "dropped": index * 2,
+                        "overlimits": 0,
+                        "requeues": index,
+                        "backlog_bytes": 2048,
+                    },
+                    "link": {
+                        "rx_bytes": index * 1000,
+                        "tx_bytes": index * 2000,
+                        "rx_dropped": index,
+                        "tx_dropped": 0,
+                    },
+                }
+            )
+        values = self._parse(
+            netns_overlay_perf.summarize("core", self._write_rows(rows))
+        )
+        self.assertEqual(values["underlay_telemetry_core_status"], "measured")
+        self.assertEqual(values["underlay_telemetry_core_samples"], "3")
+        self.assertEqual(values["underlay_telemetry_core_window_seconds"], "2.000")
+        self.assertEqual(values["underlay_telemetry_core_sockets_observed"], "1")
+        self.assertEqual(values["underlay_telemetry_core_states_seen"], "ESTAB")
+        self.assertEqual(
+            values["underlay_telemetry_core_first_socket_seconds"], "0.000"
+        )
+        self.assertEqual(
+            values["underlay_telemetry_core_tx_bytes_acked_delta"], "3000"
+        )
+        self.assertEqual(
+            values["underlay_telemetry_core_rx_bytes_received_delta"], "2000"
+        )
+        self.assertEqual(values["underlay_telemetry_core_tx_mbps"], "0.012")
+        self.assertEqual(values["underlay_telemetry_core_rx_mbps"], "0.008")
+        self.assertEqual(values["underlay_telemetry_core_cwnd_min"], "10")
+        self.assertEqual(values["underlay_telemetry_core_cwnd_max"], "40")
+        self.assertEqual(values["underlay_telemetry_core_rto_max_ms"], "200.000")
+        self.assertEqual(values["underlay_telemetry_core_retrans_total_delta"], "5")
+        self.assertEqual(
+            values["underlay_telemetry_core_delivery_rate_max_mbps"], "24.600"
+        )
+        self.assertEqual(values["underlay_telemetry_core_qdisc_dropped_delta"], "4")
+        self.assertEqual(values["underlay_telemetry_core_qdisc_requeues_delta"], "2")
+        self.assertEqual(
+            values["underlay_telemetry_core_qdisc_backlog_peak_bytes"], "2048"
+        )
+        self.assertEqual(values["underlay_telemetry_core_tun_rx_dropped_delta"], "2")
+        self.assertEqual(values["underlay_telemetry_core_tun_tx_bytes_delta"], "4000")
+        self.assertEqual(values["underlay_telemetry_core_tun_absent_samples"], "0")
+
+    def test_startup_window_without_sockets_is_measured_absence(self):
+        rows = [
+            {
+                "t": 0.0,
+                "ss": [],
+                "ss_error": None,
+                "qdisc": None,
+                "link": None,
+                "link_error": "exit-1",
+            },
+            {
+                "t": 0.25,
+                "ss": [],
+                "ss_error": None,
+                "qdisc": None,
+                "link": None,
+                "link_error": "exit-1",
+            },
+        ]
+        values = self._parse(
+            netns_overlay_perf.summarize("edge", self._write_rows(rows))
+        )
+        self.assertEqual(values["underlay_telemetry_edge_status"], "measured")
+        self.assertEqual(values["underlay_telemetry_edge_sockets_observed"], "0")
+        self.assertEqual(
+            values["underlay_telemetry_edge_states_seen"], "unavailable"
+        )
+        self.assertEqual(
+            values["underlay_telemetry_edge_first_socket_seconds"], "unavailable"
+        )
+        self.assertEqual(
+            values["underlay_telemetry_edge_socket_evidence"], "none-observed"
+        )
+        self.assertEqual(values["underlay_telemetry_edge_qdisc_evidence"], "unavailable")
+        self.assertEqual(values["underlay_telemetry_edge_tun_evidence"], "unavailable")
+        self.assertEqual(values["underlay_telemetry_edge_tun_absent_samples"], "2")
+
+    def test_all_ss_errors_without_sockets_is_unmeasured(self):
+        rows = [
+            {"t": 0.0, "ss": [], "ss_error": "exit-1"},
+            {"t": 0.25, "ss": [], "ss_error": "exit-1"},
+        ]
+        values = self._parse(
+            netns_overlay_perf.summarize("core", self._write_rows(rows))
+        )
+        self.assertEqual(values["underlay_telemetry_core_status"], "unmeasured")
+        self.assertEqual(
+            values["underlay_telemetry_core_detail"], "ss-unavailable-in-namespace"
+        )
+
+    def test_unreadable_sampler_output_is_unmeasured(self):
+        missing = os.path.join(tempfile.gettempdir(), "missing-underlay.ndjson")
+        values = self._parse(netns_overlay_perf.summarize("core", missing))
+        self.assertEqual(values["underlay_telemetry_core_status"], "unmeasured")
+        self.assertEqual(
+            values["underlay_telemetry_core_detail"], "sampler-output-unreadable"
+        )
+
+    def test_single_sample_is_unmeasured(self):
+        rows = [{"t": 0.0, "ss": [], "ss_error": None}]
+        values = self._parse(
+            netns_overlay_perf.summarize("core", self._write_rows(rows))
+        )
+        self.assertEqual(values["underlay_telemetry_core_status"], "unmeasured")
+        self.assertEqual(
+            values["underlay_telemetry_core_detail"], "need-at-least-two-samples"
+        )
+
+
+class TelemetryBoundTests(unittest.TestCase):
+    def test_sampler_bounds_are_finite_and_small(self):
+        self.assertLessEqual(netns_overlay_perf.TELEMETRY_MAX_SAMPLES, 240)
+        self.assertLessEqual(
+            netns_overlay_perf.TELEMETRY_MAX_SOCKETS_PER_SAMPLE, 32
+        )
+        self.assertLessEqual(
+            netns_overlay_perf.TELEMETRY_COMMAND_TIMEOUT_SECONDS, 5
+        )
+        # Coarse ceiling per namespace: 240 rows x 32 records x 1 KiB/record.
+        self.assertLess(
+            netns_overlay_perf.TELEMETRY_MAX_SAMPLES
+            * netns_overlay_perf.TELEMETRY_MAX_SOCKETS_PER_SAMPLE
+            * 1024,
+            8 * 1024 * 1024,
+        )
+
+    def test_sampler_stops_at_cap_and_truncates_socket_records(self):
+        clock = [0.0]
+
+        def monotonic():
+            clock[0] += 0.01
+            return clock[0]
+
+        sockets = "\n".join(
+            "ESTAB 0 0 192.0.2.1:8443 192.0.2.2:%d" % (40000 + index)
+            for index in range(33)
+        )
+        timeouts = []
+
+        def fake_run(argv, timeout):
+            timeouts.append(timeout)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(
+                timeout, netns_overlay_perf.TELEMETRY_COMMAND_TIMEOUT_SECONDS
+            )
+            if argv[0] == "ss":
+                return sockets, None
+            return "", None
+
+        stdout = io.StringIO()
+        stop_path = os.path.join(tempfile.gettempdir(), "never-created-stop")
+        with (
+            mock.patch.object(netns_overlay_perf, "_run_bounded", side_effect=fake_run),
+            mock.patch.object(netns_overlay_perf, "TELEMETRY_MAX_SAMPLES", 3),
+            mock.patch.object(
+                netns_overlay_perf.time, "monotonic", side_effect=monotonic
+            ),
+            mock.patch.object(netns_overlay_perf.time, "sleep"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            netns_overlay_perf.sampler(
+                "core", "veth-core", "btun0", 250, 60, stop_path
+            )
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(len(row["ss"]), 32)
+            self.assertEqual(row["ss_truncated"], 1)
+        self.assertEqual(
+            timeouts[0], netns_overlay_perf.TELEMETRY_COMMAND_TIMEOUT_SECONDS
+        )
 
 
 if __name__ == "__main__":

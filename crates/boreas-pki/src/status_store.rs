@@ -2,8 +2,9 @@
 //!
 //! This module persists the exact signed `StatusSnapshot` envelope plus its
 //! verified freshness metadata, a monotonic trusted-UTC floor and a rollback
-//! latch. It is **freshness storage only**: `revocations` remains an opaque
-//! byte string and nothing here closes a TLS session, circuit, lease or route.
+//! latch. It is **freshness storage only**: there is no revocation-entry decoder
+//! in this slice, so a non-empty `revocations` payload is rejected (fail closed)
+//! and nothing here closes a TLS session, circuit, lease or route.
 //!
 //! Linux is the only durable target in this slice. Other targets expose the
 //! same API but every operation fails closed with [`Error::Unsupported`].
@@ -350,9 +351,11 @@ impl StatusStore {
     /// 5. otherwise persist exact raw envelope + issuer id/generation + seq +
     ///    TBS SHA-256 + signed issued/next_update + UTC floor atomically.
     ///
-    /// A duplicate (same sequence and same `object_id`) returns
-    /// [`SnapshotResult::DuplicateNotRenewed`] and never extends lifetime. A
-    /// persist failure poisons the store.
+    /// A non-empty `revocations` payload is rejected with [`Error::BadStatus`]
+    /// until a bounded entry decoder and live-handle cleanup path exist; it is
+    /// never silently ignored. A duplicate (same sequence and same `object_id`)
+    /// returns [`SnapshotResult::DuplicateNotRenewed`] and never extends
+    /// lifetime. A persist failure poisons the store.
     pub fn accept_signed_snapshot(
         &mut self,
         raw_signed: &[u8],
@@ -719,6 +722,12 @@ impl FreshStatus<'_> {
         self.seq
     }
 
+    /// Captured process-local deadline. A watchdog must not sleep past this
+    /// instant, even when its normal poll interval is longer.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     pub fn check(&self, trusted_utc_us: u64, mono_now: Instant) -> Result<(), Error> {
         self.store.supported()?;
         if self.store.poisoned {
@@ -769,6 +778,13 @@ fn snapshot_from_verified(verified: &VerifiedObject, net: [u8; 16]) -> Result<Sn
     let ObjectBody::StatusSnapshot(body) = &object.body else {
         return Err(Error::BadStatus);
     };
+    // There is no revocation-entry decoder in this slice. Accepting opaque
+    // revocation bytes would let the daemon claim freshness while silently
+    // ignoring a signed revocation, so fail closed until a bounded decoder and
+    // live-handle cleanup path exist. This is not revocation support.
+    if !body.revocations.is_empty() {
+        return Err(Error::BadStatus);
+    }
     if object.seq != body.sequence
         || object.issued_at != body.issued_at
         || object.expires != body.next_update
@@ -1256,7 +1272,21 @@ mod tests {
             }
         }
 
-        fn sign_snapshot(&self, issued: u64, next: u64, seq: u64, revocations: &[u8]) -> Vec<u8> {
+        /// Normal fixture: every accepted snapshot in this slice has an empty
+        /// revocation payload. The argument is retained so existing call sites
+        /// continue to compile; use `sign_snapshot_with_revocations` for the
+        /// explicit rejection test.
+        fn sign_snapshot(&self, issued: u64, next: u64, seq: u64, _revocations: &[u8]) -> Vec<u8> {
+            self.sign_snapshot_with_revocations(issued, next, seq, b"")
+        }
+
+        fn sign_snapshot_with_revocations(
+            &self,
+            issued: u64,
+            next: u64,
+            seq: u64,
+            revocations: &[u8],
+        ) -> Vec<u8> {
             let object = ManagementObject {
                 net_id: self.net,
                 issuer_key_id: self.key_id.clone(),
@@ -1393,12 +1423,61 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_revocations_fail_closed_without_decoder() {
+        let signer = TestSigner::new(9, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let raw = signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, b"rev-a");
+        let mut store = open_store(&path, uid, &signer);
+        assert!(matches!(
+            store.accept_signed_snapshot(&raw, 1_500_000, Instant::now()),
+            Err(Error::BadStatus)
+        ));
+        assert_eq!(store.sequence(), None);
+        assert!(!store.is_poisoned());
+        assert!(matches!(
+            store.current_fresh(1_500_000, Instant::now()),
+            Err(Error::NotFresh)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persisted_nonempty_revocations_are_rejected_on_reopen() {
+        let signer = TestSigner::new(10, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let raw =
+            signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, b"rev-a");
+        let signed = SignedObject::decode(&raw).unwrap();
+        let mut state = State::empty(NET);
+        state.utc_floor = 1_500_000;
+        state.snapshot = Some(Snapshot {
+            issuer: signer.key_id.clone(),
+            generation: 1,
+            seq: 1,
+            object_id: sha256(&signed.raw_tbs).unwrap(),
+            issued: 1_000_000,
+            next: 2_000_000,
+            raw,
+        });
+        write_state(&path, &state);
+        assert!(matches!(
+            StatusStore::open(&path, NET, uid, trust_for(&signer)),
+            Err(Error::Corrupt)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn same_sequence_conflict_freezes_with_both_envelopes() {
         let signer = TestSigner::new(2, Authority::StatusSigner);
         let (directory, path) = dir();
         let uid = owner(&directory);
         let raw_a = signer.sign_snapshot(1_000_000, 3_000_000, 1, b"a");
-        let raw_b = signer.sign_snapshot(1_000_000, 3_000_000, 1, b"b");
+        // Same sequence, different signed issued_at => different object_id,
+        // within the signed window, with empty revocations.
+        let raw_b = signer.sign_snapshot(1_000_001, 3_000_000, 1, b"b");
         let start = Instant::now();
         {
             let mut store = open_store(&path, uid, &signer);

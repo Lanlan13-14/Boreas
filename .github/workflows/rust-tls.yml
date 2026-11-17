@@ -251,6 +251,9 @@ jobs:
             --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
+      - name: Test policy fixture encoding helpers
+        if: always()
+        run: python -m unittest discover -s tools/release -p 'test_network_policy_test_fixture.py'
       - name: Build Linux pq768 E2E daemon binary (glibc + static musl) & run real netns ping
         if: success()
         timeout-minutes: 25
@@ -261,7 +264,17 @@ jobs:
           set -euo pipefail
           cargo build --locked --release -p boreas-cli --features openssl-inner-tls
           sudo modprobe tun || true
-          sudo -E bash tools/release/netns_daemon_smoke.sh target/release/boreas \
+          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
+          mkdir -p "$POLICY_FIXTURE"
+          chmod 0700 "$POLICY_FIXTURE"
+          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE/root-ed25519.pem"
+          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE/root-mldsa65.pem"
+          chmod 0600 "$POLICY_FIXTURE/root-ed25519.pem" "$POLICY_FIXTURE/root-mldsa65.pem"
+          NOW_US="$(($(date +%s) * 1000000))"
+          BOREAS_OPENSSL_BIN="$BOREAS_OPENSSL_BIN" python tools/release/network_policy_test_fixture.py \
+            --out-dir "$POLICY_FIXTURE" --net-id 0123456789abcdef0123456789abcdef \
+            --sequence 1 --issued-at-us "$NOW_US" --expires-us "$((NOW_US + 3600000000))"
+          sudo -E BOREAS_POLICY_FIXTURE_DIR="$POLICY_FIXTURE" bash tools/release/netns_daemon_smoke.sh target/release/boreas \
             2>&1 | tee rust-tls-netns-e2e.log
 
           mkdir -p hop-node-linux
@@ -301,7 +314,7 @@ jobs:
             --binary hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             --target x86_64-unknown-linux-musl \
             --out hop-node-linux/static-linkage-pq768.json
-          sudo -E bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+          sudo -E BOREAS_POLICY_FIXTURE_DIR="$POLICY_FIXTURE" bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee -a rust-tls-netns-e2e.log
 
           printf '%s\n' \
@@ -323,7 +336,7 @@ jobs:
           set -euo pipefail
           variant_dir="$(mktemp -d "$RUNNER_TEMP/initial-backup-smoke.XXXXXX")"
           trap 'rm -rf -- "$variant_dir"' EXIT
-          cp tools/release/netns_daemon_smoke.sh tools/release/netns_overlay_perf.py "$variant_dir"/
+          cp tools/release/netns_daemon_smoke.sh tools/release/netns_overlay_perf.py tools/release/network_policy_test_fixture.py "$variant_dir"/
           python3 - "$variant_dir/netns_daemon_smoke.sh" <<'PY'
           import pathlib
           import sys
@@ -390,6 +403,9 @@ jobs:
           NEG_ROOT="$(mktemp -d "$RUNNER_TEMP/initial-backup-negative.XXXXXX")"
           NEG="$NEG_ROOT/work"
           mkdir -p "$NEG"
+          chmod 0700 "$NEG_ROOT" "$NEG"
+          chmod 0600 "$POLICY_FIXTURE/root-ed25519.pem" "$POLICY_FIXTURE/root-mldsa65.pem"
+          chmod 0700 "$POLICY_FIXTURE"
 
           PRIMARY_PORT=18445
           BACKUP_PORT=18446
@@ -449,6 +465,13 @@ jobs:
           EDGE_STATE="$NEG/edge-state"
           CONTROL_STATE="$NEG/edge-control-state"
           mkdir -p "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"
+          chmod 0700 "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"
+          # Reuse public signed inputs; no private NetworkRoot key is on a node.
+          for state in "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"; do
+            for name in tbs.cbor ed25519.sig mldsa65.sig root-ed25519.der root-mldsa65.der; do
+              install -m 0600 "$POLICY_FIXTURE/$name" "$state/$name"
+            done
+          done
 
           cat > "$NEG/core.toml" <<EOF
           version = 2
@@ -633,6 +656,14 @@ jobs:
           "$BIN" daemon serve \
             --config "$NEG/core.toml" \
             --material-dir "$NEG/core-mat" \
+            --status-state-file "$CORE_STATE/status.state" --status-state-owner-uid 0 \
+            --network-policy-tbs "$CORE_STATE/tbs.cbor" \
+            --network-policy-ed25519-signature "$CORE_STATE/ed25519.sig" \
+            --network-policy-mldsa65-signature "$CORE_STATE/mldsa65.sig" \
+            --network-root-ed25519-der "$CORE_STATE/root-ed25519.der" \
+            --network-root-mldsa65-der "$CORE_STATE/root-mldsa65.der" \
+            --network-policy-state-file "$CORE_STATE/network-policy.state" \
+            --network-policy-state-owner-uid 0 \
             --listen "127.0.0.1:$CORE_PORT" \
             --virtual-tun \
             --max-seconds 120 \
@@ -667,6 +698,14 @@ jobs:
           "$BIN" daemon connect \
             --config "$NEG/edge.toml" \
             --material-dir "$NEG/edge-mat" \
+            --status-state-file "$EDGE_STATE/status.state" --status-state-owner-uid 0 \
+            --network-policy-tbs "$EDGE_STATE/tbs.cbor" \
+            --network-policy-ed25519-signature "$EDGE_STATE/ed25519.sig" \
+            --network-policy-mldsa65-signature "$EDGE_STATE/mldsa65.sig" \
+            --network-root-ed25519-der "$EDGE_STATE/root-ed25519.der" \
+            --network-root-mldsa65-der "$EDGE_STATE/root-mldsa65.der" \
+            --network-policy-state-file "$EDGE_STATE/network-policy.state" \
+            --network-policy-state-owner-uid 0 \
             --tls-name "wss.boreas.test" \
             --ws-host "wss.boreas.test:$PRIMARY_PORT" \
             --virtual-tun \
@@ -741,6 +780,14 @@ jobs:
           "$BIN" daemon connect \
             --config "$NEG/edge-control.toml" \
             --material-dir "$NEG/edge-mat" \
+            --status-state-file "$CONTROL_STATE/status.state" --status-state-owner-uid 0 \
+            --network-policy-tbs "$CONTROL_STATE/tbs.cbor" \
+            --network-policy-ed25519-signature "$CONTROL_STATE/ed25519.sig" \
+            --network-policy-mldsa65-signature "$CONTROL_STATE/mldsa65.sig" \
+            --network-root-ed25519-der "$CONTROL_STATE/root-ed25519.der" \
+            --network-root-mldsa65-der "$CONTROL_STATE/root-mldsa65.der" \
+            --network-policy-state-file "$CONTROL_STATE/network-policy.state" \
+            --network-policy-state-owner-uid 0 \
             --connect "127.0.0.1:$BACKUP_PORT" \
             --tls-name "wss.boreas.test" \
             --ws-host "wss.boreas.test:$BACKUP_PORT" \

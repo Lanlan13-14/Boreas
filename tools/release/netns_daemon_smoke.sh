@@ -16,6 +16,13 @@ BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+# The test harness, not the daemon, creates the explicitly provisioned fixture.
+# No NetworkRoot private key is read or copied by the daemon.
+STATE_OWNER_UID="${BOREAS_TEST_STATE_OWNER_UID:-$(id -u)}"
+[[ "$STATE_OWNER_UID" =~ ^[0-9]+$ ]] || {
+  echo 'ERROR: test state owner UID must be numeric' >&2
+  exit 1
+}
 if [[ ! "$TUN_MTU" =~ ^[0-9]+$ ]] || (( TUN_MTU < 1280 || TUN_MTU > 1400 )); then
   echo 'ERROR: BOREAS_TUN_MTU must be 1280..1400' >&2
   exit 1
@@ -168,6 +175,7 @@ report_failure_evidence() {
     fi
   done
   report_ss_evidence
+  report_underlay_telemetry
   return 0
 }
 
@@ -477,6 +485,86 @@ report_ss_evidence() {
   return 0
 }
 
+# --- Periodic underlay trajectory telemetry (diagnostic only) ----------------
+# Two bounded samplers run inside the disposable namespaces from before the
+# daemons start until the probe window closes. Every 250 ms each records
+# `ss -tin` TCP_INFO for the fixed underlay pair (bytes_acked/received, cwnd,
+# rto, retrans); every fourth tick it also records `tc -s qdisc` drops/backlog
+# and `ip -s link` TUN drops. This covers a run that never connects, where the
+# before/after probe snapshots above have no socket to report. It is read-only
+# inside the namespace and changes no sysctl, qdisc, route, interface, transfer,
+# ping, deadline, byte-count, key or security state, asserts no threshold, never
+# retries and is never acceptance.
+TELEMETRY_INTERVAL_MS=250
+TELEMETRY_MAX_SECONDS=60
+TELEMETRY_SAMPLER_PIDS=()
+TELEMETRY_STOP_FILE="$WORK/underlay-telemetry.stop"
+TELEMETRY_REPORTED=0
+
+_start_underlay_telemetry() { # $1=label $2=namespace $3=underlay device
+  local label="$1" ns="$2" dev="$3"
+  local out="$WORK/underlay-telemetry-$label.ndjson"
+  local err="$WORK/underlay-telemetry-$label.err"
+  : > "$out"
+  : > "$err"
+  ip netns exec "$ns" python3 "$PERF_SCRIPT" sample \
+    "$label" "$dev" btun0 "$TELEMETRY_INTERVAL_MS" "$TELEMETRY_MAX_SECONDS" \
+    "$TELEMETRY_STOP_FILE" >"$out" 2>"$err" &
+  TELEMETRY_SAMPLER_PIDS+=("$!")
+}
+
+start_underlay_telemetry_samplers() {
+  _start_underlay_telemetry core "$CORE_NS" veth-core
+  _start_underlay_telemetry edge "$EDGE_NS" veth-edge
+}
+
+# Stop through the sentinel and join: no possibly-reused PID is signalled.
+stop_underlay_telemetry_samplers() {
+  local pid
+  [[ ${#TELEMETRY_SAMPLER_PIDS[@]} -gt 0 ]] || return 0
+  : > "$TELEMETRY_STOP_FILE" 2>/dev/null || true
+  for pid in "${TELEMETRY_SAMPLER_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  TELEMETRY_SAMPLER_PIDS=()
+}
+
+report_underlay_telemetry() {
+  local label path err line
+  if (( TELEMETRY_REPORTED )); then
+    return 0
+  fi
+  TELEMETRY_REPORTED=1
+  stop_underlay_telemetry_samplers
+  echo "--- periodic underlay trajectory telemetry (diagnostic only, never acceptance) ---"
+  echo 'underlay_telemetry_source=namespace-periodic-ss-tin+tc-qdisc+ip-link'
+  echo "underlay_telemetry_interval_ms=$TELEMETRY_INTERVAL_MS"
+  echo "underlay_telemetry_bound_seconds=$TELEMETRY_MAX_SECONDS"
+  echo 'underlay_telemetry_field_scope=kernel-underlay-outer-tls;not-overlay-e2e-or-application-latency'
+  echo 'underlay_telemetry_threshold=none-asserted'
+  echo 'underlay_telemetry_acceptance=never'
+  for label in core edge; do
+    path="$WORK/underlay-telemetry-$label.ndjson"
+    if [[ -s "$path" ]]; then
+      if ! python3 "$PERF_SCRIPT" summarize "$label" "$path"; then
+        echo "underlay_telemetry_${label}_status=unmeasured"
+        echo "underlay_telemetry_${label}_detail=summarizer-failed"
+      fi
+    else
+      echo "underlay_telemetry_${label}_status=unmeasured"
+      echo "underlay_telemetry_${label}_detail=no-sampler-output"
+    fi
+    err="$WORK/underlay-telemetry-$label.err"
+    if [[ -s "$err" ]]; then
+      echo "--- underlay telemetry $label sampler diagnostics ---"
+      while IFS= read -r line; do
+        printf '  %s\n' "$line"
+      done < "$err"
+    fi
+  done
+  return 0
+}
+
 cleanup() {
   set +e
   # Emit any stage evidence not already reported (for example a signal-terminated
@@ -485,6 +573,7 @@ cleanup() {
   # Stop the bounded resource sampler through its sentinel and join it; never
   # signal a PID that could have been reused.
   stop_resource_sampler
+  stop_underlay_telemetry_samplers
   # Only signal live child jobs, never stale PIDs from already-waited pidfiles.
   # Reap them before deleting WORK: their private mounts must be gone first.
   local pid
@@ -501,6 +590,7 @@ cleanup() {
   # Safety net for exits before the explicit reports below: the guarded filter
   # never duplicates lines and reads the daemon logs only while WORK still exists.
   report_diagnostic_timing
+  report_underlay_telemetry
   rm -rf -- "$WORK"
 }
 trap cleanup EXIT
@@ -559,6 +649,58 @@ CORE_STATE="$WORK/core-state"
 EDGE_STATE="$WORK/edge-state"
 mkdir -p "$CORE_STATE" "$EDGE_STATE"
 chmod 0700 "$CORE_STATE" "$EDGE_STATE"
+
+# Explicitly provisioned, signed default-prefix policy. This is test fixture
+# setup, not production root provisioning or custom-prefix activation.
+POLICY_FIXTURE_DIR="${BOREAS_POLICY_FIXTURE_DIR:-}"
+if [[ -n "$POLICY_FIXTURE_DIR" ]]; then
+  POLICY_FIXTURE_DIR="$(realpath -e -- "$POLICY_FIXTURE_DIR")"
+  [[ -d "$POLICY_FIXTURE_DIR" && ! -L "$POLICY_FIXTURE_DIR" ]] || {
+    echo 'ERROR: unsafe policy fixture directory' >&2
+    exit 1
+  }
+else
+  POLICY_FIXTURE_DIR="$WORK/policy-operator"
+  mkdir -p "$POLICY_FIXTURE_DIR"
+  chmod 0700 "$POLICY_FIXTURE_DIR"
+  command -v openssl >/dev/null 2>&1 || {
+    echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
+    exit 1
+  }
+  openssl genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
+  openssl genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+  POLICY_NOW_US="$(($(date +%s) * 1000000))"
+  python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
+    --out-dir "$POLICY_FIXTURE_DIR" \
+    --net-id '0123456789abcdef0123456789abcdef' --sequence 1 \
+    --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
+fi
+for spec in "core:$CORE_STATE" "edge:$EDGE_STATE"; do
+  label="${spec%%:*}"
+  state="${spec#*:}"
+  for name in tbs.cbor ed25519.sig mldsa65.sig root-ed25519.der root-mldsa65.der; do
+    source="$POLICY_FIXTURE_DIR/$name"
+    [[ -f "$source" && ! -L "$source" ]] || {
+      echo "ERROR: missing or unsafe $name policy fixture" >&2
+      exit 1
+    }
+    install -m 0600 -o "$STATE_OWNER_UID" "$source" "$state/$name" || exit 1
+  done
+  POLICY_ARGS=(
+    --network-policy-tbs "$state/tbs.cbor"
+    --network-policy-ed25519-signature "$state/ed25519.sig"
+    --network-policy-mldsa65-signature "$state/mldsa65.sig"
+    --network-root-ed25519-der "$state/root-ed25519.der"
+    --network-root-mldsa65-der "$state/root-mldsa65.der"
+    --network-policy-state-file "$state/network-policy.state"
+    --network-policy-state-owner-uid "$STATE_OWNER_UID"
+  )
+  if [[ "$label" == core ]]; then
+    CORE_POLICY_ARGS=("${POLICY_ARGS[@]}")
+  else
+    EDGE_POLICY_ARGS=("${POLICY_ARGS[@]}")
+  fi
+done
 
 "$BIN" pki init-ca \
   --ca-dir "$CA_DIR" \
@@ -670,11 +812,18 @@ if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
   done
 fi
 
+# Bounded diagnostic sampling starts before the daemons so a run that never
+# connects still leaves underlay transport evidence; it gates nothing.
+start_underlay_telemetry_samplers
+
 # Start Core daemon inside CORE_NS (creates real /dev/net/tun `btun0`).
 mono_ms CORE_LAUNCH_MS || CORE_LAUNCH_MS=''
 run_node "$CORE_NS" "$BIN" daemon serve \
   --config "$WORK/core.toml" \
   --material-dir "$CORE_MAT" \
+  --status-state-file "$CORE_STATE/status.state" \
+  --status-state-owner-uid "$STATE_OWNER_UID" \
+  "${CORE_POLICY_ARGS[@]}" \
   --listen "192.0.2.1:8443" \
   --tun-name "btun0" \
   --mtu "$TUN_MTU" \
@@ -703,6 +852,9 @@ mono_ms EDGE_LAUNCH_MS || EDGE_LAUNCH_MS=''
 run_node "$EDGE_NS" "$BIN" daemon connect \
   --config "$WORK/edge.toml" \
   --material-dir "$EDGE_MAT" \
+  --status-state-file "$EDGE_STATE/status.state" \
+  --status-state-owner-uid "$STATE_OWNER_UID" \
+  "${EDGE_POLICY_ARGS[@]}" \
   --connect "192.0.2.1:8443" \
   --tls-name "wss.boreas.test" \
   --ws-host "wss.boreas.test:8443" \
@@ -861,9 +1013,11 @@ fi
 # sentinel and join the child before any later exit, and report the measured
 # CPU/RSS evidence (no threshold applied).
 capture_ss_snapshot after
+stop_underlay_telemetry_samplers
 stop_resource_sampler
 report_resource_evidence
 report_ss_evidence
+report_underlay_telemetry
 if (( PERF_WORKER_FAILED )); then
   # Do not treat a sender's JSON as valid throughput when either worker in
   # that direction failed (for example on a digest or socket error).

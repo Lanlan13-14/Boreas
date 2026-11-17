@@ -34,6 +34,7 @@ mod config;
 mod daemon;
 mod i18n;
 mod node;
+mod network_policy_runtime;
 mod pki_cmd;
 mod render;
 mod tui;

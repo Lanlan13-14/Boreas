@@ -564,12 +564,7 @@ mod tests {
     use boreas_proto::messages::Suite as TestSuite;
 
     fn identity(node_id: u16, generation: u64, role: NodeRole) -> PeerIdentity {
-        PeerIdentity {
-            net_id: [7; 16],
-            node_id,
-            identity_generation: generation,
-            role,
-        }
+        PeerIdentity::legacy_default([7; 16], node_id, generation, role)
     }
 
     fn policy() -> SessionPolicy {

@@ -34,8 +34,8 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 
 pub fn daemon_usage() -> &'static str {
     "Usage:
-  boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
-  boreas daemon connect --config <FILE> --material-dir <DIR> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]"
+  boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
+  boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]"
 }
 
 /// Query an active daemon control socket and parse a live [`StatusSnapshot`].
@@ -227,8 +227,12 @@ mod linux_daemon {
         Policy,
         backend::{OpenSslAcceptor, OpenSslConnector},
     };
-    use boreas_pki::provisioning::{
-        parse_net_id_hex, verify_material_dir_with_roots, verify_status_freshness_from_roots,
+    use boreas_pki::{
+        provisioning::{
+            parse_net_id_hex, read_status_snapshot_raw, status_trust_from_roots,
+            verify_material_dir_with_roots,
+        },
+        status_store::StatusStore,
     };
     use boreas_proto::{
         SecurityMode as ProtoSecurityMode,
@@ -240,7 +244,7 @@ mod linux_daemon {
     };
     use boreas_tunnel::{
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
-        OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
+        OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
         PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{accept_e2e, open_e2e},
         packet_path::{PacketPath, PacketPathError},
@@ -544,6 +548,50 @@ mod linux_daemon {
             .ok_or_else(|| "daemon: endpoint resolved to zero addresses".to_string())
     }
 
+    /// Open the process-wide durable status store. The store owns its own
+    /// `ManagementTrust`; the caller must not open a second store on this path.
+    fn open_status_store(
+        state_path: &Path,
+        net_id: [u8; 16],
+        owner_uid: u32,
+        roots_path: &Path,
+        now_us: u64,
+    ) -> Result<StatusStore, String> {
+        let trust = status_trust_from_roots(roots_path, net_id, now_us)
+            .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
+        StatusStore::open(state_path, net_id, owner_uid, trust)
+            .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))
+    }
+
+    /// One fail-closed status decision at a business admission boundary.
+    ///
+    /// Every gate reads and verifies the exact current `status.signed` bytes
+    /// through the durable store. A lower sequence is a hard
+    /// `SequenceNotIncreasing` error, never a reason to silently keep using the
+    /// persisted snapshot. A duplicate at the same sequence returns
+    /// `DuplicateNotRenewed`; the store keeps the original monotonic deadline.
+    /// Non-empty revocation bytes are rejected by the store until a real
+    /// decoder and handle-cleanup path exist.
+    fn status_gate(
+        store: &mut StatusStore,
+        status_path: &Path,
+        trusted_utc_us: u64,
+        mono_now: Instant,
+    ) -> Result<(u64, Instant), String> {
+        let raw = read_status_snapshot_raw(status_path)
+            .map_err(|e| format!("status file read failed: {e}"))?;
+        store
+            .accept_signed_snapshot(&raw, trusted_utc_us, mono_now)
+            .map_err(|e| format!("status snapshot rejected: {e:?}"))?;
+        let fresh = store
+            .current_fresh(trusted_utc_us, mono_now)
+            .map_err(|e| format!("status not fresh: {e:?}"))?;
+        fresh
+            .check(trusted_utc_us, mono_now)
+            .map_err(|e| format!("status check failed: {e:?}"))?;
+        Ok((fresh.sequence(), fresh.deadline()))
+    }
+
     pub fn run_mode(mode: Mode, args: &[String]) -> Result<(), String> {
         let mut config_path: Option<PathBuf> = None;
         let mut material_dir: Option<PathBuf> = None;
@@ -557,6 +605,15 @@ mod linux_daemon {
         let mut max_packets: Option<u64> = None;
         let mut max_seconds: Option<u64> = None;
         let mut virtual_tun = false;
+        let mut status_state_file: Option<PathBuf> = None;
+        let mut status_state_owner_uid: Option<u32> = None;
+        let mut policy_tbs: Option<PathBuf> = None;
+        let mut policy_ed_sig: Option<PathBuf> = None;
+        let mut policy_pq_sig: Option<PathBuf> = None;
+        let mut policy_root_ed: Option<PathBuf> = None;
+        let mut policy_root_pq: Option<PathBuf> = None;
+        let mut policy_state_file: Option<PathBuf> = None;
+        let mut policy_state_owner_uid: Option<u32> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -572,6 +629,36 @@ mod linux_daemon {
                     match flag {
                         "--config" => config_path = Some(PathBuf::from(val)),
                         "--material-dir" => material_dir = Some(PathBuf::from(val)),
+                        "--status-state-file" => {
+                            status_state_file = Some(PathBuf::from(val));
+                        }
+                        "--status-state-owner-uid" => {
+                            status_state_owner_uid = Some(
+                                val.parse::<u32>()
+                                    .map_err(|_| "daemon: invalid --status-state-owner-uid".to_string())?,
+                            );
+                        }
+                        "--network-policy-tbs" => policy_tbs = Some(PathBuf::from(val)),
+                        "--network-policy-ed25519-signature" => {
+                            policy_ed_sig = Some(PathBuf::from(val));
+                        }
+                        "--network-policy-mldsa65-signature" => {
+                            policy_pq_sig = Some(PathBuf::from(val));
+                        }
+                        "--network-root-ed25519-der" => {
+                            policy_root_ed = Some(PathBuf::from(val));
+                        }
+                        "--network-root-mldsa65-der" => {
+                            policy_root_pq = Some(PathBuf::from(val));
+                        }
+                        "--network-policy-state-file" => {
+                            policy_state_file = Some(PathBuf::from(val));
+                        }
+                        "--network-policy-state-owner-uid" => {
+                            policy_state_owner_uid = Some(val.parse::<u32>().map_err(|_| {
+                                "daemon: invalid --network-policy-state-owner-uid".to_string()
+                            })?);
+                        }
                         "--listen" => listen_spec = Some(val.clone()),
                         "--connect" => connect_spec = Some(val.clone()),
                         "--tls-name" => tls_name = Some(val.clone()),
@@ -604,6 +691,23 @@ mod linux_daemon {
 
         if !(1280..=1400).contains(&mtu) {
             return Err("daemon: --mtu must be in 1280..=1400".to_string());
+        }
+
+        // Business forwarding is never allowed without an explicit durable
+        // status binding. There is no flag combination that silently falls
+        // back to the old path-only watchdog.
+        let (status_state_file, status_state_owner_uid) =
+            match (status_state_file, status_state_owner_uid) {
+                (Some(file), Some(owner)) => (file, owner),
+                _ => {
+                    return Err(
+                        "daemon: `--status-state-file <ABS>` and `--status-state-owner-uid <UID>` are required for durable, fail-closed status"
+                            .to_string(),
+                    );
+                }
+            };
+        if !status_state_file.is_absolute() || status_state_file.file_name().is_none() {
+            return Err("daemon: `--status-state-file` must be an absolute file path".to_string());
         }
 
         let cfg_file = config_path.ok_or_else(|| "daemon: `--config` is required".to_string())?;
@@ -645,13 +749,35 @@ mod linux_daemon {
             verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
                 .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
 
-        let local_vn = VerifiedNodeIdentity::from_verified_object(&verified.local)
+        // The default overlay now also requires a separately pinned, dual-signed
+        // policy plus durable anti-rollback state. This helper accepts no raw
+        // caller prefix and currently returns only the default runtime prefix.
+        // Missing inputs fail closed rather than selecting legacy/unbound data.
+        fn required_policy_input(value: Option<PathBuf>, flag: &str) -> Result<PathBuf, String> {
+            value.ok_or_else(|| format!("daemon: `{flag}` is required for policy-bound runtime"))
+        }
+        let network_context = crate::network_policy_runtime::verify_and_record_default_policy(
+            &required_policy_input(policy_tbs, "--network-policy-tbs")?,
+            &required_policy_input(policy_ed_sig, "--network-policy-ed25519-signature")?,
+            &required_policy_input(policy_pq_sig, "--network-policy-mldsa65-signature")?,
+            &required_policy_input(policy_root_ed, "--network-root-ed25519-der")?,
+            &required_policy_input(policy_root_pq, "--network-root-mldsa65-der")?,
+            &required_policy_input(policy_state_file, "--network-policy-state-file")?,
+            &config.paths.state_dir,
+            cfg_net_id,
+            policy_state_owner_uid.ok_or_else(|| {
+                "daemon: `--network-policy-state-owner-uid` is required".to_string()
+            })?,
+        )
+        .map_err(|error| format!("daemon network policy rejected: {error}"))?;
+
+        let local_vn = VerifiedNodeIdentity::from_verified_object(&verified.local, &network_context)
             .map_err(|_| "daemon: invalid local VerifiedNodeIdentity".to_string())?;
         let peer_obj = verified
             .peer
             .as_ref()
             .ok_or_else(|| "daemon: `peer.signed` is required".to_string())?;
-        let peer_vn = VerifiedNodeIdentity::from_verified_object(peer_obj)
+        let peer_vn = VerifiedNodeIdentity::from_verified_object(peer_obj, &network_context)
             .map_err(|_| "daemon: invalid peer VerifiedNodeIdentity".to_string())?;
 
         if local_vn.node_id() != config.identity.node_id
@@ -663,18 +789,8 @@ mod linux_daemon {
             );
         }
 
-        let local_peer = PeerIdentity {
-            net_id: local_vn.net_id(),
-            node_id: local_vn.node_id(),
-            identity_generation: local_vn.identity_generation(),
-            role: local_vn.role(),
-        };
-        let remote_peer = PeerIdentity {
-            net_id: peer_vn.net_id(),
-            node_id: peer_vn.node_id(),
-            identity_generation: peer_vn.identity_generation(),
-            role: peer_vn.role(),
-        };
+        let local_peer = local_vn.peer_identity();
+        let remote_peer = peer_vn.peer_identity();
 
         let extractor = Arc::new(
             PkiIdentityExtractor::new(vec![local_vn, peer_vn])
@@ -765,6 +881,41 @@ mod linux_daemon {
         });
         let _ctl_guard = start_control_socket(&config.paths.state_dir, Arc::clone(&counters))?;
 
+        // The durable status store is a process-wide singleton: open it once,
+        // before any accept/connect handshake, and keep it until the watchdog
+        // thread exits. A second StatusStore::open on the same path would
+        // return Busy from the adjacent .lock.
+        let canonical_state_dir = fs::canonicalize(&config.paths.state_dir)
+            .map_err(|_| "daemon: cannot canonicalize state_dir for status store".to_string())?;
+        let status_parent = status_state_file
+            .parent()
+            .ok_or_else(|| "daemon: --status-state-file has no parent".to_string())?;
+        let canonical_status_parent = fs::canonicalize(status_parent)
+            .map_err(|_| "daemon: status state parent does not exist".to_string())?;
+        if canonical_status_parent != canonical_state_dir {
+            return Err(
+                "daemon: --status-state-file must be directly under the configured state_dir"
+                    .to_string(),
+            );
+        }
+        let mut status_store = open_status_store(
+            &status_state_file,
+            cfg_net_id,
+            status_state_owner_uid,
+            &roots_path,
+            now_utc_us()?,
+        )?;
+        let (gate_seq, _gate_deadline) = status_gate(
+            &mut status_store,
+            &mat_dir.join("status.signed"),
+            now_utc_us()?,
+            Instant::now(),
+        )
+        .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
+        counters
+            .status_sequence
+            .store(gate_seq, Ordering::SeqCst);
+
         let session_policy = SessionPolicy {
             local: local_peer,
             expected_peer: remote_peer,
@@ -782,9 +933,8 @@ mod linux_daemon {
             Mode::Serve => run_serve_loop(
                 listen_spec.ok_or_else(|| "daemon serve: `--listen` is required".to_string())?,
                 &mat_dir,
-                &roots_path,
                 &mat_dir.join("status.signed"),
-                cfg_net_id,
+                status_store,
                 inner_acc,
                 extractor,
                 e2e_backend,
@@ -811,9 +961,8 @@ mod linux_daemon {
                     ws_host.as_deref(),
                     &ws_path,
                     &mat_dir,
-                    &roots_path,
                     &mat_dir.join("status.signed"),
-                    cfg_net_id,
+                    status_store,
                     inner_conn,
                     extractor,
                     e2e_backend,
@@ -924,12 +1073,12 @@ mod linux_daemon {
 
     /// §3.4 `StatusSnapshot` freshness watchdog.
     ///
-    /// The 500 ms re-check reads `roots.cbor` + `status.signed` and verifies
-    /// signatures, so it cannot live on the packet loop: a blocking socket read
-    /// would stall it past the deadline. This thread runs the same
-    /// [`verify_status_freshness_from_roots`] check, publishes the first failure
-    /// as an owned string, and interrupts any in-flight blocking I/O with
-    /// `shutdown(SHUT_RDWR)` on the outer socket.
+    /// The 500 ms re-check reads and verifies `status.signed` through the
+    /// process-wide durable store, so it cannot live on the packet loop: a
+    /// blocking read/verification would stall it past the deadline. This thread
+    /// runs [`status_gate`], publishes the first failure as an owned string, and
+    /// interrupts any in-flight blocking I/O with `shutdown(SHUT_RDWR)` on the
+    /// outer socket.
     ///
     /// It never tears the circuit down and never falls back to hop-only: the
     /// packet loop owns the fail-closed teardown and reports the published
@@ -947,9 +1096,8 @@ mod linux_daemon {
 
     impl StatusWatchdog {
         fn start(
-            roots_path: PathBuf,
+            store: StatusStore,
             status_path: PathBuf,
-            expected_net_id: [u8; 16],
             sock_fd: i32,
             counters: Arc<LiveCounters>,
             interval: Duration,
@@ -961,10 +1109,12 @@ mod linux_daemon {
             let stopped_bg = Arc::clone(&stopped);
             let fault_bg = Arc::clone(&fault);
             let handle = thread::spawn(move || {
+                let mut store = store;
+                // First check is immediate: business may already have started
+                // when this watchdog is constructed; a 500 ms grace period
+                // would be an unprotected forwarding window.
+                let mut deadline = Instant::now();
                 loop {
-                    // Monotonic deadline per check: verification work must not
-                    // stretch the cadence, and stop/join must stay prompt.
-                    let deadline = Instant::now() + interval;
                     let mut guard = match stop_bg.0.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
@@ -990,13 +1140,13 @@ mod linux_daemon {
                             "daemon: StatusSnapshot clock unavailable (system clock before UNIX_EPOCH)"
                                 .to_string(),
                         ),
-                        Ok(now_us) => match verify_status_freshness_from_roots(
-                            &roots_path,
+                        Ok(now_us) => match status_gate(
+                            &mut store,
                             &status_path,
-                            expected_net_id,
                             now_us,
+                            Instant::now(),
                         ) {
-                            Ok((seq, _issued, _next)) => {
+                            Ok((seq, status_deadline)) => {
                                 let prev = counters.status_sequence.load(Ordering::Relaxed);
                                 if seq < prev {
                                     Some(format!(
@@ -1004,6 +1154,10 @@ mod linux_daemon {
                                     ))
                                 } else {
                                     counters.status_sequence.store(seq, Ordering::Relaxed);
+                                    // Do not sleep past the captured freshness
+                                    // deadline; the normal 500 ms cadence must
+                                    // never become a post-expiry forwarding window.
+                                    deadline = (Instant::now() + interval).min(status_deadline);
                                     None
                                 }
                             }
@@ -1012,7 +1166,11 @@ mod linux_daemon {
                             )),
                         },
                     };
-                    let Some(message) = failure else { continue };
+                    let Some(message) = failure else {
+                        // `status_gate` already set the next deadline to
+                        // min(now + interval, captured freshness deadline).
+                        continue;
+                    };
                     // Ordering: flag first (observable through `ctl status`), then the
                     // owned reason, then the syscall that unblocks the packet loop.
                     counters.status_fresh.store(false, Ordering::SeqCst);
@@ -1073,9 +1231,8 @@ mod linux_daemon {
     fn run_serve_loop(
         listen_spec: String,
         mat_dir: &Path,
-        roots_path: &Path,
         status_path: &Path,
-        expected_net_id: [u8; 16],
+        mut status_store: StatusStore,
         inner_acc: OpenSslAcceptor,
         extractor: Arc<PkiIdentityExtractor>,
         e2e_backend: OpenSslE2eBackend,
@@ -1098,6 +1255,16 @@ mod linux_daemon {
         listener
             .set_nonblocking(true)
             .map_err(|_| "daemon serve: listener nonblocking failed".to_string())?;
+
+        // Status must still be fresh at the last boundary before an untrusted
+        // peer is accepted.
+        status_gate(
+            &mut status_store,
+            status_path,
+            now_utc_us()?,
+            Instant::now(),
+        )
+        .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
 
         let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
         let accept_deadline = Instant::now() + wait_limit;
@@ -1139,8 +1306,28 @@ mod linux_daemon {
             )
             .map_err(|e| format!("daemon serve: WSS + pq768 hop session rejected: {e}"))?;
 
+        // The peer authenticated, but status may have expired during the
+        // blocking handshake. Recheck before running the E2E handshake.
+        status_gate(
+            &mut status_store,
+            status_path,
+            now_utc_us()?,
+            Instant::now(),
+        )
+        .map_err(|e| format!("daemon serve: durable status gate failed after hop handshake: {e}"))?;
+
         let e2e = accept_e2e(&mut accepted.session, &e2e_backend, remote_peer)
             .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?;
+
+        // Last business-admission boundary: a status that expired during E2E
+        // handshake must stop before any packet is forwarded.
+        status_gate(
+            &mut status_store,
+            status_path,
+            now_utc_us()?,
+            Instant::now(),
+        )
+        .map_err(|e| format!("daemon serve: durable status gate failed before business: {e}"))?;
 
         counters.inbound_connections.store(1, Ordering::SeqCst);
         counters.connected.store(true, Ordering::SeqCst);
@@ -1151,9 +1338,8 @@ mod linux_daemon {
             tun,
             e2e,
             mtu,
-            roots_path,
             status_path,
-            expected_net_id,
+            status_store,
             max_packets,
             max_seconds,
             counters,
@@ -1172,9 +1358,8 @@ mod linux_daemon {
         ws_host_override: Option<&str>,
         ws_path: &str,
         mat_dir: &Path,
-        roots_path: &Path,
         status_path: &Path,
-        expected_net_id: [u8; 16],
+        mut status_store: StatusStore,
         inner_conn: OpenSslConnector,
         extractor: Arc<PkiIdentityExtractor>,
         e2e_backend: OpenSslE2eBackend,
@@ -1209,9 +1394,13 @@ mod linux_daemon {
         let endpoints = connect_endpoints(primary_spec, backup_spec);
         let mut connected: Option<(boreas_tunnel::EstablishedSession, i32)> = None;
         for (index, endpoint) in endpoints.iter().enumerate() {
-            let now_us = now_utc_us()?;
-            verify_status_freshness_from_roots(roots_path, status_path, expected_net_id, now_us)
-                .map_err(|e| format!("daemon connect: StatusSnapshot stale or invalid: {e}"))?;
+            status_gate(
+                &mut status_store,
+                status_path,
+                now_utc_us()?,
+                Instant::now(),
+            )
+            .map_err(|e| format!("daemon connect: durable status gate failed before dial: {e}"))?;
             let target = client_target(endpoint, tls_name_override, ws_host_override, ws_path)?;
             match attempt_endpoint(
                 index,
@@ -1220,19 +1409,32 @@ mod linux_daemon {
                 may_try_backup,
             ) {
                 Ok(tcp) => {
-                    let now_us = now_utc_us()?;
-                    verify_status_freshness_from_roots(
-                        roots_path,
+                    // TCP connect can take time; recheck before spending the
+                    // blocking WSS/hop handshake on a stale status.
+                    status_gate(
+                        &mut status_store,
                         status_path,
-                        expected_net_id,
-                        now_us,
+                        now_utc_us()?,
+                        Instant::now(),
                     )
-                    .map_err(|e| format!("daemon connect: StatusSnapshot stale or invalid: {e}"))?;
+                    .map_err(|e| {
+                        format!("daemon connect: durable status gate failed after TCP connect: {e}")
+                    })?;
                     let session = link_client
                         .connect_preconnected(tcp, &target, session_policy.clone())
                         .map_err(|e| {
                             format!("daemon connect: WSS + pq768 hop session rejected: {e}")
                         })?;
+                    // Status may have expired during the blocking handshake.
+                    status_gate(
+                        &mut status_store,
+                        status_path,
+                        now_utc_us()?,
+                        Instant::now(),
+                    )
+                    .map_err(|e| {
+                        format!("daemon connect: durable status gate failed after hop handshake: {e}")
+                    })?;
                     connected = Some((session, fd_slot.load(Ordering::SeqCst)));
                     break;
                 }
@@ -1248,6 +1450,15 @@ mod linux_daemon {
         let e2e = open_e2e(&mut hop_session, &e2e_backend, remote_peer, 1)
             .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
 
+        // Last business-admission boundary before the packet loop starts.
+        status_gate(
+            &mut status_store,
+            status_path,
+            now_utc_us()?,
+            Instant::now(),
+        )
+        .map_err(|e| format!("daemon connect: durable status gate failed before business: {e}"))?;
+
         counters.outbound_upstreams.store(1, Ordering::SeqCst);
         counters.connected.store(true, Ordering::SeqCst);
 
@@ -1257,9 +1468,8 @@ mod linux_daemon {
             tun,
             e2e,
             mtu,
-            roots_path,
             status_path,
-            expected_net_id,
+            status_store,
             max_packets,
             max_seconds,
             counters,
@@ -1277,9 +1487,8 @@ mod linux_daemon {
         tun: &TunEndpoint,
         e2e: boreas_tunnel::e2e::E2eCircuit<'_>,
         mtu: usize,
-        roots_path: &Path,
         status_path: &Path,
-        expected_net_id: [u8; 16],
+        status_store: StatusStore,
         max_packets: Option<u64>,
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
@@ -1293,9 +1502,8 @@ mod linux_daemon {
         // before the E2E stream (and its socket) is dropped, so `shutdown()`
         // can never target a recycled descriptor.
         let watchdog = StatusWatchdog::start(
-            roots_path.to_path_buf(),
+            status_store,
             status_path.to_path_buf(),
-            expected_net_id,
             sock_fd,
             Arc::clone(counters),
             STATUS_RECHECK_INTERVAL,
@@ -1452,6 +1660,30 @@ mod linux_daemon {
     #[cfg(test)]
     mod watchdog_tests {
         use super::*;
+        use boreas_pki::{management::ManagementTrust, status_store::StatusStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Real Linux durable-store fixture for watchdog tests. The caller owns
+        /// the returned directory and removes it after dropping the watchdog.
+        fn store_fixture(label: &str) -> (PathBuf, StatusStore) {
+            let dir = std::env::temp_dir().join(format!(
+                "boreas-watchdog-{label}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create watchdog store dir");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .expect("watchdog store dir 0700");
+            let uid = unsafe { libc::geteuid() };
+            let store = StatusStore::open(
+                dir.join("status.state"),
+                [0x2a; 16],
+                uid,
+                ManagementTrust::new([0x2a; 16]),
+            )
+            .expect("open watchdog status store");
+            (dir, store)
+        }
 
         #[test]
         fn endpoint_selection_used_by_connect_loop_and_names_honor_overrides() {
@@ -1533,10 +1765,10 @@ mod linux_daemon {
         #[test]
         fn watchdog_publishes_status_failure_and_marks_stale() {
             let counters = counters();
+            let (dir, store) = store_fixture("publishes");
             let watchdog = StatusWatchdog::start(
-                PathBuf::from("/nonexistent-boreas-roots.cbor"),
+                store,
                 PathBuf::from("/nonexistent-boreas-status.signed"),
-                [0x2a; 16],
                 -1,
                 Arc::clone(&counters),
                 Duration::from_millis(10),
@@ -1556,16 +1788,19 @@ mod linux_daemon {
                 "unexpected reason: {reason}"
             );
             assert!(!counters.status_fresh.load(Ordering::SeqCst));
+            drop(watchdog);
+            let _ = fs::remove_dir_all(dir);
         }
 
-        /// `Drop` stops and joins promptly even while the checker is parked.
+        /// `Drop` stops and joins promptly even when the immediate first check
+        /// has already published a fault.
         #[test]
         fn watchdog_drop_joins_promptly_without_fault() {
             let counters = counters();
+            let (dir, store) = store_fixture("drop");
             let watchdog = StatusWatchdog::start(
-                PathBuf::from("/nonexistent-boreas-roots.cbor"),
+                store,
                 PathBuf::from("/nonexistent-boreas-status.signed"),
-                [0x2a; 16],
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
@@ -1577,7 +1812,56 @@ mod linux_daemon {
                 "watchdog drop must not block: {:?}",
                 started.elapsed()
             );
-            assert!(counters.status_fresh.load(Ordering::SeqCst));
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        /// A second store on the same path is Busy; the watchdog must never
+        /// reopen per tick or retry through the lock.
+        #[test]
+        fn second_store_open_is_busy_and_never_retried() {
+            let (dir, store) = store_fixture("busy");
+            let uid = unsafe { libc::geteuid() };
+            let second = StatusStore::open(
+                dir.join("status.state"),
+                [0x2a; 16],
+                uid,
+                ManagementTrust::new([0x2a; 16]),
+            );
+            assert!(matches!(
+                second,
+                Err(boreas_pki::status_store::Error::Busy)
+            ));
+            drop(store);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        /// The first check must not wait for `interval`: an old implementation
+        /// parked for 500 ms (or 1 h in this test) after business started.
+        #[test]
+        fn watchdog_first_check_is_immediate() {
+            let counters = counters();
+            let (dir, store) = store_fixture("immediate");
+            let watchdog = StatusWatchdog::start(
+                store,
+                PathBuf::from("/nonexistent-boreas-status.signed"),
+                -1,
+                Arc::clone(&counters),
+                Duration::from_secs(3600),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if watchdog.fault().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                watchdog.fault().is_some(),
+                "watchdog first check must be immediate"
+            );
+            assert!(!counters.status_fresh.load(Ordering::SeqCst));
+            drop(watchdog);
+            let _ = fs::remove_dir_all(dir);
         }
 
         /// `shutdown(SHUT_RDWR)` is the mechanism that unblocks a stalled read;

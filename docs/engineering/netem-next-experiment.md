@@ -5,10 +5,19 @@ does not claim a root cause, and does not turn any existing red result green.
 
 ## Evidence boundary
 
-Tested binary: source `4ef5e37fd7b7d06712eb7ab4799019375bfa1b37` from successful
-backend run `43899414586`. Performance run
-[`43901434822`](https://github.com/Lanlan13-14/Boreas/actions/runs/43901434822)
-completed failure. Its workflow head `02c958a` is not the tested source.
+Latest downloaded artifact: performance run
+[`44089808664`](https://github.com/Lanlan13-14/Boreas/actions/runs/44089808664),
+workflow head `ff076a1`, tested source/binary
+`7be5abff064229980c99420b6ccac735de6dcf7e`, backend run `44088534961`. The run
+completed failure: the 1 MiB sample measured **2.439 / 2.305 Mbps** and the
+8 MiB sample **2.879 / 2.556 Mbps** (Edge -> Core / Core -> Edge), both below
+the unchanged 3 Mbps bound. The sender phase fields (`connect_seconds`,
+`send_seconds`, `digest_seconds`) are already separated in the artifact; this
+note does not re-derive them from the log.
+
+The table and historical numbers below come from run `43901434822` (tested
+source `4ef5e37fd7b7d06712eb7ab4799019375bfa1b37`, backend `43899414586`); its
+workflow head `02c958a` is not the tested source.
 
 The netem profile is **one-way delay per veth**, so the observed overlay RTT is
 twice the profile number. The smoke's nominal `100 x 50 ms` connected loop takes
@@ -25,6 +34,17 @@ call that loop a 5 s handshake deadline.
 Jobs: `133418900865` (50 ms), `133418900930` (200 ms strict), `133418900987`
 (400 ms), `133418900812` (200 ms 3%), `133418900688` (1 MiB vs 8 MiB).
 
+Latest paired diagnostic (run `44089808664`, same 200 ms / 0.1% / 100 Mbps
+profile, unchanged gates and byte counts):
+
+| Sample | Bytes | Edge -> Core | Core -> Edge | Bound | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 MiB | 1048576 | 2.439 Mbps | 2.305 Mbps | 3 Mbps | fail |
+| 8 MiB | 8388608 | 2.879 Mbps | 2.556 Mbps | 3 Mbps | fail |
+
+Both samples are single short windows; they are not steady state, not an SLA and
+not a root cause.
+
 TUN creation at 400 ms took only 100 / 50 ms. The failure is after TUN, not in
 TUN startup. Both post-window `ctl` probes still reported
 `available-not-connected`; Edge reported `outbound_upstreams: 0`.
@@ -39,9 +59,12 @@ TUN startup. Both post-window `ctl` probes still reported
 - 200 ms / 3% reaches about **19 RTT** without connecting. That is not explained
   by the same 10–11 RTT baseline alone; loss recovery, a handshake stall, scheduling,
   and other causes still need to be distinguished, and current evidence is insufficient for attribution.
-- The 200 ms / 0.1% job fails 1 MiB but the same-source 8 MiB diagnostic passed
-  one trial at 3.989 / 6.075 Mbps. The 1 MiB result is therefore not a fixed
-  3 Mbps ceiling. One 8 MiB pass is not steady state and not acceptance.
+- Run `43901434822` failed 1 MiB but its same-source 8 MiB diagnostic passed one
+  trial at 3.989 / 6.075 Mbps, so that single pair was not a fixed 3 Mbps
+  ceiling. Run `44089808664` did not reproduce the 8 MiB pass: both samples
+  stayed below 3 Mbps (1 MiB 2.439 / 2.305, 8 MiB 2.879 / 2.556). Across two
+  runs the 8 MiB outcome is unstable; neither pass nor fail is steady state or
+  acceptance, and this note attributes no cause.
 
 ## `ss -tin` evidence, and its limit
 
@@ -68,6 +91,36 @@ the 1 MiB average is slow start, an application-limited burst, or loss recovery.
 The 8 MiB end state suggests loss-driven cwnd reduction in at least one
 direction, but one trial cannot separate that from the short window.
 
+## Periodic trajectory telemetry (implemented, diagnostic only)
+
+The smoke starts two bounded samplers inside the disposable namespaces before
+the daemons launch and stops them when the probe window closes. Every 250 ms
+each records `ss -tin` for the fixed underlay pair (`bytes_acked`,
+`bytes_received`, `cwnd`, `ssthresh`, `rto`, `retrans`, `unacked`, `rtt`,
+`delivery_rate`); every fourth tick it also records `tc -s qdisc` drops,
+overlimits, requeues and backlog plus `ip -s link` TUN RX/TX bytes and drops. A
+non-connected run therefore still records what the kernel saw (for example
+`SYN-SENT`), and the qdisc/TUN counters show whether the underlay itself dropped
+or queued packets.
+
+Bounds: at most 240 samples and 32 socket records per sample per namespace
+(expected about 0.4 MiB, under 8 MiB worst-case NDJSON in the disposable work
+directory), 360 `timeout`-capped commands per namespace (240 `ss` + 60 `tc` + 60
+`ip`), and the process cannot outlive its 60 s deadline by more than one short
+tick. Only about 30 summary lines per namespace reach the uploaded log. The
+sampler overhead sits inside the measured probe window because sampling starts
+before the daemons, so it perturbs the same run it observes; it changes no
+threshold, wait, netem profile, byte count or gate and is never acceptance.
+
+The summary compares per-namespace `bytes_acked` deltas and implied TCP rates
+with the overlay `throughput_mbps`. That comparison is diagnostic only: TCP
+payload carries TLS/WSS/relay framing, the windows are short, and a rate
+difference is not by itself an attribution.
+
+Still missing for H2/H3/H4: the N >= 3 matrix, the 32 MiB sample, and phase
+alignment between sampler ticks and the sender's `send_seconds`. One diagnostic
+run cannot select a hypothesis, and none of this note claims a root cause.
+
 ## Experiment A: attribute the handshake stages
 
 Purpose: determine which protocol round trips consume the 10–11 RTT and whether
@@ -86,11 +139,11 @@ variable and emitted once to stderr (no status or key material):
    `connect_preconnected` (`:1231-1236`), after `open_e2e` (`:1248-1249`), and
    immediately before `drive_packet_path` (`:1254`). Serve-side counterparts:
    `:1132-1146`.
-4. Early `ss -tin` sampler from Edge launch to connected, every 100–250 ms,
-   retaining `SYN-SENT`/`ESTABLISHED` and `rtt/rto/retrans/cwnd`. The current
-   smoke only samples before and after the transfer
-   (`tools/release/netns_daemon_smoke.sh:349-443`), so a non-connected run has
-   no transport evidence at all.
+4. Early `ss -tin` sampling from Edge launch to connected, retaining
+   `SYN-SENT`/`ESTABLISHED` and `rtt/rto/retrans/cwnd`. This is now implemented
+   by the periodic trajectory telemetry above (250 ms cadence, started before
+   the daemons); the remaining gap is aligning those ticks with the binary's
+   stage trace.
 
 Diagnostic matrix, N >= 3, same binary and 1000 Mbps rate for handshake-only
 runs: 400 ms / 0%, 400 ms / 0.1%, 400 ms / 1%, with 200 ms / 0.1%, 200 ms / 3%,
@@ -112,11 +165,17 @@ Purpose: decide whether the 200 ms / 0.1% failure is short-window slow start,
 underlay loss/cwnd collapse, or per-packet serialization.
 
 Run 1 / 8 / 32 MiB at 200 ms / 0.1% and 200 ms / 1%, N >= 3, unchanged 3 Mbps
-floor. During the transfer, sample `ss -tin` every 250 ms on both namespaces and
-derive per-interval `bytes_acked`/`bytes_received` deltas; retain cwnd, ssthresh,
-retransmits, rto, delivery rate, `app_limited`, and `rwnd_limited`. Also capture
-`tc -s qdisc show dev veth-core/veth-edge` and `ip -s link show btun0` so netem
-backlog/drops and TUN drops are not guessed.
+floor. The periodic sampling above is now implemented for every smoke run:
+`ss -tin` every 250 ms and `tc -s qdisc` / `ip -s link` every fourth tick on both
+namespaces, summarized as per-namespace `bytes_acked`/`bytes_received` deltas
+with cwnd, ssthresh, retransmits, rto and delivery rate. The N >= 3 matrix and
+the 32 MiB sample remain future work; one diagnostic run cannot select H2, H3 or
+H4.
+
+The latest pair weakens H4 as a complete explanation: the 8 MiB sample rose
+relative to 1 MiB (2.879 / 2.556 vs 2.439 / 2.305 Mbps) but still stayed below
+the 3 Mbps bound, so it did not converge above the gate. That is still two short
+windows, not a conclusion.
 
 | Hypothesis | Discriminating observation | If supported |
 | --- | --- | --- |

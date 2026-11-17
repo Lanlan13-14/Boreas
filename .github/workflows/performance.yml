@@ -184,6 +184,11 @@ jobs:
     # with the original 1 MiB probe and a longer 8 MiB probe. Both samples run
     # even if the first fails; the job fails if either sample fails. A single
     # short window is not steady state and is not an SLA.
+    #
+    # The smoke also emits a bounded periodic underlay trajectory (ss -tin
+    # TCP_INFO plus tc qdisc and TUN counters) from before the daemons start.
+    # That evidence is diagnostic only: it changes no threshold, wait, netem
+    # profile or byte count, and nothing in it can mark a sample as accepted.
     needs: source
     name: Diagnostic 1 MiB vs 8 MiB (one-way 200 ms, loss 0.1%, 100 Mbps)
     runs-on: ubuntu-24.04
@@ -236,6 +241,7 @@ jobs:
             echo "diagnostic_source_run=${SOURCE_RUN}"
             echo 'diagnostic_profile=one-way-200ms-loss-0.1pct-rate-100mbit'
             echo 'diagnostic_scope=single-paired-short-window-not-steady-state'
+            echo 'diagnostic_telemetry=namespace-periodic-ss-tin+tc-qdisc+ip-link-diag-only'
           } > diagnostic-status.txt
           overall=0
           run_sample() {
@@ -276,6 +282,7 @@ jobs:
           set +e
           set -u
           echo 'diagnostic_caveat=single short window, not steady state and not an SLA'
+          echo 'diagnostic_telemetry_caveat=periodic underlay ss/tc/TUN counters are diagnostic; no threshold and never acceptance'
           if [[ -f diagnostic-status.txt ]]; then
             cat diagnostic-status.txt
           else
@@ -288,7 +295,7 @@ jobs:
               echo "${label}_evidence=missing"
               continue
             fi
-            grep -E '^(overlay_throughput_(edge_to_core|core_to_edge)_mbps|overlay_ping_(loss_percent|average_ms|max_ms)|resource_(evidence_status|window_seconds|samples)|(core|edge)_(evidence_status|window_seconds|samples|cpu_[a-z_]+|rss_peak_kb))=' "$log" || true
+            grep -E '^(overlay_throughput_(edge_to_core|core_to_edge)_mbps|overlay_ping_(loss_percent|average_ms|max_ms)|resource_(evidence_status|window_seconds|samples)|(core|edge)_(evidence_status|window_seconds|samples|cpu_[a-z_]+|rss_peak_kb)|underlay_telemetry_[a-z_]+)=' "$log" || true
             reasons="$(grep -E '(^ERROR:|^  - |overlay_perf_failure:|overlay_ping_failure:|resource_evidence_detail=|^Traceback)' "$log" | tail -n 40)"
             echo "--- ${label} failure reasons ---"
             if [[ -n "$reasons" ]]; then

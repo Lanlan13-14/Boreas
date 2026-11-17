@@ -5,12 +5,16 @@
 
 use std::fs;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use boreas_pki::root_authorization::NetworkRootPin;
+use boreas_proto::{network_policy::NetworkPolicyCandidate, objects::MldsaParameterSet};
+use openssl::{pkey::{KeyType, PKey, Private}, sign::Signer};
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -44,6 +48,70 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn owner_uid(path: &Path) -> String {
+    fs::metadata(path)
+        .unwrap()
+        .uid()
+        .to_string()
+}
+
+fn policy_fixture(state_dir: &Path, ed: &PKey<Private>, ml: &PKey<Private>, net_id: [u8; 16], seq: u64) {
+    fs::create_dir_all(state_dir).unwrap();
+    fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let pin = NetworkRootPin::provisioned(
+        net_id,
+        ed.public_key_to_der().unwrap(),
+        MldsaParameterSet::Mldsa65,
+        ml.public_key_to_der().unwrap(),
+    ).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+    let candidate = NetworkPolicyCandidate {
+        net_id,
+        root_key_fingerprint: pin.fingerprint().unwrap(),
+        overlay_base: [10, 20, 0, 0],
+        version: 1,
+        seq,
+        issued_at: now.saturating_sub(1_000_000),
+        expires: now.saturating_add(3_600_000_000),
+    };
+    let tbs = candidate.encode_tbs().unwrap();
+    let signed = NetworkPolicyCandidate::signature_input(&tbs).unwrap();
+    let mut signer = Signer::new_without_digest(ed).unwrap();
+    let ed_sig = signer.sign_oneshot_to_vec(&signed).unwrap();
+    let mut signer = Signer::new_without_digest(ml).unwrap();
+    let ml_sig = signer.sign_oneshot_to_vec(&signed).unwrap();
+    for (name, bytes) in [
+        ("policy.tbs", tbs),
+        ("policy.ed25519.sig", ed_sig),
+        ("policy.mldsa65.sig", ml_sig),
+        ("root.ed25519.der", ed.public_key_to_der().unwrap()),
+        ("root.mldsa65.der", ml.public_key_to_der().unwrap()),
+    ] {
+        let path = state_dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn policy_args(state_dir: &Path) -> Vec<String> {
+    let mut args = Vec::new();
+    for (flag, file) in [
+        ("--network-policy-tbs", "policy.tbs"),
+        ("--network-policy-ed25519-signature", "policy.ed25519.sig"),
+        ("--network-policy-mldsa65-signature", "policy.mldsa65.sig"),
+        ("--network-root-ed25519-der", "root.ed25519.der"),
+        ("--network-root-mldsa65-der", "root.mldsa65.der"),
+        ("--network-policy-state-file", "policy.state"),
+    ] {
+        args.push(flag.to_string());
+        args.push(state_dir.join(file).to_string_lossy().into_owned());
+    }
+    args.push("--network-policy-state-owner-uid".into());
+    args.push(owner_uid(state_dir));
+    args
+}
+
 fn write_config(
     path: &Path,
     role: &str,
@@ -57,7 +125,7 @@ fn write_config(
         r#"version = 2
 
 [node]
-net_id = "0123456789abcdef0123456789abcdef"
+net_id = "03030303030303030303030303030303"
 role = "{role}"
 home_core_id = 1
 vip_octet = {vip_octet}
@@ -85,6 +153,43 @@ probe_paths = 1
 }
 
 #[test]
+fn business_modes_require_explicit_durable_status_binding() {
+    for mode in ["serve", "connect"] {
+        let out = Command::new(bin())
+            .args(["daemon", mode])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{mode} must refuse without status binding");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--status-state-file"),
+            "{mode} stderr must name the required state file: {err}"
+        );
+        assert!(
+            err.contains("--status-state-owner-uid"),
+            "{mode} stderr must name the required owner UID: {err}"
+        );
+    }
+
+    let relative = Command::new(bin())
+        .args([
+            "daemon",
+            "serve",
+            "--status-state-file",
+            "relative-status.state",
+            "--status-state-owner-uid",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!relative.status.success());
+    assert!(
+        String::from_utf8_lossy(&relative.stderr).contains("absolute"),
+        "relative state path must fail closed"
+    );
+}
+
+#[test]
 fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     let root = TempDir::new("full");
     let ca_dir = root.0.join("ca");
@@ -92,6 +197,20 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     let edge_mat = root.0.join("edge-mat");
     let core_state = root.0.join("core-state");
     let edge_state = root.0.join("edge-state");
+    let core_status_state = core_state.join("status.state");
+    let edge_status_state = edge_state.join("status.state");
+    fs::create_dir_all(&core_state).unwrap();
+    fs::create_dir_all(&edge_state).unwrap();
+    fs::set_permissions(&core_state, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&edge_state, fs::Permissions::from_mode(0o700)).unwrap();
+    let net_id = [3u8; 16];
+    let root_ed = PKey::generate_ed25519().unwrap();
+    let root_ml = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[73; 32]).unwrap();
+    policy_fixture(&core_state, &root_ed, &root_ml, net_id, 1);
+    policy_fixture(&edge_state, &root_ed, &root_ml, net_id, 1);
+    // Each daemon status store is independently bound to its state directory owner.
+    let core_state_owner = owner_uid(&core_state);
+    let edge_state_owner = owner_uid(&edge_state);
 
     // 1. Offline CA init (`boreas pki init-ca`).
     let init_out = Command::new(bin())
@@ -101,7 +220,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             "--ca-dir",
             ca_dir.to_str().unwrap(),
             "--net-id",
-            "0123456789abcdef0123456789abcdef",
+            "03030303030303030303030303030303",
             "--validity-days",
             "30",
         ])
@@ -212,6 +331,43 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         &format!("wss.boreas.test:{port}"),
     );
 
+    // Both missing trust pins and a malformed dual-signature input are rejected
+    // before a daemon process can start forwarding.
+    let complete_policy_args = policy_args(&edge_state);
+    let mut incomplete_policy_args = Vec::new();
+    for pair in complete_policy_args.chunks_exact(2) {
+        if pair[0] != "--network-root-mldsa65-der" {
+            incomplete_policy_args.extend_from_slice(pair);
+        }
+    }
+    let missing = Command::new(bin())
+        .args([
+            "daemon", "connect", "--config", edge_cfg.to_str().unwrap(),
+            "--material-dir", edge_mat.to_str().unwrap(),
+            "--status-state-file", edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid", &edge_state_owner,
+        ])
+        .args(incomplete_policy_args
+        .output().unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--network-root-mldsa65-der"));
+
+    let ml_sig_path = edge_state.join("policy.mldsa65.sig");
+    let valid_ml_sig = fs::read(&ml_sig_path).unwrap();
+    fs::write(&ml_sig_path, [0u8; 3309]).unwrap();
+    let bad_signature = Command::new(bin())
+        .args([
+            "daemon", "connect", "--config", edge_cfg.to_str().unwrap(),
+            "--material-dir", edge_mat.to_str().unwrap(),
+            "--status-state-file", edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid", &edge_state_owner,
+        ])
+        .args(policy_args(&edge_state))
+        .output().unwrap();
+    fs::write(&ml_sig_path, valid_ml_sig).unwrap();
+    assert!(!bad_signature.status.success());
+    assert!(String::from_utf8_lossy(&bad_signature.stderr).contains("network policy rejected"));
+
     let srv = Command::new(bin())
         .args([
             "daemon",
@@ -220,12 +376,17 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             core_cfg.to_str().unwrap(),
             "--material-dir",
             core_mat.to_str().unwrap(),
+            "--status-state-file",
+            core_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &core_state_owner,
             "--listen",
             &listen,
             "--virtual-tun",
             "--max-seconds",
             "3",
         ])
+        .args(policy_args(&core_state))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -247,6 +408,10 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             edge_cfg.to_str().unwrap(),
             "--material-dir",
             edge_mat.to_str().unwrap(),
+            "--status-state-file",
+            edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &edge_state_owner,
             "--connect",
             &listen,
             "--tls-name",
@@ -255,6 +420,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             "--max-seconds",
             "2",
         ])
+        .args(policy_args(&edge_state))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -335,12 +501,17 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             core_cfg.to_str().unwrap(),
             "--material-dir",
             core_mat.to_str().unwrap(),
+            "--status-state-file",
+            core_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &core_state_owner,
             "--listen",
             &listen2,
             "--virtual-tun",
             "--max-seconds",
             "4",
         ])
+        .args(policy_args(&core_state))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -356,6 +527,10 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             edge_cfg.to_str().unwrap(),
             "--material-dir",
             edge_mat.to_str().unwrap(),
+            "--status-state-file",
+            edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &edge_state_owner,
             "--connect",
             &listen2,
             "--tls-name",
@@ -364,6 +539,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             "--max-seconds",
             "4",
         ])
+        .args(policy_args(&edge_state))
         .output()
         .unwrap();
     let _ = srv2.wait_with_output();

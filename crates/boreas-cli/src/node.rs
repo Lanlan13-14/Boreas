@@ -381,21 +381,11 @@ struct VerifiedPair {
 #[cfg(feature = "openssl-inner-tls")]
 impl VerifiedPair {
     fn local_peer(&self) -> boreas_tunnel::tls::PeerIdentity {
-        boreas_tunnel::tls::PeerIdentity {
-            net_id: self.local.net_id(),
-            node_id: self.local.node_id(),
-            identity_generation: self.local.identity_generation(),
-            role: self.local.role(),
-        }
+        self.local.peer_identity()
     }
 
     fn peer_peer(&self) -> boreas_tunnel::tls::PeerIdentity {
-        boreas_tunnel::tls::PeerIdentity {
-            net_id: self.peer.net_id(),
-            node_id: self.peer.node_id(),
-            identity_generation: self.peer.identity_generation(),
-            role: self.peer.role(),
-        }
+        self.peer.peer_identity()
     }
 }
 
@@ -452,9 +442,9 @@ fn load_verified_identities(
             now_us,
         )
         .map_err(|error| format!("error: peer NodeIdentity rejected: {error}"))?;
-    let local = VerifiedNodeIdentity::from_verified_object(&local_object)
+    let local = VerifiedNodeIdentity::from_verified_object_legacy_for_hop_only(&local_object)
         .map_err(|error| format!("error: local identity mapping rejected: {error}"))?;
-    let peer = VerifiedNodeIdentity::from_verified_object(&peer_object)
+    let peer = VerifiedNodeIdentity::from_verified_object_legacy_for_hop_only(&peer_object)
         .map_err(|error| format!("error: peer identity mapping rejected: {error}"))?;
     if local.net_id() != net_id
         || local.node_id() != prepared.config.identity.node_id

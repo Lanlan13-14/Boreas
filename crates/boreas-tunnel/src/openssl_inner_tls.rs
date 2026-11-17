@@ -214,20 +214,38 @@ pub struct VerifiedNodeIdentity {
     role: NodeRole,
     home_core_id: u8,
     vip: [u8; 4],
+    policy: Option<boreas_pki::VerifiedNetworkContext>,
     not_before: u64,
     expires: u64,
     public_key_spki: Vec<u8>,
 }
 
 impl VerifiedNodeIdentity {
-    pub fn from_verified_object(object: &VerifiedObject) -> Result<Self, TunnelError> {
-        let management = object.object();
-        let ObjectBody::NodeIdentity(body) = &management.body else {
-            return Err(TunnelError::Unsupported("not a NodeIdentity object"));
-        };
-        if management.net_id != body.net_id || body.net_id == [0u8; 16] {
+    pub fn from_verified_object(
+        object: &VerifiedObject,
+        policy: &boreas_pki::VerifiedNetworkContext,
+    ) -> Result<Self, TunnelError> {
+        let body = verified_node_body(object)?;
+        if body.net_id != policy.net_id() {
             return Err(TunnelError::Unsupported("identity network mismatch"));
         }
+        if policy.overlay_base() != [10, 20, 0, 0] {
+            return Err(TunnelError::Unsupported("unsupported runtime network prefix"));
+        }
+        Self::from_validated_body(body, Some(*policy))
+    }
+
+    /// Explicitly unbound compatibility path for hop-only diagnostics. The
+    /// resulting identity cannot authorize an E2E packet path.
+    pub fn from_verified_object_legacy_for_hop_only(object: &VerifiedObject) -> Result<Self, TunnelError> {
+        let body = verified_node_body(object)?;
+        Self::from_validated_body(body, None)
+    }
+
+    fn from_validated_body(
+        body: &boreas_proto::objects::NodeIdentity,
+        policy: Option<boreas_pki::VerifiedNetworkContext>,
+    ) -> Result<Self, TunnelError> {
         let expected_vip = boreas_pki::expected_vip(
             body.home_core_id,
             body.vip[3],
@@ -275,6 +293,7 @@ impl VerifiedNodeIdentity {
             role: map_object_role(body.role),
             home_core_id: body.home_core_id,
             vip: body.vip,
+            policy,
             not_before: body.not_before,
             expires: body.expires,
             public_key_spki: ml_dsa_spki(oid, &body.identity_pub_mldsa),
@@ -302,6 +321,17 @@ impl VerifiedNodeIdentity {
         self.vip
     }
 
+    pub fn peer_identity(&self) -> PeerIdentity {
+        match self.policy {
+            Some(policy) => PeerIdentity::policy_bound(
+                self.net_id, self.node_id, self.identity_generation, self.role, policy,
+            ).expect("validated identity and policy share network id"),
+            None => PeerIdentity::legacy_default(
+                self.net_id, self.node_id, self.identity_generation, self.role,
+            ),
+        }
+    }
+
     pub fn not_before(&self) -> u64 {
         self.not_before
     }
@@ -309,6 +339,35 @@ impl VerifiedNodeIdentity {
     pub fn expires(&self) -> u64 {
         self.expires
     }
+}
+
+fn verified_node_body(object: &VerifiedObject) -> Result<&boreas_proto::objects::NodeIdentity, TunnelError> {
+    let management = object.object();
+    let ObjectBody::NodeIdentity(body) = &management.body else {
+        return Err(TunnelError::Unsupported("not a NodeIdentity object"));
+    };
+    if management.net_id != body.net_id || body.net_id == [0; 16] {
+        return Err(TunnelError::Unsupported("identity network mismatch"));
+    }
+    let role = match body.role {
+        ObjectRole::Edge => boreas_pki::NodeRole::Edge,
+        ObjectRole::Core => boreas_pki::NodeRole::Core,
+        ObjectRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
+    };
+    let vip = boreas_pki::expected_vip(body.home_core_id, body.vip[3], role)
+        .map_err(|_| TunnelError::Unsupported("invalid identity VIP"))?;
+    if body.vip != vip {
+        return Err(TunnelError::Unsupported("identity VIP mismatch"));
+    }
+    let node_id = boreas_pki::node_id(body.home_core_id, body.vip[3], role)
+        .map_err(|_| TunnelError::Unsupported("invalid identity node mapping"))?;
+    if body.node_id != node_id || body.node_id == 0 || body.identity_generation == 0 {
+        return Err(TunnelError::Unsupported("identity node mapping mismatch"));
+    }
+    if body.identity_pub_mldsa.is_empty() {
+        return Err(TunnelError::Unsupported("missing identity key"));
+    }
+    Ok(body)
 }
 
 /// RFC 9881 id-ml-dsa-65 OID content (2.16.840.1.101.3.4.3.18).
@@ -460,12 +519,7 @@ impl PeerIdentityExtractor for PkiIdentityExtractor {
         if identity.vip != expected_vip {
             return None;
         }
-        Some(PeerIdentity {
-            net_id: identity.net_id,
-            node_id: identity.node_id,
-            identity_generation: identity.identity_generation,
-            role: identity.role,
-        })
+        Some(identity.peer_identity())
     }
 }
 

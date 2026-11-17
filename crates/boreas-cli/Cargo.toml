@@ -38,3 +38,6 @@ boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 # so this adds no new locked package.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"
+
+[dev-dependencies]
+openssl = "=0.10.82"

@@ -11,27 +11,36 @@
       {"workflow": ".github/workflows/openwrt.yml", "target": "linux-x86_64", "compiler": "musl-gcc", "extra_options": ["no-async", "no-legacy"]},
       {"workflow": ".github/workflows/openwrt.yml", "target": "linux-aarch64", "compiler": "musl-gcc", "extra_options": ["no-async", "no-legacy", "-mno-outline-atomics"]}
     ],
-    "evidence": "Source-level expected path removal only. CI must collect generated AND installed configuration.h defines, structured configdata disabled map, runtime disabled listings, negative CMS/QUIC/SIV registration checks, positive native group/signature/AES-GCM capability, static linkage and real mTLS. No successful Actions evidence reviewed; affected_ranges remain blocking. crypto-poc now uses the same candidate pin and verifier, also pending Actions."
+    "evidence": "Source-level expected path removal only. CI must collect generated AND installed configuration.h defines, structured configdata disabled map, runtime disabled listings, negative CMS/QUIC/SIV registration checks, positive native group/signature/AES-GCM capability, static linkage and real mTLS. No successful Actions evidence reviewed; affected_ranges remain blocking. The 20261117 notice adds one QUIC path plus two non-QUIC paths, so the candidate reduction cannot clear the complete notice. Official 4.1.1 tag API returned 404 on 2026-11-17 and the official source table still lists 4.1.0; no 4.1.1 pin or checksum is available."
   },
-  "reviewed_through_notice": "20261110",
+  "reviewed_through_notice": "20261117",
   "applicability": {
     "CVE-2026-88822": "4.1.0 affected upstream: QUIC automated peer detection leaks stack data. For the five exact configurations above, no-quic is expected to exclude the QUIC implementation (OPENSSL_NO_QUIC), not patch it. Runtime/header/linkage and mTLS evidence pending; CI still blocks. Remaining 3.6.5 is unsupported/unanalysed.",
     "CVE-2026-95691": "4.1.0 affected upstream: retransmitted QUIC CRYPTO client UAF. Same no-quic removal expectation for the five exact configurations; no whole-program or produced-binary proof yet. CI still blocks.",
     "CVE-2026-88823": "4.1.0 affected upstream: AES-GCM-SIV fragmented/zero-length AAD authentication error. no-siv controls both SIV and GCM-SIV implementation sources and default-provider registration. Require OPENSSL_NO_SIV plus no AES-*-SIV/AES-*-GCM-SIV runtime registration; ordinary AES-GCM retained. Evidence pending; CI still blocks.",
     "CVE-2026-95692": "4.1.0 affected upstream: AES-GCM-SIV short/long IV handling. Same no-siv removal expectation, not an AES-GCM TLS vulnerability or a patch. Evidence pending; CI still blocks.",
-    "CVE-2026-107496": "CMS_encrypt/CMS_encrypt_ex with attacker-controlled EC order=1 recipient. Advisory limits 4.x exposure to enable-ec_explicit_curves; these configurations do not enable it and additionally use no-cms. Require OPENSSL_NO_CMS and OPENSSL_NO_EC_EXPLICIT_CURVES and absent CMS CLI registration. TLS/QUIC do not use the CMS path, but that fact alone is not a waiver. Evidence pending; CI still blocks."
+    "CVE-2026-107496": "CMS_encrypt/CMS_encrypt_ex with attacker-controlled EC order=1 recipient. Advisory limits 4.x exposure to enable-ec_explicit_curves; these configurations do not enable it and additionally use no-cms. Require OPENSSL_NO_CMS and OPENSSL_NO_EC_EXPLICIT_CURVES and absent CMS CLI registration. TLS/QUIC do not use the CMS path, but that fact alone is not a waiver. Evidence pending; CI still blocks.",
+    "CVE-2026-35190": "20261117: 4.1.0 is affected. TLS 1.3 server key-share processing can read beyond a fixed group list only when SSL_CTX_set_cert_flags() sets SSL_CERT_FLAG_SUITEB_128_LOS. The advisory says default configurations and stock s_server -suiteB_128 do not reach it. no-quic/no-cms/no-siv does not remove this TLS path; absence of a project call is not a whole-program waiver. 4.1.1 is not released as of this review, so CI blocks.",
+    "CVE-2026-107493": "20261117: 4.1.0 is affected. PEM_X509_INFO_read_bio_ex() and related functions can leave freed entries when appending to a caller-supplied stack fails. The advisory says OpenSSL's own CA-loading callers pass NULL; only applications supplying an existing stack and using it after failure are affected. no-quic/no-cms/no-siv does not remove this parser path and no call-graph waiver is claimed. 4.1.1 is not released as of this review, so CI blocks.",
+    "CVE-2026-124709": "20261117: 4.1.0 is affected. A QUIC server can retain rejected stream state without bound. no-quic is expected to remove this implementation for the five exact configurations, subject to the same generated-header/configdata/static-symbol evidence as the earlier QUIC CVEs. That candidate path removal neither patches 4.1.0 nor addresses the two other 20261117 findings; CI still blocks."
   },
   "affected_ranges": [
-    {"minimum": "4.1.0", "fixed": "4.1.1", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
-    {"minimum": "4.0.0", "fixed": "4.0.4", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]},
-    {"minimum": "3.5.0", "fixed": "3.5.10", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496"]}
+    {"minimum": "4.1.0", "fixed": "4.1.1", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496", "CVE-2026-35190", "CVE-2026-107493", "CVE-2026-124709"]},
+    {"minimum": "4.0.0", "fixed": "4.0.4", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496", "CVE-2026-35190", "CVE-2026-107493", "CVE-2026-124709"]},
+    {"minimum": "3.5.0", "fixed": "3.5.10", "cves": ["CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692", "CVE-2026-107496", "CVE-2026-35190", "CVE-2026-107493", "CVE-2026-124709"]},
+    {"minimum": "3.0.0", "fixed": "3.0.24", "cves": ["CVE-2026-107496", "CVE-2026-107493"]},
+    {"minimum": "1.1.1", "fixed": "1.1.1zk", "cves": ["CVE-2026-107496", "CVE-2026-107493"]},
+    {"minimum": "1.0.2", "fixed": "1.0.2zt", "cves": ["CVE-2026-107496", "CVE-2026-107493"]}
   ],
-  "queried_at": "2026-11-16",
-  "status": "4.1.0 release digest and tagged source independently reviewed on 2026-11-16. Reduced builds are migration candidates, NOT a CVE waiver; no successful Actions evidence reviewed. CI continues to block known affected ranges; all three native workflow pins now target the same migration candidate, not an approved backend. New notices require renewed review.",
+  "queried_at": "2026-11-17",
+  "status": "20261110 and 20261117 notices reviewed. OpenSSL 4.1.1 was not published at query time: the official GitHub tag API returned 404 and the official download table still listed 4.1.0, so no fixed-version migration or SHA-256 can honestly be added. The 4.1.0 reduced builds remain unapproved migration candidates, NOT a CVE waiver. All eight 4.1.0 findings through 20261117 remain encoded in affected_ranges and blocking; no-quic can only address the three QUIC paths as a build-removal candidate, while the Suite B TLS and PEM_X509_INFO paths require separate review or an actually released fixed version. New notices require renewed review; no advisory is suppressed.",
   "sources": [
     "https://openssl-library.org/source/",
     "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-3.6.5",
     "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-4.1.0",
+    "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-4.1.1",
+    "https://github.com/openssl/openssl/releases/download/openssl-4.1.0/openssl-4.1.0.tar.gz",
+    "https://github.com/openssl/openssl/releases/download/openssl-4.1.0/openssl-4.1.0.tar.gz.sha256",
     "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/Configure",
     "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/include/openssl/configuration.h.in",
     "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/apps/include/configuration.h.in",
@@ -39,6 +48,7 @@
     "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/providers/implementations/ciphers/build.info",
     "https://raw.githubusercontent.com/openssl/openssl/openssl-4.1.0/providers/defltprov.c",
     "https://openssl-library.org/news/vulnerabilities/",
-    "https://openssl-library.org/news/secadv/20261110.txt"
+    "https://openssl-library.org/news/secadv/20261110.txt",
+    "https://openssl-library.org/news/secadv/20261117.txt"
   ]
 }

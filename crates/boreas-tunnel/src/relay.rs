@@ -725,12 +725,7 @@ mod tests {
         use boreas_crypto::NodeRole;
         use boreas_proto::messages::Suite as MessageSuite;
 
-        let peer = PeerIdentity {
-            net_id: [7; 16],
-            node_id: 2,
-            identity_generation: 1,
-            role: NodeRole::Core,
-        };
+        let peer = PeerIdentity::legacy_default([7; 16], 2, 1, NodeRole::Core);
         let strict = InnerTlsSession::test_only(peer, strict_test_negotiated());
         assert!(
             VerifiedE2eSession::from_verified_e2e_tls(&strict, peer, MessageSuite::Pq768, false)

@@ -220,6 +220,8 @@ pub enum PacketPathError {
     MtuAboveCircuitCap,
     /// An identity is not a usable Boreas node identity.
     InvalidIdentity,
+    /// The identity is not bound to the same verified network policy as its peer.
+    PolicyMismatch,
     /// The node id and role do not describe a permanent VIP slot.
     InvalidPermanentSlot,
     /// A permanent VIP is not in the network overlay or not canonical.
@@ -252,6 +254,7 @@ impl fmt::Display for PacketPathError {
             Self::MtuOutOfRange => f.write_str("mtu-out-of-range"),
             Self::MtuAboveCircuitCap => f.write_str("mtu-above-circuit-cap"),
             Self::InvalidIdentity => f.write_str("identity-invalid"),
+            Self::PolicyMismatch => f.write_str("policy-mismatch"),
             Self::InvalidPermanentSlot => f.write_str("permanent-slot-invalid"),
             Self::InvalidEndpointVip => f.write_str("endpoint-vip-invalid"),
             Self::SelfPair => f.write_str("endpoint-pair-self"),
@@ -277,6 +280,8 @@ pub struct EndpointFacts {
     identity_generation: u64,
     role: NodeRole,
     vip: Ipv4Addr,
+    #[cfg(feature = "openssl-inner-tls")]
+    policy_digest: [u8; 32],
 }
 
 impl EndpointFacts {
@@ -303,8 +308,8 @@ impl EndpointFacts {
 
     /// Derive the endpoint from authenticated identity facts.
     ///
-    /// The VIP is a deterministic function of `(node_id, role)`: the network
-    /// overlay `10.20.<home_core>.<vip_octet>` with
+    /// The VIP is a deterministic function of `(node_id, role)` for the sole
+    /// runtime-supported default policy prefix, `10.20.<home_core>.<vip_octet>`, with
     /// `node_id = ((home_core - 1) << 8) | vip_octet`, Core `vip_octet = 1` and
     /// Edge `vip_octet` in `2..=251`. This reproduces `boreas-pki`'s permanent
     /// slot rule so the L3 binding can be checked in a build without the PKI
@@ -316,6 +321,14 @@ impl EndpointFacts {
         {
             return Err(PacketPathError::InvalidIdentity);
         }
+        #[cfg(feature = "openssl-inner-tls")]
+        let policy = identity.policy().ok_or(PacketPathError::PolicyMismatch)?;
+        #[cfg(feature = "openssl-inner-tls")]
+        if policy.net_id() != identity.net_id || policy.overlay_base() != [10, 20, 0, 0] {
+            return Err(PacketPathError::PolicyMismatch);
+        }
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        return Err(PacketPathError::PolicyMismatch);
         let vip = permanent_vip(identity.node_id, identity.role)
             .ok_or(PacketPathError::InvalidPermanentSlot)?;
         Ok(Self {
@@ -324,6 +337,8 @@ impl EndpointFacts {
             identity_generation: identity.identity_generation,
             role: identity.role,
             vip,
+            #[cfg(feature = "openssl-inner-tls")]
+            policy_digest: policy.policy_digest(),
         })
     }
 }
@@ -514,6 +529,10 @@ impl AuthorizedEndpoints {
         let peer = EndpointFacts::from_verified_identity(peer)?;
         if local.net_id != peer.net_id || local.node_id == peer.node_id {
             return Err(PacketPathError::IdentityMismatch);
+        }
+        #[cfg(feature = "openssl-inner-tls")]
+        if local.policy_digest != peer.policy_digest {
+            return Err(PacketPathError::PolicyMismatch);
         }
         if local.vip == peer.vip {
             return Err(PacketPathError::SelfPair);
@@ -1034,6 +1053,21 @@ impl PacketPathError {
 }
 
 #[cfg(test)]
+mod unbound_default_tests {
+    use super::*;
+
+    #[cfg(not(feature = "openssl-inner-tls"))]
+    #[test]
+    fn packet_path_rejects_legacy_identity_without_crypto_feature() {
+        let peer = PeerIdentity::legacy_default([7; 16], 0x0209, 1, NodeRole::Edge);
+        assert_eq!(
+            EndpointFacts::from_verified_identity(peer).unwrap_err(),
+            PacketPathError::PolicyMismatch,
+        );
+    }
+}
+
+#[cfg(all(test, feature = "openssl-inner-tls"))]
 mod tests {
     //! In-crate tests.
     //!
@@ -1075,17 +1109,78 @@ mod tests {
     }
 
     fn identity(node_id: u16, role: NodeRole) -> PeerIdentity {
-        PeerIdentity {
-            net_id: NET,
-            node_id,
-            identity_generation: GENERATION,
-            role,
-        }
+        PeerIdentity::legacy_default(NET, node_id, GENERATION, role)
     }
 
     fn endpoints(local: PeerIdentity, peer: PeerIdentity) -> AuthorizedEndpoints {
+        // This helper exists only in backend-enabled tests; production cannot
+        // synthesize a binding and default-build tests cover rejection separately.
+        let policy = test_policy_context(NET);
+        let local = PeerIdentity::policy_bound(NET, local.node_id, local.identity_generation, local.role, policy)
+            .expect("verified fixture context");
+        let peer = PeerIdentity::policy_bound(NET, peer.node_id, peer.identity_generation, peer.role, policy)
+            .expect("verified fixture context");
         AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
             .expect("canonical permanent pair")
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    fn test_policy_context(net_id: [u8; 16]) -> boreas_pki::VerifiedNetworkContext {
+        use boreas_proto::network_policy::NetworkPolicyCandidate;
+        use boreas_proto::objects::MldsaParameterSet;
+        use openssl::{pkey::{KeyType, PKey}, sign::Signer};
+        let ed = PKey::generate_ed25519().expect("Ed25519 test root");
+        let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[0x65; 32])
+            .expect("ML-DSA test root");
+        let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
+            net_id, ed.public_key_to_der().unwrap(), MldsaParameterSet::Mldsa65,
+            pq.public_key_to_der().unwrap(),
+        ).unwrap();
+        let candidate = NetworkPolicyCandidate {
+            net_id, root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0], version: 1, seq: 1, issued_at: 1, expires: u64::MAX,
+        };
+        let raw = candidate.encode_tbs().unwrap();
+        let message = NetworkPolicyCandidate::signature_input(&raw).unwrap();
+        let mut signer = Signer::new_without_digest(&ed).unwrap();
+        let ed_sig = signer.sign_oneshot_to_vec(&message).unwrap();
+        let mut signer = Signer::new_without_digest(&pq).unwrap();
+        let pq_sig = signer.sign_oneshot_to_vec(&message).unwrap();
+        boreas_pki::verify_network_policy(&raw, &ed_sig, &pq_sig, &pin, net_id, 2)
+            .unwrap().require_default_runtime().unwrap()
+    }
+
+    fn assert_unbound_rejected(local: PeerIdentity, peer: PeerIdentity) {
+        assert_eq!(
+            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
+                .unwrap_err(),
+            PacketPathError::PolicyMismatch,
+        );
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn packet_endpoint_refuses_legacy_unbound_identity() {
+        assert_unbound_rejected(
+            identity(0x0201, NodeRole::Core),
+            identity(0x0209, NodeRole::Edge),
+        );
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn packet_endpoint_rejects_distinct_signed_policy_digests() {
+        let local = PeerIdentity::policy_bound(
+            NET, 0x0201, GENERATION, NodeRole::Core, test_policy_context(NET),
+        ).unwrap();
+        let peer = PeerIdentity::policy_bound(
+            NET, 0x0209, GENERATION, NodeRole::Edge, test_policy_context(NET),
+        ).unwrap();
+        assert_eq!(
+            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
+                .unwrap_err(),
+            PacketPathError::PolicyMismatch,
+        );
     }
 
     fn checksum_value(data: &[u8]) -> u16 {
@@ -1242,21 +1337,23 @@ mod tests {
     fn bind_accepts_only_canonical_permanent_pairs() {
         let local = identity(0x0201, NodeRole::Core);
         let peer = identity(0x0209, NodeRole::Edge);
+        #[cfg(feature = "openssl-inner-tls")]
         let bound = endpoints(local, peer);
+        #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.local.vip, Ipv4Addr::new(10, 20, 3, 1));
+        #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.peer.vip, Ipv4Addr::new(10, 20, 3, 9));
+        #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.circuit_id, [0x11; 16]);
+        #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.path_hops, 1);
+        #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.mtu_cap, u16::try_from(DEFAULT_MTU).unwrap());
 
         let bind = |circuit: [u8; 16], hops: u8, peer: PeerIdentity, local: PeerIdentity| {
-            AuthorizedEndpoints::bind(
-                circuit,
-                hops,
-                peer,
-                local,
-                u16::try_from(DEFAULT_MTU).unwrap(),
-            )
+            let peer = PeerIdentity::policy_bound(NET, peer.node_id, peer.identity_generation, peer.role, test_policy_context(NET)).unwrap();
+            let local = PeerIdentity::policy_bound(NET, local.node_id, local.identity_generation, local.role, test_policy_context(NET)).unwrap();
+            AuthorizedEndpoints::bind(circuit, hops, peer, local, u16::try_from(DEFAULT_MTU).unwrap())
         };
         // An enrollment-service node has no packet endpoint.
         assert_eq!(
@@ -1275,11 +1372,15 @@ mod tests {
             PacketPathError::InvalidPermanentSlot
         );
         // Cross-network and same-node bindings fail closed.
-        let mut other_network = peer;
-        other_network.net_id = [0x2b; 16];
+        let other_network = PeerIdentity::legacy_default([0x2b; 16], peer.node_id, peer.identity_generation, peer.role);
         assert_eq!(
             bind([0x11; 16], 1, other_network, local).unwrap_err(),
-            PacketPathError::IdentityMismatch
+            PacketPathError::PolicyMismatch
+        );
+        assert_eq!(
+            AuthorizedEndpoints::bind([0x11; 16], 1, peer, identity(0x0201, NodeRole::Core), 1400)
+                .unwrap_err(),
+            PacketPathError::PolicyMismatch,
         );
         assert_eq!(
             bind([0x11; 16], 1, peer, peer).unwrap_err(),

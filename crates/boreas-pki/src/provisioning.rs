@@ -927,14 +927,17 @@ pub fn verify_material_dir(
     )
 }
 
-/// Re-verify `status.signed` from `roots_path` at `now_us` (used by the live daemon poll loop
-/// to enforce §3.4 fail-closed status expiry and hot-reload higher-sequence snapshots).
-pub fn verify_status_freshness_from_roots(
+/// Build the status-signing `ManagementTrust` from `roots_path` at `now_us`.
+///
+/// This is the single roots-to-trust construction used by both the one-shot
+/// status verifier and the durable `StatusStore` owner. It requires an
+/// authorized `StatusSigner`; it does not read or grant freshness for any
+/// status file.
+pub fn status_trust_from_roots(
     roots_path: &Path,
-    status_path: &Path,
     expected_net_id: [u8; 16],
     now_us: u64,
-) -> Result<(u64, u64, u64), ProvisionError> {
+) -> Result<ManagementTrust, ProvisionError> {
     let roots_raw = read_bounded(roots_path)?;
     let roots_bundle = RootsBundle::decode(&roots_raw)?;
     let (_, authorizations) = roots_bundle.verify_all(expected_net_id, now_us)?;
@@ -950,6 +953,26 @@ pub fn verify_status_freshness_from_roots(
     if !has_status {
         return Err(ProvisionError::MissingAuthority("StatusSigner"));
     }
+    Ok(trust)
+}
+
+/// Read `status.signed` with the same bounded reader used by provisioning.
+///
+/// The caller must still verify these exact bytes; this helper exists so the
+/// daemon's durable status owner does not add an unbounded `fs::read`.
+pub fn read_status_snapshot_raw(status_path: &Path) -> Result<Vec<u8>, ProvisionError> {
+    read_bounded(status_path)
+}
+
+/// Re-verify `status.signed` from `roots_path` at `now_us` (used by the live daemon poll loop
+/// to enforce §3.4 fail-closed status expiry and hot-reload higher-sequence snapshots).
+pub fn verify_status_freshness_from_roots(
+    roots_path: &Path,
+    status_path: &Path,
+    expected_net_id: [u8; 16],
+    now_us: u64,
+) -> Result<(u64, u64, u64), ProvisionError> {
+    let mut trust = status_trust_from_roots(roots_path, expected_net_id, now_us)?;
     verify_status_file_against_trust(&mut trust, status_path, now_us)
 }
 
