@@ -1,13 +1,15 @@
-# Config parser, `config-check` and `config-migrate`
+# Config parser, `config-check`, `config-migrate` and `config-save-candidate`
 
-`crates/boreas-cli/src/config.rs` is a typed TOML model with fail-closed static policy validation, exposed through two commands:
+`crates/boreas-cli/src/config.rs` is a typed TOML model with fail-closed static policy validation, exposed through three commands:
 
 ```
 boreas config-check   <path>   # validate, print redacted JSON
 boreas config-migrate <path>   # print the canonical version = 2 document
+boreas config-save-candidate --config <path> --primary <host:port> [--backup <host:port>] --confirm SAVE
+                               # Linux only: write an endpoint-only candidate; never applied
 ```
 
-Neither command starts a daemon, opens a socket, reads the private key or trust-anchor contents, resolves an endpoint, authenticates a peer, or establishes TLS. `config-check` success means "the document matches the declared schema and static policy" — nothing more. `config-migrate` writes only to stdout.
+None of these commands starts a daemon, opens a socket, reads the private key or trust-anchor contents, resolves an endpoint, authenticates a peer, or establishes TLS. `config-check` success means "the document matches the declared schema and static policy" — nothing more. `config-migrate` writes only to stdout. `config-save-candidate` reads the source, revalidates only the changed endpoints, and writes only an `[uplink]` fragment under the per-user candidate directory; it never applies or replaces the source configuration.
 
 ## Two schemas, always by explicit version
 
@@ -28,6 +30,42 @@ Migration refuses to lose information rather than approximating:
 - a non-`wss://` scheme → `LegacyUplinkNeedsRewrite`.
 
 Legacy `transport.uplinks[0]` becomes `[uplink].primary` (port defaults to `443`), `uplinks[1]` becomes `backup`, `[features]` maps onto `[limits]`, and `paths`/`probe_paths` take the §5.5 defaults (4 / 1).
+
+## `config-save-candidate`: Linux-only endpoint fragment, never applied
+
+`config-save-candidate` persists a reviewed endpoint change as a **candidate**. It does not install, merge, replace, apply, reload, connect, or start a daemon. It is implemented on Linux only; with a valid source document, Windows and macOS exit 2 with `candidate saving is supported only on Linux` and create nothing.
+
+```
+boreas config-save-candidate \
+  --config /etc/boreas/config.toml \
+  --primary edge.example.net:443 \
+  [--backup backup.example.net:443] \
+  --confirm SAVE
+```
+
+`--config`, `--primary` and `--confirm SAVE` are mandatory; `--backup` is optional. `SAVE` is compared as an exact string: lowercase, surrounding whitespace, prefixes, a missing `--confirm`, or duplicate/unknown arguments fail before any write. The CLI never prompts and never reads stdin for confirmation, so a non-interactive invocation cannot hang waiting for input.
+
+The source is read through the same bounded contract as `config-check` (64 KiB, regular file, mode `0600`, owner root/effective user, final symlink/reparse point refused). The changed endpoints are revalidated by `Config::validate` under `NO_RUNTIME`, so existing identity/slot, security mode/suite, path, limits, DNS capability and non-default `overlay_prefix` refusals still apply. The command does not read key, trust-anchor or state contents, resolve or dial an endpoint, or authenticate anything.
+
+Only an `[uplink]` fragment is written: `primary`, optional `backup`, the source document's existing `paths`/`probe_paths`, and a comment saying the candidate is not applied. It is **not** a complete `version = 2` document — it omits `version`, `[node]`, `[paths]`, limits and DNS — so it cannot be dropped in as a replacement for the active configuration. The command never edits or replaces the source file, and the source's key/root/state references remain unchanged.
+
+Destination contract (Linux):
+
+- If `XDG_CONFIG_HOME` is set, it must be an absolute, **already existing** per-user config root, owned by the effective UID; a relative or unsafe value is refused and there is **no fallback** to `$HOME/.config`. The candidate goes under `$XDG_CONFIG_HOME/boreas/candidates/`.
+- If `XDG_CONFIG_HOME` is unset, `$HOME/.config` must be absolute and already exist under the same checks; the candidate goes under `$HOME/.config/boreas/candidates/`.
+- Every path component must be a real directory (no symlinks), owned by the effective user or root, and not group/world-writable; the selected root itself must be owned by the effective UID. The selected root is never created by this command.
+- Missing `boreas/` and `candidates/` directories below that verified root are auto-created with mode `0700` (and synced). If they already exist, they must be real, current-user-owned directories with mode exactly `0700`; unsafe ones are refused, never chmod-repaired.
+- The filename is generated (`uplink-<pid>-<UTC nanoseconds>-<nonce>.toml`), never caller-supplied. It is created exclusively with mode `0600` and no-follow semantics, synced before success, and never overwrites or truncates an existing file; collisions retry a bounded number of times.
+
+Success prints one JSON object and exits 0:
+
+```json
+{"saved":true,"applied":false,"candidate":"uplink-<pid>-<timestamp>-<nonce>.toml"}
+```
+
+`applied` is always `false`; there is no apply/reload path. `candidate` is a sanitized basename only, not an absolute path. A failure exits 2 and never reports success. If writing has begun, it attempts to remove the partial file and sync the directory; cleanup is best-effort, so a crash or power loss can leave partial state, and newly created `boreas/`/`candidates/` directories may remain.
+
+The console (`boreas-easy` / `boreas console`) remains preview-only: it can edit and preview `[uplink]` endpoints, but it has no save action, and a typed `SAVE` does not write anything. It directs the user to copy the preview and review it outside the console.
 
 ## Schema (canonical, `version = 2`)
 
@@ -103,7 +141,7 @@ No daemon, session manager or audit log integrates this API yet, and neither con
 
 ## Verification status (evidence boundary)
 
-Produced without any local compiler, test runner or package-manager invocation, by explicit project policy; every compile/test/format/lint result must come from GitHub Actions. Unverified at the time of writing:
+Formal acceptance is GitHub Actions only; this page performed no local compiler, test-runner, formatter or package-manager execution. Earlier local work on this slice — including the recorded local `cargo`/`rustfmt` attempt — is not acceptance evidence. The candidate-save slice is evidenced at the exact commit [`0295cf8`](https://github.com/Lanlan13-14/Boreas/commit/0295cf86b08261aa57a8fecd3c21fb17be618692): Rust workflow [43972354816](https://github.com/Lanlan13-14/Boreas/actions/runs/43972354816) and TLS workflow [43972354900](https://github.com/Lanlan13-14/Boreas/actions/runs/43972354900) succeeded. That is evidence for the candidate-save/private-directory tests at that SHA only — not for the current branch tip, any later commit, an all-green release, or a production/security gate. The native security workflow for that commit ([43972354797](https://github.com/Lanlan13-14/Boreas/actions/runs/43972354797)) did not pass and remains blocked; no `v0.1.0-pre.4` has been published. Unverified at the time of writing for this tree:
 
 - The overlay slice adds no registry package: `boreas-pki` becomes an unconditional backend-free CLI dependency, and `openssl-inner-tls` still explicitly enables its crypto backend. The existing lock already lists that CLI dependency plus the serde/TOML dependencies; no lock refresh is expected for this slice. This is static inspection, not proof of `--locked` resolution; Actions must verify it.
 - Rustfmt formatting was applied by hand, not by `cargo fmt`.

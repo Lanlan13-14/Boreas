@@ -2,7 +2,7 @@
 
 **将 IP 流量装进经认证的加密隧道。** Boreas 是以 Rust 编写的实验性 L3 TUN 隧道项目：以 TLS 1.3 + WebSocket over TCP 建立承载，在节点间协商后量子混合密钥套件，并为业务电路提供端到端加密设计。项目面向开发者、网络工程师与安全研究人员；当前仍是开发预发布项目，不是经审计的生产 VPN。
 
-> **先读边界：** 目前最新公开预发布资产仍为 [`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)。仓库正在推进下一版开发主线；工作流文件、安装器或 UI 实现存在，并不等于相应功能已通过设备验收。生产审批仍为 `false`，24 项生产门禁仍开放。不要用于高敏或关键生产业务。
+> **先读边界：** 目前最新公开预发布资产仍为 [`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)。仓库正在推进下一版开发主线；工作流文件、安装器或 UI 实现存在，并不等于相应功能已通过设备验收。原生依赖安全门禁仍未通过，`v0.1.0-pre.4` 尚未创建或发布；不要预设其版本号、资产名或校验和。生产审批仍为 `false`，24 项生产门禁仍开放。不要用于高敏或关键生产业务。
 
 [双机部署教程](docs/deployment/README.md) · [一键安装器边界与流程](docs/deployment/ONE_CLICK.md) · [实现状态与 CI 证据](docs/engineering/implementation-status.md) · [配置参考](docs/config/README.md)
 
@@ -23,6 +23,7 @@ Boreas 的目标是让业务 IP 报文经由 TCP/WSS 承载穿过常见网络，
 | 范围 | 可据实陈述 | 不能据此推断 |
 |---|---|---|
 | Linux 双节点隧道 | `pre.3` 公开资产提供 Linux x86_64 musl pq768 二进制；项目已有 Linux TUN/CI 与隔离环境端到端验证记录 | 多节点网格、自动故障切换、通用生产 VPN 或其他平台 daemon 已支持 |
+| 端点候选保存 | Linux 上 `config-save-candidate` 可将已校验的 `[uplink]` 片段写入当前用户已有安全配置根下的 `boreas/candidates`，必须精确 `--confirm SAVE`，成功返回 `applied:false`；源配置及密钥/roots 引用不变 | Windows/macOS 不支持；片段不是完整配置，不能直接替换；不安装、不应用、不重载、不连接，也不验证可达性 |
 | 性能 | 精确提交 [`8cf865e`](https://github.com/Lanlan13-14/Boreas/commit/8cf865ec7bc9f974b2db623c6c60917e6af7ec08) 的隔离 netns/veth 基准中，glibc 平均延迟 `0.228 ms`、吞吐 `268.450 Mbps`；musl 平均延迟 `0.256 ms`、吞吐 `194.547 Mbps`。参见 [该提交性能工作流](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214463) | 这些数字代表公网 SLA、跨地域 RTT、持续负载/攻击容量或任意版本的性能 |
 | CI | 同一精确提交的 Rust、平台及 Linux TUN 工作流分别为 [43722214359](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214359)、[43722214368](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214368)、[43722214397](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214397)，均成功 | CI 成功不等于所有生产门禁通过、独立互操作/审计通过或当前分支 tip 已覆盖 |
 | `boreas-easy` | 有行式控制台入口与中文简体、繁体、英文本地化；当前适合作为控制台/状态操作入口 | 它不是图形界面，也不能据此宣称已完成生产控制面、完整服务管理或安全操作验收 |
@@ -56,7 +57,7 @@ boreas-easy --json
 boreas console --json --socket /var/lib/boreas/control.sock --config /etc/boreas/edge.toml
 ```
 
-终端宽度有限时可用 `--narrow`；语言可由 `--lang zh-CN|zh-TW|en` 指定。控制台不是绕过权限或信任策略的管理后门；启动服务等动作需审阅确认提示及本机服务配置。若控制套接字不可用，检查 daemon 是否运行、socket 路径与 UID/权限是否匹配。
+终端宽度有限时可用 `--narrow`；语言可由 `--lang zh-CN|zh-TW|en` 指定。控制台不是绕过权限或信任策略的管理后门；启动服务等动作需审阅确认提示及本机服务配置。若控制套接字不可用，检查 daemon 是否运行、socket 路径与 UID/权限是否匹配。控制台目前只有端点预览，不提供保存动作；输入 `SAVE` 不会写入候选。
 
 ---
 
@@ -85,6 +86,7 @@ boreas doctor
 | `boreas doctor` / `boreas self-check` | 显示此二进制的编译能力；不是健康检查或安全认证 |
 | `boreas config-check <FILE>` | 校验配置格式与文件权限，输出脱敏结果 |
 | `boreas config-migrate <FILE>` | 将受支持的旧版配置转换并输出至 stdout，不原地改写 |
+| `boreas config-save-candidate ...` | 仅 Linux：保存端点候选片段；需精确 `--confirm SAVE`，成功返回 `applied:false`；不替换源配置；详见[配置参考](docs/config/README.md) |
 | `boreas pki init-ca ...` | 初始化离线 PKI；私钥必须离线保护，切勿上传到公网节点 |
 | `boreas pki issue-node ...` / `sign-status ...` | 签发节点材料或状态快照；请参考部署教程的完整参数与轮换流程 |
 | `boreas pki verify-bundle --material-dir <DIR> --require-peer` | 验证本地节点材料包，不证明其分发渠道安全 |
@@ -93,6 +95,34 @@ boreas doctor
 | `boreas-easy` / `boreas console` | 行式三语控制台；非交互场景可传 `--json` |
 
 带有 OpenSSL 后端要求的 `pki`/`daemon` 命令，需使用包含 `openssl-inner-tls` 能力的构建。缺少后端的基础 CLI 构建会拒绝相关命令；请以 `boreas doctor` 为准。
+
+### 端点候选保存（仅 Linux，`applied:false`）
+
+`config-save-candidate` 只持久化 endpoint-only 候选，不安装、不合并、不替换、不应用、不重载、不连接，也不启动 daemon。Linux 上使用：
+
+```sh
+boreas config-save-candidate \
+  --config /etc/boreas/config.toml \
+  --primary edge.example.net:443 \
+  --backup backup.example.net:443 \
+  --confirm SAVE
+```
+
+`--config`、`--primary`、`--confirm SAVE` 必填，`--backup` 可选；`SAVE` 必须逐字匹配，小写、空白、前缀、缺失或重复/未知参数都会在任何写入前失败。命令不弹交互提示、不读 stdin。
+
+路径只使用**已存在**的安全用户配置根：`XDG_CONFIG_HOME` 已设置时必须为绝对路径、已存在、属于当前有效 UID，且路径组件不是符号链接、不可被组/其他用户写入；相对或不安全的显式值会直接拒绝，**不会**回退到 `$HOME/.config`。未设置时 `$HOME/.config` 也必须已存在并通过同样检查。`boreas/` 与 `candidates/` 若缺失会在已验证根下自动创建为 `0700`；若已存在则必须是当前用户所有的 `0700` 真实目录，否则拒绝且不 chmod 修复。程序自行生成 `uplink-<pid>-<时间戳>-<nonce>.toml`，以 `0600` 独占创建，绝不覆盖已有文件。
+
+成功输出类似：
+
+```json
+{"saved":true,"applied":false,"candidate":"uplink-1234-...-0.toml"}
+```
+
+`candidate` 只是 basename，`applied` 恒为 `false`。写入内容只有 `[uplink]` 的 primary、可选 backup、原有 paths/probe_paths 和“未应用”注释；它**不是完整 `version = 2` 配置**，不能直接替换现有配置。源配置及其中引用的密钥、roots、state_dir 均不被改写，密钥/roots 内容也不会被读取；成功不表示端点可达、配置已安装或已生效。
+
+Windows/macOS 不支持写入候选：命令报 `candidate saving is supported only on Linux` 并非零退出，不创建文件。`boreas-easy`/`boreas console` 仍只有端点预览，没有保存动作；在控制台输入 `SAVE` 不会写入候选，需在控制台外审阅预览或使用上述显式命令。
+
+**证据边界：** 精确提交 [`0295cf8`](https://github.com/Lanlan13-14/Boreas/commit/0295cf86b08261aa57a8fecd3c21fb17be618692) 的 Rust [43972354816](https://github.com/Lanlan13-14/Boreas/actions/runs/43972354816) 与 TLS [43972354900](https://github.com/Lanlan13-14/Boreas/actions/runs/43972354900) 工作流成功；这只是该 SHA 上候选保存/私有目录测试的证据，不代表后续提交或当前分支 tip 全绿，也不代表生产/安全门禁通过。原生安全门禁仍未通过，`pre.4` 尚未发布。
 
 ---
 
