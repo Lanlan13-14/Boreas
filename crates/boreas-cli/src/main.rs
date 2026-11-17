@@ -167,10 +167,7 @@ fn terminal_columns() -> Option<usize> {
 
     unsafe extern "system" {
         fn GetStdHandle(which: u32) -> *mut c_void;
-        fn GetConsoleScreenBufferInfo(
-            console: *mut c_void,
-            info: *mut ScreenBufferInfo,
-        ) -> i32;
+        fn GetConsoleScreenBufferInfo(console: *mut c_void, info: *mut ScreenBufferInfo) -> i32;
     }
 
     // SAFETY: `GetStdHandle` takes a constant selector and returns a handle this
@@ -453,7 +450,11 @@ fn run_status(
         (0, render_status(&snapshot, lang), String::new())
     } else {
         let width = columns.unwrap_or(BOX_WIDTH).min(BOX_WIDTH);
-        (0, render_status_narrow(&snapshot, lang, width), String::new())
+        (
+            0,
+            render_status_narrow(&snapshot, lang, width),
+            String::new(),
+        )
     }
 }
 
@@ -1960,8 +1961,7 @@ uplinks = ["wss://hub-us-c.example.net"]
         for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
             // Explicit width: the assertion must not depend on the width of
             // whatever terminal happens to run the test.
-            let (code, stdout, stderr) =
-                run_with_columns(&args(&["status"]), lang, true, Some(80));
+            let (code, stdout, stderr) = run_with_columns(&args(&["status"]), lang, true, Some(80));
             assert_eq!(code, 0);
             assert!(stderr.is_empty());
             assert!(stdout.contains("BOREAS CONSOLE"));
@@ -2063,8 +2063,7 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn menu_tty_is_boxed_and_narrow_is_not() {
-        let (code, stdout, stderr) =
-            run_with_columns(&args(&["menu"]), Lang::En, true, Some(80));
+        let (code, stdout, stderr) = run_with_columns(&args(&["menu"]), Lang::En, true, Some(80));
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert!(stdout.contains("BOREAS CONSOLE"));
@@ -2401,7 +2400,10 @@ uplinks = ["wss://hub-us-c.example.net"]
     fn painted_screen(argv: &[&str], lang: Lang, columns: Option<usize>, input: &[u8]) -> String {
         let (code, stdout, painted, stderr) = run_scripted_console(argv, lang, columns, input);
         assert_eq!(code, 0, "{stderr}");
-        assert!(stdout.is_empty(), "the TTY path paints instead of printing JSON");
+        assert!(
+            stdout.is_empty(),
+            "the TTY path paints instead of printing JSON"
+        );
         painted
     }
 
@@ -2425,8 +2427,14 @@ uplinks = ["wss://hub-us-c.example.net"]
             !painted.as_bytes().contains(&0x1B),
             "no ANSI, so no DSR/CPR probe can be written"
         );
-        assert!(!painted.contains("[6n"), "no Device Status Report is issued");
-        assert!(!painted.contains("narrow list"), "the frame needs no notice");
+        assert!(
+            !painted.contains("[6n"),
+            "no Device Status Report is issued"
+        );
+        assert!(
+            !painted.contains("narrow list"),
+            "the frame needs no notice"
+        );
     }
 
     #[test]
@@ -2455,7 +2463,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(painted.contains('┌'), "{painted}");
         assert!(painted.contains("> [1] Live Telemetry"));
         assert!(
-            painted.lines().nth(17).is_some_and(|line| line.ends_with('┘')),
+            painted
+                .lines()
+                .nth(17)
+                .is_some_and(|line| line.ends_with('┘')),
             "the 18th line must be the bottom border: {painted}"
         );
     }
@@ -2505,24 +2516,18 @@ uplinks = ["wss://hub-us-c.example.net"]
 
     #[test]
     fn easy_alias_routes_the_console_through_the_width_aware_path() {
-        let easy = dispatch_with_columns(
-            "boreas-easy",
-            &args(&["--json"]),
-            probe_en,
-            true,
-            Some(80),
-        );
+        let easy =
+            dispatch_with_columns("boreas-easy", &args(&["--json"]), probe_en, true, Some(80));
         assert_eq!(easy.0, 0);
-        assert!(easy.1.starts_with("{\"command\":\"console\""), "{:?}", easy.1);
+        assert!(
+            easy.1.starts_with("{\"command\":\"console\""),
+            "{:?}",
+            easy.1
+        );
         // The alias must resolve to the same path as the explicit subcommand.
         assert_eq!(
             easy,
-            run_with_columns(
-                &args(&["console", "--json"]),
-                Lang::En,
-                true,
-                Some(80)
-            )
+            run_with_columns(&args(&["console", "--json"]), Lang::En, true, Some(80))
         );
     }
 
@@ -3030,7 +3035,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert!(finished, "fixture did not finish within {JOIN_TIMEOUT:?}");
 
         assert_eq!(code, 0, "{stderr}");
-        assert!(stdout.is_empty(), "the TTY path paints instead of printing JSON");
+        assert!(
+            stdout.is_empty(),
+            "the TTY path paints instead of printing JSON"
+        );
         let screen: Vec<&str> = painted.lines().take(18).collect();
         assert_eq!(screen.len(), 18, "no injected line: {painted}");
         for line in &screen {
