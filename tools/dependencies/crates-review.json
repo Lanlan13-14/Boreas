@@ -1,0 +1,55 @@
+{
+  "reviewed_at": "2026-11-17",
+  "policy": "Every directly pinned crate has one recorded decision. A candidate may only leave this file once its decision is ADOPTED, and a BLOCKED_* decision must keep the machine-checkable evidence that still justifies it. Nothing here is a vulnerability waiver: a green check means the recorded decision still matches the manifests, the committed lock and upstream metadata.",
+  "decisions": ["ADOPTED", "BLOCKED_TYPE_IDENTITY", "CANDIDATE_LOCK_REFRESH_REQUIRED", "CANDIDATE_UPSTREAM_UNAVAILABLE"],
+  "crates": [
+    {
+      "crate": "foreign-types-shared",
+      "manifest": "crates/boreas-crypto/Cargo.toml",
+      "lock_owner": "crates/boreas-crypto",
+      "adopted": "=0.1.1",
+      "candidate": "0.3.1",
+      "decision": "BLOCKED_TYPE_IDENTITY",
+      "reason": "crates/boreas-crypto calls `ssl.as_ptr()` through `foreign_types_shared::ForeignTypeRef` so it can pass a borrowed SslRef to openssl-sys::SSL_session_reused without taking ownership of the SSL object. The trait implementation only exists for the foreign-types-shared instance that openssl 0.10.82 links: openssl -> foreign-types 0.3.2 -> foreign-types-shared ^0.1 (resolved 0.1.1). A direct `=0.3.1` dependency would add a second copy of the crate, so SslRef would no longer implement the trait the backend imports (no `as_ptr`), and the only ways to keep compiling would be a pointer transmute or dropping the borrow guarantee. 0.3.1 itself publishes no `rust-version` in its registry metadata and exposes the same three public items (Opaque, ForeignType, ForeignTypeRef), but as a separate crate major it is a distinct trait type: the blocker is type identity, not API shape, and no MSRV change can remove it. 0.3.1 becomes adoptable only if the binding moves to a foreign-types release that requires ^0.3, which the committed openssl 0.10.82 pin does not.",
+      "blocking_evidence": {
+        "predicate": "consumer_requirement_excludes_candidate",
+        "consumer": "foreign-types",
+        "consumer_version": "0.3.2",
+        "consumer_requirement": "^0.1",
+        "api": "https://crates.io/api/v1/crates/foreign-types/0.3.2/dependencies"
+      },
+      "sources": [
+        "https://crates.io/api/v1/crates/foreign-types-shared",
+        "https://crates.io/api/v1/crates/foreign-types/0.3.2/dependencies",
+        "https://docs.rs/foreign-types-shared/0.3.1/foreign_types_shared/trait.ForeignTypeRef.html",
+        "https://docs.rs/foreign-types-shared/0.1.1/foreign_types_shared/trait.ForeignTypeRef.html"
+      ]
+    },
+    {
+      "crate": "windows-sys",
+      "manifest": "crates/boreas-tun/Cargo.toml",
+      "lock_owner": "crates/boreas-tun",
+      "adopted": "=0.59.0",
+      "candidate": "0.61.2",
+      "decision": "CANDIDATE_LOCK_REFRESH_REQUIRED",
+      "reason": "Audited as a sound upgrade but not applied in this change. 0.61.2 is the current stable release (published 2025-10-06) and declares rust-version 1.71, below the 1.100 the owning crate already requires, so the MSRV step is not a constraint. All seven features the crate enables exist in 0.61.2 with identical names and the Win32_Security_Cryptography/IpHelper/Ndis/WinSock modules imported by src/windows.rs are still exported; identical function signatures are expected but not proven without a Windows compile. The upgrade replaces the windows-targets 0.52.6 fan-out with a single windows-link 0.2.1 dependency, which changes Cargo.lock; the lock is refreshed by the Actions lock job, not by this tooling, so the manifest pin stays at 0.59.0 until that refresh lands with a Windows build and the crypto/tun test suites. No compile or test evidence for 0.61.2 exists in this change, and none is claimed.",
+      "preconditions": {
+        "min_rust_version": "1.71",
+        "adopted_features": [
+          "Win32_Foundation",
+          "Win32_NetworkManagement_IpHelper",
+          "Win32_NetworkManagement_Ndis",
+          "Win32_Networking_WinSock",
+          "Win32_Security_Cryptography",
+          "Win32_System_LibraryLoader",
+          "Win32_System_Threading"
+        ]
+      },
+      "sources": [
+        "https://crates.io/api/v1/crates/windows-sys",
+        "https://crates.io/api/v1/crates/windows-sys/0.61.2/dependencies",
+        "https://github.com/microsoft/windows-rs/releases"
+      ]
+    }
+  ]
+}

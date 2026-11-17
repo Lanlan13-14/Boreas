@@ -18,4 +18,8 @@ openssl = { version = "=0.10.82", optional = true }
 openssl-sys = { version = "=0.9.118", optional = true }
 # Importing ForeignTypeRef is required to pass SslRef's borrowed pointer to
 # openssl-sys introspection functions without owning/freeing the SSL object.
+# This exact version is the instance openssl 0.10.82 links through foreign-types
+# 0.3.2 (^0.1). 0.3.1 was reviewed and is blocked, not pending: a direct bump
+# would add a second copy of the crate, so SslRef would no longer implement the
+# trait imported here. See tools/dependencies/crates-review.json.
 foreign-types-shared = { version = "=0.1.1", optional = true }

@@ -96,6 +96,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FAIL_ON_OUTDATED: ${{ inputs.fail_on_outdated && '1' || '0' }}
         run: python tools/dependencies/report.py
+      - name: Re-check reviewed crate decisions, MSRV and blocker evidence
+        # The native OpenSSL gate is expected to fail while 4.1.1 is unreleased,
+        # so this evidence step must still run: otherwise it would never execute.
+        if: always()
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/dependencies/check-crate-review.py --verify-candidates
+      - name: Regress the native OpenSSL review logic without network access
+        if: always()
+        env:
+          GITHUB_ACTIONS: 'true'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/dependencies/test-report-logic.py
       - name: Preserve raw sources and reports even on failure
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -104,6 +117,81 @@ jobs:
           path: dependency-reports/
           if-no-files-found: error
           retention-days: 30
+
+  # The supply chain of the workflows themselves. It proves that every `uses:`
+  # still points at the reviewed commit for the reviewed version and that the
+  # official tag still resolves to that commit; a floating reference outside the
+  # frozen inventory ceiling is a blocking error. It is not a review of the
+  # actions' behaviour.
+  action-pin-audit:
+    name: Workflow action pin audit (reviewed commits)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - name: Audit workflow pins against the reviewed record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/dependencies/check-action-pins.py --verify-remote
+      - name: Preserve the pin audit even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: action-pin-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dependency-reports/action-pins.*
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Fixtures for the dependency tooling itself: no build, no network, no Cargo
+  # state. A weakened check, or a check that stops failing on a fabricated
+  # violation, turns this job red instead of leaving a silently green gate.
+  dependency-tooling-fixture:
+    name: Dependency tooling fixtures (Actions-only, no build, no network)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - name: Prove the tooling refuses non-Actions execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_refusal() {
+            local description=$1
+            shift
+            local status=0
+            "$@" >/dev/null 2>&1 || status=$?
+            if [[ $status -ne 2 ]]; then
+              printf 'FAIL - %s (exit %s, expected 2)\n' "$description" "$status" >&2
+              exit 1
+            fi
+            printf 'ok - %s\n' "$description"
+          }
+          check_refusal 'action-pin audit refuses GITHUB_ACTIONS=false' \
+            env GITHUB_ACTIONS=false python tools/dependencies/check-action-pins.py
+          check_refusal 'crate-review checker refuses an unset GITHUB_ACTIONS' \
+            env -u GITHUB_ACTIONS python tools/dependencies/check-crate-review.py
+          check_refusal 'report-logic fixture refuses GITHUB_ACTIONS=false' \
+            env GITHUB_ACTIONS=false python tools/dependencies/test-report-logic.py
+      - name: Run the dependency tooling fixtures
+        shell: bash
+        env:
+          GITHUB_ACTIONS: 'true'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          python tools/dependencies/test-report-logic.py
+          python tools/dependencies/check-action-pins.py --self-test
+          python tools/dependencies/check-crate-review.py --self-test
 
   # Independent regression gate for the reduced-build verifier itself. It builds
   # nothing, downloads nothing and does not replace the real reduced-build

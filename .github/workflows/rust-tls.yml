@@ -58,8 +58,8 @@ jobs:
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
         with:
           components: rustfmt, clippy
       - name: Install native build tools
@@ -819,7 +819,7 @@ jobs:
           echo 'initial_backup_negative.backup_usable=control-connect-through-same-proxy-status-ok'
       - name: Upload hop-node development binary
         if: success()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
           path: hop-node-linux
@@ -827,7 +827,7 @@ jobs:
           retention-days: 14
       - name: Upload non-secret CI evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rust-tls-${{ github.run_id }}
           path: |

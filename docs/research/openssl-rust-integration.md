@@ -22,12 +22,75 @@ ourselves. The WebSocket Upgrade/framing engine remains outside this crate.
 | [rust-openssl 0.10.82 `SslStream`](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslStream.html) / [source](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl/src/ssl/mod.rs) | `SslStream<S>` wraps any `Read + Write`; `SslStream::new` performs no I/O; `do_handshake`, `ssl_read`, `ssl_write` expose `ErrorCode::{WANT_READ,WANT_WRITE}` for non-blocking drivers. The maintained BIO adapter maps `WouldBlock` to BIO retry and catches panics across FFI. | The BIO adapter does not turn the stream into a WebSocket engine: HTTP Upgrade, frame parsing, control-frame handling, compression rejection, and the transport-wide queue budget remain caller work. |
 | [`SslContextBuilder`](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslContextBuilder.html) | TLS version bounds, `set_groups_list`, `set_sigalgs_list`, `set_ciphersuites`, `set_verify_depth`, certificates, verify stores/modes, tickets/session cache, `set_max_early_data`. | Presence of a setter does not prove the pinned OpenSSL build registered the algorithm. This backend additionally checks the verified chain's SPKI/signature OIDs after every handshake. |
 | [openssl-sys 0.9.118 SSL declarations](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl-sys/src/handwritten/ssl.rs) | `SSL_session_reused` is available for the one post-handshake resumption readout; `ForeignTypeRef::as_ptr` borrows the `SSL` object. | There is no safe negotiated-group or peer-signature-scheme getter in this binding. Those reported values remain constrained-context inference, not wire readout. |
-| [OpenSSL 3.6.5 `ssl/t1_lib.c`](https://github.com/openssl/openssl/blob/openssl-3.6.5/ssl/t1_lib.c), [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html), [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html), [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html), [TLS ML-DSA draft -06](https://www.ietf.org/archive/id/draft-ietf-tls-mldsa-06.txt) | OpenSSL 3.6.5 carries the hybrid group and the ML-DSA TLS/X.509 machinery used by the tests; RFC 10024 defines group `0x11EC`, RFC 9881 defines id-ml-dsa-65 OID `2.16.840.1.101.3.4.3.18`. TLS `mldsa65` is still draft-06 code point `0x0905` at this snapshot. | Source listing is not end-to-end identity authentication. The two test endpoints share the same OpenSSL codebase; no independent implementation has been interop-tested. |
+| [OpenSSL 4.1.0 `ssl/t1_lib.c`](https://github.com/openssl/openssl/blob/openssl-4.1.0/ssl/t1_lib.c), [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html), [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html), [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html), [TLS ML-DSA draft -06](https://www.ietf.org/archive/id/draft-ietf-tls-mldsa-06.txt) | OpenSSL 4.1.0 carries the hybrid group and the ML-DSA TLS/X.509 machinery used by the tests; RFC 10024 defines group `0x11EC`, RFC 9881 defines id-ml-dsa-65 OID `2.16.840.1.101.3.4.3.18`. TLS `mldsa65` is still draft-06 code point `0x0905` at this snapshot. | Source listing is not end-to-end identity authentication. The two test endpoints share the same OpenSSL codebase; no independent implementation has been interop-tested. 4.1.0 is itself affected by the reviewed advisories below, so this observation is capability evidence, never a security approval. |
 
 The reviewed binding pins are `openssl = "=0.10.82"`, `openssl-sys =
 "=0.9.118"`, `foreign-types-shared = "=0.1.1"`; this change adds no dependency
 and does not modify `Cargo.lock`. `openssl-src`/`vendored` is deliberately not
-used: it would select OpenSSL 3.2.0 rather than the reviewed 3.6.5 build.
+used: it would select OpenSSL 3.2.0 rather than the reviewed 4.1.0 build.
+
+## Pinned candidate and measured status (2026-11-17)
+
+| Item | Pinned value | Status |
+|---|---|---|
+| `openssl` (rust-openssl) | `=0.10.82` | reviewed binding, unchanged |
+| `openssl-sys` | `=0.9.118` | reviewed binding, unchanged |
+| `foreign-types-shared` | `=0.1.1` | forced by the binding graph, see below |
+| native OpenSSL | `4.1.0`, SHA-256 `50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd` | reduced build candidate, **security gate RED** |
+| reduced options | `no-quic no-cms no-siv no-shared no-tests` | candidate surface reduction, not a waiver |
+| fixed release `4.1.1` | none | not published; see below |
+
+**Measured results for `openssl 0.10.82` + native `4.1.0`: none recorded in this
+change.** No Actions run of `rust-tls.yml` or `crypto-poc.yml` was observed while
+this record was written, so this document claims no build, handshake, capability
+or CVE-reduction result for that pair. What is recorded is only: the release
+metadata and tarball digest above (official API), the reviewed advisory ranges in
+`tools/dependencies/openssl-review.json`, and the assertions the workflows are
+required to produce. The native gate therefore stays red for two independent
+reasons:
+
+1. `CVE-2026-35190` (TLS 1.3 server key-share, Suite B cert flag) and
+   `CVE-2026-107493` (`PEM_X509_INFO_read_bio_ex`) are not removed by
+   `no-quic`/`no-cms`/`no-siv`; no whole-program or call-graph waiver is claimed.
+2. OpenSSL `4.1.1` was **not released** on 2026-11-17: the official tag API
+   returned HTTP 404 for `openssl-4.1.1`, while `releases/latest` still returned
+   `openssl-4.1.0` with the reviewed digest. A fixed pin, checksum or migration
+   cannot honestly be recorded, and none is invented here.
+
+A green `verify-openssl-build.sh` run would only prove that the five reduced
+configurations exclude the QUIC/CMS/SIV implementations they claim to exclude. It
+would not close the gate.
+
+## Dependency pin review
+
+Recorded in `tools/dependencies/crates-review.json` and re-checked in Actions by
+`tools/dependencies/check-crate-review.py`:
+
+- **`foreign-types-shared` 0.3.1 is blocked, not pending.** `crates/boreas-crypto`
+  imports `ForeignTypeRef` to pass a borrowed `SslRef` pointer to
+  `openssl_sys::SSL_session_reused` without taking ownership. `openssl 0.10.82`
+  links `foreign-types 0.3.2`, which requires `foreign-types-shared ^0.1`
+  (resolved 0.1.1). A direct `=0.3.1` dependency would add a second copy of the
+  crate, so `SslRef` would no longer implement the imported trait; the only ways
+  to keep compiling would be a pointer transmute or dropping the borrow
+  guarantee. 0.3.1 publishes no `rust-version` and exposes the same three public
+  items (`Opaque`, `ForeignType`, `ForeignTypeRef`), but as a distinct crate major
+  it is a distinct trait type: the blocker is type identity, not API shape, so no
+  MSRV or changelog review can remove it. The pin stays `=0.1.1` because it is the
+  same instance the binding uses.
+- **`windows-sys` 0.61.2 is audited but not applied.** 0.61.2 is stable
+  (published 2025-10-06) with `rust-version 1.71`, below the owning crate's 1.100;
+  all seven enabled `Win32_*` features exist under the same names, and the
+  `Win32_Security_Cryptography` `BCrypt*`, `IpHelper`, `Ndis` and `WinSock`
+  modules the crate imports are still exported. Identical function signatures are
+  expected but **not proven** without a Windows compile. The upgrade also replaces
+  the `windows-targets 0.52.6` fan-out with `windows-link 0.2.1`, which rewrites
+  `Cargo.lock` — owned by the Actions lock job, not by this tooling. The pin stays
+  `=0.59.0` until that refresh lands together with a Windows build and the
+  crypto/tun test suites.
+
+Neither entry is a vulnerability waiver: both are reviewed decisions whose
+justification is re-verified from crates.io metadata on every dependency run.
 
 ## Layering and byte flow
 
@@ -189,10 +252,11 @@ is uploaded. CLI output is sanitized line-by-line before assertions.
 
 `.github/workflows/rust-tls.yml`:
 
-1. Downloads the pinned OpenSSL 3.6.5 tarball, verifies its SHA-256, checks
-   `VERSION.dat`, builds `no-shared no-tests`, installs it, writes a minimal
-   default-provider-only `openssl.cnf`, and records `version -a` plus
-   `readelf -d` evidence.
+1. Downloads the pinned OpenSSL 4.1.0 tarball, verifies its SHA-256, checks
+   `VERSION.dat`, builds `no-quic no-cms no-siv no-shared no-tests`, installs it,
+   writes a minimal default-provider-only `openssl.cnf`, and records `version -a`
+   plus `readelf -d` evidence. `.github/workflows/crypto-poc.yml` builds the same
+   reduced configuration and runs `tools/dependencies/verify-openssl-build.sh`.
 2. Refuses a `vendored` feature in `crates/boreas-crypto`.
 3. Runs `cargo fmt -p boreas-crypto -- --check`.
 4. Runs policy-only tests without OpenSSL.
@@ -204,14 +268,28 @@ is uploaded. CLI output is sanitized line-by-line before assertions.
    management/CSR/signing tests and `cargo test -p boreas-tunnel
    --all-features` for the inner-TLS seam with the backend feature, uploading
    their logs separately.
-8. The job builds only `no-shared` OpenSSL on Ubuntu x86_64. It is **not** a
-   fully static libc release and does not build aarch64. The workspace default
-   feature set has no crypto backend at all; a default build must not be
-   described as a complete TLS-capable binary, and platform-gates/static
-   release work must retain that distinction.
+8. The job builds only `no-shared` OpenSSL on Ubuntu x86_64 and (for the musl
+   variant) does not prove a fully static libc release or an aarch64 handshake.
+   The workspace default feature set has no crypto backend at all; a default
+   build must not be described as a complete TLS-capable binary, and
+   platform-gates/static release work must retain that distinction.
+9. `.github/workflows/dependencies.yml` runs the independent gates this document
+   depends on: locked RustSec audit, registry/advisory/native-OpenSSL intelligence
+   (`report.py`), the reviewed crate decisions (`check-crate-review.py
+   --verify-candidates`), the action-pin audit (`check-action-pins.py
+   --verify-remote`) and network-free fixtures for that tooling. Those jobs prove
+   the review record still matches reality; they do not approve the 4.1.0 pin.
 
 ## Follow-up (not done)
 
+- A published OpenSSL `4.1.1` (or a reviewed, still-supported branch) with an
+  official digest; until then `CVE-2026-35190` and `CVE-2026-107493` keep the
+  native gate red regardless of the reduced-build result.
+- First Actions measurement of `openssl 0.10.82` + native `4.1.0`, including
+  `verify-openssl-build.sh` evidence and real mTLS logs; nothing is measured in
+  this change.
+- `windows-sys` 0.61.2 adoption together with the Actions lock refresh and a
+  Windows build, then removal of its review entry's candidate state.
 - Direct negotiated group/sigalg readout (upstream getter or reviewed FFI ADR).
 - Independent implementation interop matrix and code-point capture.
 - HTTP Upgrade + RFC 6455/8441 framing and a real WSS transport engine, wired
@@ -229,7 +307,11 @@ is uploaded. CLI output is sanitized line-by-line before assertions.
 - [SslRef API](https://docs.rs/openssl/0.10.82/openssl/ssl/struct.SslRef.html)
 - [Maintained binding BIO adapter source](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl/src/ssl/bio.rs)
 - [OpenSSL binding `openssl-sys` SSL declarations](https://github.com/rust-openssl/rust-openssl/blob/openssl-v0.10.82/openssl-sys/src/handwritten/ssl.rs)
-- [OpenSSL 3.6.5 TLS group/signature discovery source](https://github.com/openssl/openssl/blob/openssl-3.6.5/ssl/t1_lib.c)
+- [OpenSSL 4.1.0 TLS group/signature discovery source](https://github.com/openssl/openssl/blob/openssl-4.1.0/ssl/t1_lib.c)
+- [OpenSSL 4.1.0 security advisories](https://openssl-library.org/news/vulnerabilities/)
+- [crates.io `foreign-types-shared`](https://crates.io/api/v1/crates/foreign-types-shared)
+- [crates.io `foreign-types` 0.3.2 dependency requirement](https://crates.io/api/v1/crates/foreign-types/0.3.2/dependencies)
+- [crates.io `windows-sys`](https://crates.io/api/v1/crates/windows-sys)
 - [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html)
 - [RFC 10024](https://www.rfc-editor.org/rfc/rfc10024.html)
 - [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html)

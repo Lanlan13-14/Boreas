@@ -13,6 +13,10 @@ libc = "=0.2.191"
 libc = "=0.2.191"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# 0.61.2 is audited (rust-version 1.71, identical feature names, windows-link
+# instead of the windows-targets fan-out) but deliberately not applied here: the
+# upgrade rewrites Cargo.lock, which the Actions lock job owns, and no Windows
+# compile evidence exists yet. See tools/dependencies/crates-review.json.
 windows-sys = { version = "=0.59.0", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

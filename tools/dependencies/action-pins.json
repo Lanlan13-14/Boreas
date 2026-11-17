@@ -1,0 +1,53 @@
+{
+  "reviewed_at": "2026-11-17",
+  "policy": "A workflow `uses:` entry must reference the exact reviewed commit for the reviewed version of that action, with a trailing comment that starts with the reviewed version. Floating tags and branches are only tolerated while they are listed verbatim in action-pins-inventory.json, which may shrink but never grow. A newer reviewed version replaces the older entry; the old commit then becomes invalid everywhere.",
+  "verification": "Every commit below was resolved from the official GitHub API ref for the reviewed version (ref_api) on reviewed_at, and the newest published tag for that action was compared with reviewed_semver so that the recorded pin is the latest reviewed stable release. Re-run tools/dependencies/check-action-pins.py --verify-remote in Actions to re-check the mapping.",
+  "actions": {
+    "actions/checkout": {
+      "reviewed_version": "v7",
+      "reviewed_semver": "7.0.1",
+      "ref_kind": "tag",
+      "commit": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "ref_api": "https://api.github.com/repos/actions/checkout/git/ref/tags/v7",
+      "tags_api": "https://api.github.com/repos/actions/checkout/tags?per_page=1",
+      "reviewed_at": "2026-11-17"
+    },
+    "actions/upload-artifact": {
+      "reviewed_version": "v7",
+      "reviewed_semver": "7.0.2",
+      "ref_kind": "tag",
+      "commit": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+      "ref_api": "https://api.github.com/repos/actions/upload-artifact/git/ref/tags/v7",
+      "tags_api": "https://api.github.com/repos/actions/upload-artifact/tags?per_page=1",
+      "reviewed_at": "2026-11-17"
+    },
+    "actions/download-artifact": {
+      "reviewed_version": "v8",
+      "reviewed_semver": "8",
+      "ref_kind": "tag",
+      "commit": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+      "ref_api": "https://api.github.com/repos/actions/download-artifact/git/ref/tags/v8",
+      "tags_api": "https://api.github.com/repos/actions/download-artifact/tags?per_page=1",
+      "reviewed_at": "2026-11-17"
+    },
+    "actions/setup-python": {
+      "reviewed_version": "v7",
+      "reviewed_semver": "7.1.0",
+      "ref_kind": "tag",
+      "commit": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+      "ref_api": "https://api.github.com/repos/actions/setup-python/git/ref/tags/v7",
+      "tags_api": "https://api.github.com/repos/actions/setup-python/tags?per_page=1",
+      "reviewed_at": "2026-11-17"
+    },
+    "dtolnay/rust-toolchain": {
+      "reviewed_version": "stable",
+      "reviewed_semver": "stable",
+      "ref_kind": "branch",
+      "commit": "39008827e6b4319a349e9a42dfc90579dd25f1ca",
+      "ref_api": "https://api.github.com/repos/dtolnay/rust-toolchain/git/ref/heads/stable",
+      "tags_api": null,
+      "reviewed_at": "2026-11-17",
+      "note": "Branch-based action: the pinned commit is the reviewed tip of the `stable` branch. If the branch advances, the pinned commit still runs the reviewed code, so the audit reports the drift as a re-review reminder instead of a blocking finding; a missing or unreadable ref stays blocking."
+    }
+  }
+}

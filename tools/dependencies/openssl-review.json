@@ -33,6 +33,40 @@
     {"minimum": "1.0.2", "fixed": "1.0.2zt", "cves": ["CVE-2026-107496", "CVE-2026-107493"]}
   ],
   "queried_at": "2026-11-17",
+  "pinned_candidate": {
+    "rust_bindings": {
+      "openssl": "0.10.82",
+      "openssl-sys": "0.9.118",
+      "foreign-types-shared": "0.1.1",
+      "note": "Unchanged in this change. foreign-types-shared must stay at the version openssl 0.10.82 links through foreign-types 0.3.2 (^0.1); see tools/dependencies/crates-review.json."
+    },
+    "native": {
+      "version": "4.1.0",
+      "sha256": "50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd",
+      "options": ["no-quic", "no-cms", "no-siv", "no-shared", "no-tests"]
+    },
+    "gate": "RED",
+    "measured_results": "NONE_RECORDED_IN_THIS_CHANGE",
+    "measured_results_detail": "No Actions run of .github/workflows/rust-tls.yml or crypto-poc.yml was observed while preparing this record, so no build, handshake, capability or CVE-reduction result is claimed for the 0.10.82 + 4.1.0 candidate. The only facts recorded here come from read-only upstream queries (release metadata, tarball digest, advisory notices, crates.io metadata) and from the pinned workflows' declared assertions. A passing reduced build would still not close the gate: the 4.1.0 TLS/PEM findings in affected_ranges have no build-removal argument.",
+    "evidence_required_before_any_status_change": [
+      "Actions log of the pinned 4.1.0 x86_64 build with the five reduced options",
+      "tools/dependencies/verify-openssl-build.sh PASSED evidence (generated and installed configuration.h, configdata disabled map, list -disabled, static symbol table, static linkage, native pq768 group/signature/AES-GCM capabilities)",
+      "real mTLS and fail-closed test logs from crates/boreas-crypto with BOREAS_REQUIRE_TLS_TESTS=1",
+      "musl and aarch64 variants for the same reduced configuration",
+      "an independent review decision for CVE-2026-35190 and CVE-2026-107493, which are not removed by no-quic/no-cms/no-siv"
+    ]
+  },
+  "fixed_release_availability": {
+    "wanted_fixed_version": "4.1.1",
+    "available": false,
+    "rechecked_at": "2026-11-17",
+    "evidence": [
+      "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-4.1.1 returned HTTP 404",
+      "https://api.github.com/repos/openssl/openssl/releases/latest returned openssl-4.1.0 (published 2026-10-23) with asset digest sha256:50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd, i.e. 4.1.0 is still the newest release"
+    ],
+    "consequence": "No 4.1.1 pin, SHA-256 or migration can be recorded. The affected_ranges entry with fixed 4.1.1 stays blocking, so the native gate remains red. This is an honest block, not a waiver: no checksum or release asset is inferred from a tag that does not exist.",
+    "unblock_condition": "A published, non-prerelease openssl-4.1.1 release with an official digest for the reviewed archive, then a new review of applicability, options and workflow pins."
+  },
   "status": "20261110 and 20261117 notices reviewed. OpenSSL 4.1.1 was not published at query time: the official GitHub tag API returned 404 and the official download table still listed 4.1.0, so no fixed-version migration or SHA-256 can honestly be added. The 4.1.0 reduced builds remain unapproved migration candidates, NOT a CVE waiver. All eight 4.1.0 findings through 20261117 remain encoded in affected_ranges and blocking; no-quic can only address the three QUIC paths as a build-removal candidate, while the Suite B TLS and PEM_X509_INFO paths require separate review or an actually released fixed version. New notices require renewed review; no advisory is suppressed.",
   "sources": [
     "https://openssl-library.org/source/",

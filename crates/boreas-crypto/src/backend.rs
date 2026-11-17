@@ -847,6 +847,11 @@ fn session_reused(ssl: &SslRef) -> bool {
     // state query that does not mutate or free the object; a non-zero result
     // is surfaced and the pure policy gate rejects it before this backend
     // returns an I/O stream.
+    //
+    // The `ForeignTypeRef` import must stay on the foreign-types-shared copy
+    // that openssl 0.10.82 links (0.1.1 through foreign-types 0.3.2); bumping
+    // the direct pin to 0.3.x adds a second copy of the trait and this call
+    // stops compiling.  See tools/dependencies/crates-review.json.
     unsafe { openssl_sys::SSL_session_reused(ssl.as_ptr()) != 0 }
 }
 
