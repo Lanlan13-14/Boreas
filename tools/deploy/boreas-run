@@ -150,12 +150,42 @@ MATERIAL=$PREFIX/releases/$ACTIVE/materials
 [ -f "$CONFIG" ] || ex_config "active release config missing: $CONFIG"
 [ -d "$MATERIAL" ] || ex_config "active release materials missing: $MATERIAL"
 
+# Signed policy inputs are published per release directly under state/ because
+# the daemon requires them as direct children of state_dir. The active pointer
+# therefore also selects the input generation; a rollback needs no re-publish.
+# Missing, symlinked, foreign-owned or group/other-readable inputs are a
+# configuration error (78), not something to retry in a hot loop.
+STATE=$PREFIX/state
+POLICY_TBS=$STATE/$ACTIVE.policy.tbs
+POLICY_ED_SIG=$STATE/$ACTIVE.policy.ed25519.sig
+POLICY_PQ_SIG=$STATE/$ACTIVE.policy.mldsa65.sig
+ROOT_ED_DER=$STATE/$ACTIVE.root.ed25519.der
+ROOT_PQ_DER=$STATE/$ACTIVE.root.mldsa65.der
+for _policy_input in "$POLICY_TBS" "$POLICY_ED_SIG" "$POLICY_PQ_SIG" "$ROOT_ED_DER" "$ROOT_PQ_DER"; do
+  if [ ! -f "$_policy_input" ] || [ -L "$_policy_input" ]; then
+    ex_config "missing or unsafe policy input for active release $ACTIVE: ${_policy_input##*/}"
+  fi
+  _policy_state=$(stat -c '%u %a' -- "$_policy_input") \
+    || ex_config "cannot stat policy input ${_policy_input##*/}"
+  [ "${_policy_state%% *}" = 0 ] \
+    || ex_config "policy input must be owned by root: ${_policy_input##*/}"
+  [ $((0${_policy_state##* } & 0077)) -eq 0 ] \
+    || ex_config "policy input must not be group/other accessible: ${_policy_input##*/}"
+done
+
 case "$BOREAS_ROLE" in
   core)
     [ -n "$BOREAS_LISTEN" ] || die 'set BOREAS_LISTEN=IPv4:port for the core role'
     valid_hostport "$BOREAS_LISTEN" || die "BOREAS_LISTEN must be IPv4:port with port 1..65535: $BOREAS_LISTEN"
     set -- "$BIN" daemon serve \
       --config "$CONFIG" --material-dir "$MATERIAL" \
+      --status-state-file "$STATE/status.state" --status-state-owner-uid 0 \
+      --network-policy-tbs "$POLICY_TBS" \
+      --network-policy-ed25519-signature "$POLICY_ED_SIG" \
+      --network-policy-mldsa65-signature "$POLICY_PQ_SIG" \
+      --network-root-ed25519-der "$ROOT_ED_DER" \
+      --network-root-mldsa65-der "$ROOT_PQ_DER" \
+      --network-policy-state-file "$STATE/policy.state" --network-policy-state-owner-uid 0 \
       --listen "$BOREAS_LISTEN" --tun-name "$TUN" --mtu "$MTU"
     ;;
   edge)
@@ -173,6 +203,13 @@ case "$BOREAS_ROLE" in
     set -- "$BIN" daemon connect \
       --config "$CONFIG" --material-dir "$MATERIAL" \
       --connect "$BOREAS_CONNECT" --tls-name "$BOREAS_TLS_NAME" --ws-host "$WS_HOST" \
+      --status-state-file "$STATE/status.state" --status-state-owner-uid 0 \
+      --network-policy-tbs "$POLICY_TBS" \
+      --network-policy-ed25519-signature "$POLICY_ED_SIG" \
+      --network-policy-mldsa65-signature "$POLICY_PQ_SIG" \
+      --network-root-ed25519-der "$ROOT_ED_DER" \
+      --network-root-mldsa65-der "$ROOT_PQ_DER" \
+      --network-policy-state-file "$STATE/policy.state" --network-policy-state-owner-uid 0 \
       --tun-name "$TUN" --mtu "$MTU"
     ;;
 esac

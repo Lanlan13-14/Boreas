@@ -103,8 +103,30 @@ cat > "$FAKE/stat" <<'EOF'
 # Model a safe root-owned hierarchy without inheriting the runner's uid or
 # writable /tmp mode. Targeted fault injection must affect only that path;
 # otherwise --bindir or an unrelated ancestor can mask the intended failure.
+# `-c %h` is real: hard-link detection must be proven on a real hard link, not
+# a constant. TEST_FAKE_LINKS can still force a value for a pure-fault case.
+fmt=
 target=
-for arg do target=$arg; done
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -c) fmt=$2; shift 2 ;;
+    --) shift ;;
+    *) target=$1; shift ;;
+  esac
+done
+[ -n "$target" ] || { echo 'fake stat: no path' >&2; exit 2; }
+if [ "$fmt" = '%h' ]; then
+  if [ -n "${TEST_FAKE_LINKS:-}" ]; then printf '%s\n' "$TEST_FAKE_LINKS"; exit 0; fi
+  exec "${TEST_REAL_STAT:?}" -c '%h' -- "$target"
+fi
+if [ -n "${TEST_MODE_PATH:-}" ] && [ "$target" = "$TEST_MODE_PATH" ]; then
+  printf '0 %s\n' "${TEST_MODE_VALUE:-644}"
+  exit 0
+fi
+if [ -n "${TEST_OWNER_PATH:-}" ] && [ "$target" = "$TEST_OWNER_PATH" ]; then
+  printf '%s 700\n' "${TEST_OWNER_UID_VALUE:-1000}"
+  exit 0
+fi
 if [ -n "${TEST_STAT_PATH:-}" ] && [ "$target" != "$TEST_STAT_PATH" ]; then
   printf '0 700\n'
 else
@@ -249,8 +271,9 @@ case "$1" in
   # The canonical output depends on the input so a changed source config is
   # observable in the bundle manifest, exactly like the real config-migrate.
   config-migrate)
-    printf '%s\n' '# canonical' 'version = 2'
-    sed '/^version = /d' "$2"
+    printf '%s\n' '# canonical' 'version = 2' '[node]' \
+      'net_id = "0123456789abcdef0123456789abcdef"'
+    sed '/^version = /d; /^net_id = /d' "$2"
     printf '%s\n' '[paths]' 'identity_key = "/source/identity.key"' \
       'roots = ["/source/roots.cbor", "/another/root.cbor"]' 'state_dir = "/source/state"'
     case "${TEST_CANON_MODE:-good}" in
@@ -272,6 +295,9 @@ invoke() {
   PATH="$FAKE:$PATH" \
   TEST_FAKE_UID=${FAKE_UID:-0} TEST_FAKE_MODE=${FAKE_MODE:-700} \
    TEST_STAT_PATH=${STAT_PATH:-} TEST_CANON_MODE=${CANON_MODE:-good} \
+  TEST_REAL_STAT="$REAL_STAT" TEST_FAKE_LINKS=${FAKE_LINKS:-} \
+  TEST_MODE_PATH=${MODE_PATH:-} TEST_MODE_VALUE=${MODE_VALUE:-644} \
+  TEST_OWNER_PATH=${OWNER_PATH:-} TEST_OWNER_UID_VALUE=${OWNER_UID:-1000} \
   TEST_HASH_CONST=${HASH_CONST-$GOOD} TEST_ELF_MODE=${ELF_MODE:-static} \
   TEST_ELF_MACHINE="$ELF_MACHINE" TEST_CAND_LOG="$CAND_LOG" \
   TEST_HASH_LOG="$HASH_LOG" TEST_SYSTEM_LOG="$SYSTEM_LOG" \
@@ -297,12 +323,149 @@ chmod 0755 "$T/boreas-src"
 
 # The standard install invocation; extra arguments are appended.
 # A function (not a word-split string) so no unquoted expansion is needed.
-run_base() {
-  invoke --sha256 "$GOOD" --release test.1 --config "$T/config.toml" \
-    --binary "$T/boreas-src" "$@"
+POLICY=$T/policy
+mkdir -m 0700 "$POLICY"
+# The three signed policy inputs live in --policy-dir; the two NetworkRoot pins
+# are separate, independently provisioned files outside it.
+for policy_file in policy.tbs policy.ed25519.sig policy.mldsa65.sig; do
+  printf 'trusted policy fixture %s\n' "$policy_file" > "$POLICY/$policy_file"
+  chmod 0600 "$POLICY/$policy_file"
+done
+for pin_file in root.ed25519.der root.mldsa65.der; do
+  printf 'independently provisioned pin %s\n' "$pin_file" > "$T/$pin_file"
+  chmod 0600 "$T/$pin_file"
+done
+run_release() { # release id, extra arguments...
+  rel=$1
+  shift
+  invoke --sha256 "$GOOD" --release "$rel" --config "$T/config.toml" \
+    --binary "$T/boreas-src" --policy-dir "$POLICY" --network-id 0123456789abcdef0123456789abcdef \
+    --network-root-ed25519-der "$T/root.ed25519.der" \
+    --network-root-mldsa65-der "$T/root.mldsa65.der" "$@"
 }
+run_base() { run_release test.1 "$@"; }
 
 P=$T/opt/boreas
+
+# Missing policy/pin inputs are fail-closed, never silently legacy behavior.
+# A valid materials directory keeps the failure on the policy input under test.
+MAT_EARLY=$(mkmat early)
+expect_fail_msg 'missing NetworkRoot pin is refused' 'both separately provisioned NetworkRoot pins' \
+  invoke --sha256 "$GOOD" --release test.0 --materials "$MAT_EARLY" --config "$T/config.toml" \
+  --binary "$T/boreas-src" --policy-dir "$POLICY" --network-id 0123456789abcdef0123456789abcdef --dry-run
+expect_fail_msg 'missing policy directory is refused' 'policy is mandatory' \
+  invoke --sha256 "$GOOD" --release test.0 --materials "$MAT_EARLY" --config "$T/config.toml" \
+  --binary "$T/boreas-src" --dry-run
+
+# Policy/NetworkRoot inputs are fail-closed on every property the installer
+# claims to check: presence, regular non-symlink type, no hard links, invoking
+# user ownership, no group/other access, distinctness, and a stable set.
+MAT_POL=$(mkmat policy)
+copy_policy() { # directory -> fresh copy of the three valid policy inputs
+  mkdir -m 0700 "$1"
+  cp "$POLICY/policy.tbs" "$POLICY/policy.ed25519.sig" "$POLICY/policy.mldsa65.sig" "$1/"
+}
+policy_invocation() { # policy dir, ed pin, pq pin, extra args...
+  pdir=$1 ed_pin=$2 pq_pin=$3
+  shift 3
+  invoke --sha256 "$GOOD" --release test.0 --materials "$MAT_POL" --config "$T/config.toml" \
+    --binary "$T/boreas-src" --policy-dir "$pdir" --network-id 0123456789abcdef0123456789abcdef \
+    --network-root-ed25519-der "$ed_pin" --network-root-mldsa65-der "$pq_pin" --dry-run "$@"
+}
+expect_fail_msg 'short --network-id is refused' '32 hexadecimal' \
+  policy_invocation "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der" --network-id abc
+expect_fail_msg 'missing NetworkRoot pin file is refused' 'regular non-symlink file' \
+  policy_invocation "$POLICY" "$T/no-such-pin" "$T/root.mldsa65.der"
+ln -s "$T/root.ed25519.der" "$T/root.ed.link"
+expect_fail_msg 'symlinked NetworkRoot pin is refused' 'regular non-symlink file' \
+  policy_invocation "$POLICY" "$T/root.ed.link" "$T/root.mldsa65.der"
+expect_fail_msg 'the two NetworkRoot pins must be distinct files' 'must be distinct files' \
+  policy_invocation "$POLICY" "$T/root.ed25519.der" "$T/root.ed25519.der"
+
+POLICY_MISSING=$T/policy-missing
+mkdir -m 0700 "$POLICY_MISSING"
+cp "$POLICY/policy.ed25519.sig" "$POLICY/policy.mldsa65.sig" "$POLICY_MISSING/"
+expect_fail_msg 'missing policy input is refused' 'must be a regular non-symlink file' \
+  policy_invocation "$POLICY_MISSING" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+
+POLICY_SYM=$T/policy-sym
+copy_policy "$POLICY_SYM"
+rm -f "$POLICY_SYM/policy.tbs"
+ln -s "$POLICY/policy.tbs" "$POLICY_SYM/policy.tbs"
+expect_fail_msg 'symlinked policy input is refused' 'must be a regular non-symlink file' \
+  policy_invocation "$POLICY_SYM" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+
+POLICY_EXTRA=$T/policy-extra
+copy_policy "$POLICY_EXTRA"
+printf 'unexpected\n' > "$POLICY_EXTRA/notes.txt"
+expect_fail_msg 'extra --policy-dir entry is refused' 'unexpected entry' \
+  policy_invocation "$POLICY_EXTRA" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+
+POLICY_HL=$T/policy-hardlink
+copy_policy "$POLICY_HL"
+ln -- "$POLICY_HL/policy.tbs" "$T/policy.tbs.hardlink"
+expect_fail_msg 'hard-linked policy input is refused' 'must not be hard-linked' \
+  policy_invocation "$POLICY_HL" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+rm -f "$T/policy.tbs.hardlink"
+
+# Fault injection is scoped to one call: the fake stat sees the injected value
+# only while these helpers run, so later checks keep the safe defaults.
+mode_case() {
+  MODE_PATH=$1
+  MODE_VALUE=$2
+  shift 2
+  policy_invocation "$@"
+  rc=$?
+  MODE_PATH=
+  MODE_VALUE=
+  return "$rc"
+}
+owner_case() {
+  OWNER_PATH=$1
+  OWNER_UID=$2
+  shift 2
+  policy_invocation "$@"
+  rc=$?
+  OWNER_PATH=
+  OWNER_UID=
+  return "$rc"
+}
+expect_fail_msg 'group/other-readable policy input is refused' 'group/other accessible' \
+  mode_case "$POLICY/policy.tbs" 644 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+expect_fail_msg 'policy input owned by another user is refused' 'owned by the invoking user' \
+  owner_case "$POLICY/policy.mldsa65.sig" 1000 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+# A writable or foreign-owned input directory would let the verified bytes be
+# swapped before the installer copies them; the same applies to every ancestor.
+PIN_DIR=$T/pin-dir
+mkdir -m 0700 "$PIN_DIR"
+cp "$T/root.ed25519.der" "$T/root.mldsa65.der" "$PIN_DIR/"
+expect_fail_msg 'group/other-writable --policy-dir is refused' 'must not be group/other writable' \
+  mode_case "$POLICY" 777 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+expect_fail_msg '--policy-dir owned by another user is refused' 'owned by the invoking user' \
+  owner_case "$POLICY" 1000 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+expect_fail_msg 'group/other-writable NetworkRoot pin directory is refused' \
+  'must not be group/other writable' \
+  mode_case "$PIN_DIR" 777 "$POLICY" "$PIN_DIR/root.ed25519.der" "$PIN_DIR/root.mldsa65.der"
+expect_fail_msg 'a non-sticky group/other-writable ancestor is refused' \
+  'ancestor without the sticky bit' \
+  mode_case "$T" 777 "$POLICY" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+ln -s "$T" "$T/ancestor-link"
+expect_fail_msg 'a symlinked ancestor is refused' 'must not traverse a symbolic link' \
+  policy_invocation "$T/ancestor-link/policy" "$T/root.ed25519.der" "$T/root.mldsa65.der"
+# Sticky /tmp is acceptable: a non-owner cannot rename a root-0700 child out of
+# it. Inject the mode only for this invocation.
+MODE_PATH=$T MODE_VALUE=1777
+expect_ok 'a sticky group/other-writable ancestor is accepted' \
+  policy_invocation "$POLICY" "$PIN_DIR/root.ed25519.der" "$PIN_DIR/root.mldsa65.der"
+MODE_PATH=; MODE_VALUE=
+
+PNET=$T/net-id-prefix/boreas
+expect_fail_msg '--network-id must match the canonical config net_id' \
+  'does not match the canonical config' \
+  run_release test.9 --materials "$MAT_POL" --prefix "$PNET" --bindir "$T/bindir" \
+  --network-id ffffffffffffffffffffffffffffffff
+assert_absent "$PNET/active"
+assert_absent "$PNET/releases/test.9"
 
 # ---------------------------------------------------------------------------
 # 1. --dry-run: read-only, never executes the candidate
@@ -432,6 +595,9 @@ HASH_CONST=$BAD expect_fail_msg 'digest mismatch fails closed' 'SHA-256 mismatch
 HASH_CONST=$GOOD
 [ ! -s "$CAND_LOG" ] || bail 'a candidate was executed after a digest mismatch'
 pass 'no candidate execution before the digest check passes'
+# A failed run must release its own lock; otherwise every later attempt fails.
+assert_absent "$PNEG/.install.lock"
+pass 'a failed install releases its own lock'
 
 ELF_MODE=interp_request expect_fail_msg 'requested program interpreter is refused' \
   'requests an interpreter' \
@@ -478,9 +644,56 @@ assert_absent "$P/releases/test.1/config.source.toml"
 assert_file "$P/releases/test.1/materials/identity.pem"
 assert_mode "$P/releases/test.1/materials" 700
 assert_mode "$P/releases/test.1/materials/identity.key" 600
+# The five signed inputs are published once under release-scoped names directly
+# in state/ (runtime requires direct children), byte-identical to the verified
+# staging copies, and the shared durable stores are NOT pre-created.
+for input in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  assert_file "$P/state/test.1.$input"
+  assert_mode "$P/state/test.1.$input" 600
+done
+cmp -s "$POLICY/policy.tbs" "$P/state/test.1.policy.tbs" || bail 'published TBS differs from the verified input'
+cmp -s "$T/root.mldsa65.der" "$P/state/test.1.root.mldsa65.der" || bail 'published pin differs from the verified pin'
+pass 'published policy inputs are byte-identical to the verified inputs'
+# The publish step hard-links into state/ and then drops the staging name, so the
+# final file must have exactly one link (a second name would be an unnoticed alias
+# that re-entry rejects).
+for input in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  [ "$($REAL_STAT -c '%h' -- "$P/state/test.1.$input")" = 1 ] \
+    || bail "published policy input has more than one link: $input"
+done
+pass 'published policy inputs have exactly one link'
+grep -q 'policy-inputs/policy.tbs$' "$P/releases/test.1/bundle.sha256" \
+  || bail 'bundle manifest does not cover the policy inputs'
+pass 'bundle manifest covers every policy input'
+assert_absent "$P/state/status.state"
+assert_absent "$P/state/policy.state"
+pass 'durable stores are left for the daemon to create'
+# An empty placeholder would be read back as a corrupt store, so an existing
+# zero-length store is refused rather than silently accepted.
+: > "$P/state/status.state"
+chmod 0600 "$P/state/status.state"
+expect_fail_msg 'an empty pre-existing durable store is refused' 'is empty; remove it' \
+  run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+rm -f "$P/state/status.state"
+[ "$(sed -n '1p' "$P/active")" = 'test.1' ] || bail 'a refused store check changed the active pointer'
+assert_contains "$P/releases/test.1/config.toml" 'net_id = "0123456789abcdef0123456789abcdef"'
 assert_file "$P/active"
 [ "$(sed -n '1p' "$P/active")" = 'test.1' ] || bail 'active pointer does not name the release'
 pass 'active pointer names the release'
+# The whole mutating run is serialized by a create-only lock removed on success.
+# A pre-existing lock (another installer, or a stale one) must fail before
+# staging and must never be removed by a run that did not create it.
+assert_absent "$P/.install.lock"
+mkdir -m 0700 "$P/.install.lock"
+expect_fail_msg 'a held installation lock is refused' 'installation lock is held' \
+  run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+[ "$(sed -n '1p' "$P/active")" = 'test.1' ] || bail 'a refused installation lock changed the active pointer'
+[ -d "$P/.install.lock" ] || bail 'the installer removed a lock it did not create'
+pass 'a foreign installation lock is left untouched'
+[ -z "$(find "$P" -mindepth 1 -maxdepth 1 -name '.stage.*' -print)" ] \
+  || bail 'a refused installation lock still created a staging directory'
+pass 'a refused installation lock fails before staging'
+rmdir "$P/.install.lock"
 assert_file "$P/boreas-dispatch"
 assert_mode "$P/boreas-dispatch" 755
 assert_contains "$P/boreas-dispatch" "PREFIX=$P"
@@ -556,6 +769,63 @@ printf 'fixture\n' > "$MAT/local.signed"
 expect_ok 're-entry works again once the bundle matches' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
 
+# Release-scoped publication never overwrites. A tampered existing generation is
+# a release-id conflict; an identical one is reused so re-entry stays idempotent.
+printf 'tampered\n' > "$P/state/test.1.policy.tbs"
+expect_fail_msg 'a conflicting published policy input is refused' \
+  'already published with a different policy input' \
+  run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+grep -q 'tampered' "$P/state/test.1.policy.tbs" \
+  || bail 'a conflicting re-entry overwrote the published input'
+pass 'a conflicting re-entry did not overwrite the published input'
+cp "$POLICY/policy.tbs" "$P/state/test.1.policy.tbs"
+expect_ok 're-entry reuses a byte-identical published generation' \
+  run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+
+# ---------------------------------------------------------------------------
+# 6b. Upgrade publication: per-generation files, no partial publish, rollback
+# ---------------------------------------------------------------------------
+
+expect_ok 'upgrade installs release test.2' \
+  run_release test.2 --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+[ "$(sed -n '1p' "$P/active")" = 'test.2' ] || bail 'upgrade did not move the active pointer'
+for input in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  assert_file "$P/state/test.2.$input"
+done
+cmp -s "$POLICY/policy.tbs" "$P/state/test.1.policy.tbs" \
+  || bail 'upgrade mutated the previous policy generation'
+pass 'upgrade leaves the previous generation untouched'
+
+# Half-finished upgrade: test.3's third input already exists with different
+# bytes. Publication must fail without overwriting it, must remove the inputs it
+# already linked for test.3, and must leave the active pointer on test.2.
+printf 'conflict\n' > "$P/state/test.3.policy.mldsa65.sig"
+chmod 0600 "$P/state/test.3.policy.mldsa65.sig"
+expect_fail_msg 'a conflicting upgrade conflicts instead of overwriting' \
+  'already published with a different policy input' \
+  run_release test.3 --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+[ "$(sed -n '1p' "$P/active")" = 'test.2' ] || bail 'a failed upgrade changed the active pointer'
+assert_absent "$P/state/test.3.policy.tbs"
+assert_absent "$P/state/test.3.policy.ed25519.sig"
+grep -q 'conflict' "$P/state/test.3.policy.mldsa65.sig" \
+  || bail 'a failed upgrade overwrote an existing input'
+cmp -s "$POLICY/policy.tbs" "$P/state/test.2.policy.tbs" \
+  || bail 'a failed upgrade damaged the previous generation'
+pass 'a failed upgrade cleans up only its own partial publication'
+
+# The same upgrade succeeds once the conflict is gone, and writing the previous
+# id back into the pointer re-selects the previous unmodified inputs: no
+# re-publish is needed for a rollback.
+rm -f "$P/state/test.3.policy.mldsa65.sig"
+expect_ok 'the upgrade succeeds once the conflict is removed' \
+  run_release test.3 --materials "$MAT" --prefix "$P" --bindir "$T/bindir"
+[ "$(sed -n '1p' "$P/active")" = 'test.3' ] || bail 'upgrade pointer is not test.3'
+printf '%s\n' 'test.2' > "$P/active"
+cmp -s "$POLICY/policy.tbs" "$P/state/test.2.policy.tbs" \
+  || bail 'rollback would not find the previous generation inputs'
+pass 'pointer rollback re-selects the previous inputs without re-publishing'
+printf '%s\n' 'test.1' > "$P/active"
+
 # ---------------------------------------------------------------------------
 # 7. Prefix ownership gates, --start ordering, --bindir
 # ---------------------------------------------------------------------------
@@ -575,12 +845,14 @@ STAT_PATH=$T/unsafe-ancestor FAKE_UID=1000 expect_fail_msg 'non-root ancestor is
   'owned by root' run_base --materials "$MAT" --prefix "$T/unsafe-ancestor/new/boreas" --bindir "$T/bindir"
 STAT_PATH=; FAKE_UID=0; FAKE_MODE=700
 POWN=$T/own-opt/boreas
-FAKE_UID=1000 expect_fail_msg 'prefix owned by a non-root user is refused' 'owned by root' \
+# Scope the injected uid/mode to the prefix path so the policy-input checks keep
+# their safe fake defaults and the failure under test is the prefix gate.
+STAT_PATH=$POWN FAKE_UID=1000 expect_fail_msg 'prefix owned by a non-root user is refused' 'owned by root' \
   run_base --materials "$MAT" --prefix "$POWN" --bindir "$T/bindir"
-FAKE_UID=0
-FAKE_MODE=0777 expect_fail_msg 'group/other-writable prefix is refused' 'group/other writable' \
+STAT_PATH=; FAKE_UID=0
+STAT_PATH=$POWN FAKE_MODE=0777 expect_fail_msg 'group/other-writable prefix is refused' 'group/other writable' \
   run_base --materials "$MAT" --prefix "$POWN" --bindir "$T/bindir"
-FAKE_MODE=700
+STAT_PATH=; FAKE_MODE=700
 
 expect_fail_msg '--start without a service is refused' '--start requires' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir" --start
@@ -603,8 +875,16 @@ WP=$T/wr
 mkdir -p "$WP/releases/r1/materials"
 printf 'version = 2\n' > "$WP/releases/r1/config.toml"
 printf 'fixture\n' > "$WP/releases/r1/materials/local.signed"
+# The wrapper must resolve the five inputs from the active release id, so each
+# release owns a generation under state/ while the durable stores stay shared.
+mkdir -m 0700 "$WP/state"
+for name in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  printf 'wrapper fixture %s\n' "$name" > "$WP/state/r1.$name"
+  chmod 0600 "$WP/state/r1.$name"
+done
 cat > "$WP/releases/r1/boreas" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >> "${TEST_DAEMON_LOG:?}"
 exit "${TEST_DAEMON_RC:-7}"
 EOF
 chmod 0755 "$WP/releases/r1/boreas"
@@ -622,6 +902,7 @@ run_wrapper() {
   : > "$IP_LOG"
   PATH="$FAKE:$PATH" TEST_IP_MODE=${IP_MODE:-free} TEST_IP_LOG="$IP_LOG" \
   TEST_IP_COUNT="$IP_COUNT" TEST_DAEMON_RC=${DAEMON_RC:-7} \
+  TEST_DAEMON_LOG="$T/daemon.log" \
   BOREAS_ROLE=${ROLE:-core} BOREAS_VIP=${VIP-10.20.1.1} \
   BOREAS_PEER_VIP=${PEER-10.20.1.2} BOREAS_LISTEN=${LISTEN-0.0.0.0:8443} \
   BOREAS_CONNECT=${CONNECT:-} BOREAS_TLS_NAME=${TLS_NAME:-} \
@@ -681,6 +962,65 @@ set -e
 [ "$rc" -eq 78 ] || bail "pre-existing TUN exit code is $rc, expected 78"
 pass 'pre-existing TUN exits 78 (EX_CONFIG)'
 
+# The wrapper resolves all five signed inputs from the active release id, so a
+# missing/symlinked generation must be a configuration error (78) before any TUN
+# probe or route change. The wrapper contract is exit 78 (EX_CONFIG), not just
+# the message: a supervisor must be able to prevent a hot restart loop.
+expect_config_error() { # desc, command...
+  desc=$1
+  shift
+  set +e
+  "$@" > "$T/out" 2> "$T/err"
+  _config_rc=$?
+  set -e
+  [ "$_config_rc" -eq 78 ] || {
+    printf 'FAIL - %s: exit %s, expected 78\n' "$desc" "$_config_rc" >&2
+    dump
+    exit 1
+  }
+  grep -q 'missing or unsafe policy input for active release r1' "$T/err" || {
+    printf 'FAIL - %s: stderr lacks the policy-input diagnostic\n' "$desc" >&2
+    dump
+    exit 1
+  }
+  pass "$desc"
+}
+mv "$WP/state/r1.policy.tbs" "$T/r1.policy.tbs.hidden"
+expect_config_error 'a missing active-release policy input is refused' run_wrapper
+mv "$T/r1.policy.tbs.hidden" "$WP/state/r1.policy.tbs"
+rm -f "$WP/state/r1.root.mldsa65.der"
+ln -s /etc/passwd "$WP/state/r1.root.mldsa65.der"
+expect_config_error 'a symlinked policy input is refused' run_wrapper
+[ ! -s "$IP_LOG" ] || bail 'a policy input failure reached the ip command'
+pass 'policy input failures happen before any ip command'
+rm -f "$WP/state/r1.root.mldsa65.der"
+printf 'wrapper fixture %s\n' root.mldsa65.der > "$WP/state/r1.root.mldsa65.der"
+chmod 0600 "$WP/state/r1.root.mldsa65.der"
+
+# A second generation is selected purely by the pointer; the wrapper must not
+# keep reading the previous release's files.
+mkdir -p "$WP/releases/r2/materials"
+printf 'version = 2\n' > "$WP/releases/r2/config.toml"
+printf 'fixture\n' > "$WP/releases/r2/materials/local.signed"
+cp "$WP/releases/r1/boreas" "$WP/releases/r2/boreas"
+chmod 0755 "$WP/releases/r2/boreas"
+for name in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  printf 'wrapper fixture r2 %s\n' "$name" > "$WP/state/r2.$name"
+  chmod 0600 "$WP/state/r2.$name"
+done
+printf '%s\n' 'r2' > "$WP/active"
+: > "$T/daemon.log"
+IP_MODE=free DAEMON_RC=0
+set +e
+run_wrapper > /dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || bail "second-generation wrapper run exited $rc"
+assert_contains "$T/daemon.log" "--network-policy-tbs $WP/state/r2.policy.tbs"
+assert_not_contains "$T/daemon.log" 'r1.policy.tbs'
+pass 'the wrapper resolves policy inputs from the active release id'
+printf '%s\n' 'r1' > "$WP/active"
+
 # Successful path: address before route, daemon status propagated, and only the
 # objects this invocation added are removed (route, then address).
 IP_MODE=free DAEMON_RC=7
@@ -690,6 +1030,14 @@ rc=$?
 set -e
 [ "$rc" -eq 7 ] || bail "daemon status was not propagated (got $rc)"
 pass 'daemon exit status is propagated'
+assert_contains "$T/daemon.log" "--network-policy-tbs $WP/state/r1.policy.tbs"
+assert_contains "$T/daemon.log" "--network-policy-ed25519-signature $WP/state/r1.policy.ed25519.sig"
+assert_contains "$T/daemon.log" "--network-policy-mldsa65-signature $WP/state/r1.policy.mldsa65.sig"
+assert_contains "$T/daemon.log" "--network-root-ed25519-der $WP/state/r1.root.ed25519.der"
+assert_contains "$T/daemon.log" "--network-root-mldsa65-der $WP/state/r1.root.mldsa65.der"
+assert_contains "$T/daemon.log" "--status-state-file $WP/state/status.state"
+assert_contains "$T/daemon.log" "--network-policy-state-file $WP/state/policy.state"
+pass 'the wrapper passes every policy option with the active generation paths'
 assert_contains "$IP_LOG" 'addr add 10.20.1.1/32 dev btun0'
 assert_contains "$IP_LOG" 'route add 10.20.1.2/32 dev btun0'
 addr_line=$(grep -n 'addr add' "$IP_LOG" | sed -n '1p' | cut -d: -f1)

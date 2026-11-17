@@ -10,6 +10,7 @@ BIN=${1:?usage: test-real-install.sh STATIC_BOREAS_BINARY}
 [ "${GITHUB_ACTIONS:-}" = true ] || { echo 'real-install harness is restricted to GitHub Actions' >&2; exit 1; }
 command -v sudo >/dev/null 2>&1 || { echo 'sudo required' >&2; exit 1; }
 command -v readelf >/dev/null 2>&1 || { echo 'readelf required' >&2; exit 1; }
+command -v cmp >/dev/null 2>&1 || { echo 'cmp required' >&2; exit 1; }
 # The installer walks every ancestor; give it a genuinely root-owned, private
 # tree rather than weakening the production ownership/mode gate.
 # RUNNER_TEMP is normally below /home/runner and therefore fails the installer's
@@ -30,6 +31,22 @@ sudo mkdir -m 0700 "$P" "$B"
 # Make real, internally consistent node bundles with the candidate itself.
 # local.signed and peer.signed must carry two independent node identities.
 NET=0123456789abcdef0123456789abcdef
+# Policy/root inputs are structurally valid but non-secret placeholders: this
+# harness installs with --service none and never starts the daemon, while the
+# installer deliberately checks only file provenance (type, owner, mode, links,
+# distinctness) and not policy cryptography. Cryptographic verification is
+# fail-closed in the daemon at every start. A real deployment must use policy
+# inputs and independently provisioned NetworkRoot pins from its own trust root.
+POL=$T/policy
+sudo mkdir -m 0700 "$POL"
+for name in policy.tbs policy.ed25519.sig policy.mldsa65.sig; do
+  printf 'non-secret install-harness placeholder: %s\n' "$name" | sudo tee "$POL/$name" >/dev/null
+  sudo chmod 0600 "$POL/$name"
+done
+for name in root.ed25519.der root.mldsa65.der; do
+  printf 'non-secret install-harness placeholder pin: %s\n' "$name" | sudo tee "$T/$name" >/dev/null
+  sudo chmod 0600 "$T/$name"
+done
 CORE=$T/materials-core
 EDGE=$T/materials-edge
 sudo "$BIN" pki init-ca --ca-dir "$T/ca" --net-id "$NET" --validity-days 30
@@ -44,11 +61,39 @@ sudo cp -- "$ROOT/docs/config/config.legacy-v1.example.toml" "$T/config.toml"
 # and relocates its three path fields into the temporary prefix.
 HASH=$(sudo sha256sum -- "$BIN" | awk '{print $1}')
 REL=gha-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}
-set -- --binary "$BIN" --sha256 "$HASH" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none
-sudo sh "$DEPLOY/install.sh" "$@"
+# One invocation shape for every case; callers vary only binary, digest and
+# prefix so an early input error cannot masquerade as the gate under test.
+run_install() { # binary sha256 prefix [extra args...]
+  ibin=$1 isha=$2 iprefix=$3
+  shift 3
+  sudo sh "$DEPLOY/install.sh" --binary "$ibin" --sha256 "$isha" --release "$REL" \
+    --materials "$CORE" --policy-dir "$POL" --network-id "$NET" \
+    --network-root-ed25519-der "$T/root.ed25519.der" \
+    --network-root-mldsa65-der "$T/root.mldsa65.der" \
+    --config "$T/config.toml" --prefix "$iprefix" --bindir "$B" --service none "$@"
+}
+run_install "$BIN" "$HASH" "$P"
 ACTIVE=$(sudo sed -n '1p' "$P/active")
 [ "$ACTIVE" = "$REL" ]
 [ "$(sudo sha256sum "$P/releases/$ACTIVE/boreas" | awk '{print $1}')" = "$HASH" ]
+# The five inputs are published once under release-scoped names; the shared
+# durable stores stay absent so the daemon creates them at first start.
+for name in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der root.mldsa65.der; do
+  [ "$(sudo stat -c '%a' -- "$P/state/$REL.$name")" = 600 ]
+  [ "$(sudo stat -c '%h' -- "$P/state/$REL.$name")" = 1 ]
+done
+sudo cmp -s -- "$POL/policy.tbs" "$P/state/$REL.policy.tbs" \
+  || { echo 'published TBS differs from the verified placeholder' >&2; exit 1; }
+sudo cmp -s -- "$T/root.mldsa65.der" "$P/state/$REL.root.mldsa65.der" \
+  || { echo 'published pin differs from the verified placeholder' >&2; exit 1; }
+for store in status.state policy.state; do
+  if sudo stat -c '%F' -- "$P/state/$store" >/dev/null 2>&1; then
+    echo "installer pre-created the durable store $store" >&2; exit 1
+  fi
+done
+if sudo stat -c '%F' -- "$P/.install.lock" >/dev/null 2>&1; then
+  echo 'installer left its installation lock behind' >&2; exit 1
+fi
 sudo readelf -h "$P/releases/$ACTIVE/boreas" | grep -q ELF64
 # Inspect program-header type fields, not the whole line (which always contains
 # the word INTERP in GNU readelf's column heading).
@@ -59,7 +104,7 @@ fi
 sudo "$B/boreas" --help >/dev/null
 sudo "$B/boreas" doctor >/dev/null
 # Wrong digest must fail before candidate execution or changing active pointer.
-if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$(printf '%064d' 0)" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
+if run_install "$BIN" "$(printf '%064d' 0)" "$P" >"$BAD" 2>&1; then
   echo 'wrong hash unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'SHA-256 mismatch' "$BAD"
@@ -69,7 +114,7 @@ grep -q 'SHA-256 mismatch' "$BAD"
 sudo cp -- "$BIN" "$T/conflict"
 printf '\nconflict\n' | sudo tee -a "$T/conflict" >/dev/null
 CH=$(sudo sha256sum "$T/conflict" | awk '{print $1}')
-if sudo sh "$DEPLOY/install.sh" --binary "$T/conflict" --sha256 "$CH" --release "$REL" --materials "$CORE" --config "$T/config.toml" --prefix "$P" --bindir "$B" --service none >"$BAD" 2>&1; then
+if run_install "$T/conflict" "$CH" "$P" >"$BAD" 2>&1; then
   echo 'conflicting existing release unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'already exists with a different bundle' "$BAD"
@@ -80,8 +125,7 @@ grep -q 'already exists with a different bundle' "$BAD"
 # so each refusal must leave the pointer and active binary byte-identical.
 GOOD_INSTALL=$(sudo sha256sum -- "$P/active" "$P/releases/$ACTIVE/boreas")
 expect_unsafe_prefix_rejected() { # $1=prefix, $2=exact production error line
-  if sudo sh "$DEPLOY/install.sh" --binary "$BIN" --sha256 "$HASH" --release "$REL" \
-      --materials "$CORE" --config "$T/config.toml" --prefix "$1" --bindir "$B" --service none >"$BAD" 2>&1; then
+  if run_install "$BIN" "$HASH" "$1" >"$BAD" 2>&1; then
     echo "installer accepted unsafe --prefix: $1" >&2; exit 1
   fi
   # Whole-line, case-sensitive production message: an earlier unrelated failure
