@@ -340,7 +340,10 @@ impl EndpointFacts {
             role: identity.role,
             vip,
             #[cfg(feature = "openssl-inner-tls")]
-            policy_digest: identity.policy().ok_or(PacketPathError::PolicyMismatch)?.policy_digest(),
+            policy_digest: identity
+                .policy()
+                .ok_or(PacketPathError::PolicyMismatch)?
+                .policy_digest(),
         })
     }
 }
