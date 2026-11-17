@@ -1,30 +1,37 @@
 name: '[Test] Sandbox audit & diagnostics evidence'
 
 # Independent evidence workflow for tools/sandbox-audit + tools/diagnostics
-# (master plan v1.11.0 section 9.5 / Phase 3 G-SANDBOX groundwork).
+# (master plan v1.11.0 section 9.5 / Phase 3 G-SANDBOX groundwork), plus the
+# supervisor's real child-process seccomp and crash-recovery negative tests.
 #
-# What a green run means: the reference seccomp fixture and the redacted
-# diagnostics collector behaved as specified on a GitHub-hosted Linux
-# runner. It does NOT mean any Boreas daemon/worker passed G-SANDBOX, and
-# it is not production-environment evidence (plan section 11). The audit
-# report.json uploaded below always states
-# "g_sandbox_production": "UNPROVEN".
+# What a green run means:
+#   * the reference seccomp fixture and the redacted diagnostics collector
+#     behaved as specified on a GitHub-hosted Linux runner;
+#   * the supervisor's own BPF policy was enforced by the kernel in real child
+#     processes on that native ABI;
+#   * SIGKILL/early-crash recovery left the upgrade journal unconfirmed and
+#     rolled back on the next real invocation.
 #
-# This workflow is deliberately a separate file and does not touch the
-# Rust workspace, so it cannot mask or be masked by workspace CI.
+# It does NOT mean any Boreas daemon/worker passed G-SANDBOX, and it is not
+# production-environment evidence (plan section 11). The audit report.json
+# uploaded below always states "g_sandbox_production": "UNPROVEN".
 
 on:
   push:
     paths:
       - 'tools/sandbox-audit/**'
       - 'tools/diagnostics/**'
+      - 'crates/boreas-supervisor/**'
       - 'docs/engineering/sandbox-audit-and-diagnostics.md'
+      - 'docs/engineering/sandbox-runtime.md'
       - '.github/workflows/sandbox-diagnostics.yml'
   pull_request:
     paths:
       - 'tools/sandbox-audit/**'
       - 'tools/diagnostics/**'
+      - 'crates/boreas-supervisor/**'
       - 'docs/engineering/sandbox-audit-and-diagnostics.md'
+      - 'docs/engineering/sandbox-runtime.md'
       - '.github/workflows/sandbox-diagnostics.yml'
   workflow_dispatch:
 
@@ -46,7 +53,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install toolchain (cc, strace, shellcheck)
         run: sudo apt-get update && sudo apt-get install -y gcc strace shellcheck
@@ -74,6 +81,7 @@ jobs:
           grep -q '"status": "PASS_FIXTURE"' "$RUNNER_TEMP/sandbox-audit/report.json"
           grep -q '"g_sandbox_production": "UNPROVEN"' "$RUNNER_TEMP/sandbox-audit/report.json"
           grep -q '"production_daemon_audited": false' "$RUNNER_TEMP/sandbox-audit/report.json"
+          grep -q '"inherited_fd_audit": "probe-process-only"' "$RUNNER_TEMP/sandbox-audit/report.json"
           cat "$RUNNER_TEMP/sandbox-audit/report.json"
 
       - name: Run redacted diagnostics (with self-test, against /bin/sh as sample ELF)
@@ -86,11 +94,107 @@ jobs:
 
       - name: Upload evidence bundle
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sandbox-diagnostics-evidence-${{ matrix.arch }}
           path: |
             ${{ runner.temp }}/sandbox-audit/
             ${{ runner.temp }}/diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
+
+  supervisor-sandbox-negative:
+    name: Real seccomp child process + crash recovery (${{ matrix.arch }})
+    # Native runners only: AUDIT_ARCH and the kernel's seccomp action must
+    # come from the target ABI, not from emulation.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      # New references use the reviewed commits from
+      # tools/dependencies/action-pins.json; the floating-debt ceiling in
+      # action-pins-inventory.json must not grow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+        with:
+          components: rustfmt, clippy
+
+      - name: Clippy the supervisor and its real-process tests
+        run: cargo clippy -p boreas-supervisor --all-targets --locked -- -D warnings
+
+      - name: Sandbox BPF unit matrix (userspace interpreter, compat arch cases)
+        run: cargo test -p boreas-supervisor --lib --locked -- sandbox::tests
+
+      # Each case re-executes the test binary as a child, installs the real
+      # supervisor filter (NO_NEW_PRIVS + TSYNC), and performs the case's
+      # probe syscall(s). The parent asserts the kernel's SIGSYS/EPERM
+      # action, so a userspace interpreter bug cannot make this green.
+      - name: Real child-process seccomp enforcement
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p boreas-supervisor --test sandbox_enforcement --locked \
+            -- --test-threads=1 --nocapture 2>&1 | tee sandbox-enforcement.log
+
+      - name: Assert child-process evidence matches this native arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=af_unix_stream_cloexec verdict=allowed" sandbox-enforcement.log
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=inet_udp_raw_unix_dgram verdict=denied_eperm" sandbox-enforcement.log
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=io_uring_trio verdict=killed_sigsys" sandbox-enforcement.log
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=syscall_number_102_over_deny verdict=killed_sigsys" sandbox-enforcement.log
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=inherited_udp_fd verdict=usable_new_socket_denied" sandbox-enforcement.log
+          grep -q "BOREAS_SANDBOX_EVIDENCE arch=${arch} case=inherited_af_unix_dgram_fd verdict=usable" sandbox-enforcement.log
+          if [ "$arch" = "x86_64" ]; then
+            grep -q "BOREAS_SANDBOX_EVIDENCE arch=x86_64 case=x32_syscall_bit verdict=killed_sigsys" sandbox-enforcement.log
+          fi
+          grep -q 'test result: ok' sandbox-enforcement.log
+          ! grep -Eq 'test result: FAILED|[1-9][0-9]* failed' sandbox-enforcement.log
+
+      # Real supervisor processes: SIGKILL mid-trial and an early candidate
+      # exit must both leave the journal unconfirmed, roll back on the next
+      # invocation, and keep the durable attempt count.
+      - name: Supervisor SIGKILL / early-crash recovery negative tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p boreas-supervisor --test readiness --locked \
+            -- --test-threads=1 --nocapture 2>&1 | tee supervisor-recovery.log
+
+      - name: Assert recovery evidence and no skipped cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'BOREAS_SUPERVISOR_RECOVERY_EVIDENCE case=sigkill_mid_trial' supervisor-recovery.log
+          grep -q 'BOREAS_SUPERVISOR_RECOVERY_EVIDENCE case=early_exit_before_readiness' supervisor-recovery.log
+          grep -q 'test result: ok' supervisor-recovery.log
+          if grep -Eq '[1-9][0-9]* ignored' supervisor-recovery.log; then
+            echo "::error::readiness/recovery tests were ignored; a skipped crash test is not evidence"
+            exit 1
+          fi
+          # With --nocapture libtest prints "test <name> ... <test output>"
+          # and pads the name to the longest test, so match the name alone.
+          # The "test result: ok" check above proves the run finished green.
+          grep -Fq 'test sigkill_mid_trial_is_not_confirmed_and_next_boot_recovers_old_version' supervisor-recovery.log
+          grep -Fq 'test early_candidate_exit_before_readiness_rolls_back_and_consumes_attempt' supervisor-recovery.log
+
+      - name: Upload seccomp and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: supervisor-sandbox-negative-${{ matrix.arch }}-${{ github.run_id }}
+          path: |
+            sandbox-enforcement.log
+            supervisor-recovery.log
           if-no-files-found: warn
           retention-days: 30

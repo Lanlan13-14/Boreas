@@ -89,6 +89,7 @@ write_report() {
         echo '  "evidence_level": "fixture-reference-filter",'
         echo '  "g_sandbox_production": "UNPROVEN",'
         echo '  "production_daemon_audited": false,'
+        echo '  "inherited_fd_audit": "probe-process-only",'
         echo "  \"cases_ok\": $3,"
         echo "  \"cases_required\": $4,"
         echo "  \"strace\": \"$5\","
@@ -164,12 +165,13 @@ if ! grep -q '^FILTER_INSTALLED ' "$PROBE_OUT" || ! grep -q '^PROBE_DONE$' "$PRO
     finish 2
 fi
 
-# --- Judge the case matrix. Every listed case must appear with an OK_*. -----
-REQUIRED_CASES="unix_stream unix_seqpacket tcp_stream_v4 tcp_stream_v6 inet_udp_v4 inet_udp_v6 inet_udp_cloexec inet_udp_nonblock inet_raw_v4 inet_raw_v6 unix_dgram_strict io_uring_setup"
+# --- Judge the case matrix. Every required case must appear with an OK_*. ---
+REQUIRED_CASES="unix_stream unix_seqpacket tcp_stream_v4 tcp_stream_v6 inet_udp_v4 inet_udp_v6 inet_udp_cloexec inet_udp_nonblock inet_raw_v4 inet_raw_v6 unix_dgram_strict io_uring_setup io_uring_enter io_uring_register inherited_udp_fd inherited_unix_dgram_fd"
 CASES_REQUIRED=0
 CASES_OK=0
 CASES_FAIL=""
 CASES_INCONCLUSIVE=""
+CASES_SKIPPED=""
 for case_name in $REQUIRED_CASES; do
     CASES_REQUIRED=$((CASES_REQUIRED + 1))
     line=$(grep "^CASE $case_name result=" "$PROBE_OUT" || true)
@@ -184,6 +186,31 @@ for case_name in $REQUIRED_CASES; do
     esac
 done
 
+# The inherited-ring case is conditional: creating a ring before installing
+# the filter requires kernel policy to permit io_uring_setup. A host that
+# forbids it records setup-unavailable instead of claiming ring evidence. If
+# a ring was created, the filter must still block further io_uring_enter.
+RING_LINE=$(grep '^CASE inherited_io_uring_ring result=' "$PROBE_OUT" || true)
+if [ -z "$RING_LINE" ]; then
+    CASES_FAIL="$CASES_FAIL inherited_io_uring_ring(missing)"
+else
+    case "$RING_LINE" in
+        *" result=OK_"*)
+            CASES_REQUIRED=$((CASES_REQUIRED + 1))
+            CASES_OK=$((CASES_OK + 1))
+            ;;
+        *" result=INCONCLUSIVE_SETUP_FAILED"*)
+            CASES_SKIPPED="$CASES_SKIPPED inherited_io_uring_ring(setup-unavailable)"
+            ;;
+        *" result=INCONCLUSIVE_"*)
+            CASES_INCONCLUSIVE="$CASES_INCONCLUSIVE inherited_io_uring_ring"
+            ;;
+        *)
+            CASES_FAIL="$CASES_FAIL inherited_io_uring_ring"
+            ;;
+    esac
+fi
+
 # --- Optional strace cross-check (plan G-SANDBOX asks for strace evidence). --
 # strace under an outer ptrace-based sandbox (PRoot) can report fabricated
 # results, so a strace disagreement never upgrades a verdict; it is recorded
@@ -196,12 +223,18 @@ if command -v strace >/dev/null 2>&1; then
     set -e
     if [ "$STRACE_EXIT" -eq 0 ] && [ -s "$STRACE_OUT" ]; then
         STRACE_NOTE="recorded"
-        # If strace shows a successful UDP/RAW socket or io_uring_setup while
-        # the direct probe denied it, the tracing layer is interfering
-        # (observed under PRoot): the whole run is then unproven, not failed
-        # policy, because neither transcript can be fully trusted there.
-        if grep -E 'socket\(AF_INET6?, SOCK_(DGRAM|RAW)[^)]*\)[[:space:]]*=[[:space:]]*[0-9]' "$STRACE_OUT" >/dev/null 2>&1 \
-           || grep -E 'io_uring_setup\([^)]*\)[[:space:]]*=[[:space:]]*[0-9]' "$STRACE_OUT" >/dev/null 2>&1; then
+        # The probe intentionally creates UDP and io_uring descriptors BEFORE
+        # installing its filter, so successful socket/io_uring_setup lines
+        # before the seccomp install are expected, not a contradiction. Only
+        # the transcript after the filter install can contradict the probe.
+        STRACE_AFTER_FILTER="$OUT_DIR/strace-after-filter.txt"
+        awk '/seccomp\(/ { after = 1 } after' "$STRACE_OUT" > "$STRACE_AFTER_FILTER"
+        # If strace shows a successful UDP/RAW socket or io_uring_setup after
+        # the install while the direct probe denied it, the tracing layer is
+        # interfering (observed under PRoot): the whole run is then unproven,
+        # not failed policy, because neither transcript can be fully trusted.
+        if grep -E 'socket\(AF_INET6?, SOCK_(DGRAM|RAW)[^)]*\)[[:space:]]*=[[:space:]]*[0-9]' "$STRACE_AFTER_FILTER" >/dev/null 2>&1 \
+           || grep -E 'io_uring_setup\([^)]*\)[[:space:]]*=[[:space:]]*[0-9]' "$STRACE_AFTER_FILTER" >/dev/null 2>&1; then
             STRACE_NOTE="contradicts-probe-outer-ptrace-suspected"
         fi
     else
@@ -267,4 +300,7 @@ fi
 
 STATUS="PASS_FIXTURE"
 REASON="all required fixture cases matched reference policy; production daemon not audited"
+if [ -n "$CASES_SKIPPED" ]; then
+    REASON="$REASON; conditional cases skipped:$CASES_SKIPPED"
+fi
 finish 0

@@ -45,8 +45,13 @@
 //! 3. The x86-32 `socketcall` syscall (number 102) is unconditionally
 //!    `SECCOMP_RET_KILL_PROCESS`. Classic BPF cannot dereference the argument
 //!    pointer that `socketcall` passes, so the family and type cannot be
-//!    inspected. x86-64 and AArch64 do not use `socketcall`; killing number 102
-//!    there also rejects a compat/x32 attempt that reuses that number.
+//!    inspected. `socketcall` is an i386/ARM-32 multiplexer, not an x86-64 or
+//!    AArch64 native syscall; compat i386 and AArch32 are rejected by the
+//!    audit-arch compare above, and x32 by bit 30. On native x86-64/AArch64,
+//!    number 102 is `getuid`/`getitimer`, so this rule is an over-deny there.
+//!    It is kept unchanged (removing it needs a policy review) and the real
+//!    child test records it as an over-deny, never as socketcall or compat
+//!    proof.
 //! 4. `socket` is allowed only when argument 0 is `AF_UNIX` **and** argument 1
 //!    is exactly `SOCK_STREAM | SOCK_CLOEXEC`. `AF_INET` and `AF_INET6` are
 //!    rejected. `SOCK_DGRAM` and `SOCK_RAW` are rejected on every family,
@@ -64,7 +69,10 @@
 //! Unit tests interpret the emitted instructions over synthetic
 //! `seccomp_data`. They do not call [`install_current`]: this process may
 //! already sit inside an outer sandbox, and a successful install cannot be
-//! undone.
+//! undone. Kernel-level enforcement of this exact builder is covered by
+//! `tests/sandbox_enforcement.rs`, which installs it only in short-lived child
+//! processes on native Linux x86-64/AArch64. That is real filter evidence for
+//! those children, still not a daemon sandbox or `G-SANDBOX`.
 
 use std::fmt;
 #[cfg(target_os = "linux")]
@@ -744,6 +752,49 @@ mod tests {
                 SECCOMP_RET_KILL_PROCESS
             );
         }
+    }
+
+    /// A 64-bit test child can enter i386 compat on x86-64 (for example via
+    /// `int 0x80`), which this slice does not exercise; AArch64 cannot execute
+    /// AArch32 from a 64-bit process. These cases therefore stay at the
+    /// interpreter level. The arch check kills any i386/AArch32 syscall,
+    /// including 102, and the x86-64 x32-bit check kills
+    /// `102 | __X32_SYSCALL_BIT` before the number-102 rule is reached.
+    #[test]
+    fn compat_arch_and_x32_bit_reject_number_102() {
+        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+        const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+
+        let x86_64 = program(TargetArch::X86_64);
+        assert_eq!(
+            action(
+                &x86_64,
+                X86_32_SOCKETCALL,
+                AUDIT_ARCH_I386,
+                [1, 0, 0, 0, 0, 0]
+            ),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        assert_eq!(
+            action(
+                &x86_64,
+                X86_32_SOCKETCALL | X32_SYSCALL_BIT,
+                AUDIT_ARCH_X86_64,
+                [1, 0, 0, 0, 0, 0]
+            ),
+            SECCOMP_RET_KILL_PROCESS
+        );
+
+        let aarch64 = program(TargetArch::Aarch64);
+        assert_eq!(
+            action(
+                &aarch64,
+                X86_32_SOCKETCALL,
+                AUDIT_ARCH_ARM,
+                [1, 0, 0, 0, 0, 0]
+            ),
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 
     #[test]
