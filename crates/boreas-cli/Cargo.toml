@@ -22,6 +22,7 @@ openssl-inner-tls = [
     "boreas-crypto/openssl-backend",
     "boreas-pki/openssl-backend",
     "boreas-tunnel/openssl-inner-tls",
+    "dep:openssl",
 ]
 
 [dependencies]
@@ -39,7 +40,7 @@ boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"
 
-[target.'cfg(all(target_os = "linux", feature = "openssl-inner-tls"))'.dev-dependencies]
-# Only real backend tests generate/sign fixtures. An unconditional dev dependency
-# would make default-feature cross-platform tests require an uninstalled OpenSSL.
-openssl = "=0.10.82"
+[dev-dependencies]
+# Optional dev-only fixture signer: target OS selects the dependency, while this
+# feature selects availability. Default-feature targets do not link OpenSSL.
+openssl = { version = "=0.10.82", optional = true }

@@ -1136,8 +1136,26 @@ mod tests {
             .expect("canonical permanent pair")
     }
 
+    /// One process-wide verification context per test network.
+    ///
+    /// Every provisioning call generates fresh root keys, so two calls produce
+    /// two *different* signed policy digests. Positive cases must share exactly
+    /// one context or even a re-bound pair fails closed as `PolicyMismatch`.
+    /// [`fresh_test_policy_context`] remains available only for the negative
+    /// test that deliberately needs two distinct digests.
     #[cfg(feature = "openssl-inner-tls")]
     fn test_policy_context(net_id: [u8; 16]) -> boreas_pki::VerifiedNetworkContext {
+        static CACHED: std::sync::OnceLock<boreas_pki::VerifiedNetworkContext> =
+            std::sync::OnceLock::new();
+        assert_eq!(
+            net_id, NET,
+            "the cached context is provisioned for the fixture network only"
+        );
+        *CACHED.get_or_init(|| fresh_test_policy_context(net_id))
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    fn fresh_test_policy_context(net_id: [u8; 16]) -> boreas_pki::VerifiedNetworkContext {
         use boreas_proto::network_policy::NetworkPolicyCandidate;
         use boreas_proto::objects::MldsaParameterSet;
         use openssl::{
@@ -1194,12 +1212,15 @@ mod tests {
     #[cfg(feature = "openssl-inner-tls")]
     #[test]
     fn packet_endpoint_rejects_distinct_signed_policy_digests() {
+        // Two independent provisioning runs: fresh root keys, so two different
+        // signed policy digests. This is the negative case that must stay
+        // distinct, hence `fresh_test_policy_context` rather than the cache.
         let local = PeerIdentity::policy_bound(
             NET,
             0x0201,
             GENERATION,
             NodeRole::Core,
-            test_policy_context(NET),
+            fresh_test_policy_context(NET),
         )
         .unwrap();
         let peer = PeerIdentity::policy_bound(
@@ -1207,7 +1228,7 @@ mod tests {
             0x0209,
             GENERATION,
             NodeRole::Edge,
-            test_policy_context(NET),
+            fresh_test_policy_context(NET),
         )
         .unwrap();
         assert_eq!(
@@ -1383,28 +1404,33 @@ mod tests {
         #[cfg(feature = "openssl-inner-tls")]
         assert_eq!(bound.mtu_cap, u16::try_from(DEFAULT_MTU).unwrap());
 
+        // Exactly one verification context for this test. Each call provisions a
+        // fresh random root, so a second `test_policy_context` call would carry a
+        // different signed policy digest and every pair below would fail as
+        // `PolicyMismatch` instead of exercising the rule under test.
+        let policy = test_policy_context(NET);
+        // An identity from another network cannot carry this policy, so it stays
+        // unbound and `bind` still observes the missing verified policy.
+        let with_policy = |identity: PeerIdentity| {
+            if identity.net_id == NET {
+                PeerIdentity::policy_bound(
+                    NET,
+                    identity.node_id,
+                    identity.identity_generation,
+                    identity.role,
+                    policy,
+                )
+                .unwrap()
+            } else {
+                identity
+            }
+        };
         let bind = |circuit: [u8; 16], hops: u8, peer: PeerIdentity, local: PeerIdentity| {
-            let peer = PeerIdentity::policy_bound(
-                NET,
-                peer.node_id,
-                peer.identity_generation,
-                peer.role,
-                test_policy_context(NET),
-            )
-            .unwrap();
-            let local = PeerIdentity::policy_bound(
-                NET,
-                local.node_id,
-                local.identity_generation,
-                local.role,
-                test_policy_context(NET),
-            )
-            .unwrap();
             AuthorizedEndpoints::bind(
                 circuit,
                 hops,
-                peer,
-                local,
+                with_policy(peer),
+                with_policy(local),
                 u16::try_from(DEFAULT_MTU).unwrap(),
             )
         };
@@ -1489,15 +1515,27 @@ mod tests {
             Err(other) => panic!("unexpected mtu error: {other:?}"),
             Ok(_) => panic!("mtu above the circuit cap must be refused"),
         }
-        let capped = AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, 1400)
-            .expect("capped permanent pair");
+        let capped = AuthorizedEndpoints::bind(
+            [0x11; 16],
+            1,
+            with_policy(peer),
+            with_policy(local),
+            1400,
+        )
+        .expect("capped permanent pair");
         match PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1401) {
             Err(PacketPathError::MtuAboveCircuitCap) => {}
             Err(other) => panic!("unexpected mtu error: {other:?}"),
             Ok(_) => panic!("mtu above the circuit cap must be refused"),
         }
-        let capped = AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, 1400)
-            .expect("capped permanent pair");
+        let capped = AuthorizedEndpoints::bind(
+            [0x11; 16],
+            1,
+            with_policy(peer),
+            with_policy(local),
+            1400,
+        )
+        .expect("capped permanent pair");
         assert!(PacketPath::try_new(&pair.0, OutboundSink::new().0, capped, 1400).is_ok());
     }
 

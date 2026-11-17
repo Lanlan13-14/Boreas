@@ -64,6 +64,7 @@ impl PeerIdentity {
 
     /// Explicit compatibility identity for old non-packet session/control paths.
     /// It is not evidence of signed policy and packet path rejects it.
+    #[cfg(any(test, feature = "openssl-inner-tls"))]
     pub(crate) fn legacy_default(
         net_id: [u8; 16],
         node_id: u16,

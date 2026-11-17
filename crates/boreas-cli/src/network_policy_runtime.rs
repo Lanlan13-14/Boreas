@@ -3,10 +3,12 @@
 //! state directory; this layout is explicit operator input, not candidate-derived provenance.
 //! Wall-clock validity uses the local clock; this is not a trusted-time service.
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "openssl-inner-tls"))]
 use std::fs::File;
+#[cfg(feature = "openssl-inner-tls")]
 use std::{fmt, io::Read, path::Path};
 
+#[cfg(feature = "openssl-inner-tls")]
 #[derive(Debug)]
 pub enum PolicyRuntimeError {
     Input(&'static str),
@@ -16,13 +18,16 @@ pub enum PolicyRuntimeError {
     UnsupportedPrefix,
     Clock,
 }
+#[cfg(feature = "openssl-inner-tls")]
 impl fmt::Display for PolicyRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
 }
+#[cfg(feature = "openssl-inner-tls")]
 impl std::error::Error for PolicyRuntimeError {}
 
+#[cfg(feature = "openssl-inner-tls")]
 fn read_bounded_regular(
     path: &Path,
     max: usize,
@@ -78,7 +83,7 @@ fn read_bounded_regular(
 /// `expected_net_id` is from active daemon configuration. The installer/operator must
 /// pre-place each candidate/signature/key file directly within `configured_state_dir`;
 /// this is deployment layout, not provenance inferred from the signed candidate. Owner UID
-/// is an independent deployment input. Returns default-prefix context only after fresh
+/// is an independent deployment input. Returns the signed private-prefix context only after fresh
 /// verification and successful anti-replay commit.
 #[cfg(feature = "openssl-inner-tls")]
 pub fn verify_and_record_default_policy(
@@ -208,7 +213,7 @@ pub fn parse_expected_net_id(text: &str) -> Result<[u8; 16], PolicyRuntimeError>
         .map_err(|_| PolicyRuntimeError::Input("invalid network id"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openssl-inner-tls"))]
 mod tests {
     use super::*;
     use std::{
@@ -335,17 +340,19 @@ mod tests {
             .is_err()
         );
         fs::write(&paths[3], ed.public_key_to_der().unwrap()).unwrap();
-        let nondefault = setup(&state_dir, &ed, &pq, net, [172, 19, 0, 0], 3, 0);
-        assert!(matches!(
+        let private = setup(&state_dir, &ed, &pq, net, [172, 19, 0, 0], 3, 0);
+        assert_eq!(
             invoke(
-                &nondefault,
-                &state_dir.join("nondefault.state"),
+                &private,
+                &state_dir.join("private.state"),
                 &state_dir,
                 net,
                 uid
-            ),
-            Err(PolicyRuntimeError::UnsupportedPrefix)
-        ));
+            )
+            .unwrap()
+            .overlay_base(),
+            [172, 19, 0, 0]
+        );
         let _ = fs::remove_dir_all(root);
     }
 

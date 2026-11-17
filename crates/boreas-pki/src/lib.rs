@@ -21,6 +21,8 @@ pub mod revoke_cleanup;
 #[cfg(feature = "openssl-backend")]
 pub mod root_authorization;
 #[cfg(feature = "openssl-backend")]
+pub use root_authorization::NetworkRootPin;
+#[cfg(feature = "openssl-backend")]
 pub use network_policy::{
     NetworkPolicyError, VerifiedNetworkContext, VerifiedNetworkPolicy, verify_network_policy,
 };
