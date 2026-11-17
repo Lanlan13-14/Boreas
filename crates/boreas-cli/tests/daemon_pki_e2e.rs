@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 use boreas_pki::root_authorization::NetworkRootPin;
 use boreas_proto::{network_policy::NetworkPolicyCandidate, objects::MldsaParameterSet};
-use openssl::{pkey::{KeyType, PKey, Private}, sign::Signer};
+use openssl::{
+    pkey::{KeyType, PKey, Private},
+    sign::Signer,
+};
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -49,13 +52,16 @@ fn free_port() -> u16 {
 }
 
 fn owner_uid(path: &Path) -> String {
-    fs::metadata(path)
-        .unwrap()
-        .uid()
-        .to_string()
+    fs::metadata(path).unwrap().uid().to_string()
 }
 
-fn policy_fixture(state_dir: &Path, ed: &PKey<Private>, ml: &PKey<Private>, net_id: [u8; 16], seq: u64) {
+fn policy_fixture(
+    state_dir: &Path,
+    ed: &PKey<Private>,
+    ml: &PKey<Private>,
+    net_id: [u8; 16],
+    seq: u64,
+) {
     fs::create_dir_all(state_dir).unwrap();
     fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let pin = NetworkRootPin::provisioned(
@@ -63,9 +69,12 @@ fn policy_fixture(state_dir: &Path, ed: &PKey<Private>, ml: &PKey<Private>, net_
         ed.public_key_to_der().unwrap(),
         MldsaParameterSet::Mldsa65,
         ml.public_key_to_der().unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
     let candidate = NetworkPolicyCandidate {
         net_id,
         root_key_fingerprint: pin.fingerprint().unwrap(),
@@ -155,11 +164,11 @@ probe_paths = 1
 #[test]
 fn business_modes_require_explicit_durable_status_binding() {
     for mode in ["serve", "connect"] {
-        let out = Command::new(bin())
-            .args(["daemon", mode])
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "{mode} must refuse without status binding");
+        let out = Command::new(bin()).args(["daemon", mode]).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{mode} must refuse without status binding"
+        );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.contains("--status-state-file"),
@@ -342,13 +351,20 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     }
     let missing = Command::new(bin())
         .args([
-            "daemon", "connect", "--config", edge_cfg.to_str().unwrap(),
-            "--material-dir", edge_mat.to_str().unwrap(),
-            "--status-state-file", edge_status_state.to_str().unwrap(),
-            "--status-state-owner-uid", &edge_state_owner,
+            "daemon",
+            "connect",
+            "--config",
+            edge_cfg.to_str().unwrap(),
+            "--material-dir",
+            edge_mat.to_str().unwrap(),
+            "--status-state-file",
+            edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &edge_state_owner,
         ])
         .args(incomplete_policy_args)
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("--network-root-mldsa65-der"));
 
@@ -357,13 +373,20 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     fs::write(&ml_sig_path, [0u8; 3309]).unwrap();
     let bad_signature = Command::new(bin())
         .args([
-            "daemon", "connect", "--config", edge_cfg.to_str().unwrap(),
-            "--material-dir", edge_mat.to_str().unwrap(),
-            "--status-state-file", edge_status_state.to_str().unwrap(),
-            "--status-state-owner-uid", &edge_state_owner,
+            "daemon",
+            "connect",
+            "--config",
+            edge_cfg.to_str().unwrap(),
+            "--material-dir",
+            edge_mat.to_str().unwrap(),
+            "--status-state-file",
+            edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &edge_state_owner,
         ])
         .args(policy_args(&edge_state))
-        .output().unwrap();
+        .output()
+        .unwrap();
     fs::write(&ml_sig_path, valid_ml_sig).unwrap();
     assert!(!bad_signature.status.success());
     assert!(String::from_utf8_lossy(&bad_signature.stderr).contains("network policy rejected"));

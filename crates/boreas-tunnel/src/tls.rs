@@ -44,27 +44,46 @@ impl PeerIdentity {
     /// context produced by successful NetworkRoot-pinned verification.
     #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn policy_bound(
-        net_id: [u8; 16], node_id: u16, identity_generation: u64, role: NodeRole,
+        net_id: [u8; 16],
+        node_id: u16,
+        identity_generation: u64,
+        role: NodeRole,
         policy: VerifiedNetworkContext,
     ) -> Option<Self> {
-        if net_id != policy.net_id() { return None; }
-        Some(Self { net_id, node_id, identity_generation, role, policy: Some(policy) })
+        if net_id != policy.net_id() {
+            return None;
+        }
+        Some(Self {
+            net_id,
+            node_id,
+            identity_generation,
+            role,
+            policy: Some(policy),
+        })
     }
 
     /// Explicit compatibility identity for old non-packet session/control paths.
     /// It is not evidence of signed policy and packet path rejects it.
     pub(crate) fn legacy_default(
-        net_id: [u8; 16], node_id: u16, identity_generation: u64, role: NodeRole,
+        net_id: [u8; 16],
+        node_id: u16,
+        identity_generation: u64,
+        role: NodeRole,
     ) -> Self {
         Self {
-            net_id, node_id, identity_generation, role,
+            net_id,
+            node_id,
+            identity_generation,
+            role,
             #[cfg(feature = "openssl-inner-tls")]
             policy: None,
         }
     }
 
     #[cfg(feature = "openssl-inner-tls")]
-    pub(crate) fn policy(&self) -> Option<VerifiedNetworkContext> { self.policy }
+    pub(crate) fn policy(&self) -> Option<VerifiedNetworkContext> {
+        self.policy
+    }
     #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn policy_digest(&self) -> Option<[u8; 32]> {
         self.policy.map(|policy| policy.policy_digest())

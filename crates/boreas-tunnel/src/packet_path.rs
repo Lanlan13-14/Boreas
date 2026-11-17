@@ -1116,10 +1116,22 @@ mod tests {
         // This helper exists only in backend-enabled tests; production cannot
         // synthesize a binding and default-build tests cover rejection separately.
         let policy = test_policy_context(NET);
-        let local = PeerIdentity::policy_bound(NET, local.node_id, local.identity_generation, local.role, policy)
-            .expect("verified fixture context");
-        let peer = PeerIdentity::policy_bound(NET, peer.node_id, peer.identity_generation, peer.role, policy)
-            .expect("verified fixture context");
+        let local = PeerIdentity::policy_bound(
+            NET,
+            local.node_id,
+            local.identity_generation,
+            local.role,
+            policy,
+        )
+        .expect("verified fixture context");
+        let peer = PeerIdentity::policy_bound(
+            NET,
+            peer.node_id,
+            peer.identity_generation,
+            peer.role,
+            policy,
+        )
+        .expect("verified fixture context");
         AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
             .expect("canonical permanent pair")
     }
@@ -1128,17 +1140,28 @@ mod tests {
     fn test_policy_context(net_id: [u8; 16]) -> boreas_pki::VerifiedNetworkContext {
         use boreas_proto::network_policy::NetworkPolicyCandidate;
         use boreas_proto::objects::MldsaParameterSet;
-        use openssl::{pkey::{KeyType, PKey}, sign::Signer};
+        use openssl::{
+            pkey::{KeyType, PKey},
+            sign::Signer,
+        };
         let ed = PKey::generate_ed25519().expect("Ed25519 test root");
         let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[0x65; 32])
             .expect("ML-DSA test root");
         let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
-            net_id, ed.public_key_to_der().unwrap(), MldsaParameterSet::Mldsa65,
+            net_id,
+            ed.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa65,
             pq.public_key_to_der().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let candidate = NetworkPolicyCandidate {
-            net_id, root_key_fingerprint: pin.fingerprint().unwrap(),
-            overlay_base: [10, 20, 0, 0], version: 1, seq: 1, issued_at: 1, expires: u64::MAX,
+            net_id,
+            root_key_fingerprint: pin.fingerprint().unwrap(),
+            overlay_base: [10, 20, 0, 0],
+            version: 1,
+            seq: 1,
+            issued_at: 1,
+            expires: u64::MAX,
         };
         let raw = candidate.encode_tbs().unwrap();
         let message = NetworkPolicyCandidate::signature_input(&raw).unwrap();
@@ -1147,13 +1170,14 @@ mod tests {
         let mut signer = Signer::new_without_digest(&pq).unwrap();
         let pq_sig = signer.sign_oneshot_to_vec(&message).unwrap();
         boreas_pki::verify_network_policy(&raw, &ed_sig, &pq_sig, &pin, net_id, 2)
-            .unwrap().require_default_runtime().unwrap()
+            .unwrap()
+            .require_default_runtime()
+            .unwrap()
     }
 
     fn assert_unbound_rejected(local: PeerIdentity, peer: PeerIdentity) {
         assert_eq!(
-            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
-                .unwrap_err(),
+            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16).unwrap_err(),
             PacketPathError::PolicyMismatch,
         );
     }
@@ -1171,14 +1195,23 @@ mod tests {
     #[test]
     fn packet_endpoint_rejects_distinct_signed_policy_digests() {
         let local = PeerIdentity::policy_bound(
-            NET, 0x0201, GENERATION, NodeRole::Core, test_policy_context(NET),
-        ).unwrap();
+            NET,
+            0x0201,
+            GENERATION,
+            NodeRole::Core,
+            test_policy_context(NET),
+        )
+        .unwrap();
         let peer = PeerIdentity::policy_bound(
-            NET, 0x0209, GENERATION, NodeRole::Edge, test_policy_context(NET),
-        ).unwrap();
+            NET,
+            0x0209,
+            GENERATION,
+            NodeRole::Edge,
+            test_policy_context(NET),
+        )
+        .unwrap();
         assert_eq!(
-            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16)
-                .unwrap_err(),
+            AuthorizedEndpoints::bind([0x11; 16], 1, peer, local, DEFAULT_MTU as u16).unwrap_err(),
             PacketPathError::PolicyMismatch,
         );
     }
@@ -1351,9 +1384,29 @@ mod tests {
         assert_eq!(bound.mtu_cap, u16::try_from(DEFAULT_MTU).unwrap());
 
         let bind = |circuit: [u8; 16], hops: u8, peer: PeerIdentity, local: PeerIdentity| {
-            let peer = PeerIdentity::policy_bound(NET, peer.node_id, peer.identity_generation, peer.role, test_policy_context(NET)).unwrap();
-            let local = PeerIdentity::policy_bound(NET, local.node_id, local.identity_generation, local.role, test_policy_context(NET)).unwrap();
-            AuthorizedEndpoints::bind(circuit, hops, peer, local, u16::try_from(DEFAULT_MTU).unwrap())
+            let peer = PeerIdentity::policy_bound(
+                NET,
+                peer.node_id,
+                peer.identity_generation,
+                peer.role,
+                test_policy_context(NET),
+            )
+            .unwrap();
+            let local = PeerIdentity::policy_bound(
+                NET,
+                local.node_id,
+                local.identity_generation,
+                local.role,
+                test_policy_context(NET),
+            )
+            .unwrap();
+            AuthorizedEndpoints::bind(
+                circuit,
+                hops,
+                peer,
+                local,
+                u16::try_from(DEFAULT_MTU).unwrap(),
+            )
         };
         // An enrollment-service node has no packet endpoint.
         assert_eq!(
@@ -1372,7 +1425,12 @@ mod tests {
             PacketPathError::InvalidPermanentSlot
         );
         // Cross-network and same-node bindings fail closed.
-        let other_network = PeerIdentity::legacy_default([0x2b; 16], peer.node_id, peer.identity_generation, peer.role);
+        let other_network = PeerIdentity::legacy_default(
+            [0x2b; 16],
+            peer.node_id,
+            peer.identity_generation,
+            peer.role,
+        );
         assert_eq!(
             bind([0x11; 16], 1, other_network, local).unwrap_err(),
             PacketPathError::PolicyMismatch

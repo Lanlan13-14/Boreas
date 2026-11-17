@@ -1447,8 +1447,7 @@ mod tests {
         let signer = TestSigner::new(10, Authority::StatusSigner);
         let (directory, path) = dir();
         let uid = owner(&directory);
-        let raw =
-            signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, b"rev-a");
+        let raw = signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, b"rev-a");
         let signed = SignedObject::decode(&raw).unwrap();
         let mut state = State::empty(NET);
         state.utc_floor = 1_500_000;
