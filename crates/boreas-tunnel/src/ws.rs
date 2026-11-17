@@ -355,10 +355,7 @@ impl<T: crate::stream::Duplex> WsStream<T> {
     /// `Duplex` forwarding impl in `stream.rs` cannot touch the private `io`
     /// field directly. This is crate-internal plumbing; it does not alter
     /// WebSocket framing or the frame budget.
-    pub(crate) fn set_transport_timeout(
-        &self,
-        timeout: Option<Duration>,
-    ) -> io::Result<()> {
+    pub(crate) fn set_transport_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_io_timeout(timeout)
     }
 
@@ -903,11 +900,7 @@ fn handshake_deadline(caller: Instant) -> Instant {
 /// write. The runtime transport also installs a per-operation timeout, but this
 /// loop keeps the bound explicit for every `Write` implementation, including
 /// in-memory ones used by tests.
-fn write_all_until<T: Write>(
-    io: &mut T,
-    buf: &[u8],
-    deadline: Instant,
-) -> Result<(), WsError> {
+fn write_all_until<T: Write>(io: &mut T, buf: &[u8], deadline: Instant) -> Result<(), WsError> {
     let mut written = 0usize;
     while written < buf.len() {
         if Instant::now() >= deadline {

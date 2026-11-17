@@ -381,7 +381,9 @@ mod tests {
             .expect("future deadline");
         let mut io = DeadlineIo::new(probe, deadline);
 
-        let error = io.read(&mut [0u8; 1]).expect_err("WouldBlock is a deadline failure");
+        let error = io
+            .read(&mut [0u8; 1])
+            .expect_err("WouldBlock is a deadline failure");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         let installed = io.inner.timeout().expect("timeout was installed");
         assert!(installed > Duration::ZERO);
@@ -394,7 +396,9 @@ mod tests {
         let probe = Probe::default();
         let mut io = DeadlineIo::new(probe, Instant::now());
 
-        let error = io.read(&mut [0u8; 1]).expect_err("deadline is already spent");
+        let error = io
+            .read(&mut [0u8; 1])
+            .expect_err("deadline is already spent");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(io.inner.reads(), 0);
     }
@@ -411,7 +415,9 @@ mod tests {
         assert_eq!(io.inner.timeout(), None);
         assert_eq!(io.inner.clears(), 1);
 
-        let error = io.read(&mut [0u8; 1]).expect_err("probe returns WouldBlock");
+        let error = io
+            .read(&mut [0u8; 1])
+            .expect_err("probe returns WouldBlock");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(io.inner.reads(), 1);
     }
