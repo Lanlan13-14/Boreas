@@ -347,7 +347,7 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
             "--status-state-file", edge_status_state.to_str().unwrap(),
             "--status-state-owner-uid", &edge_state_owner,
         ])
-        .args(incomplete_policy_args
+        .args(incomplete_policy_args)
         .output().unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("--network-root-mldsa65-der"));

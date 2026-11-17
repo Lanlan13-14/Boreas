@@ -339,7 +339,7 @@ def _run_bounded(argv: list[str], timeout: float) -> tuple[str | None, str | Non
 def _remaining_timeout(deadline: float) -> float:
     """Cap each command by the remaining sampler window, not just by 5 s."""
 
-    return deadline - time.monotonic()
+    return min(TELEMETRY_COMMAND_TIMEOUT_SECONDS, deadline - time.monotonic())
 
 
 def sampler(
