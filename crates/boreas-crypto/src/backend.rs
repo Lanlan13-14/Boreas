@@ -532,15 +532,12 @@ fn configure_strict_context(
         .set_max_early_data(0)
         .map_err(BackendError::from_stack)?;
 
-    // Anchors are explicit Boreas trust material, never host roots.  OpenSSL
-    // has a context certificate store and a distinct verify store; populate
-    // both with the same trust anchor so chain building and TLS peer
-    // verification cannot diverge.
-    builder
-        .cert_store_mut()
-        .add_cert(identity.trust_anchor.clone())
-        .map_err(BackendError::from_stack)?;
-
+    // Anchors are explicit Boreas trust material, never host roots. Install the
+    // trust anchor in the separate verify store used for peer validation, and
+    // do not populate the outgoing chain-building cert_store with the
+    // self-signed root (RFC 9846 §4.4.2: peers already pin the trust anchor
+    // locally, and omitting the ~5.5 KB ML-DSA-65 root avoids pushing TLS 1.3
+    // handshake flights past initcwnd=10).
     let mut verify_store =
         openssl::x509::store::X509StoreBuilder::new().map_err(BackendError::from_stack)?;
     verify_store

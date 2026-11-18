@@ -407,17 +407,20 @@ mod linux_daemon {
 
     impl PacketIo for NonBlockingLinuxTun {
         fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
-            self.queue
-                .read_packet_timeout(Duration::ZERO)
-                .map_err(|e| match e {
-                    boreas_tun::linux::LinuxTunError::Packet(p) => p,
-                    _ => TunError::QueueClosed,
-                })
+            self.queue.try_read_packet().map_err(|e| match e {
+                boreas_tun::linux::LinuxTunError::Packet(p) => p,
+                _ => TunError::QueueClosed,
+            })
         }
 
         fn write_packet(&self, packet: &[u8]) -> Result<(), TunError> {
             self.queue.write_packet(packet).map_err(|e| match e {
                 boreas_tun::linux::LinuxTunError::Packet(p) => p,
+                boreas_tun::linux::LinuxTunError::Io(io_err)
+                    if io_err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    TunError::QueueFull
+                }
                 _ => TunError::QueueClosed,
             })
         }

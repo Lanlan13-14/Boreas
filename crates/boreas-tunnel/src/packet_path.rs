@@ -832,6 +832,8 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             policy,
             state: PathState::Open,
             stats: PacketStats::default(),
+            outbound_batch: Vec::new(),
+            inbound_scratch: Vec::new(),
         })
     }
 
@@ -930,6 +932,89 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         }
     }
 
+    /// Drain up to `max_packets` currently-ready host packets (stopping
+    /// immediately when `read_packet()` returns `None` or buffered bytes reach
+    /// `max_bytes`), frame them contiguously, and emit them in a single E2E
+    /// stream write + flush. Zero coalescing timer is used (§6.4).
+    ///
+    /// Returns the number of packets delivered to the circuit (`0` if none).
+    pub fn step_outbound_batch(
+        &mut self,
+        max_packets: usize,
+        max_bytes: usize,
+    ) -> Result<usize, PacketPathError> {
+        self.check_open()?;
+        if max_packets == 0 || max_bytes == 0 {
+            return Ok(0);
+        }
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let mut drained = 0usize;
+        let mut payload_bytes = 0u64;
+        let mut attempts = 0usize;
+        let max_attempts = max_packets.saturating_mul(2);
+        self.outbound_batch.clear();
+        while drained < max_packets
+            && self.outbound_batch.len() < max_bytes
+            && attempts < max_attempts
+        {
+            attempts += 1;
+            let packet = match self.io.read_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(error) => {
+                    self.outbound_batch.clear();
+                    return Err(self.fail(PacketPathError::from_host_error(error)));
+                }
+            };
+            match self.policy.authorize_outbound(&packet) {
+                Ok(info) => {
+                    let mut frame = [0u8; MAX_FRAME_BYTES];
+                    let frame_len =
+                        match encode_packet_frame_into(&packet, self.policy.mtu(), &mut frame) {
+                            Ok(len) => len,
+                            Err(error) => {
+                                self.outbound_batch.clear();
+                                return Err(self.fail(error));
+                            }
+                        };
+                    self.outbound_batch.extend_from_slice(&frame[..frame_len]);
+                    drained += 1;
+                    payload_bytes = payload_bytes
+                        .saturating_add(u64::try_from(info.packet_len).unwrap_or(u64::MAX));
+                }
+                Err(deny) if deny.is_local_discard() => {
+                    self.stats.dropped_outbound = self.stats.dropped_outbound.saturating_add(1);
+                }
+                Err(deny) => {
+                    self.outbound_batch.clear();
+                    return Err(self.fail(PacketPathError::Denied(deny)));
+                }
+            }
+        }
+        if drained == 0 {
+            return Ok(0);
+        }
+        if let Err(error) = write_all_bounded(circuit, &self.outbound_batch)
+            .and_then(|()| {
+                circuit
+                    .flush()
+                    .map_err(|err| PacketPathError::CircuitIo(err.kind()))
+            })
+        {
+            self.outbound_batch.clear();
+            return Err(self.fail(error));
+        }
+        self.outbound_batch.clear();
+        self.stats.outbound_packets = self
+            .stats
+            .outbound_packets
+            .saturating_add(u64::try_from(drained).unwrap_or(u64::MAX));
+        self.stats.outbound_bytes = self.stats.outbound_bytes.saturating_add(payload_bytes);
+        Ok(drained)
+    }
+
     /// Read one frame from the peer and deliver its packet to the host stack.
     ///
     /// `Ok(None)` means the peer closed the circuit cleanly between frames. That
@@ -942,7 +1027,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         let Some(circuit) = self.circuit.as_mut() else {
             return Err(PacketPathError::Poisoned);
         };
-        match inbound_once(self.io, circuit, &self.policy) {
+        match inbound_once(self.io, circuit, &self.policy, &mut self.inbound_scratch) {
             Ok(Some(length)) => {
                 self.stats.inbound_packets = self.stats.inbound_packets.saturating_add(1);
                 self.stats.inbound_bytes = self
@@ -1801,5 +1886,47 @@ mod tests {
         assert!(dropped.get());
         assert_eq!(path.first_error(), None);
         assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+    }
+
+    #[test]
+    fn step_outbound_batch_coalesces_ready_packets_and_fails_closed() {
+        let mtu = DEFAULT_MTU;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let (device, _host) = VirtualTun::try_pair(8, 8, mtu).expect("bounded pair");
+
+        let p1 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"one");
+        let spoof = ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoof");
+        let p2 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"two-payload");
+        device.inject(&p1).expect("inject p1");
+        device.inject(&spoof).expect("inject spoof");
+        device.inject(&p2).expect("inject p2");
+
+        let (sink, written) = OutboundSink::new();
+        let mut path = PacketPath::try_new(&device, sink, endpoints(local, peer), mtu)
+            .expect("bound path");
+        assert_eq!(path.step_outbound_batch(16, 16_000), Ok(2));
+        assert_eq!(path.step_outbound_batch(16, 16_000), Ok(0));
+        assert_eq!(path.stats().outbound_packets, 2);
+        assert_eq!(path.stats().dropped_outbound, 1);
+
+        let wire = written.borrow();
+        let expected_first = encode_packet_frame(&p1, mtu).unwrap();
+        let expected_second = encode_packet_frame(&p2, mtu).unwrap();
+        assert_eq!(wire.len(), expected_first.len() + expected_second.len());
+        assert_eq!(&wire[..expected_first.len()], expected_first.as_slice());
+        assert_eq!(&wire[expected_first.len()..], expected_second.as_slice());
+
+        // Malformed packet poisons the path and emits no partial frame.
+        device.inject(&[0x45, 0x00, 0x00]).expect("inject malformed");
+        let (sink, written) = OutboundSink::new();
+        let mut path = PacketPath::try_new(&device, sink, endpoints(local, peer), mtu)
+            .expect("bound path");
+        assert_eq!(
+            path.step_outbound_batch(16, 16_000),
+            Err(PacketPathError::Denied(PacketDeny::Truncated))
+        );
+        assert!(!path.is_open());
+        assert!(written.borrow().is_empty());
     }
 }

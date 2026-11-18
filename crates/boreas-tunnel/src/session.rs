@@ -204,6 +204,7 @@ struct FrameIo {
     stream: Box<dyn Duplex>,
     decoder: FrameDecoder,
     buffer: Vec<u8>,
+    write_buf: Vec<u8>,
     pending: VecDeque<Frame>,
     pending_bytes: usize,
     failed: bool,
@@ -215,6 +216,7 @@ impl FrameIo {
             stream,
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
+            write_buf: Vec::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
             failed: false,
@@ -257,13 +259,14 @@ impl FrameIo {
             body_len: u32::try_from(body.len()).map_err(|_| TunnelError::FrameTooLarge)?,
         };
         let encoded = header.encode()?;
-        let mut frame = Vec::with_capacity(encoded.len() + body.len());
-        frame.extend_from_slice(&encoded);
-        frame.extend_from_slice(body);
+        self.write_buf.clear();
+        self.write_buf.reserve(encoded.len() + body.len());
+        self.write_buf.extend_from_slice(&encoded);
+        self.write_buf.extend_from_slice(body);
         // One application frame is one TLS write. TLS record boundaries remain
         // independent of AppHeader framing, but avoiding separate header/body
         // records halves avoidable encryption and WebSocket overhead.
-        self.stream.write_all(&frame)?;
+        self.stream.write_all(&self.write_buf)?;
         self.stream.flush()?;
         Ok(())
     }

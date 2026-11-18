@@ -198,6 +198,10 @@ impl WsLimits {
     }
 }
 
+/// Bounded per-stream read buffer for WebSocket frame parsing so `read_frame`
+/// does not issue 3–4 tiny TLS/socket reads per frame.
+const WS_READ_BUFFER_BYTES: usize = 32 * 1024;
+
 /// A WebSocket connection exposed as a byte stream.
 ///
 /// `Read` yields payload bytes of binary messages only. `Write` emits one
@@ -207,12 +211,70 @@ pub struct WsStream<T> {
     io: T,
     role: WsRole,
     limits: WsLimits,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    read_len: usize,
+    write_buf: Vec<u8>,
     pending: Vec<u8>,
     pending_pos: usize,
     message: MessageState,
     close_sent: bool,
     close_received: bool,
     failed: bool,
+}
+
+struct BufferedReader<'a, T> {
+    io: &'a mut T,
+    buf: &'a mut Vec<u8>,
+    pos: &'a mut usize,
+    len: &'a mut usize,
+}
+
+impl<T: Read> Read for BufferedReader<'_, T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if *pos_or_reset(self.pos, self.len) < *self.len {
+            let avail = *self.len - *self.pos;
+            let take = avail.min(out.len());
+            out[..take].copy_from_slice(&self.buf[*self.pos..*self.pos + take]);
+            *self.pos += take;
+            if *self.pos == *self.len {
+                *self.pos = 0;
+                *self.len = 0;
+            }
+            return Ok(take);
+        }
+        if out.len() >= WS_READ_BUFFER_BYTES {
+            return self.io.read(out);
+        }
+        if self.buf.len() < WS_READ_BUFFER_BYTES {
+            self.buf.resize(WS_READ_BUFFER_BYTES, 0);
+        }
+        let n = self.io.read(self.buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let take = n.min(out.len());
+        out[..take].copy_from_slice(&self.buf[..take]);
+        if take < n {
+            *self.pos = take;
+            *self.len = n;
+        } else {
+            *self.pos = 0;
+            *self.len = 0;
+        }
+        Ok(take)
+    }
+}
+
+fn pos_or_reset<'a>(pos: &'a mut usize, len: &mut usize) -> &'a mut usize {
+    if *pos >= *len {
+        *pos = 0;
+        *len = 0;
+    }
+    pos
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -228,6 +290,10 @@ impl<T: Read + Write> WsStream<T> {
             io,
             role,
             limits: limits.bounded(),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            read_len: 0,
+            write_buf: Vec::new(),
             pending: Vec::new(),
             pending_pos: 0,
             message: MessageState::default(),
@@ -238,8 +304,14 @@ impl<T: Read + Write> WsStream<T> {
     }
 
     fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsError> {
-        let frame = encode_frame(self.role == WsRole::Client, true, opcode, payload)?;
-        self.io.write_all(&frame).map_err(map_io)?;
+        encode_frame_into(
+            self.role == WsRole::Client,
+            true,
+            opcode,
+            payload,
+            &mut self.write_buf,
+        )?;
+        self.io.write_all(&self.write_buf).map_err(map_io)?;
         self.io.flush().map_err(map_io)
     }
 
@@ -346,7 +418,9 @@ impl<T: crate::stream::Duplex> WsStream<T> {
     /// A partial WebSocket frame is included conservatively; the event-loop
     /// owner still applies the normal bounded read and protocol checks.
     pub fn has_buffered_input(&self) -> bool {
-        self.pending_pos < self.pending.len() || self.io.has_buffered_input()
+        self.read_pos < self.read_len
+            || self.pending_pos < self.pending.len()
+            || self.io.has_buffered_input()
     }
 
     /// Forward a transport timeout to the wrapped byte stream.
@@ -405,6 +479,9 @@ impl<T: Read + Write> Read for WsStream<T> {
                     self.failed = true;
                     self.pending.clear();
                     self.pending_pos = 0;
+                    self.read_buf.clear();
+                    self.read_pos = 0;
+                    self.read_len = 0;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, error));
                 }
             }
@@ -1427,5 +1504,25 @@ mod tests {
             .err(),
             Some(WsError::Timeout)
         );
+    }
+
+    #[test]
+    fn buffered_reader_tracks_coalesced_frames_across_reads() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&encode_frame(false, true, OpCode::Binary, b"alpha").unwrap());
+        input.extend_from_slice(&encode_frame(false, true, OpCode::Binary, b"beta").unwrap());
+
+        let mut stream = WsStream::new(Cursor::new(input), WsRole::Client, WsLimits::default());
+        assert!(stream.has_buffered_input());
+        let mut first = [0u8; 5];
+        stream.read_exact(&mut first).expect("first frame");
+        assert_eq!(&first, b"alpha");
+        // Second frame was already pulled into WsStream's read_buf during the first read.
+        assert!(stream.read_pos < stream.read_len);
+        assert!(stream.has_buffered_input());
+        let mut second = [0u8; 4];
+        stream.read_exact(&mut second).expect("second frame");
+        assert_eq!(&second, b"beta");
+        assert!(!stream.has_buffered_input());
     }
 }

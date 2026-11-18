@@ -202,6 +202,7 @@ pub struct CircuitStream<'a> {
     send_offset: u64,
     recv_offset: u64,
     inbound: VecDeque<u8>,
+    write_buf: Vec<u8>,
     closed: bool,
 }
 
@@ -220,6 +221,7 @@ impl<'a> CircuitStream<'a> {
             send_offset: 0,
             recv_offset: 0,
             inbound: VecDeque::new(),
+            write_buf: Vec::new(),
             closed: false,
         }
     }
@@ -250,15 +252,16 @@ impl<'a> CircuitStream<'a> {
             return Err(CircuitReject::Closed.into());
         }
         let take = data.len().min(MAX_FRAGMENT_PAYLOAD);
-        let fragment = RelayFragment {
-            circuit_id: self.circuit_id,
-            direction: self.role.outbound(),
-            byte_offset: self.send_offset,
-            hops_remaining: self.path_hops,
-            payload: data[..take].to_vec(),
-        };
+        RelayFragment::encode_slice_into(
+            self.circuit_id,
+            self.role.outbound(),
+            self.send_offset,
+            self.path_hops,
+            &data[..take],
+            &mut self.write_buf,
+        )?;
         self.session
-            .send_frame(Kind::RelayCircuit, &fragment.encode()?)?;
+            .send_frame(Kind::RelayCircuit, &self.write_buf)?;
         let advance =
             u64::try_from(take).map_err(|_| TunnelError::Circuit(CircuitReject::BadBody))?;
         self.send_offset = self

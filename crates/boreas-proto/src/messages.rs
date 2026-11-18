@@ -1603,13 +1603,48 @@ impl RelayFragment {
             .checked_add(u64::from(payload_len))
             .ok_or(MessageError::OffsetOverflow)?;
         let mut out = Vec::with_capacity(RELAY_FRAGMENT_FIXED_LEN + self.payload.len());
-        out.extend_from_slice(&self.circuit_id);
-        out.push(self.direction);
-        out.extend_from_slice(&self.byte_offset.to_be_bytes());
-        out.extend_from_slice(&payload_len.to_be_bytes());
-        out.push(self.hops_remaining);
-        out.extend_from_slice(&self.payload);
+        Self::encode_slice_into(
+            self.circuit_id,
+            self.direction,
+            self.byte_offset,
+            self.hops_remaining,
+            &self.payload,
+            &mut out,
+        )?;
         Ok(out)
+    }
+
+    pub fn encode_slice_into(
+        circuit_id: [u8; 16],
+        direction: u8,
+        byte_offset: u64,
+        hops_remaining: u8,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), MessageError> {
+        if direction > 1 {
+            return Err(MessageError::InvalidDirection(direction));
+        }
+        if !(1..=MAX_CIRCUIT_HOPS).contains(&hops_remaining) {
+            return Err(MessageError::InvalidHopCount(hops_remaining));
+        }
+        if payload.len() > MAX_RELAY_PAYLOAD {
+            return Err(MessageError::PayloadTooLarge(payload.len()));
+        }
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| MessageError::PayloadTooLarge(payload.len()))?;
+        byte_offset
+            .checked_add(u64::from(payload_len))
+            .ok_or(MessageError::OffsetOverflow)?;
+        out.clear();
+        out.reserve(RELAY_FRAGMENT_FIXED_LEN + payload.len());
+        out.extend_from_slice(&circuit_id);
+        out.push(direction);
+        out.extend_from_slice(&byte_offset.to_be_bytes());
+        out.extend_from_slice(&payload_len.to_be_bytes());
+        out.push(hops_remaining);
+        out.extend_from_slice(payload);
+        Ok(())
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, MessageError> {

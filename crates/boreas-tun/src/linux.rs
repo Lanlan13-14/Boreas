@@ -257,6 +257,54 @@ impl LinuxTunQueue {
         }
         read_packet_fd(fd.as_raw_fd(), self.device.mtu)
     }
+    /// Configure `O_NONBLOCK` on this queue descriptor.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), LinuxTunError> {
+        let fd = self
+            .fd
+            .lock()
+            .map_err(|_| LinuxTunError::QueueConfiguration)?;
+        // SAFETY: `fd` is an owned TUN queue descriptor; `F_GETFL`/`F_SETFL`
+        // only update the descriptor's `O_NONBLOCK` status flag.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let next = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if next != flags {
+            let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, next) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+    /// Non-blocking single-syscall read when `O_NONBLOCK` is enabled on the queue.
+    pub fn try_read_packet(&self) -> Result<Option<Vec<u8>>, LinuxTunError> {
+        let fd = self
+            .fd
+            .lock()
+            .map_err(|_| LinuxTunError::QueueConfiguration)?;
+        let mut b = vec![0; self.device.mtu];
+        // SAFETY: `b` is writable for its length; `fd` is an owned TUN queue.
+        let n = unsafe { libc::read(fd.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(err.into());
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        b.truncate(n as usize);
+        inspect_packet(&b).map_err(LinuxTunError::Packet)?;
+        Ok(Some(b))
+    }
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
         if packet.len() > self.device.mtu {
             return Err(LinuxTunError::Packet(Error::PacketTooLarge {
