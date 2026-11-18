@@ -1894,9 +1894,8 @@ mod tests {
         let ml_sig = fs::read(out.0.join("mldsa65.sig")).unwrap();
         let ed_der = fs::read(out.0.join("root-ed25519.der")).unwrap();
         let ml_der = fs::read(out.0.join("root-mldsa65.der")).unwrap();
-        let pin =
-            NetworkRootPin::provisioned(net_id, ed_der, MldsaParameterSet::Mldsa65, ml_der)
-                .unwrap();
+        let pin = NetworkRootPin::provisioned(net_id, ed_der, MldsaParameterSet::Mldsa65, ml_der)
+            .unwrap();
         let verified =
             crate::verify_network_policy(&tbs, &ed_sig, &ml_sig, &pin, net_id, now_us).unwrap();
         assert_eq!(verified.seq(), 7);

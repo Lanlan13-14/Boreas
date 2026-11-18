@@ -321,9 +321,8 @@ fn cmd_sign_policy(args: &[String]) -> Result<(), String> {
     let sequence =
         sequence.ok_or_else(|| "pki sign-policy: `--sequence` is required".to_string())?;
 
-    let summary =
-        sign_network_policy_dir(&ca_dir, &out_dir, sequence, now_utc_us()?, ttl_seconds)
-            .map_err(|e| format!("pki sign-policy failed: {e}"))?;
+    let summary = sign_network_policy_dir(&ca_dir, &out_dir, sequence, now_utc_us()?, ttl_seconds)
+        .map_err(|e| format!("pki sign-policy failed: {e}"))?;
 
     println!(
         "{{\"command\":\"pki.sign-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{}}}",
