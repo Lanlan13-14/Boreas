@@ -1260,7 +1260,7 @@ impl EvidenceStore {
         conflicting: Vec<u8>,
     ) -> bool {
         let slot = (key, version);
-        if self.entries.get(&slot).is_some() {
+        if self.entries.contains_key(&slot) {
             // Already preserved; a second detection at the same slot adds nothing.
             return true;
         }
@@ -1602,24 +1602,24 @@ pub fn page_snapshot(snapshot: &DirectorySnapshot) -> PageIter<'_> {
 }
 
 /// `boreas-pki`-backed verification for real dual-signed management objects.
+///
+/// The production [`ObjectVerifier`]: `boreas_pki::management::ManagementTrust`
+/// verifies both signatures over the exact signed bytes, the issuer permission
+/// chain, canonical encoding, scope, freshness and per-slot replay, and keeps
+/// the conflicting original when it detects equivocation.
+///
+/// The directory never parses an object to decide trust. The one place this
+/// module decodes bytes itself is the equivocation path, and only to key the
+/// evidence record: `ManagementTrust::verify_and_authorize` checks both
+/// signatures and the permission chain *before* it consults the replay slot,
+/// so an equivocation report already implies the conflicting bytes were
+/// authenticated. Those facts are never turned into an active record.
+///
+/// Content identity is `ManagementTrust`'s `object_id`, i.e. SHA-256 of the
+/// exact canonical TBS bytes, never a hash of the signature envelope.
+/// Re-signing the same TBS therefore remains a duplicate.
 #[cfg(feature = "openssl-inner-tls")]
 pub mod pki_verifier {
-    //! The production [`ObjectVerifier`]: `boreas_pki::management::ManagementTrust`
-    //! verifies both signatures over the exact signed bytes, the issuer permission
-    //! chain, canonical encoding, scope, freshness and per-slot replay, and keeps
-    //! the conflicting original when it detects equivocation.
-    //!
-    //! The directory never parses an object to decide trust. The one place this
-    //! module decodes bytes itself is the equivocation path, and only to key the
-    //! evidence record: `ManagementTrust::verify_and_authorize` checks both
-    //! signatures and the permission chain *before* it consults the replay slot,
-    //! so an equivocation report already implies the conflicting bytes were
-    //! authenticated. Those facts are never turned into an active record.
-    //!
-    //! Content identity is `ManagementTrust`'s `object_id`, i.e. SHA-256 of the
-    //! exact canonical TBS bytes, never a hash of the signature envelope.
-    //! Re-signing the same TBS therefore remains a duplicate.
-
     use super::{
         DirectoryObjectKind, ObjectVerifier, VerifiedFacts, VerifyReject, VersionKey, WriterProof,
     };

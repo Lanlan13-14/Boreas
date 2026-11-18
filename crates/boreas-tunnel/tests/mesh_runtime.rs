@@ -761,13 +761,14 @@ fn build() -> (
     let mut peers = BTreeMap::new();
     let mut trusted = Vec::new();
     for spec in specs {
+        let leaf = spec.leaf;
         let issued = issue_node(t, &authority, &mut trust, spec);
         let verified =
             VerifiedNodeIdentity::from_verified_object(&issued.object, &verified_default_policy())
                 .expect("policy-bound identity");
-        peers.insert(spec.leaf, verified.peer_identity());
+        peers.insert(leaf, verified.peer_identity());
         trusted.push(verified);
-        nodes.insert(spec.leaf, issued);
+        nodes.insert(leaf, issued);
     }
     let extractor = Arc::new(PkiIdentityExtractor::new(trusted).expect("unique trusted SPKIs"));
 

@@ -1064,7 +1064,7 @@ impl CorePath {
             .ok()
             .and_then(|cores| cores.checked_add(1))
             .ok_or(MeshError::NoPath)?;
-        if hops < 2 || hops > MAX_MESH_PATH_HOPS {
+        if !(2..=MAX_MESH_PATH_HOPS).contains(&hops) {
             return Err(MeshError::NoPath);
         }
         Ok(hops)

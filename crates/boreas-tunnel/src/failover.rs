@@ -1261,7 +1261,9 @@ mod attachment_tests {
         admission.admit_transient(0x0304).expect("transient");
         assert_eq!(admission.total(), 3);
         assert_eq!(admission.release(0x0203), Some(Released::Backup));
-        assert_eq!(admission.backup_count(), 1);
+        // One Backup slot was admitted and that same slot was released.
+        // `backup_count` is the current accepted count, not the configured cap.
+        assert_eq!(admission.backup_count(), 0);
         assert_eq!(admission.attachment(0x0203), None);
         assert_eq!(admission.release(0x0203), None);
         assert_eq!(admission.release(0x0102), Some(Released::Primary));
