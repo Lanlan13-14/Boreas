@@ -539,10 +539,7 @@ mod tests {
         let mut signer = Signer::new_without_digest(ed).unwrap();
         let ed_signature = signer.sign_oneshot_to_vec(message).unwrap();
         let mut signer = Signer::new_without_digest(pq).unwrap();
-        (
-            ed_signature,
-            signer.sign_oneshot_to_vec(message).unwrap(),
-        )
+        (ed_signature, signer.sign_oneshot_to_vec(message).unwrap())
     }
 
     struct Fixture {
@@ -568,11 +565,7 @@ mod tests {
     /// Same real trust chain with caller-chosen policy, signer-grant and
     /// authority expiries, so freshness intersection can be tested without
     /// bypassing any signature or policy check.
-    fn fixture_with(
-        policy_expires: u64,
-        grant_expires: u64,
-        authority_expires: u64,
-    ) -> Fixture {
+    fn fixture_with(policy_expires: u64, grant_expires: u64, authority_expires: u64) -> Fixture {
         let (root_ed, root_pq) = keys(11);
         // The root pin is the independently provisioned anchor. The policy,
         // the signer grant and the authority are each verified from real bytes.
@@ -790,15 +783,8 @@ mod tests {
         let mut pq = f.grant_pq.clone();
         pq[0] ^= 1;
         assert_eq!(
-            DnsSignerPin::verify_grant(
-                &f.grant_raw,
-                &f.grant_ed,
-                &pq,
-                &f.root,
-                &f.policy,
-                1_500
-            )
-            .unwrap_err(),
+            DnsSignerPin::verify_grant(&f.grant_raw, &f.grant_ed, &pq, &f.root, &f.policy, 1_500)
+                .unwrap_err(),
             Error::InvalidMlDsaSignature
         );
         let mut ed = f.authority_ed.clone();
@@ -964,15 +950,8 @@ mod tests {
         let (other_ed, other_pq) = keys(31);
         let (ed, pq) = sign(&other_ed, &other_pq, &message);
         assert_eq!(
-            VerifiedDnsAuthority::verify(
-                &f.authority_raw,
-                &ed,
-                &pq,
-                &f.signer,
-                &f.policy,
-                1_500
-            )
-            .unwrap_err(),
+            VerifiedDnsAuthority::verify(&f.authority_raw, &ed, &pq, &f.signer, &f.policy, 1_500)
+                .unwrap_err(),
             Error::InvalidEdSignature
         );
 
@@ -1013,8 +992,7 @@ mod tests {
         let message = DnsAuthority::signature_input(&raw).unwrap();
         let (ed, pq) = sign(&f.signer_ed, &f.signer_pq, &message);
         assert_eq!(
-            VerifiedDnsAuthority::verify(&raw, &ed, &pq, &f.signer, &f.policy, 1_500)
-                .unwrap_err(),
+            VerifiedDnsAuthority::verify(&raw, &ed, &pq, &f.signer, &f.policy, 1_500).unwrap_err(),
             Error::InvalidCandidate
         );
     }

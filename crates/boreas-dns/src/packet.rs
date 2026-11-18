@@ -230,12 +230,10 @@ pub(crate) fn inspect_ip_packet(
             }
             Ok(IpPacketMeta {
                 source: IpAddr::V6(Ipv6Addr::from(
-                    <[u8; 16]>::try_from(&packet[8..24])
-                        .map_err(|_| PacketError::Truncated)?,
+                    <[u8; 16]>::try_from(&packet[8..24]).map_err(|_| PacketError::Truncated)?,
                 )),
                 destination: IpAddr::V6(Ipv6Addr::from(
-                    <[u8; 16]>::try_from(&packet[24..40])
-                        .map_err(|_| PacketError::Truncated)?,
+                    <[u8; 16]>::try_from(&packet[24..40]).map_err(|_| PacketError::Truncated)?,
                 )),
                 protocol: next,
                 header_len: IPV6_HEADER_LEN,

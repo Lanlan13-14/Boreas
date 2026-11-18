@@ -50,12 +50,8 @@ use smoltcp::{
 
 use crate::{
     AuthoritativeDns,
-    packet::{
-        AuthenticatedPeerSource, PacketConfig, inspect_ip_packet, respond_packet,
-    },
-    tcp::{
-        DNS_TCP_PORT, TcpDnsConfig, TcpDnsError, TcpDnsServer, TcpSourceAuthorizer,
-    },
+    packet::{AuthenticatedPeerSource, PacketConfig, inspect_ip_packet, respond_packet},
+    tcp::{DNS_TCP_PORT, TcpDnsConfig, TcpDnsError, TcpDnsServer, TcpSourceAuthorizer},
 };
 
 pub const DEFAULT_QUEUE_PACKETS: usize = 64;
@@ -344,8 +340,8 @@ impl PacketRuntime {
             addr: Some(listen),
             port: DNS_TCP_PORT,
         };
-        let tcp = TcpDnsServer::new(tcp, endpoint, &mut sockets)
-            .map_err(PacketRuntimeError::Tcp)?;
+        let tcp =
+            TcpDnsServer::new(tcp, endpoint, &mut sockets).map_err(PacketRuntimeError::Tcp)?;
         Ok(Self {
             iface,
             device,
@@ -446,16 +442,12 @@ impl PacketRuntime {
             }
         }
 
-        let _ = self
-            .iface
-            .poll(now, &mut self.device, &mut self.sockets);
+        let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
         let authorizer = MapAuthorizer(sources);
         stats.tcp_frames = self
             .tcp
             .process(&mut self.sockets, &self.dns, &authorizer, now);
-        let _ = self
-            .iface
-            .poll(now, &mut self.device, &mut self.sockets);
+        let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
         stats.output_queued = self.device.output_len();
         stats
     }
@@ -616,8 +608,7 @@ mod tests {
     }
 
     fn genesis() -> TrustedDnsGenesis {
-        TrustedDnsGenesis::new((Ipv4Addr::new(10, 20, 0, 0), 16), ULA48, SERVER4, SERVER6)
-            .unwrap()
+        TrustedDnsGenesis::new((Ipv4Addr::new(10, 20, 0, 0), 16), ULA48, SERVER4, SERVER6).unwrap()
     }
 
     fn packet_config() -> PacketConfig {
@@ -631,12 +622,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         )
         .unwrap();
-        AuthoritativeDns::new(
-            zone,
-            SourceAuthorization::new([IpAddr::V4(CLIENT4)]),
-            1232,
-        )
-        .unwrap()
+        AuthoritativeDns::new(zone, SourceAuthorization::new([IpAddr::V4(CLIENT4)]), 1232).unwrap()
     }
 
     struct AllowClient;
@@ -654,7 +640,10 @@ mod tests {
     struct DenyAll;
 
     impl AuthenticatedSourceMap for DenyAll {
-        fn authenticated_source(&self, _observed_source: IpAddr) -> Option<AuthenticatedPeerSource> {
+        fn authenticated_source(
+            &self,
+            _observed_source: IpAddr,
+        ) -> Option<AuthenticatedPeerSource> {
             None
         }
     }
@@ -763,8 +752,8 @@ mod tests {
     fn query(id: u16) -> Vec<u8> {
         let mut query = id.to_be_bytes().to_vec();
         query.extend_from_slice(&[
-            1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, b'h', b'o', b's', b't', 4, b'c', b'o', b'r', b'p',
-            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 0, 1, 0, 1,
+            1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, b'h', b'o', b's', b't', 4, b'c', b'o', b'r', b'p', 7,
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 0, 1, 0, 1,
         ]);
         query
     }
@@ -834,10 +823,7 @@ mod tests {
         assert_eq!(&got[2..4], &[0x12, 0x34]);
         assert_eq!(u16::from_be_bytes([got[8], got[9]]), 1);
 
-        client
-            .sockets
-            .get_mut::<tcp::Socket>(handle)
-            .close();
+        client.sockets.get_mut::<tcp::Socket>(handle).close();
         let mut closed = false;
         for n in 0..12 {
             let _ = transfer(&mut client, &mut runtime, 400 + n * 10, &sources);

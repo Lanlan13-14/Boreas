@@ -410,11 +410,7 @@ impl<'a, P: PacketIo + ?Sized> DnsUdpRuntime<'a, P> {
     /// non-DNS packet is consumed and reported as [`Handled::Ignored`]; this
     /// endpoint must not also carry traffic that another path is expected to
     /// forward.
-    pub fn poll_once(
-        &mut self,
-        now: u64,
-        monotonic: Instant,
-    ) -> Result<Option<Handled>, Error> {
+    pub fn poll_once(&mut self, now: u64, monotonic: Instant) -> Result<Option<Handled>, Error> {
         if !self.is_fresh_at(now) {
             self.stats.expired = self.stats.expired.saturating_add(1);
             return Ok(Some(Handled::Expired));
@@ -543,7 +539,12 @@ impl<'a, P: PacketIo + ?Sized> DnsUdpRuntime<'a, P> {
         }
     }
 
-    fn write_response(&mut self, destination_port: u16, payload: &[u8], truncated: bool) -> Handled {
+    fn write_response(
+        &mut self,
+        destination_port: u16,
+        payload: &[u8],
+        truncated: bool,
+    ) -> Handled {
         let total = DATAGRAM_OVERHEAD + payload.len();
         if total > self.mtu || payload.len() > usize::from(u16::MAX) - UDP_HEADER_LEN {
             self.stats.no_response = self.stats.no_response.saturating_add(1);
@@ -670,7 +671,6 @@ fn ones_complement_sum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
     use boreas_pki::dns_authority::DnsSignerPin;
     use boreas_pki::{NetworkRootPin, verify_network_policy};
     use boreas_proto::{
@@ -686,6 +686,7 @@ mod tests {
         pkey::{KeyType, PKey, Private},
         sign::Signer,
     };
+    use std::time::{Duration, Instant};
 
     const NET: [u8; 16] = [7; 16];
     const LOCAL: [u8; 4] = [10, 20, 1, 1];
@@ -809,13 +810,20 @@ mod tests {
         packet[16..20].copy_from_slice(&destination);
         packet[20..22].copy_from_slice(&source_port.to_be_bytes());
         packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
-        packet[24..26].copy_from_slice(&u16::try_from(UDP_HEADER_LEN + payload.len()).unwrap().to_be_bytes());
+        packet[24..26].copy_from_slice(
+            &u16::try_from(UDP_HEADER_LEN + payload.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
         packet[28..].copy_from_slice(payload);
         let header = ones_complement_sum(&packet[..IPV4_HEADER_LEN]);
         packet[10..12].copy_from_slice(&header.to_be_bytes());
         if with_checksum {
-            let mut value =
-                udp_checksum(Ipv4Addr::from(source), Ipv4Addr::from(destination), &packet[20..]);
+            let mut value = udp_checksum(
+                Ipv4Addr::from(source),
+                Ipv4Addr::from(destination),
+                &packet[20..],
+            );
             if value == 0 {
                 value = 0xffff;
             }
@@ -858,7 +866,10 @@ mod tests {
     ) -> (Handled, Option<Vec<u8>>) {
         let packet = udp_datagram(source, destination, 40_000, DNS_PORT, query, true);
         device.inject(&packet).unwrap();
-        let handled = runtime.poll_once(time.0, time.1).unwrap().expect("one packet");
+        let handled = runtime
+            .poll_once(time.0, time.1)
+            .unwrap()
+            .expect("one packet");
         (handled, host.read_packet().unwrap())
     }
 

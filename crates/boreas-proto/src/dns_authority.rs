@@ -445,7 +445,8 @@ impl DnsAuthority {
             r.key(0)?;
             let owner = r.blob(MAX_ZONE_LEN)?.to_vec();
             r.key(1)?;
-            let record_type = u16::try_from(r.uint()?).map_err(|_| Error::Invalid("record type"))?;
+            let record_type =
+                u16::try_from(r.uint()?).map_err(|_| Error::Invalid("record type"))?;
             r.key(2)?;
             let address = r.blob(IPV6_LEN)?.to_vec();
             records.push(DnsRecordEntry {
@@ -837,9 +838,7 @@ mod tests {
     #[test]
     fn multi_entry_and_empty_arrays_round_trip() {
         let mut authority = authority_sample();
-        let v6 = [
-            0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-        ];
+        let v6 = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         authority.vips.push(DnsVipClaim {
             node_id: 0x0302,
             ipv4: [10, 20, 3, 2],
@@ -950,9 +949,7 @@ mod tests {
             }),
             ("AAAA outside ula", {
                 let mut x = base.clone();
-                x.vips[0].ipv6 = [
-                    0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-                ];
+                x.vips[0].ipv6 = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
                 x.records[0].record_type = TYPE_AAAA;
                 x.records[0].address = vec![0x20; 16];
                 x

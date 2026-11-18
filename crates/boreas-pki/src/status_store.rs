@@ -2097,8 +2097,7 @@ mod tests {
         target_id: u64,
         epoch: u64,
     ) -> RevocationEntry {
-        RevocationEntry::new(class, origin_core, node_id, generation, target_id, epoch, 1)
-            .unwrap()
+        RevocationEntry::new(class, origin_core, node_id, generation, target_id, epoch, 1).unwrap()
     }
 
     fn payload_bytes(entries: Vec<RevocationEntry>) -> Vec<u8> {
@@ -2196,8 +2195,7 @@ mod tests {
         let (directory, path) = dir();
         let uid = owner(&directory);
         let revocations = payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0207, 2, 0, 1)]);
-        let raw =
-            signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, &revocations);
+        let raw = signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, &revocations);
         let signed = SignedObject::decode(&raw).unwrap();
         let mut state = State::empty(NET);
         state.utc_floor = 1_500_000;
@@ -2806,8 +2804,7 @@ mod tests {
             3,
             &payload_bytes(vec![entry(IssuerClass::Identity, 0, node, 2, 0, 5)]),
         );
-        let conflicting =
-            RevocationEntry::new(IssuerClass::Identity, 0, node, 2, 0, 5, 2).unwrap();
+        let conflicting = RevocationEntry::new(IssuerClass::Identity, 0, node, 2, 0, 5, 2).unwrap();
         let conflict = signer.sign_snapshot_with_revocations(
             1_300_000,
             9_000_000,
@@ -2875,12 +2872,8 @@ mod tests {
             let node = 0x0202 + index as u16;
             full.push(entry(IssuerClass::Identity, 0, node, 1, 0, 1));
         }
-        let first = signer.sign_snapshot_with_revocations(
-            1_000_000,
-            9_000_000,
-            1,
-            &payload_bytes(full),
-        );
+        let first =
+            signer.sign_snapshot_with_revocations(1_000_000, 9_000_000, 1, &payload_bytes(full));
         let extra = signer.sign_snapshot_with_revocations(
             1_100_000,
             9_000_000,

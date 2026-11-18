@@ -356,10 +356,7 @@ impl RevocationPayload {
         }
         crate::validate_deterministic_cbor(bytes, 8, MAX_REVOCATION_PAYLOAD_BYTES)
             .map_err(|_| Error::NotCanonical)?;
-        let mut reader = Reader {
-            bytes,
-            position: 0,
-        };
+        let mut reader = Reader { bytes, position: 0 };
         let (major, fields) = reader.head()?;
         if major != 5 || fields != 2 {
             return Err(Error::UnsupportedType);
@@ -588,7 +585,10 @@ mod tests {
 
     #[test]
     fn empty_payload_is_the_zero_length_string() {
-        assert_eq!(RevocationPayload::empty().encode().unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            RevocationPayload::empty().encode().unwrap(),
+            Vec::<u8>::new()
+        );
         let decoded = RevocationPayload::decode(b"").unwrap();
         assert!(decoded.is_empty());
         assert_eq!(decoded.len(), 0);
@@ -618,7 +618,10 @@ mod tests {
         assert_eq!(payload.entries()[2].target_id, 9);
         let mut duplicate = payload.entries().to_vec();
         duplicate.push(identity(0x0207, 4, 3));
-        assert_eq!(RevocationPayload::new(duplicate), Err(Error::DuplicateScope));
+        assert_eq!(
+            RevocationPayload::new(duplicate),
+            Err(Error::DuplicateScope)
+        );
     }
 
     #[test]
@@ -682,10 +685,7 @@ mod tests {
     fn decoder_rejects_unknown_class_and_version() {
         // class 5 is undefined.
         let bytes = raw_payload(&[raw_entry([5, 0, 0x0207, 1, 0, 1, 0])]);
-        assert_eq!(
-            RevocationPayload::decode(&bytes),
-            Err(Error::UnknownClass)
-        );
+        assert_eq!(RevocationPayload::decode(&bytes), Err(Error::UnknownClass));
         // class 4 (Direct) is recognised but refused: origin_core 3 is the node's
         // home core, yet that equality is not grant-issuer evidence.
         let direct = raw_payload(&[raw_entry([4, 3, 0x0207, 1, 0, 1, 0])]);
@@ -754,10 +754,7 @@ mod tests {
             Err(Error::TooManyEntries)
         );
         let oversized = vec![0u8; MAX_REVOCATION_PAYLOAD_BYTES + 1];
-        assert_eq!(
-            RevocationPayload::decode(&oversized),
-            Err(Error::TooLarge)
-        );
+        assert_eq!(RevocationPayload::decode(&oversized), Err(Error::TooLarge));
 
         // A full payload of MAX entries is accepted and stays inside the bound.
         let many = (0..MAX_REVOCATION_ENTRIES).map(|i| identity(0x0202 + i as u16, 1, 1));

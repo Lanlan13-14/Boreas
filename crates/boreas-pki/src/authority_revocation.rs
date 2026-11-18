@@ -270,12 +270,10 @@ impl AuthorityRevocationTrust {
         {
             return Err(Error::OutOfScope);
         }
-        let message = AuthorityRevocation::signature_input(raw_tbs)
-            .map_err(|_| Error::InvalidCandidate)?;
-        let ed_key =
-            PKey::public_key_from_der(&issuer.ed25519_public_key_der).map_err(|_| {
-                Error::IssuerRejected(management::Error::InvalidIssuerKey)
-            })?;
+        let message =
+            AuthorityRevocation::signature_input(raw_tbs).map_err(|_| Error::InvalidCandidate)?;
+        let ed_key = PKey::public_key_from_der(&issuer.ed25519_public_key_der)
+            .map_err(|_| Error::IssuerRejected(management::Error::InvalidIssuerKey))?;
         let pq_key = PKey::public_key_from_der(&issuer.mldsa_public_key_der)
             .map_err(|_| Error::IssuerRejected(management::Error::InvalidIssuerKey))?;
         verify_both(
@@ -461,7 +459,7 @@ mod tests {
     };
     use boreas_proto::authority_revocation::RevocationScope;
     use openssl::{
-        pkey::{Private, PKey},
+        pkey::{PKey, Private},
         sign::Signer,
     };
 
@@ -478,10 +476,7 @@ mod tests {
         let mut signer = Signer::new_without_digest(ed).unwrap();
         let ed_signature = signer.sign_oneshot_to_vec(message).unwrap();
         let mut signer = Signer::new_without_digest(pq).unwrap();
-        (
-            ed_signature,
-            signer.sign_oneshot_to_vec(message).unwrap(),
-        )
+        (ed_signature, signer.sign_oneshot_to_vec(message).unwrap())
     }
 
     fn record(ed: &PKey<Private>, pq: &PKey<Private>) -> IssuerRecord {
@@ -579,7 +574,9 @@ mod tests {
         let mut trust = AuthorityRevocationTrust::new(NET);
         trust.add_issuer(record(&ed, &pq), 1_000, 3_000).unwrap();
         let (raw, ed_signature, pq_signature) = signed(&object(), &ed, &pq);
-        let token = trust.verify(&raw, &ed_signature, &pq_signature, 1_500).unwrap();
+        let token = trust
+            .verify(&raw, &ed_signature, &pq_signature, 1_500)
+            .unwrap();
         assert_eq!(token.class(), RevocationClass::Identity);
         assert_eq!(token.subject_node_id(), 0x0007);
         assert_eq!(token.identity_generation(), 2);
@@ -622,14 +619,7 @@ mod tests {
     fn verified_root_grant_retains_its_validity_for_later_checks() {
         let (issuer_ed, issuer_pq) = keys(20);
         let (root_ed, root_pq) = keys(21);
-        let grant = verified_grant(
-            &issuer_ed,
-            &issuer_pq,
-            &root_ed,
-            &root_pq,
-            1_000,
-            1_800,
-        );
+        let grant = verified_grant(&issuer_ed, &issuer_pq, &root_ed, &root_pq, 1_000, 1_800);
         let mut trust = AuthorityRevocationTrust::new(NET);
         assert_eq!(grant.validity(), (1_000, 1_800));
         trust.add_verified_issuer(grant).unwrap();
@@ -654,21 +644,29 @@ mod tests {
         let mut bad_ed = ed_signature.clone();
         bad_ed[0] ^= 1;
         assert_eq!(
-            trust.verify(&raw, &bad_ed, &pq_signature, 1_500).unwrap_err(),
+            trust
+                .verify(&raw, &bad_ed, &pq_signature, 1_500)
+                .unwrap_err(),
             Error::InvalidEdSignature
         );
         let mut bad_pq = pq_signature.clone();
         bad_pq[0] ^= 1;
         assert_eq!(
-            trust.verify(&raw, &ed_signature, &bad_pq, 1_500).unwrap_err(),
+            trust
+                .verify(&raw, &ed_signature, &bad_pq, 1_500)
+                .unwrap_err(),
             Error::InvalidMlDsaSignature
         );
         assert_eq!(
-            trust.verify(&raw, &ed_signature, &pq_signature, 2_000).unwrap_err(),
+            trust
+                .verify(&raw, &ed_signature, &pq_signature, 2_000)
+                .unwrap_err(),
             Error::InvalidTime
         );
         assert_eq!(
-            trust.verify(&raw, &ed_signature, &pq_signature, 999).unwrap_err(),
+            trust
+                .verify(&raw, &ed_signature, &pq_signature, 999)
+                .unwrap_err(),
             Error::InvalidTime
         );
     }
@@ -683,7 +681,9 @@ mod tests {
         wrong_net.net_id = [8; 16];
         let (raw, ed_signature, pq_signature) = signed(&wrong_net, &ed, &pq);
         assert_eq!(
-            trust.verify(&raw, &ed_signature, &pq_signature, 1_500).unwrap_err(),
+            trust
+                .verify(&raw, &ed_signature, &pq_signature, 1_500)
+                .unwrap_err(),
             Error::WrongNetwork
         );
 
@@ -691,7 +691,9 @@ mod tests {
         wrong_gen.issuer_generation = 2;
         let (raw, ed_signature, pq_signature) = signed(&wrong_gen, &ed, &pq);
         assert_eq!(
-            trust.verify(&raw, &ed_signature, &pq_signature, 1_500).unwrap_err(),
+            trust
+                .verify(&raw, &ed_signature, &pq_signature, 1_500)
+                .unwrap_err(),
             Error::IssuerGenerationMismatch
         );
 
@@ -722,18 +724,14 @@ mod tests {
         wrong_authority.authority = Authority::StatusSigner;
         let mut trust = AuthorityRevocationTrust::new(NET);
         assert_eq!(
-            trust
-                .add_issuer(wrong_authority, 1_000, 3_000)
-                .unwrap_err(),
+            trust.add_issuer(wrong_authority, 1_000, 3_000).unwrap_err(),
             Error::UnsupportedClass
         );
 
         // Only Identity is enabled in this slice. A correctly signed Core
         // object is still refused, not silently routed to another authority.
         let mut identity = AuthorityRevocationTrust::new(NET);
-        identity
-            .add_issuer(record(&ed, &pq), 1_000, 3_000)
-            .unwrap();
+        identity.add_issuer(record(&ed, &pq), 1_000, 3_000).unwrap();
         let mut core = object();
         core.class = RevocationClass::Core;
         core.subject_node_id = 0x0101;

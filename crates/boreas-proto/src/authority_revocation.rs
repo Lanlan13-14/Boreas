@@ -301,7 +301,10 @@ fn node_slot(node_id: u16) -> Result<(u8, u8), Error> {
     }
     let octet = (node_id & 0xff) as u8;
     if octet == 1 || (2..=251).contains(&octet) {
-        Ok((u8::try_from(home_core).map_err(|_| Error::Invalid("node id"))?, octet))
+        Ok((
+            u8::try_from(home_core).map_err(|_| Error::Invalid("node id"))?,
+            octet,
+        ))
     } else {
         Err(Error::Invalid("node id"))
     }

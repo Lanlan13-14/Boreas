@@ -131,15 +131,7 @@ fn write_config(
     primary: &str,
 ) {
     write_config_with_uplinks(
-        path,
-        role,
-        1,
-        vip_octet,
-        node_id,
-        mat_dir,
-        state_dir,
-        primary,
-        None,
+        path, role, 1, vip_octet, node_id, mat_dir, state_dir, primary, None,
     );
 }
 
@@ -212,7 +204,8 @@ impl Pair {
         let core_mat = root.0.join("core-mat");
         let edge_mat = root.0.join("edge-mat");
         let root_ed = PKey::generate_ed25519().unwrap();
-        let root_ml = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[73; 32]).unwrap();
+        let root_ml =
+            PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[73; 32]).unwrap();
         let init = Command::new(bin())
             .args([
                 "pki",
@@ -485,17 +478,35 @@ fn same_core_standby_path_takes_over_after_the_primary_ingress_dies() {
     thread::sleep(Duration::from_millis(200));
 
     let edge_sock = edge_state.join("control.sock");
-    let edge = spawn_connect(&edge_cfg, &pair.edge_mat, &edge_state, "wss.boreas.test", "20");
+    let edge = spawn_connect(
+        &edge_cfg,
+        &pair.edge_mat,
+        &edge_state,
+        "wss.boreas.test",
+        "20",
+    );
     assert!(
-        wait_for_status(&edge_sock, "\"daemon_connected\":true", Duration::from_secs(10)),
+        wait_for_status(
+            &edge_sock,
+            "\"daemon_connected\":true",
+            Duration::from_secs(10)
+        ),
         "edge never started business on the primary ingress"
     );
     assert!(
-        wait_for_status(&edge_sock, "\"standby_ready\":true", Duration::from_secs(10)),
+        wait_for_status(
+            &edge_sock,
+            "\"standby_ready\":true",
+            Duration::from_secs(10)
+        ),
         "the authenticated standby session was never established on the backup ingress"
     );
     assert!(
-        wait_for_status(&edge_sock, "\"active_path\":\"primary\"", Duration::from_secs(5)),
+        wait_for_status(
+            &edge_sock,
+            "\"active_path\":\"primary\"",
+            Duration::from_secs(5)
+        ),
         "business must start on the primary ingress"
     );
 
@@ -523,7 +534,11 @@ fn same_core_standby_path_takes_over_after_the_primary_ingress_dies() {
     // The Core side of the backup ingress must actually be carrying the circuit,
     // not merely have been dialled: it reports its own live business state.
     assert!(
-        wait_for_status(&sock_b, "\"daemon_connected\":true", Duration::from_secs(10)),
+        wait_for_status(
+            &sock_b,
+            "\"daemon_connected\":true",
+            Duration::from_secs(10)
+        ),
         "the backup ingress never accepted the rebuilt E2E circuit"
     );
     // Cleanup contract: promotion closes the standby manager, so its dial and
@@ -624,13 +639,26 @@ fn initial_primary_refusal_falls_back_once_without_dialling_the_active_backup_as
     while Instant::now() < bind_deadline && !sock.exists() {
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(sock.exists(), "the backup listener must bind before the edge dials");
+    assert!(
+        sock.exists(),
+        "the backup listener must bind before the edge dials"
+    );
     thread::sleep(Duration::from_millis(200));
 
     let edge_sock = edge_state.join("control.sock");
-    let edge = spawn_connect(&edge_cfg, &pair.edge_mat, &edge_state, "wss.boreas.test", "20");
+    let edge = spawn_connect(
+        &edge_cfg,
+        &pair.edge_mat,
+        &edge_state,
+        "wss.boreas.test",
+        "20",
+    );
     assert!(
-        wait_for_status(&edge_sock, "\"daemon_connected\":true", Duration::from_secs(10)),
+        wait_for_status(
+            &edge_sock,
+            "\"daemon_connected\":true",
+            Duration::from_secs(10)
+        ),
         "edge never started business on the backup after the primary refusal"
     );
     let live = ctl_status(&edge_sock).expect("edge status on the initial fallback");
@@ -649,8 +677,7 @@ fn initial_primary_refusal_falls_back_once_without_dialling_the_active_backup_as
         "there is no standby link to poll on the active backup: {live}"
     );
     assert!(
-        live.contains("\"standby_state\":\"idle\"")
-            && live.contains("\"standby_rejected\":false"),
+        live.contains("\"standby_state\":\"idle\"") && live.contains("\"standby_rejected\":false"),
         "the absent standby must stay idle, not look ready: {live}"
     );
     assert!(
@@ -708,7 +735,11 @@ fn a_second_core_at_the_backup_endpoint_is_never_trusted_from_config() {
         "issue second core stderr: {}",
         String::from_utf8_lossy(&issued.stderr)
     );
-    fs::copy(pair.edge_mat.join("local.signed"), core2_mat.join("peer.signed")).unwrap();
+    fs::copy(
+        pair.edge_mat.join("local.signed"),
+        core2_mat.join("peer.signed"),
+    )
+    .unwrap();
 
     let core_state_a = pair.new_state("core-a");
     let core2_state = pair.new_state("core2");
@@ -772,16 +803,30 @@ fn a_second_core_at_the_backup_endpoint_is_never_trusted_from_config() {
     thread::sleep(Duration::from_millis(200));
 
     let edge_sock = edge_state.join("control.sock");
-    let edge = spawn_connect(&edge_cfg, &pair.edge_mat, &edge_state, "wss.boreas.test", "20");
+    let edge = spawn_connect(
+        &edge_cfg,
+        &pair.edge_mat,
+        &edge_state,
+        "wss.boreas.test",
+        "20",
+    );
     assert!(
-        wait_for_status(&edge_sock, "\"daemon_connected\":true", Duration::from_secs(10)),
+        wait_for_status(
+            &edge_sock,
+            "\"daemon_connected\":true",
+            Duration::from_secs(10)
+        ),
         "edge never started business on the primary ingress"
     );
     // An inner-TLS identity rejection is terminal for this standby path: it must
     // not be retried as an ordinary transport miss, and it must never count as a
     // failover event.
     assert!(
-        wait_for_status(&edge_sock, "\"standby_state\":\"rejected\"", Duration::from_secs(10)),
+        wait_for_status(
+            &edge_sock,
+            "\"standby_state\":\"rejected\"",
+            Duration::from_secs(10)
+        ),
         "the unauthorized second Core must be reported as a rejected standby path"
     );
     let rejected = ctl_status(&edge_sock).expect("edge status while the standby is rejected");
@@ -794,7 +839,10 @@ fn a_second_core_at_the_backup_endpoint_is_never_trusted_from_config() {
         "an identity rejection must not be treated as a failover trigger: {rejected}"
     );
     let attempts = u64_field(&rejected, "standby_attempts").expect("standby_attempts");
-    assert_eq!(attempts, 1, "a rejected identity must not be retried: {rejected}");
+    assert_eq!(
+        attempts, 1,
+        "a rejected identity must not be retried: {rejected}"
+    );
     thread::sleep(Duration::from_millis(600));
     let still_rejected = ctl_status(&edge_sock).expect("edge status after the rejection");
     assert_eq!(

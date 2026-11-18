@@ -229,7 +229,7 @@ mod linux_daemon {
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     };
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -513,8 +513,7 @@ mod linux_daemon {
             let now_us = now_utc_us()?;
             if now_us >= self.expires_utc_us {
                 return Err(
-                    "daemon: signed network policy expired, business forwarding halted"
-                        .to_string(),
+                    "daemon: signed network policy expired, business forwarding halted".to_string(),
                 );
             }
             if Instant::now() >= self.deadline {
@@ -1053,11 +1052,7 @@ mod linux_daemon {
     /// concurrent [`take_standby_slot`] can never leave `ready == true` with an
     /// empty slot (the previous publisher race). A session that is already held
     /// is never replaced: the new link is returned to the caller and dropped.
-    fn publish_standby_slot<T>(
-        slot: &Mutex<Option<T>>,
-        ready: &AtomicBool,
-        value: T,
-    ) -> Option<T> {
+    fn publish_standby_slot<T>(slot: &Mutex<Option<T>>, ready: &AtomicBool, value: T) -> Option<T> {
         let mut guard = lock_mutex(slot);
         if guard.is_some() {
             return Some(value);
@@ -1068,10 +1063,7 @@ mod linux_daemon {
     }
 
     /// Take a held standby link and clear its published flag atomically.
-    fn take_standby_slot<T>(
-        slot: &Mutex<Option<T>>,
-        ready: &AtomicBool,
-    ) -> Option<T> {
+    fn take_standby_slot<T>(slot: &Mutex<Option<T>>, ready: &AtomicBool) -> Option<T> {
         let mut guard = lock_mutex(slot);
         let taken = guard.take();
         if taken.is_some() {
@@ -1145,9 +1137,7 @@ mod linux_daemon {
             | TunnelError::Closed
             | TunnelError::Ws(boreas_tunnel::ws::WsError::Io(_))
             | TunnelError::Ws(boreas_tunnel::ws::WsError::Timeout)
-            | TunnelError::Ws(boreas_tunnel::ws::WsError::Closed) => {
-                StandbyDialFailure::Transport
-            }
+            | TunnelError::Ws(boreas_tunnel::ws::WsError::Closed) => StandbyDialFailure::Transport,
             other => StandbyDialFailure::Protocol(format!(
                 "standby: hop protocol/identity rejected: {other:?}"
             )),
@@ -1169,15 +1159,12 @@ mod linux_daemon {
         if shared.stop.load(Ordering::SeqCst) {
             return Err(StandbyDialFailure::Stopped);
         }
-        config
-            .policy_window
-            .check()
-            .map_err(|e| {
-                StandbyDialFailure::Protocol(format!(
-                    "standby {}: policy window failed before dial: {e}",
-                    config.endpoint
-                ))
-            })?;
+        config.policy_window.check().map_err(|e| {
+            StandbyDialFailure::Protocol(format!(
+                "standby {}: policy window failed before dial: {e}",
+                config.endpoint
+            ))
+        })?;
         lock_gate(&config.status_store, &config.status_path).map_err(|e| {
             StandbyDialFailure::Protocol(format!(
                 "standby {}: durable status gate failed before dial: {e}",
@@ -1217,22 +1204,17 @@ mod linux_daemon {
         let tcp = link
             .connect_tcp(&config.target, HANDSHAKE_TIMEOUT)
             .map_err(|_| StandbyDialFailure::Transport)?;
-        config
-            .policy_window
-            .check()
-            .map_err(|e| {
-                StandbyDialFailure::Protocol(format!(
-                    "standby {}: policy window failed after TCP connect: {e}",
-                    config.endpoint
-                ))
-            })?;
+        config.policy_window.check().map_err(|e| {
+            StandbyDialFailure::Protocol(format!(
+                "standby {}: policy window failed after TCP connect: {e}",
+                config.endpoint
+            ))
+        })?;
         let fd = tcp.as_raw_fd();
         // The handshake budget is the crate's single deadline. This handle exists
         // only so `close()` can interrupt it; it is not a second deadline. It is a
         // duplicated descriptor, so shutdown can never name the dial's reused fd.
-        let interrupt = tcp
-            .try_clone()
-            .map_err(|_| StandbyDialFailure::Transport)?;
+        let interrupt = tcp.try_clone().map_err(|_| StandbyDialFailure::Transport)?;
         *lock_mutex(&shared.interrupt) = Some(interrupt);
         let _interrupt = InterruptGuard { shared };
         if shared.stop.load(Ordering::SeqCst) {
@@ -1246,15 +1228,12 @@ mod linux_daemon {
         let session = link
             .connect_preconnected(tcp, &config.target, config.policy.clone())
             .map_err(classify_tunnel_failure)?;
-        config
-            .policy_window
-            .check()
-            .map_err(|e| {
-                StandbyDialFailure::Protocol(format!(
-                    "standby {}: policy window failed after hop handshake: {e}",
-                    config.endpoint
-                ))
-            })?;
+        config.policy_window.check().map_err(|e| {
+            StandbyDialFailure::Protocol(format!(
+                "standby {}: policy window failed after hop handshake: {e}",
+                config.endpoint
+            ))
+        })?;
         lock_gate(&config.status_store, &config.status_path).map_err(|e| {
             StandbyDialFailure::Protocol(format!(
                 "standby: durable status gate failed after hop handshake: {e}"
@@ -1311,10 +1290,7 @@ mod linux_daemon {
                     .counters
                     .standby_failures
                     .store(misses, Ordering::SeqCst);
-                shared
-                    .counters
-                    .standby_ready
-                    .store(false, Ordering::SeqCst);
+                shared.counters.standby_ready.store(false, Ordering::SeqCst);
                 return;
             }
             Err(StandbyDialFailure::Protocol(reason)) => {
@@ -1330,20 +1306,13 @@ mod linux_daemon {
         if shared.stop.load(Ordering::SeqCst) || shared.rejected.load(Ordering::SeqCst) {
             return;
         }
-        let published = publish_standby_slot(
-            &shared.slot,
-            &shared.counters.standby_ready,
-            link,
-        );
+        let published = publish_standby_slot(&shared.slot, &shared.counters.standby_ready, link);
         if published.is_some() {
             // A verified session was already held; keep it and drop this one.
             return;
         }
         shared.misses.store(0, Ordering::SeqCst);
-        shared
-            .counters
-            .standby_failures
-            .store(0, Ordering::SeqCst);
+        shared.counters.standby_failures.store(0, Ordering::SeqCst);
     }
 
     /// Owner-side handle for the standby path of one `connect` process.
@@ -2457,8 +2426,9 @@ mod linux_daemon {
         policy_window
             .check()
             .map_err(|e| format!("daemon serve: policy window failed before business: {e}"))?;
-        lock_gate(&status_store, status_path)
-            .map_err(|e| format!("daemon serve: durable status gate failed before business: {e}"))?;
+        lock_gate(&status_store, status_path).map_err(|e| {
+            format!("daemon serve: durable status gate failed before business: {e}")
+        })?;
 
         bound_path_io(sock_fd)?;
 
@@ -2615,7 +2585,11 @@ mod linux_daemon {
                         )
                     })?;
                     counters.active_path.store(
-                        if index == 0 { PATH_PRIMARY } else { PATH_BACKUP },
+                        if index == 0 {
+                            PATH_PRIMARY
+                        } else {
+                            PATH_BACKUP
+                        },
                         Ordering::SeqCst,
                     );
                     link = Some((
@@ -2690,9 +2664,7 @@ mod linux_daemon {
                     format!("daemon connect: policy window failed before E2E circuit: {e}")
                 })?;
                 lock_gate(&status_store, status_path).map_err(|e| {
-                    format!(
-                        "daemon connect: durable status gate failed before E2E circuit: {e}"
-                    )
+                    format!("daemon connect: durable status gate failed before E2E circuit: {e}")
                 })?;
                 // The circuit borrows this session for the whole epoch, so the
                 // standby is a distinct object that this loop only polls.
@@ -3469,7 +3441,10 @@ mod linux_daemon {
                     )
                 };
                 assert_eq!(rc, 0, "bound must be readable back");
-                assert_eq!(u64::try_from(value.tv_sec).unwrap(), PATH_IO_TIMEOUT.as_secs());
+                assert_eq!(
+                    u64::try_from(value.tv_sec).unwrap(),
+                    PATH_IO_TIMEOUT.as_secs()
+                );
                 assert_eq!(value.tv_usec, 0);
             }
             assert!(
@@ -3525,7 +3500,10 @@ mod linux_daemon {
             let now = Instant::now();
             assert!(should_dial(now, now, false, false, false));
             assert!(!should_dial(now, now, false, false, true), "stopped");
-            assert!(!should_dial(now, now, false, true, false), "already dialling");
+            assert!(
+                !should_dial(now, now, false, true, false),
+                "already dialling"
+            );
             assert!(!should_dial(now, now, true, false, false), "standby held");
             assert!(
                 !should_dial(now, now + Duration::from_secs(1), false, false, false),
@@ -3659,9 +3637,7 @@ mod linux_daemon {
         #[test]
         fn standby_protocol_and_identity_failures_are_not_transport_misses() {
             assert!(matches!(
-                classify_tunnel_failure(TunnelError::Io(
-                    std::io::ErrorKind::ConnectionReset
-                )),
+                classify_tunnel_failure(TunnelError::Io(std::io::ErrorKind::ConnectionReset)),
                 StandbyDialFailure::Transport
             ));
             assert!(matches!(
@@ -3669,9 +3645,9 @@ mod linux_daemon {
                 StandbyDialFailure::Transport
             ));
             assert!(matches!(
-                classify_tunnel_failure(TunnelError::Ws(
-                    boreas_tunnel::ws::WsError::Io(std::io::ErrorKind::ConnectionReset)
-                )),
+                classify_tunnel_failure(TunnelError::Ws(boreas_tunnel::ws::WsError::Io(
+                    std::io::ErrorKind::ConnectionReset
+                ))),
                 StandbyDialFailure::Transport
             ));
             for error in [

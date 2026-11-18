@@ -5,6 +5,10 @@
 
 #[cfg(feature = "openssl-backend")]
 pub mod authority_revocation;
+/// NetworkRoot-authorized, independently dual-signed DNS zone/VIP authority.
+/// Produces opaque verified tokens only; it does not enable the DNS runtime.
+#[cfg(feature = "openssl-backend")]
+pub mod dns_authority;
 pub mod enforcement;
 pub mod enrollment;
 /// Real Ed25519 + ML-DSA management-object verification and IdentityAuthority signing.
@@ -14,10 +18,6 @@ pub mod management;
 /// Dual-signature verification of isolated NetworkPolicy candidates (not runtime enablement).
 #[cfg(feature = "openssl-backend")]
 mod network_policy;
-/// NetworkRoot-authorized, independently dual-signed DNS zone/VIP authority.
-/// Produces opaque verified tokens only; it does not enable the DNS runtime.
-#[cfg(feature = "openssl-backend")]
-pub mod dns_authority;
 /// Offline authority separation, `roots.cbor` verification, ML-DSA-65 X.509 issuance,
 /// and signed `StatusSnapshot` lifecycle (§2.2 / §3.1 / §3.4).
 #[cfg(feature = "openssl-backend")]
