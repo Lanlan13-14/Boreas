@@ -1199,9 +1199,9 @@ mod linux_daemon {
             })?
         };
         let inner = OpenSslConnector::from_pem_files(
-            &config.mat_dir.join("identity.pem"),
+            config.mat_dir.join("identity.pem"),
             &config.key_path,
-            &config.mat_dir.join("identity-ca.pem"),
+            config.mat_dir.join("identity-ca.pem"),
             Policy::production_default(),
         )
         .map_err(|_| {
@@ -2463,6 +2463,7 @@ mod linux_daemon {
         bound_path_io(sock_fd)?;
 
         counters.inbound_connections.store(1, Ordering::SeqCst);
+        counters.path_epoch.store(1, Ordering::SeqCst);
         counters.connected.store(true, Ordering::SeqCst);
 
         let res = drive_business_path(
@@ -2711,6 +2712,7 @@ mod linux_daemon {
                         .store(failover_events, Ordering::SeqCst);
                     counters.active_path.store(PATH_BACKUP, Ordering::SeqCst);
                 }
+                counters.path_epoch.store(epoch, Ordering::SeqCst);
                 counters.outbound_upstreams.store(1, Ordering::SeqCst);
                 counters.connected.store(true, Ordering::SeqCst);
                 let result = drive_business_path(
@@ -2739,7 +2741,7 @@ mod linux_daemon {
                 .saturating_add(report.stats.inbound_packets);
             identity = Some(report.identity);
             if let PathStop::Budget(reason) = &report.stop {
-                print_path_summary("connect", tun, &report, *reason, failover_events, epoch);
+                print_path_summary("connect", tun, &report, reason, failover_events, epoch);
                 return Ok(());
             }
 
@@ -2774,7 +2776,7 @@ mod linux_daemon {
                     ));
                 }
                 PathStop::Budget(reason) => {
-                    print_path_summary("connect", tun, &report, *reason, failover_events, epoch);
+                    print_path_summary("connect", tun, &report, reason, failover_events, epoch);
                     return Ok(());
                 }
             }
