@@ -399,6 +399,8 @@ jobs:
 
           BIN="$PWD/hop-node-linux/boreas"
           test -x "$BIN"
+          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
+          test -d "$POLICY_FIXTURE"
 
           NEG_ROOT="$(mktemp -d "$RUNNER_TEMP/initial-backup-negative.XXXXXX")"
           NEG="$NEG_ROOT/work"
