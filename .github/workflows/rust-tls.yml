@@ -399,13 +399,13 @@ jobs:
 
           BIN="$PWD/hop-node-linux/boreas"
           test -x "$BIN"
-          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
-          test -d "$POLICY_FIXTURE"
-
           NEG_ROOT="$(mktemp -d "$RUNNER_TEMP/initial-backup-negative.XXXXXX")"
           NEG="$NEG_ROOT/work"
           mkdir -p "$NEG"
           chmod 0700 "$NEG_ROOT" "$NEG"
+          OWNER_UID="$(id -u)"
+          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
+          test -d "$POLICY_FIXTURE"
           chmod 0600 "$POLICY_FIXTURE/root-ed25519.pem" "$POLICY_FIXTURE/root-mldsa65.pem"
           chmod 0700 "$POLICY_FIXTURE"
 
@@ -658,14 +658,14 @@ jobs:
           "$BIN" daemon serve \
             --config "$NEG/core.toml" \
             --material-dir "$NEG/core-mat" \
-            --status-state-file "$CORE_STATE/status.state" --status-state-owner-uid 0 \
+            --status-state-file "$CORE_STATE/status.state" --status-state-owner-uid "$OWNER_UID" \
             --network-policy-tbs "$CORE_STATE/tbs.cbor" \
             --network-policy-ed25519-signature "$CORE_STATE/ed25519.sig" \
             --network-policy-mldsa65-signature "$CORE_STATE/mldsa65.sig" \
             --network-root-ed25519-der "$CORE_STATE/root-ed25519.der" \
             --network-root-mldsa65-der "$CORE_STATE/root-mldsa65.der" \
             --network-policy-state-file "$CORE_STATE/network-policy.state" \
-            --network-policy-state-owner-uid 0 \
+            --network-policy-state-owner-uid "$OWNER_UID" \
             --listen "127.0.0.1:$CORE_PORT" \
             --virtual-tun \
             --max-seconds 120 \
@@ -700,14 +700,14 @@ jobs:
           "$BIN" daemon connect \
             --config "$NEG/edge.toml" \
             --material-dir "$NEG/edge-mat" \
-            --status-state-file "$EDGE_STATE/status.state" --status-state-owner-uid 0 \
+            --status-state-file "$EDGE_STATE/status.state" --status-state-owner-uid "$OWNER_UID" \
             --network-policy-tbs "$EDGE_STATE/tbs.cbor" \
             --network-policy-ed25519-signature "$EDGE_STATE/ed25519.sig" \
             --network-policy-mldsa65-signature "$EDGE_STATE/mldsa65.sig" \
             --network-root-ed25519-der "$EDGE_STATE/root-ed25519.der" \
             --network-root-mldsa65-der "$EDGE_STATE/root-mldsa65.der" \
             --network-policy-state-file "$EDGE_STATE/network-policy.state" \
-            --network-policy-state-owner-uid 0 \
+            --network-policy-state-owner-uid "$OWNER_UID" \
             --tls-name "wss.boreas.test" \
             --ws-host "wss.boreas.test:$PRIMARY_PORT" \
             --virtual-tun \
@@ -782,14 +782,14 @@ jobs:
           "$BIN" daemon connect \
             --config "$NEG/edge-control.toml" \
             --material-dir "$NEG/edge-mat" \
-            --status-state-file "$CONTROL_STATE/status.state" --status-state-owner-uid 0 \
+            --status-state-file "$CONTROL_STATE/status.state" --status-state-owner-uid "$OWNER_UID" \
             --network-policy-tbs "$CONTROL_STATE/tbs.cbor" \
             --network-policy-ed25519-signature "$CONTROL_STATE/ed25519.sig" \
             --network-policy-mldsa65-signature "$CONTROL_STATE/mldsa65.sig" \
             --network-root-ed25519-der "$CONTROL_STATE/root-ed25519.der" \
             --network-root-mldsa65-der "$CONTROL_STATE/root-mldsa65.der" \
             --network-policy-state-file "$CONTROL_STATE/network-policy.state" \
-            --network-policy-state-owner-uid 0 \
+            --network-policy-state-owner-uid "$OWNER_UID" \
             --connect "127.0.0.1:$BACKUP_PORT" \
             --tls-name "wss.boreas.test" \
             --ws-host "wss.boreas.test:$BACKUP_PORT" \
