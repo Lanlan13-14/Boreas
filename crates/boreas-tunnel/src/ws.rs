@@ -672,16 +672,18 @@ fn read_frame<T: Read>(
     })
 }
 
-/// Encode one frame. Client frames are masked with a fresh CSPRNG mask.
-fn encode_frame(
+/// Encode one frame into reusable storage. Client frames are masked with a fresh CSPRNG mask.
+fn encode_frame_into(
     masked: bool,
     fin: bool,
     opcode: OpCode,
     payload: &[u8],
-) -> Result<Vec<u8>, WsError> {
+    out: &mut Vec<u8>,
+) -> Result<(), WsError> {
+    out.clear();
     let first = if fin { 0x80 } else { 0x00 } | opcode.bits();
     let mask_bit: u8 = if masked { 0x80 } else { 0x00 };
-    let mut out = Vec::with_capacity(payload.len() + 14);
+    out.reserve(payload.len() + 14);
     out.push(first);
     match payload.len() {
         length @ 0..=125 => out.push(mask_bit | (length as u8)),
@@ -697,15 +699,33 @@ fn encode_frame(
     if masked {
         let mask: [u8; 4] = csprng::random_array().map_err(|_| WsError::Entropy)?;
         out.extend_from_slice(&mask);
-        out.extend(
-            payload
-                .iter()
-                .enumerate()
-                .map(|(index, byte)| byte ^ mask[index % 4]),
-        );
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let (chunks, rem) = out[start..].as_chunks_mut::<4>();
+        for chunk in chunks {
+            chunk[0] ^= mask[0];
+            chunk[1] ^= mask[1];
+            chunk[2] ^= mask[2];
+            chunk[3] ^= mask[3];
+        }
+        for (idx, byte) in rem.iter_mut().enumerate() {
+            *byte ^= mask[idx];
+        }
     } else {
         out.extend_from_slice(payload);
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn encode_frame(
+    masked: bool,
+    fin: bool,
+    opcode: OpCode,
+    payload: &[u8],
+) -> Result<Vec<u8>, WsError> {
+    let mut out = Vec::new();
+    encode_frame_into(masked, fin, opcode, payload, &mut out)?;
     Ok(out)
 }
 

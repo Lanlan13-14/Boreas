@@ -681,14 +681,16 @@ fn read_prefix<C: Read + ?Sized>(
     Ok(true)
 }
 
-/// Read one whole frame and return its single packet.
-fn read_packet_frame<C: Read + ?Sized>(
+/// Read one whole frame into caller-provided storage and return whether a
+/// frame was present (`Ok(false)` on clean EOF at a frame boundary).
+fn read_packet_frame_into<C: Read + ?Sized>(
     circuit: &mut C,
     mtu: usize,
-) -> Result<Option<Vec<u8>>, PacketPathError> {
+    packet: &mut Vec<u8>,
+) -> Result<bool, PacketPathError> {
     let mut prefix = [0u8; FRAME_PREFIX_LEN];
     if !read_prefix(circuit, &mut prefix)? {
-        return Ok(None);
+        return Ok(false);
     }
     let length = usize::from(u16::from_be_bytes(prefix));
     if length == 0 {
@@ -699,8 +701,20 @@ fn read_packet_frame<C: Read + ?Sized>(
     }
     // The allocation is bounded by the negotiated MTU and happens only after the
     // declared length has been checked.
-    let mut packet = vec![0u8; length];
-    read_exact_bounded(circuit, &mut packet)?;
+    packet.resize(length, 0);
+    read_exact_bounded(circuit, packet)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn read_packet_frame<C: Read + ?Sized>(
+    circuit: &mut C,
+    mtu: usize,
+) -> Result<Option<Vec<u8>>, PacketPathError> {
+    let mut packet = Vec::new();
+    if !read_packet_frame_into(circuit, mtu, &mut packet)? {
+        return Ok(None);
+    }
     Ok(Some(packet))
 }
 
@@ -1151,15 +1165,16 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     io: &P,
     circuit: &mut C,
     policy: &PointToPoint,
+    packet: &mut Vec<u8>,
 ) -> Result<Option<usize>, PacketPathError> {
-    let Some(packet) = read_packet_frame(circuit, policy.mtu())? else {
+    if !read_packet_frame_into(circuit, policy.mtu(), packet)? {
         return Ok(None);
-    };
+    }
     let length = policy
-        .authorize_inbound(&packet)
+        .authorize_inbound(packet)
         .map_err(PacketPathError::Denied)?
         .packet_len;
-    match io.write_packet(&packet) {
+    match io.write_packet(packet) {
         Ok(()) => Ok(Some(length)),
         Err(TunError::QueueFull) => Err(PacketPathError::HostQueueFull),
         Err(TunError::QueueClosed) => Err(PacketPathError::HostQueueClosed),
