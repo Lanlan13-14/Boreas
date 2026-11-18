@@ -23,13 +23,27 @@ use std::{
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRNP\0\0\0\x01";
 // Linux UAPI flags; this entire filesystem implementation is Linux-only.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const LINUX_O_NOFOLLOW: i32 = 0x10000;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
 const LINUX_O_NOFOLLOW: i32 = 0x20000;
 #[cfg(target_os = "linux")]
 const LINUX_O_NONBLOCK: i32 = 0x800;
 #[cfg(target_os = "linux")]
 const LINUX_O_CLOEXEC: i32 = 0x80000;
 pub const MAX_NETWORK_POLICY_STATE_BYTES: usize = 128 * 1024;
+
+#[cfg(target_os = "linux")]
+struct ExclusiveLock(File);
+
+#[cfg(target_os = "linux")]
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        // Explicit unlock before close so a forked-but-unexec'd child in
+        // another thread cannot keep the flock alive across our drop.
+        let _ = self.0.unlock();
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -91,7 +105,7 @@ pub struct NetworkPolicyStore {
     #[cfg(target_os = "linux")]
     path: PathBuf,
     #[cfg(target_os = "linux")]
-    _lock: File,
+    _lock: ExclusiveLock,
     #[cfg(target_os = "linux")]
     owner: u32,
     #[cfg(target_os = "linux")]
@@ -133,6 +147,7 @@ impl NetworkPolicyStore {
                 Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
                 Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
             }
+            let lock = ExclusiveLock(lock);
             File::open(path.parent().ok_or(Error::UnsafePath)?)?.sync_all()?;
             let base = Self {
                 path,

@@ -24,8 +24,26 @@ use std::{
 
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRTS\0\0\0\x01";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const LINUX_O_NOFOLLOW: i32 = 0x10000;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const LINUX_O_NOFOLLOW: i32 = 0x20000;
+#[cfg(target_os = "linux")]
+const LINUX_O_NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "linux")]
+const LINUX_O_CLOEXEC: i32 = 0x80000;
 pub const MAX_STORE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AUTHORIZATIONS: usize = 256;
+
+#[cfg(target_os = "linux")]
+struct ExclusiveLock(File);
+
+#[cfg(target_os = "linux")]
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -79,7 +97,7 @@ pub struct DurableTrustStore {
     #[cfg(target_os = "linux")]
     path: PathBuf,
     #[cfg(target_os = "linux")]
-    _lock: File,
+    _lock: ExclusiveLock,
     #[cfg(target_os = "linux")]
     net_id: [u8; 16],
     #[cfg(target_os = "linux")]
@@ -142,6 +160,7 @@ impl DurableTrustStore {
                 Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
                 Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(e)),
             }
+            let lock = ExclusiveLock(lock);
             if fs::symlink_metadata(&staging_path).is_ok() {
                 return Err(Error::UnsafePath);
             }
@@ -485,7 +504,7 @@ fn open_private(p: &Path, create: bool, _exclusive: bool) -> Result<File, Error>
         .write(true)
         .create(create)
         .mode(0o600)
-        .custom_flags(0x20000 | 0x800);
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let f = o.open(p)?;
     if !f.metadata()?.is_file() {
         return Err(Error::UnsafePath);
@@ -499,7 +518,7 @@ fn open_staging(p: &Path) -> Result<File, Error> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(0x20000 | 0x800);
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let f = o.open(p)?;
     if !f.metadata()?.is_file() {
         return Err(Error::UnsafePath);
@@ -509,7 +528,9 @@ fn open_staging(p: &Path) -> Result<File, Error> {
 #[cfg(target_os = "linux")]
 fn open_existing_private(p: &Path) -> io::Result<File> {
     let mut o = OpenOptions::new();
-    o.read(true).write(true).custom_flags(0x20000 | 0x800);
+    o.read(true)
+        .write(true)
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let f = o.open(p)?;
     if !f.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));

@@ -108,6 +108,24 @@ use std::{
 
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRSS\0\0\0\x01";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const LINUX_O_NOFOLLOW: i32 = 0x10000;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const LINUX_O_NOFOLLOW: i32 = 0x20000;
+#[cfg(target_os = "linux")]
+const LINUX_O_NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "linux")]
+const LINUX_O_CLOEXEC: i32 = 0x80000;
+
+#[cfg(target_os = "linux")]
+struct ExclusiveLock(File);
+
+#[cfg(target_os = "linux")]
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 
 const MAX_ISSUER_ID_BYTES: usize = 64;
 /// Maximum encoded state image accepted by the Linux store.
@@ -479,7 +497,7 @@ pub struct StatusStore {
     #[cfg(target_os = "linux")]
     path: PathBuf,
     #[cfg(target_os = "linux")]
-    _lock: File,
+    _lock: ExclusiveLock,
     #[cfg(target_os = "linux")]
     owner: u32,
     net: [u8; 16],
@@ -588,6 +606,7 @@ impl StatusStore {
                 Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
                 Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
             }
+            let lock = ExclusiveLock(lock);
             File::open(path.parent().ok_or(Error::UnsafePath)?)?.sync_all()?;
             let mut store = Self {
                 path,
@@ -1818,7 +1837,7 @@ fn open_private(path: &Path, create: bool) -> Result<File, Error> {
         .write(true)
         .create(create)
         .mode(0o600)
-        .custom_flags(0x20000 | 0x800);
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(Error::UnsafePath);
@@ -1829,7 +1848,10 @@ fn open_private(path: &Path, create: bool) -> Result<File, Error> {
 #[cfg(target_os = "linux")]
 fn open_existing(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).custom_flags(0x20000 | 0x800);
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));
@@ -1845,7 +1867,7 @@ fn open_staging(path: &Path) -> Result<File, Error> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(0x20000 | 0x800);
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC);
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(Error::UnsafePath);
