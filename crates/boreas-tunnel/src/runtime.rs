@@ -255,7 +255,11 @@ impl HandshakeGuard {
 
     /// A late success is a timeout even if the watchdog was not scheduled
     /// before disarm. Sample completion before joining the watchdog.
-    fn finish<T>(&mut self, result: Result<T, TunnelError>, deadline: Instant) -> Result<T, TunnelError> {
+    fn finish<T>(
+        &mut self,
+        result: Result<T, TunnelError>,
+        deadline: Instant,
+    ) -> Result<T, TunnelError> {
         let completed_late = result.is_ok() && Instant::now() >= deadline;
         self.disarm();
         if completed_late || self.fired() {
@@ -982,7 +986,10 @@ mod tests {
             .expect("arm guard or unit-test fixture");
         // Model disarming before the watchdog could observe a late success.
         guard.disarm();
-        assert_eq!(guard.finish(Ok(()), Instant::now()), Err(TunnelError::Timeout));
+        assert_eq!(
+            guard.finish(Ok(()), Instant::now()),
+            Err(TunnelError::Timeout)
+        );
     }
 
     #[cfg(windows)]
@@ -1281,7 +1288,11 @@ mod tests {
         let session = client
             .connect_preconnected(tcp, &target(address), policy(a, b))
             .expect("client session");
-        assert_eq!(trace.clears(), 0, "the dropped clear must not reach the transport");
+        assert_eq!(
+            trace.clears(),
+            0,
+            "the dropped clear must not reach the transport"
+        );
         assert!(
             matches!(trace.last(), Some(TimeoutEvent::Armed(_))),
             "the transport must still show the last armed handshake timeout"
