@@ -337,10 +337,10 @@ fn u64_field(raw: &str, key: &str) -> Option<u64> {
 fn wait_for_status(socket: &Path, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(text) = ctl_status(socket) {
-            if text.contains(needle) {
-                return true;
-            }
+        if let Some(text) = ctl_status(socket)
+            && text.contains(needle)
+        {
+            return true;
         }
         thread::sleep(Duration::from_millis(50));
     }
