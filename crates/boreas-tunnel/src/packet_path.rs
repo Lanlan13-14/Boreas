@@ -706,18 +706,6 @@ fn read_packet_frame_into<C: Read + ?Sized>(
     Ok(true)
 }
 
-#[cfg(test)]
-fn read_packet_frame<C: Read + ?Sized>(
-    circuit: &mut C,
-    mtu: usize,
-) -> Result<Option<Vec<u8>>, PacketPathError> {
-    let mut packet = Vec::new();
-    if !read_packet_frame_into(circuit, mtu, &mut packet)? {
-        return Ok(None);
-    }
-    Ok(Some(packet))
-}
-
 /// A single-owner adapter between one host-side packet endpoint and one
 /// established E2E circuit.
 ///
@@ -1933,12 +1921,19 @@ mod tests {
         assert_eq!(&wire[expected_first.len()..], expected_second.as_slice());
 
         // Malformed packet poisons the path and emits no partial frame.
-        device
-            .inject(&[0x45, 0x00, 0x00])
-            .expect("inject malformed");
+        struct MalformedIo;
+        impl PacketIo for MalformedIo {
+            fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
+                Ok(Some(vec![0x45, 0x00, 0x00]))
+            }
+            fn write_packet(&self, _packet: &[u8]) -> Result<(), TunError> {
+                Ok(())
+            }
+        }
         let (sink, written) = OutboundSink::new();
-        let mut path =
-            PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
+        let malformed_io = MalformedIo;
+        let mut path = PacketPath::try_new(&malformed_io, sink, endpoints(local, peer), mtu)
+            .expect("bound path");
         assert_eq!(
             path.step_outbound_batch(16, 16_000),
             Err(PacketPathError::Denied(PacketDeny::Truncated))
