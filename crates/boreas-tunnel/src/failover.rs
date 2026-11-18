@@ -23,6 +23,11 @@
 //! directory freshness and resource admission separately. A selection is not
 //! permission to skip those checks or a measurement of completed recovery.
 
+#![forbid(unsafe_code)]
+
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+
 /// Initial probe interval from §8.5, in caller-supplied milliseconds; not a floor.
 pub const PROBE_INTERVAL: u64 = 2_000;
 /// Initial number of consecutive failed probe intervals; not a floor.
@@ -50,6 +55,8 @@ pub enum FailoverError {
     CircuitCapOutOfRange,
     /// Backup accepted more circuits than primary.
     BackupCapExceedsPrimary,
+    /// One of the §3.1 attachment limits was zero.
+    InvalidAttachmentLimits,
 }
 
 /// Tunable detection and hysteresis with the initial values from §8.5.
@@ -422,6 +429,215 @@ impl CircuitCaps {
 
 const fn in_cap_range(cap: u8) -> bool {
     cap >= 1 && cap <= 4
+}
+
+// --- §3.1 bounded attachment admission ---------------------------------------
+//
+// §3.1 requires every Core to cap three separate Edge loads: active Primary
+// attachments (`P_max`), hot-standby Backup attachments (`B_max`) and the
+// transient increment admitted while a failover is converging. Those caps are
+// hard acceptance limits, not targets: a Core that has reached one refuses the
+// next Edge instead of queueing it, so a failover storm cannot pile up
+// unbounded state. This model only counts; it does not authenticate the Edge,
+// check its lease, or decide a path.
+
+/// §3.1 per-Core attachment limits. All three must be non-zero: a zero cap is a
+/// configuration error, not "unlimited".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentLimits {
+    max_primary: u32,
+    max_backup: u32,
+    max_transient: u32,
+}
+
+impl AttachmentLimits {
+    pub const fn try_new(
+        max_primary: u32,
+        max_backup: u32,
+        max_transient: u32,
+    ) -> Result<Self, FailoverError> {
+        if max_primary == 0 || max_backup == 0 || max_transient == 0 {
+            return Err(FailoverError::InvalidAttachmentLimits);
+        }
+        Ok(Self {
+            max_primary,
+            max_backup,
+            max_transient,
+        })
+    }
+
+    pub const fn max_primary(self) -> u32 {
+        self.max_primary
+    }
+    pub const fn max_backup(self) -> u32 {
+        self.max_backup
+    }
+    pub const fn max_transient(self) -> u32 {
+        self.max_transient
+    }
+}
+
+/// Why an attachment was refused. None of these is a reason to skip a lease
+/// check, a source-address check or any cryptographic policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentReject {
+    /// `NodeID` 0 is not an encodable subject (§3.2).
+    InvalidNode,
+    /// This Edge already holds a slot on this Core.
+    Duplicate,
+    PrimaryFull,
+    BackupFull,
+    TransientFull,
+}
+
+/// Which slot [`AttachmentAdmission::release`] freed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Released {
+    Primary,
+    Backup,
+    Transient,
+}
+
+/// Bounded per-Core attachment accounting for the three §3.1 loads.
+#[derive(Clone, Debug)]
+pub struct AttachmentAdmission {
+    limits: AttachmentLimits,
+    primary: u32,
+    backup: u32,
+    transient: u32,
+    stable: BTreeMap<u16, CoreAttachment>,
+    transient_peers: BTreeMap<u16, ()>,
+}
+
+impl AttachmentAdmission {
+    pub fn new(limits: AttachmentLimits) -> Self {
+        Self {
+            limits,
+            primary: 0,
+            backup: 0,
+            transient: 0,
+            stable: BTreeMap::new(),
+            transient_peers: BTreeMap::new(),
+        }
+    }
+
+    pub fn limits(&self) -> AttachmentLimits {
+        self.limits
+    }
+
+    pub fn primary(&self) -> u32 {
+        self.primary
+    }
+
+    pub fn backup_count(&self) -> u32 {
+        self.backup
+    }
+
+    pub fn transient(&self) -> u32 {
+        self.transient
+    }
+
+    /// Accepted attachments of all three kinds, bounded by the limits.
+    pub fn total(&self) -> u32 {
+        self.primary
+            .saturating_add(self.backup)
+            .saturating_add(self.transient)
+    }
+
+    /// The stable (Primary/Backup) attachment of one Edge, if any.
+    pub fn attachment(&self, node_id: u16) -> Option<CoreAttachment> {
+        self.stable.get(&node_id).copied()
+    }
+
+    /// Whether the Edge currently occupies a transient failover slot.
+    pub fn is_transient(&self, node_id: u16) -> bool {
+        self.transient_peers.contains_key(&node_id)
+    }
+
+    pub fn admit_primary(&mut self, node_id: u16) -> Result<(), AttachmentReject> {
+        self.admit_stable(node_id, CoreAttachment::Primary)
+    }
+
+    /// A Backup attachment is a stable slot: §3.3 forbids signing an active
+    /// `AttachmentLease` for a standby connection, but the acceptance slot is
+    /// still bounded by `B_max`.
+    pub fn admit_backup(&mut self, node_id: u16) -> Result<(), AttachmentReject> {
+        self.admit_stable(node_id, CoreAttachment::Backup)
+    }
+
+    fn admit_stable(&mut self, node_id: u16, unit: CoreAttachment) -> Result<(), AttachmentReject> {
+        if node_id == 0 {
+            return Err(AttachmentReject::InvalidNode);
+        }
+        if self.transient_peers.contains_key(&node_id) {
+            return Err(AttachmentReject::Duplicate);
+        }
+        match self.stable.entry(node_id) {
+            Entry::Occupied(_) => Err(AttachmentReject::Duplicate),
+            Entry::Vacant(slot) => match unit {
+                CoreAttachment::Primary => {
+                    if self.primary >= self.limits.max_primary {
+                        return Err(AttachmentReject::PrimaryFull);
+                    }
+                    self.primary += 1;
+                    slot.insert(CoreAttachment::Primary);
+                    Ok(())
+                }
+                CoreAttachment::Backup => {
+                    if self.backup >= self.limits.max_backup {
+                        return Err(AttachmentReject::BackupFull);
+                    }
+                    self.backup += 1;
+                    slot.insert(CoreAttachment::Backup);
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// Admit one Edge beyond the steady caps while a failover converges. Bounded
+    /// by the transient increment alone, and refused for an Edge that already
+    /// holds a slot.
+    pub fn admit_transient(&mut self, node_id: u16) -> Result<(), AttachmentReject> {
+        if node_id == 0 {
+            return Err(AttachmentReject::InvalidNode);
+        }
+        if self.stable.contains_key(&node_id) {
+            return Err(AttachmentReject::Duplicate);
+        }
+        match self.transient_peers.entry(node_id) {
+            Entry::Occupied(_) => Err(AttachmentReject::Duplicate),
+            Entry::Vacant(slot) => {
+                if self.transient >= self.limits.max_transient {
+                    return Err(AttachmentReject::TransientFull);
+                }
+                self.transient += 1;
+                slot.insert(());
+                Ok(())
+            }
+        }
+    }
+
+    /// Release whatever slot the Edge holds, reporting which kind it was.
+    pub fn release(&mut self, node_id: u16) -> Option<Released> {
+        if let Some(unit) = self.stable.remove(&node_id) {
+            match unit {
+                CoreAttachment::Primary => {
+                    self.primary = self.primary.saturating_sub(1);
+                    return Some(Released::Primary);
+                }
+                CoreAttachment::Backup => {
+                    self.backup = self.backup.saturating_sub(1);
+                    return Some(Released::Backup);
+                }
+            }
+        }
+        if self.transient_peers.remove(&node_id).is_some() {
+            self.transient = self.transient.saturating_sub(1);
+            return Some(Released::Transient);
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1171,103 @@ mod tests {
                 NOW
             ),
             Err(FailoverError::AttachmentMismatch)
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn limits(primary: u32, backup: u32, transient: u32) -> AttachmentLimits {
+        AttachmentLimits::try_new(primary, backup, transient).expect("non-zero limits")
+    }
+
+    #[test]
+    fn zero_limits_are_a_configuration_error() {
+        assert_eq!(
+            AttachmentLimits::try_new(0, 1, 1),
+            Err(FailoverError::InvalidAttachmentLimits)
+        );
+        assert_eq!(
+            AttachmentLimits::try_new(1, 0, 1),
+            Err(FailoverError::InvalidAttachmentLimits)
+        );
+        assert_eq!(
+            AttachmentLimits::try_new(1, 1, 0),
+            Err(FailoverError::InvalidAttachmentLimits)
+        );
+    }
+
+    #[test]
+    fn primary_and_backup_caps_are_hard() {
+        let mut admission = AttachmentAdmission::new(limits(1, 1, 1));
+        assert_eq!(admission.admit_primary(0x0102), Ok(()));
+        assert_eq!(admission.attachment(0x0102), Some(CoreAttachment::Primary));
+        // A second Primary Edge is refused, not queued.
+        assert_eq!(
+            admission.admit_primary(0x0103),
+            Err(AttachmentReject::PrimaryFull)
+        );
+        // The same Edge cannot hold two slots on one Core.
+        assert_eq!(
+            admission.admit_backup(0x0102),
+            Err(AttachmentReject::Duplicate)
+        );
+        assert_eq!(admission.admit_backup(0x0203), Ok(()));
+        assert_eq!(admission.admit_backup(0x0204), Err(AttachmentReject::BackupFull));
+        assert_eq!(admission.primary(), 1);
+        assert_eq!(admission.backup_count(), 1);
+        assert_eq!(admission.total(), 2);
+        assert_eq!(admission.admit_primary(0), Err(AttachmentReject::InvalidNode));
+    }
+
+    #[test]
+    fn failover_transient_increment_is_separately_bounded() {
+        let mut admission = AttachmentAdmission::new(limits(1, 1, 2));
+        assert_eq!(admission.admit_primary(0x0102), Ok(()));
+        // A converging failover admits Edges beyond the steady caps.
+        assert_eq!(admission.admit_transient(0x0103), Ok(()));
+        assert_eq!(admission.admit_transient(0x0104), Ok(()));
+        assert!(admission.is_transient(0x0103));
+        // The transient budget is its own hard cap.
+        assert_eq!(
+            admission.admit_transient(0x0105),
+            Err(AttachmentReject::TransientFull)
+        );
+        // A transient Edge is not a stable attachment and cannot double-book.
+        assert_eq!(admission.attachment(0x0103), None);
+        assert_eq!(
+            admission.admit_primary(0x0103),
+            Err(AttachmentReject::Duplicate)
+        );
+        assert_eq!(admission.total(), 3);
+        assert_eq!(admission.release(0x0103), Some(Released::Transient));
+        assert_eq!(admission.transient(), 1);
+        assert_eq!(admission.admit_transient(0x0105), Ok(()));
+    }
+
+    #[test]
+    fn release_frees_exactly_one_slot() {
+        let mut admission = AttachmentAdmission::new(limits(2, 2, 1));
+        admission.admit_primary(0x0102).expect("primary");
+        admission.admit_backup(0x0203).expect("backup");
+        admission.admit_transient(0x0304).expect("transient");
+        assert_eq!(admission.total(), 3);
+        assert_eq!(admission.release(0x0203), Some(Released::Backup));
+        assert_eq!(admission.backup_count(), 1);
+        assert_eq!(admission.attachment(0x0203), None);
+        assert_eq!(admission.release(0x0203), None);
+        assert_eq!(admission.release(0x0102), Some(Released::Primary));
+        assert_eq!(admission.primary(), 0);
+        assert_eq!(admission.release(0x0304), Some(Released::Transient));
+        assert_eq!(admission.total(), 0);
+        // The freed slots are usable again.
+        assert_eq!(admission.admit_primary(0x0105), Ok(()));
+        assert_eq!(admission.admit_primary(0x0106), Ok(()));
+        assert_eq!(
+            admission.admit_primary(0x0107),
+            Err(AttachmentReject::PrimaryFull)
         );
     }
 }

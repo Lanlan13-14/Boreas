@@ -4,23 +4,32 @@
 //!
 //! # Scope and non-goals
 //!
-//! This module performs NO cryptography: it does not verify signatures,
-//! certificate/permission chains, or that `content_hash` really binds
-//! `payload`. Callers MUST supply envelopes whose original signed bytes
-//! have already passed full verification — for `AttachmentLease` that
-//! means BOTH the node's primary signature and the attached Core's
-//! countersignature (§3.3 requires Edge nodes to verify the complete
-//! chain and dual signatures locally over the unmodified original bytes;
-//! §5.4 additionally requires Ed25519 and ML-DSA over the same bytes to
-//! both pass). [`WriterProof`] merely *records* which signer structure
-//! the caller claims to have verified; it proves nothing by itself.
+//! The pure convergence engine itself performs NO cryptography: it does not
+//! verify signatures, certificate/permission chains, or that the caller-supplied
+//! `content_hash` is really the digest of the record's canonical TBS. The
+//! production ingest path is not unverified: [`DirectoryIngest`] delegates to
+//! [`ObjectVerifier`], and the reviewed `PkiObjectVerifier` binds
+//! `boreas_pki::management::ManagementTrust`, which really verifies both
+//! signatures over the exact signed bytes. Callers MUST supply envelopes whose
+//! original signed bytes have already passed that full verification — for
+//! `AttachmentLease` that means BOTH the node's primary signature and the
+//! attached Core's countersignature (§3.3 requires Edge nodes to verify the
+//! complete chain and dual signatures locally over the unmodified original
+//! bytes; §5.4 additionally requires Ed25519 and ML-DSA over the same bytes to
+//! both pass). [`WriterProof`] merely *records* which signer structure the
+//! caller claims to have verified; it proves nothing by itself.
 //!
-//! Also out of scope: wire encoding (§5.4 structures are candidates, not
-//! a frozen wire format), dissemination / anti-entropy paging
-//! (`DirectoryPage`), persistence, equivocation evidence storage and
-//! alerting (§3.3 requires preserving both original signed objects — the
-//! caller owns that, this module keeps only bounded fingerprints), and
-//! revocation/freshness filtering. This module has no time fields and
+//! `content_hash` is content identity, not envelope identity: it MUST be
+//! `SHA-256` over the exact canonical TBS bytes (the `object_id` rule), never
+//! over the signature envelope. Re-signing the same TBS changes signature
+//! bytes only and MUST remain a duplicate, not an equivocation.
+//!
+//! Also out of scope for the pure [`DirectoryConvergence`] engine: wire encoding
+//! (§5.4 structures are candidates, not a frozen wire format), persistence,
+//! revocation/freshness filtering, and anti-entropy page transport. Paging and
+//! original-byte evidence are provided above it by [`DirectoryIngest`],
+//! [`page_snapshot`] and [`SignedObjectPage`]; they are not absent. This engine
+//! has no time fields and
 //! never reads a clock: §3.4 freshness depends only on signed
 //! `issued_at` / `next_update` (and per-object `not_before` / `expires`),
 //! so the caller MUST time-filter with trusted UTC before delivery and
@@ -31,6 +40,33 @@
 //! converge independently here (§3.3 keeps their version spaces
 //! orthogonal), because rejecting on arrival-time cross-object state
 //! would make the outcome depend on delivery order.
+//!
+//! # Verification gate, evidence and paging
+//!
+//! §3.3 also requires that only locally verified original bytes ever enter
+//! convergence, that a same-version fork preserve BOTH original signed
+//! objects, and that synchronisation be paged and bounded. Those duties need
+//! the raw objects, so they live above the pure engine:
+//!
+//! * [`ObjectVerifier`] is the consumer API the trust layer implements —
+//!   `PkiObjectVerifier` (feature `openssl-inner-tls`) binds
+//!   `boreas_pki::management::ManagementTrust`, which verifies both signatures,
+//!   the issuer permission chain, canonical encoding, scope, freshness and
+//!   per-slot replay over the exact signed bytes. Nothing here decides trust
+//!   from an unauthenticated frame field.
+//! * [`DirectoryIngest`] is the only supported entry point: it refuses an
+//!   object before convergence when verification fails, isolates a
+//!   verifier-reported fork, and records bounded [`ForkEvidence`] holding both
+//!   original byte strings. Persisting that evidence and raising the highest
+//!   severity alert remain the caller's §3.3 duty.
+//! * [`page_snapshot`] / [`DirectoryIngest::ingest_page`] implement bounded
+//!   anti-entropy over the exact original signed objects, carried on the
+//!   candidate `DirectoryPage` control body (`SignedObjectPage::encode_wire`),
+//!   with every receiver re-verifying locally instead of trusting its attached
+//!   Core.
+//!
+//! The periodic 5 s cadence, durable evidence storage and alerting remain
+//! upper-layer responsibilities.
 //!
 //! # Version and epoch model (§3.3, §5.4)
 //!
@@ -59,9 +95,10 @@
 //!
 //! Per `(kind, subject)` key the lexicographically highest version wins;
 //! lower versions are `Stale` (generation rollback can never become
-//! active); the same version with identical content is an idempotent
-//! `Duplicate`; the same version with differing content is equivocation
-//! (§3.3) and poisons its *epoch*: every record of that epoch — including
+//! active); the same version with the same TBS hash (and lease target /
+//! tombstone state) is an idempotent `Duplicate`; a different TBS hash at
+//! the same version is equivocation (§3.3) and poisons its *epoch*: every
+//! record of that epoch — including
 //! an already-delivered higher within-epoch `seq` / `attach_generation`
 //! top — is frozen out of the active view, and no higher within-epoch
 //! version ever launders it. Only a strictly higher epoch (new
@@ -80,17 +117,25 @@
 //! not wire format and not cryptographic evidence. They must not be
 //! cited as protocol semantics until a Phase 0 ADR freezes them:
 //!
-//! * [`WriterProof`] itself: how the dual lease signature and writer
-//!   identities are encoded on the wire is unfrozen (§5.4 is a candidate
-//!   schema; `boreas-proto::objects` currently carries a single
-//!   `issuer_key_id` and no dual-signature representation at all). The
-//!   former `writer == 0` sentinel for the `IdentityAuthority` was such
-//!   a local convention and has been removed rather than entrenched.
+//! * [`WriterProof`] itself: §5.4 wire encoding is still a candidate.
+//!   `boreas-proto::messages::SignedObject` already carries a signer vector
+//!   (a lease has Primary + CoSign signers), while
+//!   `boreas-proto::objects::ManagementObject` carries a single
+//!   `issuer_key_id`; how those signer identities are projected into this
+//!   local directory key/carrier remains unfrozen. Existing
+//!   `ManagementTrust` signature verification is real and is not replaced by
+//!   this field. The former `writer == 0` sentinel for the
+//!   `IdentityAuthority` was a local convention and has been removed rather
+//!   than entrenched.
 //! * Generation components must be `>= 1`. §5.4 states this only for
 //!   `identity_generation` ("从 1 单调递增"); extending it to
 //!   `attach_generation`, `core_generation` and `CoreLsa.seq` follows
 //!   the candidate validation in `boreas-proto::objects` and is adopted
 //!   fail-closed pending the Phase 0 freeze.
+//! * When the same TBS is re-signed into different exact envelopes, the
+//!   lexicographically smallest envelope is retained. This keeps active
+//!   snapshots arrival-order independent without treating signature bytes as
+//!   content identity. Local convention pending ADR.
 //! * The bounded per-key evidence window (`MAX_EVIDENCE_PER_KEY`) and
 //!   poisoned-epoch window (`MAX_POISONED_EPOCHS_PER_KEY`). A fork proof
 //!   concerning only versions that have aged out of the evidence window
@@ -113,9 +158,18 @@
 //!   poisoned epoch.
 //! * The snapshot `digest` is FNV-1a, a non-cryptographic consistency
 //!   fingerprint for replica comparison only.
+//! * The ingest-layer bounds — [`MAX_PAGE_OBJECTS`], [`MAX_PAGE_BYTES`],
+//!   [`MAX_EVIDENCE_ENTRIES`] and [`MAX_EVIDENCE_BYTES`]. §3.3 fixes the 16 KiB
+//!   object ceiling and requires bounded paging, not these exact numbers. A
+//!   page is carried on the candidate `boreas-proto` `ControlType::DirectoryPage`
+//!   body (16 KiB, at most `MAX_DIRECTORY_OBJECTS` envelopes), which is still a
+//!   candidate rather than a frozen frame; the in-process [`SignedObjectPage`]
+//!   is exactly that body's payload model.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+
+use boreas_proto::messages::{DirectoryPage as ProtoDirectoryPage, SignedObject};
 
 /// Highest valid Core identifier (§3.2: `home_core_id ∈ 1..=16`).
 pub const MAX_CORE_ID: u16 = 16;
@@ -280,8 +334,9 @@ pub struct DirectoryKey {
 }
 
 /// A caller-verified directory record. `content_hash` is supplied by the
-/// caller (in production `SHA-256` of the signed bytes); this module
-/// neither recomputes it nor parses `payload`. `subject` is a NodeID for
+/// caller and is `SHA-256` of the exact canonical TBS bytes (`object_id`),
+/// never of the signature envelope. This module neither recomputes it nor
+/// parses `payload`. `subject` is a NodeID for
 /// `NodeIdentity`/`AttachmentLease` and a Core id for `CoreLsa`.
 /// `target_core_id` is the lease's signed attachment target and must be
 /// `Some` exactly for `AttachmentLease`.
@@ -293,6 +348,9 @@ pub struct RecordEnvelope {
     pub writer: WriterProof,
     pub target_core_id: Option<u8>,
     pub content_hash: [u8; 32],
+    /// Exact original signed object bytes, retained for paging and fork
+    /// evidence. Signature bytes are not content identity: re-signing the same
+    /// TBS legitimately changes this field without changing `content_hash`.
     pub payload: Vec<u8>,
     pub tombstone: bool,
 }
@@ -416,24 +474,30 @@ pub enum DirectoryError {
     TooManyKeys,
 }
 
-/// Result of a structurally valid record delivery. Every variant is safe
-/// to receive repeatedly; duplicates and stale deliveries never mutate
-/// the active view.
+/// Result of a structurally valid record delivery. Every variant is safe to
+/// receive repeatedly; duplicates and stale deliveries never change the active
+/// content identity. A duplicate may only canonicalize the retained signature
+/// envelope for the same TBS, deterministically.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyOutcome {
     /// The record became (or, for a tombstone, replaced) the key's top
     /// record. Also returned for the first record of a strictly higher
     /// epoch superseding a poisoned lower epoch.
     Applied,
-    /// Same version and identical content as the current top record.
+    /// Same version and identical content identity (TBS hash, lease target and
+    /// tombstone state) as the current top record. Signature-envelope bytes may
+    /// legitimately differ when the same TBS was re-signed; the retained exact
+    /// envelope is canonicalized to the lexicographically smallest one seen, so
+    /// snapshots do not depend on arrival order.
     Duplicate,
     /// Version is below the key's watermark (including any generation
     /// rollback); the record was ignored except for bounded
     /// equivocation evidence.
     Stale,
-    /// This delivery exposed same-version differing content: the
-    /// record's epoch has just been poisoned. A top record in a strictly
-    /// higher epoch, if any, stays active (cross-epoch isolation).
+    /// This delivery exposed a different content identity at the same version
+    /// (different TBS hash, lease target or tombstone state): the record's
+    /// epoch has just been poisoned. A top record in a strictly higher epoch,
+    /// if any, stays active (cross-epoch isolation).
     Equivocated,
     /// The record's epoch was already poisoned; the record cannot
     /// revive it, whatever its within-epoch order.
@@ -564,8 +628,8 @@ fn validate_structure(record: &RecordEnvelope) -> Result<(), DirectoryError> {
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// FNV-1a 64-bit fold. Used ONLY for payload comparison support and the
-/// snapshot consistency digest; never for any cryptographic purpose.
+/// FNV-1a 64-bit fold. Used ONLY for the snapshot consistency digest; never
+/// for any cryptographic purpose.
 fn fnv1a_64(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -575,25 +639,21 @@ fn fnv1a_64(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// Content identity used for duplicate/equivocation decisions at one
-/// version. The caller-supplied `content_hash` is authoritative; the
-/// payload FNV and length additionally catch a caller bug where equal
-/// hashes are attached to different payload bytes, and `target_core_id`
-/// separates lease bodies that differ only in their signed target
-/// (both treated conservatively as equivocation, never resolved by
-/// arrival order).
+/// version. The caller-supplied `content_hash` is authoritative and binds the
+/// canonical TBS (`object_id`); signature-envelope bytes are deliberately not
+/// compared, because re-signing the same TBS legitimately changes only those
+/// bytes. A different TBS changes `content_hash`; `target_core_id`
+/// additionally separates lease bodies whose signed target differs (treated
+/// conservatively as equivocation, never resolved by arrival order).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fingerprint {
     content_hash: [u8; 32],
-    payload_digest: u64,
-    payload_len: usize,
     tombstone: bool,
     target_core_id: Option<u8>,
 }
 fn fingerprint(record: &RecordEnvelope) -> Fingerprint {
     Fingerprint {
         content_hash: record.content_hash,
-        payload_digest: fnv1a_64(FNV_OFFSET_BASIS, &record.payload),
-        payload_len: record.payload.len(),
         tombstone: record.tombstone,
         target_core_id: record.target_core_id,
     }
@@ -766,6 +826,27 @@ impl DirectoryConvergence {
             .and_then(|entry| entry.poisoned.get(&epoch).copied())
     }
 
+    /// Isolate a key at `version` when the trust layer caught a same-version
+    /// fork before convergence saw the second body.
+    ///
+    /// §3.3 requires the conflicting object to be frozen immediately, not only
+    /// when both bodies arrive here. This poisons `version`'s epoch exactly like
+    /// an in-convergence fork and returns `true` when this view held the key
+    /// (so something could be isolated); `false` when it never held it, in which
+    /// case nothing is active and no state is invented.
+    pub fn isolate(&mut self, key: DirectoryKey, version: VersionKey) -> bool {
+        if version.kind() != key.kind {
+            return false;
+        }
+        match self.entries.get_mut(&key) {
+            Some(entry) => {
+                let _ = entry.poison(version);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Merge one already-verified record. Structural failures return
     /// `Err` and never mutate state; valid deliveries return their
     /// [`ApplyOutcome`]. Delivery order and duplication do not affect
@@ -832,6 +913,15 @@ impl DirectoryConvergence {
                     .as_ref()
                     .is_some_and(|top| fingerprint(top) == print)
                 {
+                    // Same content identity; envelopes may differ only in
+                    // signature bytes. Retain the lexicographically smallest
+                    // exact envelope so a re-signed duplicate cannot make the
+                    // snapshot depend on arrival order.
+                    if let Some(top) = entry.top.as_mut()
+                        && record.payload < top.payload
+                    {
+                        top.payload = record.payload;
+                    }
                     Ok(ApplyOutcome::Duplicate)
                 } else {
                     // `top` is `Some` here (the watermark epoch is not
@@ -870,11 +960,10 @@ impl DirectoryConvergence {
     /// in `(kind, subject, epoch)` order (including older poisoned
     /// epochs below an active higher epoch). `digest` is FNV-1a 64-bit
     /// over, in key order: each active record's `(kind tag, subject,
-    /// version components, target, content_hash, payload digest,
-    /// payload length)`, each tombstoned top's `(kind tag, subject,
-    /// version components, content_hash)`, and each poisoned epoch's
-    /// `(kind tag, subject, epoch, equivocation version components,
-    /// watermark components)` — so two replicas can compare convergence
+    /// version components, target, content_hash)`, each tombstoned top's
+    /// `(kind tag, subject, version components, content_hash)`, and each
+    /// poisoned epoch's `(kind tag, subject, epoch, equivocation version
+    /// components, watermark components)` — so two replicas can compare convergence
     /// state with one `u64`. It is a consistency fingerprint only, NOT
     /// a cryptographic hash.
     pub fn snapshot(&self) -> DirectorySnapshot {
@@ -912,26 +1001,740 @@ impl DirectoryConvergence {
                 digest = fnv1a_64(digest, &top.content_hash);
                 continue;
             }
-            let print = fingerprint(top);
             digest = fnv1a_64(digest, &[0x61, key.kind.tag()]);
             digest = fnv1a_64(digest, &key.subject.to_be_bytes());
             digest = fnv1a_64(digest, &epoch.to_be_bytes());
             digest = fnv1a_64(digest, &within.to_be_bytes());
             digest = fnv1a_64(digest, &[top.target_core_id.unwrap_or(0)]);
-            digest = fnv1a_64(digest, &print.content_hash);
-            digest = fnv1a_64(digest, &print.payload_digest.to_be_bytes());
-            digest = fnv1a_64(
-                digest,
-                &u64::try_from(print.payload_len)
-                    .unwrap_or(u64::MAX)
-                    .to_be_bytes(),
-            );
+            digest = fnv1a_64(digest, &top.content_hash);
             active.push(top.clone());
         }
         DirectorySnapshot {
             active,
             poisoned,
             digest,
+        }
+    }
+}
+
+// --- verified ingest, original-byte evidence, bounded anti-entropy pages -----
+//
+// §3.3 requires four duties beyond pure convergence: the exact original signed
+// bytes of every object are what gets distributed, every Edge verifies the full
+// permission chain and both signatures locally instead of trusting its attached
+// Core, a same-version fork preserves BOTH original objects as evidence, and
+// synchronisation is paged under a global receive quota. Those duties need the
+// raw objects, so they live here, above [`DirectoryConvergence`], which stays
+// the pure order-independent engine.
+//
+// This layer still performs no cryptography: [`ObjectVerifier`] is the consumer
+// API the identity/PKI layer implements (`boreas-pki`'s `ManagementTrust` via
+// [`pki_verifier::PkiObjectVerifier`] in production builds). An object whose
+// original bytes the verifier refuses never reaches convergence, so no
+// unverified record can become active, page out, or be cited as evidence.
+
+/// Maximum number of objects one anti-entropy page carries. This matches the
+/// candidate `boreas-proto` `MAX_DIRECTORY_OBJECTS` bound so an in-process page
+/// is always encodable; §3.3 requires bounded paging and forbids an unbounded
+/// whole-directory pull.
+pub const MAX_PAGE_OBJECTS: usize = 16;
+
+/// Candidate `ControlType::DirectoryPage` body cap (16 KiB) — one page is one
+/// control body, not a bulk transfer.
+const PAGE_BODY_CAP: usize = 16 * 1024;
+
+/// Fixed page header: subtype byte, `page_seq` (u64) and the object count byte.
+const PAGE_HEADER_LEN: usize = 1 + 8 + 1;
+
+/// Per-object length prefix inside the candidate page body.
+const PAGE_OBJECT_PREFIX_LEN: usize = 2;
+
+/// Byte bound for one page, summed over its original signed objects. Derived
+/// from the candidate control-body cap so [`SignedObjectPage::encode_wire`] can
+/// never produce a body the codec refuses.
+pub const MAX_PAGE_BYTES: usize =
+    PAGE_BODY_CAP - PAGE_HEADER_LEN - PAGE_OBJECT_PREFIX_LEN * MAX_PAGE_OBJECTS;
+
+const _: () = assert!(MAX_PAGE_BYTES == 16_342);
+
+/// Retained fork-evidence entries per ingest state. §3.3 wants both originals
+/// preserved; persistence is the caller's duty, so this window is bounded and
+/// every refusal to retain is counted in [`IngestStats::evidence_dropped`].
+pub const MAX_EVIDENCE_ENTRIES: usize = 8;
+
+/// Retained fork-evidence bytes per ingest state (both originals per entry).
+pub const MAX_EVIDENCE_BYTES: usize = 256 * 1024;
+
+/// Pure-model facts reported by an injected verifier for one management object.
+/// Every field is supposed to be derived from the *original signed bytes*; none
+/// may be taken from an unauthenticated frame header.
+///
+/// These are plain Rust values, **not a capability or token**. The fields are
+/// public, so any caller can fabricate a `VerifiedFacts`; trust exists only in
+/// the verifier instance injected into [`DirectoryIngest`]. Production code
+/// must use the reviewed PKI verifier and must never deserialize these fields
+/// from a frame or cite them as authentication evidence by themselves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedFacts {
+    pub kind: DirectoryObjectKind,
+    pub subject: u16,
+    pub version: VersionKey,
+    pub writer: WriterProof,
+    pub target_core_id: Option<u8>,
+    /// SHA-256 of the exact canonical TBS bytes (`object_id`) the verifier
+    /// authenticated — never a hash of the signature envelope. Re-signing the
+    /// same TBS must not manufacture a fork.
+    pub content_hash: [u8; 32],
+    /// Tombstone flag. The three §3.3 object bodies carry no tombstone field, so
+    /// a verifier built on them reports `false`; revocation is a separate
+    /// object class handled by the upper layer.
+    pub tombstone: bool,
+}
+
+impl VerifiedFacts {
+    pub fn key(&self) -> DirectoryKey {
+        DirectoryKey {
+            kind: self.kind,
+            subject: self.subject,
+        }
+    }
+
+    /// Pair the facts with the exact original signed bytes they describe.
+    pub fn into_envelope(self, raw_signed_object: Vec<u8>) -> RecordEnvelope {
+        RecordEnvelope {
+            kind: self.kind,
+            subject: self.subject,
+            version: self.version,
+            writer: self.writer,
+            target_core_id: self.target_core_id,
+            content_hash: self.content_hash,
+            payload: raw_signed_object,
+            tombstone: self.tombstone,
+        }
+    }
+}
+
+/// Why the trust layer refused an object's original bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyReject {
+    /// Malformed, badly signed, out of scope, stale, expired or otherwise not
+    /// authorised. The object is discarded and convergence state is untouched.
+    Rejected,
+    /// The same writer slot and version already carried a different canonical
+    /// TBS (not merely a different signature encoding), and the verifier's own
+    /// signature, scope and encoding checks had already passed. The carried
+    /// facts key the evidence record; they never activate a record.
+    Equivocation(VerifiedFacts),
+}
+
+/// Verification gate the identity layer implements.
+///
+/// This is a pure-model integration boundary, **not a capability or
+/// authentication token**. Any implementation can return arbitrary
+/// [`VerifiedFacts`], and [`DirectoryIngest`] trusts whichever verifier it is
+/// constructed with. Only the reviewed `PkiObjectVerifier` (feature
+/// `openssl-inner-tls`) binds real `ManagementTrust` verification in this
+/// crate. Implementations MUST verify both signatures (node primary + attached
+/// Core countersignature for a lease), the issuer permission chain, canonical
+/// encoding and freshness over the exact `raw_signed_object` bytes, and MUST
+/// NOT report facts for an object that failed those checks.
+pub trait ObjectVerifier {
+    fn verify(
+        &mut self,
+        raw_signed_object: &[u8],
+        now_us: u64,
+    ) -> Result<VerifiedFacts, VerifyReject>;
+}
+
+/// Result of one verified delivery. Every variant leaves the state either
+/// untouched or in a state that a repeat delivery cannot worsen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngestOutcome {
+    /// The verifier accepted the original bytes; the inner outcome is from
+    /// [`DirectoryConvergence::apply`].
+    Verified(ApplyOutcome),
+    /// The verifier refused the original bytes; nothing entered convergence.
+    Rejected,
+    /// Same version, different verified content: the record is isolated and both
+    /// originals are preserved in [`EvidenceStore`] when the byte budget allows.
+    Equivocated,
+    /// Verification passed but the envelope was structurally refused (payload
+    /// bound, writer structure, key capacity). Never a silent accept.
+    Refused(DirectoryError),
+}
+
+impl IngestOutcome {
+    /// Whether the object was kept out of the active view for a non-convergence
+    /// reason (rejected or structurally refused).
+    pub const fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected | Self::Refused(_))
+    }
+
+    /// Whether this delivery became the key's active top record.
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Verified(ApplyOutcome::Applied))
+    }
+
+    /// Whether this delivery preserved a same-version fork.
+    pub const fn is_equivocation(&self) -> bool {
+        matches!(self, Self::Equivocated)
+    }
+}
+
+/// Bounded counters for operational visibility. Counters never gate traffic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IngestStats {
+    pub verified: u64,
+    pub rejected: u64,
+    pub equivocated: u64,
+    pub applied: u64,
+    pub duplicate: u64,
+    pub stale: u64,
+    pub poisoned: u64,
+    pub refused: u64,
+    pub evidence_dropped: u64,
+}
+
+/// One preserved same-version fork: both exact original signed objects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkEvidence {
+    pub key: DirectoryKey,
+    pub version: VersionKey,
+    /// The original bytes this replica already held for that version, when it
+    /// held any. `None` means only the conflicting side was seen here; the upper
+    /// layer must still persist and alert on what it has.
+    pub retained: Option<Vec<u8>>,
+    /// The original bytes that triggered the fork.
+    pub conflicting: Vec<u8>,
+}
+
+/// Bounded, deterministically ordered fork evidence. Entries are keyed by
+/// `(key, version)` so repeated detections at one slot do not grow the store.
+#[derive(Debug, Default)]
+pub struct EvidenceStore {
+    entries: BTreeMap<(DirectoryKey, VersionKey), ForkEvidence>,
+    bytes: usize,
+    dropped: u64,
+}
+
+impl EvidenceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Retained original bytes across all entries.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Forks the byte or entry budget refused to retain. Non-zero is an audit
+    /// signal: §3.3 requires both originals on durable storage.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Ascending `(kind, subject, version)` order.
+    pub fn iter(&self) -> impl Iterator<Item = &ForkEvidence> {
+        self.entries.values()
+    }
+
+    pub fn get(&self, key: DirectoryKey, version: VersionKey) -> Option<&ForkEvidence> {
+        self.entries.get(&(key, version))
+    }
+
+    /// Retain one fork. Returns `false` when the budget refused it; the caller
+    /// counts that as a drop rather than silently losing evidence.
+    fn record(
+        &mut self,
+        key: DirectoryKey,
+        version: VersionKey,
+        retained: Option<Vec<u8>>,
+        conflicting: Vec<u8>,
+    ) -> bool {
+        let slot = (key, version);
+        if self.entries.get(&slot).is_some() {
+            // Already preserved; a second detection at the same slot adds nothing.
+            return true;
+        }
+        let added = retained.as_ref().map_or(0, Vec::len) + conflicting.len();
+        if self.entries.len() >= MAX_EVIDENCE_ENTRIES
+            || self
+                .bytes
+                .checked_add(added)
+                .is_none_or(|n| n > MAX_EVIDENCE_BYTES)
+        {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.bytes += added;
+        self.entries.insert(
+            slot,
+            ForkEvidence {
+                key,
+                version,
+                retained,
+                conflicting,
+            },
+        );
+        true
+    }
+}
+
+impl<'a> IntoIterator for &'a EvidenceStore {
+    type Item = &'a ForkEvidence;
+    type IntoIter = std::collections::btree_map::Values<'a, (DirectoryKey, VersionKey), ForkEvidence>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.values()
+    }
+}
+
+/// Pure verified-ingest model: the convergence engine, the injected verifier,
+/// the bounded evidence store and the counters.
+///
+/// This type performs no cryptography itself. It is only as trustworthy as the
+/// verifier passed to [`Self::new`]; an arbitrary implementation can fabricate
+/// facts, so this is not an authentication token or a trust boundary by itself.
+#[derive(Debug)]
+pub struct DirectoryIngest<V> {
+    convergence: DirectoryConvergence,
+    verifier: V,
+    evidence: EvidenceStore,
+    stats: IngestStats,
+}
+
+impl<V: ObjectVerifier> DirectoryIngest<V> {
+    /// `verifier` is trusted by construction. This constructor accepts any
+    /// implementation, so passing an untrusted verifier yields forged facts;
+    /// production must pass the reviewed `PkiObjectVerifier`.
+    pub fn new(verifier: V) -> Self {
+        Self {
+            convergence: DirectoryConvergence::new(),
+            verifier,
+            evidence: EvidenceStore::new(),
+            stats: IngestStats::default(),
+        }
+    }
+
+    /// Same key bound as [`DirectoryConvergence::with_max_keys`] and the same
+    /// verifier-trust caveat as [`Self::new`].
+    pub fn with_max_keys(verifier: V, max_keys: usize) -> Result<Self, DirectoryError> {
+        Ok(Self {
+            convergence: DirectoryConvergence::with_max_keys(max_keys)?,
+            verifier,
+            evidence: EvidenceStore::new(),
+            stats: IngestStats::default(),
+        })
+    }
+
+    pub fn directory(&self) -> &DirectoryConvergence {
+        &self.convergence
+    }
+
+    pub fn verifier(&self) -> &V {
+        &self.verifier
+    }
+
+    pub fn verifier_mut(&mut self) -> &mut V {
+        &mut self.verifier
+    }
+
+    pub fn evidence(&self) -> &EvidenceStore {
+        &self.evidence
+    }
+
+    pub fn stats(&self) -> IngestStats {
+        self.stats
+    }
+
+    pub fn snapshot(&self) -> DirectorySnapshot {
+        self.convergence.snapshot()
+    }
+
+    /// Verify one object's original bytes, then converge it.
+    ///
+    /// `now_us` is trusted UTC microseconds for the verifier's freshness checks;
+    /// this module never reads a clock and repeated delivery never extends
+    /// freshness (§3.4).
+    pub fn verify_and_apply(&mut self, raw_signed_object: &[u8], now_us: u64) -> IngestOutcome {
+        if raw_signed_object.is_empty() {
+            self.stats.rejected = self.stats.rejected.saturating_add(1);
+            return IngestOutcome::Rejected;
+        }
+        if raw_signed_object.len() > MAX_PAYLOAD_BYTES {
+            self.stats.refused = self.stats.refused.saturating_add(1);
+            return IngestOutcome::Refused(DirectoryError::PayloadTooLarge);
+        }
+        let facts = match self.verifier.verify(raw_signed_object, now_us) {
+            Ok(facts) => facts,
+            Err(VerifyReject::Rejected) => {
+                self.stats.rejected = self.stats.rejected.saturating_add(1);
+                return IngestOutcome::Rejected;
+            }
+            Err(VerifyReject::Equivocation(facts)) => {
+                // The counterpart bytes are whatever this replica already held
+                // at that version; when it held none the evidence says so.
+                let retained = self
+                    .convergence
+                    .get_including_tombstone(facts.key())
+                    .filter(|record| record.version == facts.version)
+                    .map(|record| record.payload.clone());
+                // §3.3: freeze the conflicting object at once, even though the
+                // second body never enters convergence.
+                self.convergence.isolate(facts.key(), facts.version);
+                self.note_fork(facts.key(), facts.version, retained, raw_signed_object.to_vec());
+                self.stats.equivocated = self.stats.equivocated.saturating_add(1);
+                return IngestOutcome::Equivocated;
+            }
+        };
+        self.stats.verified = self.stats.verified.saturating_add(1);
+        let key = facts.key();
+        let version = facts.version;
+        // Capture the counterpart bytes *before* convergence runs: an in-engine
+        // fork clears the top record, and evidence needs the bytes it held.
+        let prior_at_version = self
+            .convergence
+            .get_including_tombstone(key)
+            .filter(|record| record.version == version)
+            .map(|record| record.payload.clone());
+        let envelope = facts.into_envelope(raw_signed_object.to_vec());
+        match self.convergence.apply(envelope) {
+            Ok(ApplyOutcome::Applied) => {
+                self.stats.applied = self.stats.applied.saturating_add(1);
+                IngestOutcome::Verified(ApplyOutcome::Applied)
+            }
+            Ok(ApplyOutcome::Duplicate) => {
+                self.stats.duplicate = self.stats.duplicate.saturating_add(1);
+                IngestOutcome::Verified(ApplyOutcome::Duplicate)
+            }
+            Ok(ApplyOutcome::Stale) => {
+                self.stats.stale = self.stats.stale.saturating_add(1);
+                IngestOutcome::Verified(ApplyOutcome::Stale)
+            }
+            Ok(ApplyOutcome::Poisoned) => {
+                self.stats.poisoned = self.stats.poisoned.saturating_add(1);
+                IngestOutcome::Verified(ApplyOutcome::Poisoned)
+            }
+            Ok(ApplyOutcome::Equivocated) => {
+                // The verifier let both bodies through and convergence saw two
+                // different bodies at one version: preserve both originals.
+                self.note_fork(key, version, prior_at_version, raw_signed_object.to_vec());
+                self.stats.equivocated = self.stats.equivocated.saturating_add(1);
+                IngestOutcome::Equivocated
+            }
+            Err(error) => {
+                self.stats.refused = self.stats.refused.saturating_add(1);
+                IngestOutcome::Refused(error)
+            }
+        }
+    }
+
+    fn note_fork(
+        &mut self,
+        key: DirectoryKey,
+        version: VersionKey,
+        retained: Option<Vec<u8>>,
+        conflicting: Vec<u8>,
+    ) {
+        if !self.evidence.record(key, version, retained, conflicting) {
+            self.stats.evidence_dropped = self.stats.evidence_dropped.saturating_add(1);
+        }
+    }
+
+    /// Apply one anti-entropy page. Each record is re-verified locally; nothing
+    /// in the page is trusted because the sender verified it (§3.3).
+    pub fn ingest_page(&mut self, page: &SignedObjectPage, now_us: u64) -> PageIngest {
+        let mut outcomes = Vec::with_capacity(page.records.len().min(MAX_PAGE_OBJECTS));
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for raw in page.records.iter().take(MAX_PAGE_OBJECTS) {
+            let outcome = self.verify_and_apply(raw, now_us);
+            if outcome.is_rejected() {
+                rejected += 1;
+            } else {
+                accepted += 1;
+            }
+            outcomes.push(outcome);
+        }
+        let over_limit = page.records.len().saturating_sub(MAX_PAGE_OBJECTS);
+        PageIngest {
+            page_seq: page.page_seq,
+            outcomes,
+            accepted,
+            rejected,
+            over_limit,
+        }
+    }
+}
+
+/// One bounded anti-entropy page of exact original signed objects, matching the
+/// candidate `boreas-proto` `DirectoryPage` control body (`page_seq` plus up to
+/// [`MAX_PAGE_OBJECTS`] signed-object envelopes).
+///
+/// The sender emits it with [`Self::encode_wire`]; the receiver decodes with
+/// [`Self::decode_wire`] and then re-verifies every object locally — decoding
+/// proves nothing about who signed anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedObjectPage {
+    pub page_seq: u64,
+    pub records: Vec<Vec<u8>>,
+}
+
+impl SignedObjectPage {
+    /// Encode as a candidate `ControlType::DirectoryPage` body. Every record
+    /// must be a decodable signed-object envelope; the codec's own 16 KiB body
+    /// cap is enforced again here, so an oversized page fails closed instead of
+    /// being split or truncated silently.
+    pub fn encode_wire(&self) -> Result<Vec<u8>, PageWireError> {
+        if self.records.is_empty() || self.records.len() > MAX_PAGE_OBJECTS {
+            return Err(PageWireError::InvalidCount);
+        }
+        let mut objects = Vec::with_capacity(self.records.len());
+        for raw in &self.records {
+            objects.push(SignedObject::decode(raw).map_err(|_| PageWireError::NotSignedObject)?);
+        }
+        ProtoDirectoryPage {
+            page_seq: self.page_seq,
+            objects,
+        }
+        .encode()
+        .map_err(|_| PageWireError::BodyTooLarge)
+    }
+
+    /// Decode a candidate page body back into exact signed-object bytes. The
+    /// re-encoded envelope is byte-identical to the transported one because the
+    /// candidate codec is canonical and never repairs TBS bytes.
+    pub fn decode_wire(body: &[u8]) -> Result<Self, PageWireError> {
+        let page = ProtoDirectoryPage::decode(body).map_err(|_| PageWireError::Malformed)?;
+        let mut records = Vec::with_capacity(page.objects.len());
+        for object in &page.objects {
+            records.push(object.encode().map_err(|_| PageWireError::Malformed)?);
+        }
+        Ok(Self {
+            page_seq: page.page_seq,
+            records,
+        })
+    }
+}
+
+/// Why a page could not be carried on the candidate control body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageWireError {
+    /// The page carried no object, or more than [`MAX_PAGE_OBJECTS`].
+    InvalidCount,
+    /// A record is not a decodable signed-object envelope.
+    NotSignedObject,
+    /// The encoded body would exceed the candidate 16 KiB control-body cap.
+    BodyTooLarge,
+    /// The body or one of its envelopes failed the candidate codec.
+    Malformed,
+}
+
+/// Outcome of one page, bounded by [`MAX_PAGE_OBJECTS`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageIngest {
+    pub page_seq: u64,
+    pub outcomes: Vec<IngestOutcome>,
+    pub accepted: usize,
+    pub rejected: usize,
+    /// Records the page carried beyond [`MAX_PAGE_OBJECTS`]; never applied.
+    pub over_limit: usize,
+}
+
+/// Splits a snapshot's active records into bounded pages. Only active records
+/// are distributed: a tombstoned top is the anti-resurrection watermark, and a
+/// poisoned epoch is already isolated locally.
+pub struct PageIter<'a> {
+    records: &'a [RecordEnvelope],
+    cursor: usize,
+    page_seq: u64,
+}
+
+impl<'a> Iterator for PageIter<'a> {
+    type Item = SignedObjectPage;
+
+    fn next(&mut self) -> Option<SignedObjectPage> {
+        if self.cursor >= self.records.len() {
+            return None;
+        }
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        while self.cursor < self.records.len() && records.len() < MAX_PAGE_OBJECTS {
+            let payload = &self.records[self.cursor].payload;
+            if !records.is_empty() && bytes.saturating_add(payload.len()) > MAX_PAGE_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(payload.len());
+            records.push(payload.clone());
+            self.cursor += 1;
+        }
+        let page = SignedObjectPage {
+            page_seq: self.page_seq,
+            records,
+        };
+        self.page_seq = self.page_seq.saturating_add(1);
+        Some(page)
+    }
+}
+
+/// Page the active set of one snapshot. Bounded by [`MAX_PAGE_OBJECTS`] and
+/// [`MAX_PAGE_BYTES`]; an empty active set yields no page at all.
+pub fn page_snapshot(snapshot: &DirectorySnapshot) -> PageIter<'_> {
+    PageIter {
+        records: &snapshot.active,
+        cursor: 0,
+        page_seq: 0,
+    }
+}
+
+/// `boreas-pki`-backed verification for real dual-signed management objects.
+#[cfg(feature = "openssl-inner-tls")]
+pub mod pki_verifier {
+    //! The production [`ObjectVerifier`]: `boreas_pki::management::ManagementTrust`
+    //! verifies both signatures over the exact signed bytes, the issuer permission
+    //! chain, canonical encoding, scope, freshness and per-slot replay, and keeps
+    //! the conflicting original when it detects equivocation.
+    //!
+    //! The directory never parses an object to decide trust. The one place this
+    //! module decodes bytes itself is the equivocation path, and only to key the
+    //! evidence record: `ManagementTrust::verify_and_authorize` checks both
+    //! signatures and the permission chain *before* it consults the replay slot,
+    //! so an equivocation report already implies the conflicting bytes were
+    //! authenticated. Those facts are never turned into an active record.
+    //!
+    //! Content identity is `ManagementTrust`'s `object_id`, i.e. SHA-256 of the
+    //! exact canonical TBS bytes, never a hash of the signature envelope.
+    //! Re-signing the same TBS therefore remains a duplicate.
+
+    use super::{
+        DirectoryObjectKind, ObjectVerifier, VerifiedFacts, VerifyReject, VersionKey, WriterProof,
+    };
+    use boreas_pki::management::{Error as PkiError, ManagementTrust};
+    use boreas_proto::messages::SignedObject;
+    use boreas_proto::objects::{self, ManagementObject, ObjectBody};
+
+    /// Adapter pairing the tunnel directory with the PKI trust layer. The
+    /// `ManagementTrust` is owned here because its replay slots are per node.
+    pub struct PkiObjectVerifier {
+        trust: ManagementTrust,
+    }
+
+    impl PkiObjectVerifier {
+        pub fn new(trust: ManagementTrust) -> Self {
+            Self { trust }
+        }
+
+        /// Empty trust for one network: identities and issuer records must be
+        /// provisioned by the caller before anything verifies.
+        pub fn with_net_id(net_id: [u8; 16]) -> Self {
+            Self {
+                trust: ManagementTrust::new(net_id),
+            }
+        }
+
+        pub fn trust(&self) -> &ManagementTrust {
+            &self.trust
+        }
+
+        pub fn trust_mut(&mut self) -> &mut ManagementTrust {
+            &mut self.trust
+        }
+    }
+
+    impl ObjectVerifier for PkiObjectVerifier {
+        fn verify(
+            &mut self,
+            raw_signed_object: &[u8],
+            now_us: u64,
+        ) -> Result<VerifiedFacts, VerifyReject> {
+            match self.trust.verify_and_authorize(raw_signed_object, now_us) {
+                // `object_id` is SHA-256 of the exact canonical TBS bytes. It
+                // is deliberately not a hash of the signature envelope: a
+                // legitimate re-signing of the same TBS must stay a duplicate.
+                Ok(verified) => facts_from_object(verified.object(), verified.object_id())
+                    .ok_or(VerifyReject::Rejected),
+                Err(PkiError::Equivocation) => match decode_original(raw_signed_object) {
+                    Some((object, content_hash)) => match facts_from_object(&object, content_hash) {
+                        Some(facts) => Err(VerifyReject::Equivocation(facts)),
+                        None => Err(VerifyReject::Rejected),
+                    },
+                    None => Err(VerifyReject::Rejected),
+                },
+                Err(_) => Err(VerifyReject::Rejected),
+            }
+        }
+    }
+
+    /// Decode the envelope this replica was handed, without trusting it. Only
+    /// reachable after the trust layer reported an authenticated conflict.
+    /// Returns the object and SHA-256 of its exact canonical TBS bytes
+    /// (`object_id`), never the envelope hash.
+    fn decode_original(raw: &[u8]) -> Option<(ManagementObject, [u8; 32])> {
+        let signed = SignedObject::decode(raw).ok()?;
+        let object = objects::decode_tbs(&signed.raw_tbs).ok()?;
+        Some((object, openssl::sha::sha256(&signed.raw_tbs)))
+    }
+
+    fn facts_from_object(
+        object: &ManagementObject,
+        content_hash: [u8; 32],
+    ) -> Option<VerifiedFacts> {
+        match &object.body {
+            ObjectBody::NodeIdentity(body) => Some(VerifiedFacts {
+                kind: DirectoryObjectKind::NodeIdentity,
+                subject: body.node_id,
+                version: VersionKey::NodeIdentity {
+                    identity_generation: body.identity_generation,
+                },
+                writer: WriterProof::IdentityAuthority,
+                target_core_id: None,
+                content_hash,
+                tombstone: false,
+            }),
+            ObjectBody::AttachmentLease(body) => Some(VerifiedFacts {
+                kind: DirectoryObjectKind::AttachmentLease,
+                subject: body.node_id,
+                version: VersionKey::AttachmentLease {
+                    identity_generation: body.identity_generation,
+                    attach_generation: body.attach_generation,
+                },
+                // The trust layer verified the node's primary signature and the
+                // co-signature of exactly this target Core.
+                writer: WriterProof::AttachmentLease {
+                    node_signed: true,
+                    countersigning_core_id: Some(body.target_core_id),
+                },
+                target_core_id: Some(body.target_core_id),
+                content_hash,
+                tombstone: false,
+            }),
+            ObjectBody::CoreLsa(body) => Some(VerifiedFacts {
+                kind: DirectoryObjectKind::CoreLsa,
+                subject: u16::from(body.core_id),
+                version: VersionKey::CoreLsa {
+                    core_generation: body.core_generation,
+                    seq: body.seq,
+                },
+                writer: WriterProof::CoreOperationalKey {
+                    core_id: body.core_id,
+                },
+                target_core_id: None,
+                content_hash,
+                tombstone: false,
+            }),
+            // RouteGrant / DirectGrant / StatusSnapshot are not §3.3 directory
+            // objects; their authority checks belong to the upper layer.
+            ObjectBody::RouteGrant(_)
+            | ObjectBody::DirectGrant(_)
+            | ObjectBody::StatusSnapshot(_) => None,
         }
     }
 }
@@ -1673,24 +2476,40 @@ mod tests {
     }
 
     #[test]
-    fn same_hash_different_payload_is_equivocation() {
-        // The caller's content_hash is trusted, but equal hashes over
-        // differing payload bytes indicate a broken pipeline; fail
-        // closed instead of letting arrival order pick a winner.
+    fn same_content_hash_with_different_envelope_bytes_is_a_duplicate() {
+        // `content_hash` is SHA-256 of the canonical TBS, not of the signature
+        // envelope. Re-signing identical TBS bytes changes only `payload`
+        // bytes here, so it must not be reported as a fork.
+        let key = DirectoryKey {
+            kind: DirectoryObjectKind::CoreLsa,
+            subject: 7,
+        };
         let mut state = DirectoryConvergence::new();
-        let mut first = lsa(7, 1, 4, 40);
-        first.payload = vec![1];
+        let first = lsa(7, 1, 4, 40);
         let mut second = lsa(7, 1, 4, 40);
         second.payload = vec![2];
         assert_eq!(state.apply(first), Ok(ApplyOutcome::Applied));
-        assert_eq!(state.apply(second), Ok(ApplyOutcome::Equivocated));
+        assert_eq!(state.apply(second), Ok(ApplyOutcome::Duplicate));
+        assert_eq!(state.status(key), KeyStatus::Active);
+        // Both envelopes carry the same TBS; the smaller exact envelope is
+        // retained so a re-signed duplicate is order independent.
         assert_eq!(
-            state.status(DirectoryKey {
-                kind: DirectoryObjectKind::CoreLsa,
-                subject: 7,
-            }),
-            KeyStatus::Poisoned
+            state.get(key).expect("active").payload.as_slice(),
+            &[2u8][..]
         );
+
+        let mut reverse = DirectoryConvergence::new();
+        let mut smaller_first = lsa(7, 1, 4, 40);
+        smaller_first.payload = vec![2];
+        assert_eq!(
+            reverse.apply(smaller_first),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            reverse.apply(lsa(7, 1, 4, 40)),
+            Ok(ApplyOutcome::Duplicate)
+        );
+        assert_eq!(reverse.snapshot(), state.snapshot());
     }
 
     /// Deterministic body for (key, version) in the generated set:
@@ -1854,5 +2673,531 @@ mod tests {
             reference_state.apply(record.clone()).unwrap();
         }
         assert_eq!(reference_state.snapshot(), reference);
+    }
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+
+    /// Test-only pseudo-envelope layout. It is NOT a wire format and carries no
+    /// signature: these tests probe the verification gate, the evidence bound and
+    /// the paging bound, not cryptography. Real dual-signed objects are exercised
+    /// through [`pki_verifier::PkiObjectVerifier`] in `tests/mesh_runtime.rs`.
+    const MAGIC: u8 = 0xA1;
+    const FORK_MAGIC: u8 = 0xE0;
+    const PREFIX_LEN: usize = 23;
+
+    /// Non-cryptographic digest for the test verifier's `content_hash`.
+    fn hash32(raw: &[u8]) -> [u8; 32] {
+        let mut state = FNV_OFFSET_BASIS;
+        for byte in raw {
+            state ^= u64::from(*byte);
+            state = state.wrapping_mul(FNV_PRIME);
+        }
+        let mut out = [0u8; 32];
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = state.rotate_left((index % 64) as u32) as u8;
+        }
+        out
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct RawSpec {
+        kind: u8,
+        subject: u16,
+        epoch: u64,
+        within: u64,
+        target: u8,
+        countersigner: u8,
+        node_signed: bool,
+    }
+
+    fn envelope(magic: u8, spec: RawSpec, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PREFIX_LEN + body.len());
+        out.push(magic);
+        out.push(spec.kind);
+        out.extend_from_slice(&spec.subject.to_be_bytes());
+        out.extend_from_slice(&spec.epoch.to_be_bytes());
+        out.extend_from_slice(&spec.within.to_be_bytes());
+        out.push(spec.target);
+        out.push(spec.countersigner);
+        out.push(u8::from(spec.node_signed));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn parse(raw: &[u8]) -> Option<VerifiedFacts> {
+        if raw.len() < PREFIX_LEN {
+            return None;
+        }
+        let subject = u16::from_be_bytes([raw[2], raw[3]]);
+        let epoch = u64::from_be_bytes(raw[4..12].try_into().ok()?);
+        let within = u64::from_be_bytes(raw[12..20].try_into().ok()?);
+        let target = (raw[20] != 0).then_some(raw[20]);
+        let countersigner = (raw[21] != 0).then_some(raw[21]);
+        let node_signed = raw[22] == 1;
+        let (kind, version, writer, target_core_id) = match raw[1] {
+            1 => (
+                DirectoryObjectKind::NodeIdentity,
+                VersionKey::NodeIdentity {
+                    identity_generation: epoch,
+                },
+                WriterProof::IdentityAuthority,
+                None,
+            ),
+            2 => (
+                DirectoryObjectKind::AttachmentLease,
+                VersionKey::AttachmentLease {
+                    identity_generation: epoch,
+                    attach_generation: within,
+                },
+                WriterProof::AttachmentLease {
+                    node_signed,
+                    countersigning_core_id: countersigner.or(target),
+                },
+                target,
+            ),
+            3 => (
+                DirectoryObjectKind::CoreLsa,
+                VersionKey::CoreLsa {
+                    core_generation: epoch,
+                    seq: within,
+                },
+                WriterProof::CoreOperationalKey {
+                    core_id: u8::try_from(subject).ok()?,
+                },
+                None,
+            ),
+            _ => return None,
+        };
+        Some(VerifiedFacts {
+            kind,
+            subject,
+            version,
+            writer,
+            target_core_id,
+            content_hash: hash32(raw),
+            tombstone: false,
+        })
+    }
+
+    #[derive(Default)]
+    struct TestVerifier {
+        calls: usize,
+    }
+
+    impl ObjectVerifier for TestVerifier {
+        fn verify(
+            &mut self,
+            raw_signed_object: &[u8],
+            _now_us: u64,
+        ) -> Result<VerifiedFacts, VerifyReject> {
+            self.calls += 1;
+            match raw_signed_object.first() {
+                Some(&MAGIC) | Some(&FORK_MAGIC) => {
+                    let facts = parse(raw_signed_object).ok_or(VerifyReject::Rejected)?;
+                    if raw_signed_object[0] == FORK_MAGIC {
+                        Err(VerifyReject::Equivocation(facts))
+                    } else {
+                        Ok(facts)
+                    }
+                }
+                _ => Err(VerifyReject::Rejected),
+            }
+        }
+    }
+
+    fn node(core: u8, octet: u8) -> u16 {
+        ((u16::from(core) - 1) << 8) | u16::from(octet)
+    }
+
+    fn identity_raw(subject: u16, generation: u64, body: &[u8]) -> Vec<u8> {
+        envelope(
+            MAGIC,
+            RawSpec {
+                kind: 1,
+                subject,
+                epoch: generation,
+                ..RawSpec::default()
+            },
+            body,
+        )
+    }
+
+    fn lease_raw(subject: u16, id_gen: u64, attach_gen: u64, target: u8, body: &[u8]) -> Vec<u8> {
+        envelope(
+            MAGIC,
+            RawSpec {
+                kind: 2,
+                subject,
+                epoch: id_gen,
+                within: attach_gen,
+                target,
+                node_signed: true,
+                ..RawSpec::default()
+            },
+            body,
+        )
+    }
+
+    fn lease_key(subject: u16) -> DirectoryKey {
+        DirectoryKey {
+            kind: DirectoryObjectKind::AttachmentLease,
+            subject,
+        }
+    }
+
+    fn lease_version(id_gen: u64, attach_gen: u64) -> VersionKey {
+        VersionKey::AttachmentLease {
+            identity_generation: id_gen,
+            attach_generation: attach_gen,
+        }
+    }
+
+    #[test]
+    fn unverified_bytes_never_reach_convergence() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        // Unknown envelope: the verifier refuses it.
+        let rejected = [0xB0u8; 24];
+        assert_eq!(
+            ingest.verify_and_apply(&rejected, 1),
+            IngestOutcome::Rejected
+        );
+        assert_eq!(ingest.directory().key_count(), 0);
+        assert_eq!(ingest.stats().rejected, 1);
+        assert_eq!(ingest.verifier().calls, 1);
+
+        // Oversize input is refused by the payload bound before any verifier
+        // call, so a huge frame cannot even reach the trust layer.
+        let oversize = vec![MAGIC; MAX_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            ingest.verify_and_apply(&oversize, 1),
+            IngestOutcome::Refused(DirectoryError::PayloadTooLarge)
+        );
+        assert_eq!(ingest.verifier().calls, 1);
+        assert_eq!(ingest.stats().refused, 1);
+
+        // Empty input is not an object.
+        assert_eq!(ingest.verify_and_apply(&[], 1), IngestOutcome::Rejected);
+        assert_eq!(ingest.stats().rejected, 2);
+    }
+
+    #[test]
+    fn dual_signature_requirement_is_enforced_before_convergence() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        let subject = node(2, 9);
+        let good = lease_raw(subject, 1, 1, 2, b"lease");
+        assert_eq!(
+            ingest.verify_and_apply(&good, 1),
+            IngestOutcome::Verified(ApplyOutcome::Applied)
+        );
+
+        // The co-signer claims to be Core 3 while the lease names Core 2.
+        let mut wrong_core = lease_raw(subject, 1, 2, 2, b"lease-2");
+        wrong_core[21] = 3;
+        assert_eq!(
+            ingest.verify_and_apply(&wrong_core, 1),
+            IngestOutcome::Refused(DirectoryError::CountersignatureMismatch)
+        );
+
+        // A lease without the node's own primary signature.
+        let mut unsigned = lease_raw(subject, 1, 3, 2, b"lease-3");
+        unsigned[22] = 0;
+        assert_eq!(
+            ingest.verify_and_apply(&unsigned, 1),
+            IngestOutcome::Refused(DirectoryError::MissingNodeSignature)
+        );
+
+        // Neither refused lease advanced the accepted attach generation.
+        let top = ingest
+            .directory()
+            .get(lease_key(subject))
+            .expect("first lease still active");
+        assert_eq!(top.version, lease_version(1, 1));
+        assert_eq!(top.target_core_id, Some(2));
+        assert_eq!(ingest.stats().applied, 1);
+        assert_eq!(ingest.stats().refused, 2);
+    }
+
+    #[test]
+    fn same_version_fork_preserves_both_original_bytes() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        let subject = node(2, 11);
+        let first = lease_raw(subject, 1, 4, 2, b"body-a");
+        let second = lease_raw(subject, 1, 4, 2, b"body-b");
+        assert_eq!(
+            ingest.verify_and_apply(&first, 1),
+            IngestOutcome::Verified(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            ingest.verify_and_apply(&second, 1),
+            IngestOutcome::Equivocated
+        );
+        assert_eq!(
+            ingest.directory().status(lease_key(subject)),
+            KeyStatus::Poisoned
+        );
+        let evidence = ingest
+            .evidence()
+            .get(lease_key(subject), lease_version(1, 4))
+            .expect("fork evidence retained");
+        assert_eq!(evidence.retained.as_deref(), Some(first.as_slice()));
+        assert_eq!(evidence.conflicting, second);
+        assert_eq!(ingest.evidence().dropped(), 0);
+        assert_eq!(ingest.stats().equivocated, 1);
+    }
+
+    #[test]
+    fn verifier_reported_fork_is_keyed_without_a_counterpart() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        let subject = node(5, 3);
+        let forked = envelope(
+            FORK_MAGIC,
+            RawSpec {
+                kind: 2,
+                subject,
+                epoch: 4,
+                within: 2,
+                target: 5,
+                node_signed: true,
+                ..RawSpec::default()
+            },
+            b"forked",
+        );
+        assert_eq!(
+            ingest.verify_and_apply(&forked, 1),
+            IngestOutcome::Equivocated
+        );
+        let evidence = ingest
+            .evidence()
+            .get(lease_key(subject), lease_version(4, 2))
+            .expect("conflicting original retained");
+        // This replica never held the counterpart, and says so instead of
+        // inventing one.
+        assert_eq!(evidence.retained, None);
+        assert_eq!(evidence.conflicting, forked);
+        assert_eq!(
+            ingest.directory().status(lease_key(subject)),
+            KeyStatus::Absent
+        );
+    }
+
+    #[test]
+    fn evidence_budget_is_bounded_and_every_drop_is_counted() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        // Thirteen distinct keys at one byte each: the evidence window holds
+        // eight, so five forks must be reported as dropped.
+        let total = 13u64;
+        for octet in 2..=14u8 {
+            let subject = node(3, octet);
+            assert_eq!(
+                ingest.verify_and_apply(&lease_raw(subject, 1, 1, 3, &[octet]), 1),
+                IngestOutcome::Verified(ApplyOutcome::Applied)
+            );
+            assert_eq!(
+                ingest.verify_and_apply(&lease_raw(subject, 1, 1, 3, &[octet, octet]), 1),
+                IngestOutcome::Equivocated
+            );
+            assert_eq!(
+                ingest.directory().status(lease_key(subject)),
+                KeyStatus::Poisoned
+            );
+        }
+        assert_eq!(ingest.evidence().len(), MAX_EVIDENCE_ENTRIES);
+        assert!(ingest.evidence().bytes() <= MAX_EVIDENCE_BYTES);
+        assert_eq!(
+            ingest.evidence().dropped(),
+            total - MAX_EVIDENCE_ENTRIES as u64
+        );
+        assert_eq!(
+            ingest.stats().evidence_dropped,
+            ingest.evidence().dropped()
+        );
+    }
+
+    #[test]
+    fn paged_anti_entropy_converges_in_any_delivery_order() {
+        let mut source = DirectoryIngest::new(TestVerifier::default());
+        for octet in 2..=60u8 {
+            let subject = node(2, octet);
+            let body = [octet; 16];
+            assert_eq!(
+                source.verify_and_apply(&identity_raw(subject, 1, &body), 10),
+                IngestOutcome::Verified(ApplyOutcome::Applied)
+            );
+            assert_eq!(
+                source.verify_and_apply(&lease_raw(subject, 1, 1, 2, &body), 10),
+                IngestOutcome::Verified(ApplyOutcome::Applied)
+            );
+        }
+        let snapshot = source.snapshot();
+        assert_eq!(snapshot.active.len(), 118);
+
+        let pages: Vec<SignedObjectPage> = page_snapshot(&snapshot).collect();
+        assert!(pages.len() > 1, "118 objects must not fit one page");
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(page.page_seq, u64::try_from(index).expect("page index"));
+            assert!(page.records.len() <= MAX_PAGE_OBJECTS);
+            assert!(
+                page.records.iter().map(Vec::len).sum::<usize>() <= MAX_PAGE_BYTES,
+                "page {} exceeded the byte bound",
+                page.page_seq
+            );
+            assert!(page.records.iter().all(|record| !record.is_empty()));
+        }
+        assert_eq!(
+            pages.iter().flat_map(|page| page.records.iter()).count(),
+            snapshot.active.len()
+        );
+
+        // Deliver every page in reverse order to a second replica. Convergence is
+        // order independent; the periodic cycle repeats whole pages, so the same
+        // set delivered again must change nothing.
+        let mut replica = DirectoryIngest::new(TestVerifier::default());
+        for page in pages.iter().rev() {
+            let outcome = replica.ingest_page(page, 10);
+            assert_eq!(outcome.page_seq, page.page_seq);
+            assert_eq!(outcome.over_limit, 0);
+            assert_eq!(outcome.rejected, 0);
+            assert_eq!(outcome.outcomes.len(), page.records.len());
+        }
+        assert_eq!(replica.snapshot(), snapshot);
+        let converged = replica.stats();
+        for page in &pages {
+            replica.ingest_page(page, 10);
+        }
+        assert_eq!(replica.snapshot(), snapshot);
+        assert!(replica.stats().duplicate >= converged.duplicate);
+        assert_eq!(replica.stats().equivocated, 0);
+        assert_eq!(replica.evidence().len(), 0);
+    }
+
+    #[test]
+    fn page_bounds_hold_for_large_objects() {
+        let mut ingest = DirectoryIngest::new(TestVerifier::default());
+        let body = vec![0x5a; 4096];
+        for octet in 2..=41u8 {
+            ingest.verify_and_apply(&identity_raw(node(4, octet), 1, &body), 1);
+        }
+        let snapshot = ingest.snapshot();
+        assert_eq!(snapshot.active.len(), 40);
+        let pages: Vec<SignedObjectPage> = page_snapshot(&snapshot).collect();
+        for page in &pages {
+            assert!(page.records.len() <= MAX_PAGE_OBJECTS);
+            assert!(page.records.iter().map(Vec::len).sum::<usize>() <= MAX_PAGE_BYTES);
+        }
+        assert_eq!(
+            pages.iter().flat_map(|page| page.records.iter()).count(),
+            40
+        );
+        // 4 KiB bodies cannot fill 16 per page under the 16 KiB page bound.
+        assert!(pages[0].records.len() < MAX_PAGE_OBJECTS);
+        assert!(pages.len() > 1);
+    }
+
+    /// Codec-only fixture: a structurally valid signed-object envelope with
+    /// zero-filled signatures. `SignedObject::encode` validates lengths and
+    /// shape, never a signature, so this exercises the page codec without
+    /// claiming any cryptographic evidence.
+    fn codec_identity(home_core: u8) -> Vec<u8> {
+        let node_id = ((u16::from(home_core) - 1) << 8) | 1;
+        let body = boreas_proto::objects::NodeIdentity {
+            net_id: [0x39; 16],
+            node_id,
+            home_core_id: home_core,
+            vip: [10, 20, home_core, 1],
+            vip6: [0u8; 16],
+            role: boreas_proto::objects::NodeRole::Core,
+            mldsa_parameter_set: boreas_proto::objects::MldsaParameterSet::Mldsa65,
+            identity_pub_mldsa: vec![0x11; 32],
+            identity_pub_ed25519: [0x22; 32],
+            identity_generation: 1,
+            not_before: 1_000_000,
+            expires: 9_000_000_000_000_000,
+            scope: Vec::new(),
+        };
+        let object = boreas_proto::objects::ManagementObject {
+            net_id: [0x39; 16],
+            issuer_key_id: b"codec-fixture".to_vec(),
+            issuer_generation: 1,
+            subject_identity: boreas_proto::objects::SubjectIdentity::Node(node_id),
+            seq: 1,
+            issued_at: 1_000_000,
+            expires: 9_000_000_000_000_000,
+            extensions: Vec::new(),
+            body: boreas_proto::objects::ObjectBody::NodeIdentity(body),
+        };
+        let raw_tbs = boreas_proto::objects::encode_tbs(&object).expect("codec fixture TBS");
+        boreas_proto::messages::SignedObject {
+            object_type: boreas_proto::objects::ObjectType::NodeIdentity,
+            raw_tbs,
+            signers: vec![boreas_proto::messages::SignerSignatures {
+                role: boreas_proto::messages::SignerRole::Primary,
+                ed25519: [0u8; 64],
+                mldsa_parameter_set: boreas_proto::objects::MldsaParameterSet::Mldsa65,
+                mldsa: vec![0u8; 3309],
+            }],
+        }
+        .encode()
+        .expect("codec fixture envelope")
+    }
+
+    #[test]
+    fn page_body_round_trips_through_the_candidate_control_codec() {
+        let first = codec_identity(2);
+        let second = codec_identity(3);
+        let page = SignedObjectPage {
+            page_seq: 7,
+            records: vec![first.clone(), second.clone()],
+        };
+        let body = page.encode_wire().expect("candidate page body");
+        assert_eq!(
+            body.len(),
+            1 + 8 + 1 + 2 + first.len() + 2 + second.len()
+        );
+        assert!(body.len() <= 16 * 1024);
+        assert_eq!(SignedObjectPage::decode_wire(&body).expect("decode"), page);
+        // The subtype byte is the candidate `ControlType::DirectoryPage` tag.
+        assert_eq!(body[0], 4);
+
+        // A record that is not a signed-object envelope cannot be paged out.
+        let bogus = SignedObjectPage {
+            page_seq: 1,
+            records: vec![b"not-an-envelope".to_vec()],
+        };
+        assert_eq!(bogus.encode_wire(), Err(PageWireError::NotSignedObject));
+
+        // The candidate count bound and the empty-page rule are enforced first.
+        let too_many = SignedObjectPage {
+            page_seq: 1,
+            records: vec![first.clone(); MAX_PAGE_OBJECTS + 1],
+        };
+        assert_eq!(too_many.encode_wire(), Err(PageWireError::InvalidCount));
+        let empty = SignedObjectPage {
+            page_seq: 0,
+            records: Vec::new(),
+        };
+        assert_eq!(empty.encode_wire(), Err(PageWireError::InvalidCount));
+
+        // Hand-building an oversized page must fail closed, not truncate.
+        let oversize = SignedObjectPage {
+            page_seq: 2,
+            records: vec![first; 6],
+        };
+        assert_eq!(oversize.encode_wire(), Err(PageWireError::BodyTooLarge));
+
+        // A malformed body is refused by the candidate codec.
+        assert_eq!(
+            SignedObjectPage::decode_wire(&[0xFF; 12]),
+            Err(PageWireError::Malformed)
+        );
+    }
+
+    #[test]
+    fn empty_directory_pages_nothing() {
+        let ingest = DirectoryIngest::new(TestVerifier::default());
+        let snapshot = ingest.snapshot();
+        assert!(page_snapshot(&snapshot).next().is_none());
     }
 }
