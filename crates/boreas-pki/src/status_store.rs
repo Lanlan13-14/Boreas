@@ -109,9 +109,9 @@ use std::{
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRSS\0\0\0\x01";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const LINUX_O_NOFOLLOW: i32 = 0x10000;
+const LINUX_O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
-const LINUX_O_NOFOLLOW: i32 = 0x20000;
+const LINUX_O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(target_os = "linux")]
 const LINUX_O_NONBLOCK: i32 = 0x800;
 #[cfg(target_os = "linux")]
