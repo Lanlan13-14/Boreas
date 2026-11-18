@@ -228,22 +228,18 @@ impl TcpDnsServer {
                 }
                 continue;
             }
+            if matches!(
+                socket.state(),
+                tcp::State::SynSent | tcp::State::SynReceived
+            ) {
+                // Handshake still in progress; `may_recv()` is false in SynReceived
+                // and must not be mistaken for a peer FIN half-close.
+                continue;
+            }
 
             // Flush only a bounded amount into smoltcp's fixed send buffer.
-            if conn.transmit_offset < conn.transmit.len() && socket.can_send() {
-                let left = &conn.transmit[conn.transmit_offset..];
-                match socket.send_slice(left) {
-                    Ok(n) => conn.transmit_offset += n,
-                    Err(_) => {
-                        socket.abort();
-                        reset_connection(conn, now);
-                        continue;
-                    }
-                }
-                if conn.transmit_offset == conn.transmit.len() {
-                    conn.transmit.clear();
-                    conn.transmit_offset = 0;
-                }
+            if !flush_transmit(conn, socket, now) {
+                continue;
             }
 
             // Process frames already buffered from an earlier poll before
@@ -280,6 +276,9 @@ impl TcpDnsServer {
                     break;
                 }
             }
+            if !flush_transmit(conn, socket, now) {
+                continue;
+            }
             if completed >= self.config.max_frames_per_poll {
                 break;
             }
@@ -303,6 +302,29 @@ impl TcpDnsServer {
         }
         completed
     }
+}
+
+fn flush_transmit(
+    conn: &mut Connection,
+    socket: &mut tcp::Socket<'_>,
+    now: smoltcp::time::Instant,
+) -> bool {
+    if conn.transmit_offset < conn.transmit.len() && socket.can_send() {
+        let left = &conn.transmit[conn.transmit_offset..];
+        match socket.send_slice(left) {
+            Ok(n) => conn.transmit_offset += n,
+            Err(_) => {
+                socket.abort();
+                reset_connection(conn, now);
+                return false;
+            }
+        }
+        if conn.transmit_offset == conn.transmit.len() {
+            conn.transmit.clear();
+            conn.transmit_offset = 0;
+        }
+    }
+    true
 }
 
 fn extract_frames(

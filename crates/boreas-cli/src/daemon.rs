@@ -844,7 +844,7 @@ mod linux_daemon {
             return Err("daemon: cannot bound I/O on an invalid socket".to_string());
         }
         let timeout = libc::timeval {
-            tv_sec: PATH_IO_TIMEOUT.as_secs() as libc::time_t,
+            tv_sec: PATH_IO_TIMEOUT.as_secs() as _,
             tv_usec: 0,
         };
         for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
@@ -1211,7 +1211,7 @@ mod linux_daemon {
             Box::new(outer),
             Box::new(OpenSslInnerConnector::new(
                 inner,
-                Arc::clone(&config.extractor),
+                Arc::clone(&config.extractor) as Arc<dyn PeerIdentityExtractor>,
             )),
         );
         let tcp = link
@@ -2561,7 +2561,7 @@ mod linux_daemon {
             Box::new(outer_conn),
             Box::new(OpenSslInnerConnector::new(
                 inner_conn,
-                Arc::clone(&extractor),
+                Arc::clone(&extractor) as Arc<dyn PeerIdentityExtractor>,
             )),
         );
         let endpoints = connect_endpoints(primary_spec, backup_spec);

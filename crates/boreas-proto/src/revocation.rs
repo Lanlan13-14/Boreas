@@ -712,7 +712,7 @@ mod tests {
         let unsorted = raw_payload(&[second, first.clone()]);
         assert!(RevocationPayload::decode(&unsorted).is_err());
 
-        let mut trailing = raw_payload(&[first.clone()]);
+        let mut trailing = raw_payload(std::slice::from_ref(&first));
         trailing.push(0);
         assert_eq!(
             RevocationPayload::decode(&trailing),

@@ -654,11 +654,11 @@ fn udp_checksum(source: Ipv4Addr, destination: Ipv4Addr, udp: &[u8]) -> u16 {
 
 fn ones_complement_sum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for &[hi, lo] in chunks {
+        sum += u32::from(u16::from_be_bytes([hi, lo]));
     }
-    if let Some(&byte) = chunks.remainder().first() {
+    if let Some(&byte) = remainder.first() {
         sum += u32::from(byte) << 8;
     }
     while sum >> 16 != 0 {
