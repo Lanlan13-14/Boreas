@@ -996,13 +996,11 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         if drained == 0 {
             return Ok(0);
         }
-        if let Err(error) = write_all_bounded(circuit, &self.outbound_batch)
-            .and_then(|()| {
-                circuit
-                    .flush()
-                    .map_err(|err| PacketPathError::CircuitIo(err.kind()))
-            })
-        {
+        if let Err(error) = write_all_bounded(circuit, &self.outbound_batch).and_then(|()| {
+            circuit
+                .flush()
+                .map_err(|err| PacketPathError::CircuitIo(err.kind()))
+        }) {
             self.outbound_batch.clear();
             return Err(self.fail(error));
         }
@@ -1903,8 +1901,8 @@ mod tests {
         device.inject(&p2).expect("inject p2");
 
         let (sink, written) = OutboundSink::new();
-        let mut path = PacketPath::try_new(&device, sink, endpoints(local, peer), mtu)
-            .expect("bound path");
+        let mut path =
+            PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
         assert_eq!(path.step_outbound_batch(16, 16_000), Ok(2));
         assert_eq!(path.step_outbound_batch(16, 16_000), Ok(0));
         assert_eq!(path.stats().outbound_packets, 2);
@@ -1918,10 +1916,12 @@ mod tests {
         assert_eq!(&wire[expected_first.len()..], expected_second.as_slice());
 
         // Malformed packet poisons the path and emits no partial frame.
-        device.inject(&[0x45, 0x00, 0x00]).expect("inject malformed");
+        device
+            .inject(&[0x45, 0x00, 0x00])
+            .expect("inject malformed");
         let (sink, written) = OutboundSink::new();
-        let mut path = PacketPath::try_new(&device, sink, endpoints(local, peer), mtu)
-            .expect("bound path");
+        let mut path =
+            PacketPath::try_new(&device, sink, endpoints(local, peer), mtu).expect("bound path");
         assert_eq!(
             path.step_outbound_batch(16, 16_000),
             Err(PacketPathError::Denied(PacketDeny::Truncated))
