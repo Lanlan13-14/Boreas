@@ -13,8 +13,11 @@
 //! transport that performs no TLS and is not security evidence.
 //!
 //! Every handshake entry point arms an owner-clone shutdown guard for its
-//! absolute deadline. Socket read/write timeouts alone are per-syscall hints and
-//! cannot bound an outer-TLS backend that loops inside one call.
+//! absolute deadline where the platform supports it
+//! ([`HARD_HANDSHAKE_DEADLINE_SUPPORTED`]). Where it does not, production
+//! handshakes fail closed with `Unsupported` instead of running with a weaker
+//! bound. Socket read/write timeouts alone are per-syscall hints and cannot
+//! bound an outer-TLS backend that loops inside one call.
 
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -88,6 +91,17 @@ fn diagnostic_timing_line(phase: &'static str, elapsed_us: u128) -> String {
     format!("boreas-diagnostic-timing phase={phase} elapsed_us={elapsed_us}")
 }
 
+/// Whether this platform can interrupt an in-flight handshake syscall.
+///
+/// The owner-clone guard relies on `shutdown(Both)` on a duplicated socket
+/// handle waking the blocking read on the original handle. Windows CI showed
+/// that this does not happen there, and `try_clone` socket options are not a
+/// reliable shared-policy view either. Production handshake entry points on
+/// Windows therefore fail closed with `io::ErrorKind::Unsupported` instead of
+/// running a handshake with a weaker, unbounded guarantee. Unix keeps the hard
+/// guard.
+pub const HARD_HANDSHAKE_DEADLINE_SUPPORTED: bool = !cfg!(windows);
+
 /// Static build capabilities. These describe what this binary can do; they are
 /// not evidence that any Phase 0-5 gate is complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +114,8 @@ pub struct RuntimeCapabilities {
     pub e2e_tls: bool,
     /// Bounded circuit open/accept/forwarding exists.
     pub circuit_forwarding: bool,
+    /// The handshake guard can interrupt an in-flight I/O syscall.
+    pub hard_handshake_deadline: bool,
     /// No control socket exists in this crate.
     pub control_socket: bool,
     /// No DNS-over-TCP capability is advertised.
@@ -114,6 +130,7 @@ pub const fn runtime_capabilities() -> RuntimeCapabilities {
         hop_inner_tls_backend: cfg!(feature = "openssl-inner-tls"),
         e2e_tls: cfg!(feature = "openssl-inner-tls"),
         circuit_forwarding: true,
+        hard_handshake_deadline: HARD_HANDSHAKE_DEADLINE_SUPPORTED,
         control_socket: false,
         dns_tcp: false,
         daemon: false,
@@ -133,7 +150,9 @@ pub struct ClientTarget {
     pub path: String,
 }
 
-/// Absolute cutoff for one handshake, backed by a duplicated socket handle.
+/// Absolute cutoff for one handshake where a duplicated socket handle can
+/// interrupt the original. Production arming returns `Unsupported` elsewhere;
+/// only the `cfg(test)` protocol fixture substitutes a disarmed placeholder.
 ///
 /// [`DeadlineIo`] can refuse to start another transport operation once the
 /// deadline has passed, but it cannot interrupt a backend already blocked in a
@@ -160,13 +179,21 @@ struct GuardState {
 }
 
 impl HandshakeGuard {
+    /// Production arming. Platforms without hard cancellation fail closed; they
+    /// do not silently continue with a weaker guarantee.
     fn arm(tcp: &TcpStream, deadline: Instant) -> io::Result<Self> {
-        let socket = tcp.try_clone()?;
+        if !HARD_HANDSHAKE_DEADLINE_SUPPORTED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hard handshake cancellation is unsupported on this platform",
+            ));
+        }
         let state = std::sync::Arc::new(GuardState {
             cancelled: std::sync::Mutex::new(false),
             wake: std::sync::Condvar::new(),
             fired: std::sync::atomic::AtomicBool::new(false),
         });
+        let socket = tcp.try_clone()?;
         let thread_state = std::sync::Arc::clone(&state);
         let thread = std::thread::Builder::new()
             .name("boreas-handshake-deadline".to_owned())
@@ -175,6 +202,34 @@ impl HandshakeGuard {
             state,
             thread: Some(thread),
         })
+    }
+
+    /// Unit-test fixture used only where the production guard is unsupported.
+    ///
+    /// It is compiled only for unit tests and is never selected by a non-test
+    /// build. On Unix it delegates to the real production guard, so the normal
+    /// tests still exercise it. On Windows it returns an explicitly disarmed
+    /// placeholder so plaintext protocol tests can run; those tests do not claim
+    /// production handshake safety, and the Windows capability test asserts that
+    /// [`Self::arm`] itself returns `Unsupported`.
+    #[cfg(test)]
+    fn arm_for_unit_tests(tcp: &TcpStream, deadline: Instant) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let _ = (tcp, deadline);
+            Ok(Self {
+                state: std::sync::Arc::new(GuardState {
+                    cancelled: std::sync::Mutex::new(false),
+                    wake: std::sync::Condvar::new(),
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                }),
+                thread: None,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Self::arm(tcp, deadline)
+        }
     }
 
     fn fired(&self) -> bool {
@@ -198,10 +253,12 @@ impl HandshakeGuard {
         let _ = thread.join();
     }
 
-    /// Disarm, then report a guard-fired shutdown as a handshake timeout.
-    fn finish<T>(&mut self, result: Result<T, TunnelError>) -> Result<T, TunnelError> {
+    /// A late success is a timeout even if the watchdog was not scheduled
+    /// before disarm. Sample completion before joining the watchdog.
+    fn finish<T>(&mut self, result: Result<T, TunnelError>, deadline: Instant) -> Result<T, TunnelError> {
+        let completed_late = result.is_ok() && Instant::now() >= deadline;
         self.disarm();
-        if self.fired() {
+        if completed_late || self.fired() {
             return Err(TunnelError::Timeout);
         }
         result
@@ -211,6 +268,20 @@ impl HandshakeGuard {
 impl Drop for HandshakeGuard {
     fn drop(&mut self) {
         self.disarm();
+    }
+}
+
+/// Select the real guard in every non-test build. Unit tests on a platform
+/// without hard cancellation use an explicit placeholder; integration tests and
+/// production binaries never do.
+fn arm_handshake_guard(tcp: &TcpStream, deadline: Instant) -> io::Result<HandshakeGuard> {
+    #[cfg(test)]
+    {
+        HandshakeGuard::arm_for_unit_tests(tcp, deadline)
+    }
+    #[cfg(not(test))]
+    {
+        HandshakeGuard::arm(tcp, deadline)
     }
 }
 
@@ -246,12 +317,14 @@ impl LinkClient {
     /// Connect, run outer TLS, upgrade to WebSocket inside it, run the hop inner
     /// TLS handshake, then the `SessionHello`/`SessionAccept` authorization.
     ///
-    /// `io_timeout` bounds the exchange from before the TCP dial. The deadline
-    /// is absolute: a guard thread shuts down a duplicated socket handle when it
-    /// expires, so a trickling outer-TLS backend cannot run the handshake
-    /// indefinitely. The outer-TLS backend still receives the remaining budget
-    /// as per-read/per-write socket timeouts; that is a transport hint, not the
-    /// mechanism that makes the deadline absolute.
+    /// `io_timeout` bounds the exchange from before the TCP dial. Where the
+    /// platform supports it, a guard thread shuts down a duplicated socket
+    /// handle when the deadline expires, so a trickling outer-TLS backend cannot
+    /// run the handshake indefinitely. On platforms without that capability the
+    /// handshake fails closed with `Unsupported` before outer TLS; no weaker
+    /// fallback is used. The outer-TLS backend receives the remaining budget as
+    /// per-read/per-write timeouts; that is a transport hint, not the absolute
+    /// mechanism.
     pub fn connect(
         &self,
         target: &ClientTarget,
@@ -350,13 +423,20 @@ impl LinkClient {
 
     /// Handshake on a preconnected socket under one absolute deadline.
     ///
-    /// The owner-clone handshake guard owns a duplicated socket handle and
-    /// shuts it down when the deadline expires. That is what makes the deadline
-    /// absolute: the outer-TLS backend takes the raw `TcpStream` and may block
-    /// in, or loop over, several transport calls inside `connect`, so a per-read
-    /// socket timeout alone cannot bound it. The guard covers outer TLS, the
-    /// WebSocket upgrade, inner TLS, and the session exchange. It is disarmed
-    /// and joined only after the session handshake returns.
+    /// Where [`HARD_HANDSHAKE_DEADLINE_SUPPORTED`] is true, the owner-clone
+    /// handshake guard owns a duplicated socket handle and shuts it down when
+    /// the deadline expires. That is what makes the deadline absolute: the
+    /// outer-TLS backend takes the raw `TcpStream` and may block in, or loop
+    /// over, several transport calls inside `connect`, so a per-read socket
+    /// timeout alone cannot bound it. The guard covers outer TLS, the WebSocket
+    /// upgrade, inner TLS, and the session exchange. It is disarmed and joined
+    /// only after the session handshake returns.
+    ///
+    /// Where that capability is false (currently Windows), `arm` returns
+    /// `Unsupported` and this function fails before outer TLS. Unit tests use an
+    /// explicit `cfg(test)` placeholder only so the plaintext protocol tests can
+    /// run; that fixture never exists in a non-test build and does not grant a
+    /// production deadline token.
     ///
     /// The operation-boundary deadline wrapper is still installed after outer
     /// TLS. It recomputes the remaining budget before each operation and gives a
@@ -378,9 +458,9 @@ impl LinkClient {
         }
         let diagnostics = diagnostic_timing_enabled();
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
-        let mut guard = HandshakeGuard::arm(&tcp, deadline)?;
+        let mut guard = arm_handshake_guard(&tcp, deadline)?;
         let result = self.finish_client_handshake(tcp, target, policy, deadline, diagnostics);
-        guard.finish(result)
+        guard.finish(result, deadline)
     }
 
     fn finish_client_handshake(
@@ -481,12 +561,14 @@ impl LinkServer {
     /// handshake deadline without changing listener-wide blocking mode.
     /// Admission is still reserved before outer TLS work.
     ///
-    /// `io_timeout` bounds the exchange, starting when this call begins. The
-    /// owner-clone handshake guard shuts down a duplicated socket handle when
-    /// the deadline expires, so it is an absolute bound across outer TLS, the
-    /// WebSocket upgrade, inner TLS, and the session exchange. The outer-TLS
-    /// backend also receives the remaining budget as per-read/per-write socket
-    /// timeouts, but that hint is not what makes the deadline absolute.
+    /// `io_timeout` bounds the exchange, starting when this call begins. Where
+    /// [`HARD_HANDSHAKE_DEADLINE_SUPPORTED`] is true, the owner-clone guard
+    /// shuts down a duplicated socket handle when the deadline expires, making
+    /// it an absolute bound across outer TLS, the WebSocket upgrade, inner TLS,
+    /// and the session exchange. Elsewhere the handshake fails closed with
+    /// `Unsupported` before outer TLS; no weaker fallback is used. The
+    /// outer-TLS backend also receives the remaining budget as
+    /// per-read/per-write socket timeouts, not as the absolute mechanism.
     pub fn accept_tls_stream(
         &self,
         tcp: TcpStream,
@@ -515,11 +597,11 @@ impl LinkServer {
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
-        let mut guard = HandshakeGuard::arm(&tcp, deadline)?;
+        let mut guard = arm_handshake_guard(&tcp, deadline)?;
         let result = outer.accept(tcp).and_then(|outer| {
             self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline)
         });
-        guard.finish(result)
+        guard.finish(result, deadline)
     }
 
     /// Explicitly insecure development path: TCP straight into the WebSocket
@@ -540,10 +622,10 @@ impl LinkServer {
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
-        let mut guard = HandshakeGuard::arm(&tcp, deadline)?;
+        let mut guard = arm_handshake_guard(&tcp, deadline)?;
         let outer: Box<dyn Duplex> = Box::new(tcp);
         let result = self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline);
-        guard.finish(result)
+        guard.finish(result, deadline)
     }
 
     fn accept_outer_complete(
@@ -606,12 +688,13 @@ impl LinkServer {
 /// The timeout installed here is a per-read/per-write socket timeout, not an
 /// absolute deadline: the OS applies it afresh to every blocking syscall, and a
 /// backend such as outer TLS may perform several calls inside one handshake.
-/// Callers must not describe this as an absolute handshake deadline. The
-/// absolute cutoff comes from [`HandshakeGuard`], which shuts down a duplicated
-/// socket handle when the deadline expires. The runtime also installs the
-/// *remaining* budget before a backend call, re-checks the deadline after that
-/// call, and from the WebSocket upgrade onward [`DeadlineIo`] recomputes the
-/// remaining budget for each later operation.
+/// Callers must not describe this as an absolute handshake deadline. Where
+/// [`HARD_HANDSHAKE_DEADLINE_SUPPORTED`] is true, the absolute cutoff comes from
+/// [`HandshakeGuard`], which shuts down a duplicated socket handle when the
+/// deadline expires. The runtime also installs the *remaining* budget before a
+/// backend call, re-checks the deadline after that call, and from the WebSocket
+/// upgrade onward [`DeadlineIo`] recomputes the remaining budget for each later
+/// operation.
 ///
 /// A sub-millisecond remainder is rounded up to one millisecond: some platforms
 /// interpret a zero `SO_RCVTIMEO`/`SO_SNDTIMEO` as "wait forever", which would
@@ -636,8 +719,8 @@ mod tests {
     use boreas_proto::{ControlType, Kind, SecurityMode};
     use std::io::Read;
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -865,6 +948,7 @@ mod tests {
         drop(listener);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn handshake_guard_shuts_down_a_blocked_socket_at_the_deadline() {
         let (listener, address) = listener();
@@ -889,6 +973,38 @@ mod tests {
         drop(guard);
     }
 
+    #[test]
+    fn handshake_completion_cannot_succeed_after_the_deadline() {
+        let (listener, address) = listener();
+        let tcp = TcpStream::connect(address).expect("connect");
+        let (_peer, _) = listener.accept().expect("accept");
+        let mut guard = arm_handshake_guard(&tcp, Instant::now() + Duration::from_secs(5))
+            .expect("arm guard or unit-test fixture");
+        // Model disarming before the watchdog could observe a late success.
+        guard.disarm();
+        assert_eq!(guard.finish(Ok(()), Instant::now()), Err(TunnelError::Timeout));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_handshake_deadline_is_explicitly_unsupported_on_windows() {
+        assert!(!HARD_HANDSHAKE_DEADLINE_SUPPORTED);
+        assert!(!runtime_capabilities().hard_handshake_deadline);
+
+        let (listener, address) = listener();
+        let accept = thread::spawn(move || listener.accept().expect("accept"));
+        let tcp = TcpStream::connect(address).expect("connect");
+        let (_server, _) = accept.join().expect("server thread");
+        // This is exactly what non-test `arm_handshake_guard` calls on Windows.
+        // The cfg(test) placeholder is deliberately not used here.
+        let error = match HandshakeGuard::arm(&tcp, Instant::now() + Duration::from_secs(1)) {
+            Ok(_) => panic!("production arming must fail closed on Windows"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn handshake_guard_disarm_joins_without_shutting_down_the_socket() {
         let (listener, address) = listener();
@@ -954,6 +1070,99 @@ mod tests {
         server.join().expect("server thread");
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TimeoutEvent {
+        Armed(Duration),
+        Cleared,
+    }
+
+    /// Observes calls on the actual transport object, not a duplicated socket.
+    ///
+    /// Windows `TcpStream::try_clone` does not expose a reliable shared view of
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO`, so asserting on a clone is a false test
+    /// there. Recording the real wrapper's calls catches a dropped clear on
+    /// every platform.
+    #[derive(Clone, Default)]
+    struct TimeoutTrace {
+        events: Arc<Mutex<Vec<TimeoutEvent>>>,
+    }
+
+    impl TimeoutTrace {
+        fn record(&self, event: TimeoutEvent) {
+            self.events.lock().expect("trace lock").push(event);
+        }
+
+        fn clears(&self) -> usize {
+            self.events
+                .lock()
+                .expect("trace lock")
+                .iter()
+                .filter(|event| **event == TimeoutEvent::Cleared)
+                .count()
+        }
+
+        fn last(&self) -> Option<TimeoutEvent> {
+            self.events.lock().expect("trace lock").last().copied()
+        }
+    }
+
+    struct RecordingTransport<T> {
+        inner: T,
+        trace: TimeoutTrace,
+    }
+
+    impl<T: Read> Read for RecordingTransport<T> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(out)
+        }
+    }
+
+    impl<T: Write> Write for RecordingTransport<T> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl<T: Duplex> Duplex for RecordingTransport<T> {
+        fn has_buffered_input(&self) -> bool {
+            self.inner.has_buffered_input()
+        }
+
+        fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            if let Some(timeout) = timeout {
+                self.trace.record(TimeoutEvent::Armed(timeout));
+            }
+            self.inner.set_io_timeout(timeout)
+        }
+
+        fn clear_handshake_deadline(&self) -> io::Result<()> {
+            self.inner.clear_handshake_deadline()?;
+            self.trace.record(TimeoutEvent::Cleared);
+            Ok(())
+        }
+    }
+
+    struct RecordingOuter {
+        trace: TimeoutTrace,
+    }
+
+    impl crate::tls::OuterTlsConnector for RecordingOuter {
+        fn connect(
+            &self,
+            tcp: TcpStream,
+            _server_name: &str,
+        ) -> Result<Box<dyn Duplex>, TunnelError> {
+            Ok(Box::new(RecordingTransport {
+                inner: tcp,
+                trace: self.trace.clone(),
+            }))
+        }
+    }
+
     /// Models the failure the positive test guards against: a wrapper that
     /// forwards the handshake timeout while it is armed but silently drops the
     /// clear. Authorization still succeeds; the stale socket timeout would then
@@ -995,7 +1204,9 @@ mod tests {
         }
     }
 
-    struct ClearDroppingOuter;
+    struct ClearDroppingOuter {
+        trace: TimeoutTrace,
+    }
 
     impl crate::tls::OuterTlsConnector for ClearDroppingOuter {
         fn connect(
@@ -1003,52 +1214,15 @@ mod tests {
             tcp: TcpStream,
             _server_name: &str,
         ) -> Result<Box<dyn Duplex>, TunnelError> {
-            Ok(Box::new(ClearDropping(Box::new(tcp))))
+            Ok(Box::new(ClearDropping(RecordingTransport {
+                inner: tcp,
+                trace: self.trace.clone(),
+            })))
         }
     }
 
     #[test]
-    fn session_handshake_clears_the_socket_timeout_through_every_layer() {
-        let (listener, address) = listener();
-        let a = identity(0x0101, NodeRole::Edge);
-        let b = identity(0x0201, NodeRole::Core);
-        let server = {
-            let policy = policy(b, a);
-            let admission = admission();
-            thread::spawn(move || {
-                let (tcp, _) = listener.accept().expect("accept");
-                let observer = tcp.try_clone().expect("clone");
-                let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
-                let session = server
-                    .accept_tls_stream(tcp, &TestOnlyPlaintextOuter, policy, TIMEOUT, &admission)
-                    .expect("server session");
-                assert_eq!(observer.read_timeout().expect("read timeout"), None);
-                assert_eq!(observer.write_timeout().expect("write timeout"), None);
-                drop(session);
-            })
-        };
-
-        let client = LinkClient::new(
-            Box::new(TestOnlyPlaintextOuter),
-            Box::new(TestOnlyPlaintextTls { peer: b }),
-        );
-        let tcp = client.connect_tcp(&target(address), TIMEOUT).expect("dial");
-        let observer = tcp.try_clone().expect("clone");
-        assert!(
-            observer.read_timeout().expect("read timeout").is_some(),
-            "the per-read handshake timeout is installed before outer TLS"
-        );
-        let session = client
-            .connect_preconnected(tcp, &target(address), policy(a, b))
-            .expect("client session");
-        assert_eq!(observer.read_timeout().expect("read timeout"), None);
-        assert_eq!(observer.write_timeout().expect("write timeout"), None);
-        drop(session);
-        server.join().expect("server thread");
-    }
-
-    #[test]
-    fn a_layer_that_drops_the_clear_leaves_the_socket_timeout_armed() {
+    fn session_handshake_clears_the_timeout_through_the_real_transport() {
         let (listener, address) = listener();
         let a = identity(0x0101, NodeRole::Edge);
         let b = identity(0x0201, NodeRole::Core);
@@ -1063,19 +1237,54 @@ mod tests {
             })
         };
 
+        let trace = TimeoutTrace::default();
         let client = LinkClient::new(
-            Box::new(ClearDroppingOuter),
+            Box::new(RecordingOuter {
+                trace: trace.clone(),
+            }),
             Box::new(TestOnlyPlaintextTls { peer: b }),
         );
         let tcp = client.connect_tcp(&target(address), TIMEOUT).expect("dial");
-        let observer = tcp.try_clone().expect("clone");
         let session = client
             .connect_preconnected(tcp, &target(address), policy(a, b))
             .expect("client session");
+        assert!(trace.clears() >= 1, "the real transport must be cleared");
+        assert_eq!(trace.last(), Some(TimeoutEvent::Cleared));
+        drop(session);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn a_layer_that_drops_the_clear_is_detected_on_the_real_transport() {
+        let (listener, address) = listener();
+        let a = identity(0x0101, NodeRole::Edge);
+        let b = identity(0x0201, NodeRole::Core);
+        let server = {
+            let policy = policy(b, a);
+            let admission = admission();
+            thread::spawn(move || {
+                let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: a }));
+                let _session = server
+                    .accept(&listener, policy, TIMEOUT, &admission)
+                    .expect("server session");
+            })
+        };
+
+        let trace = TimeoutTrace::default();
+        let client = LinkClient::new(
+            Box::new(ClearDroppingOuter {
+                trace: trace.clone(),
+            }),
+            Box::new(TestOnlyPlaintextTls { peer: b }),
+        );
+        let tcp = client.connect_tcp(&target(address), TIMEOUT).expect("dial");
+        let session = client
+            .connect_preconnected(tcp, &target(address), policy(a, b))
+            .expect("client session");
+        assert_eq!(trace.clears(), 0, "the dropped clear must not reach the transport");
         assert!(
-            observer.read_timeout().expect("read timeout").is_some(),
-            "a no-op clear must leave the stale handshake timeout visible; \
-             otherwise the positive test proves nothing"
+            matches!(trace.last(), Some(TimeoutEvent::Armed(_))),
+            "the transport must still show the last armed handshake timeout"
         );
         drop(session);
         server.join().expect("server thread");
@@ -1182,9 +1391,47 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error, TunnelError::Timeout);
+        if HARD_HANDSHAKE_DEADLINE_SUPPORTED {
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "the guard must interrupt outer TLS before the backend can finish all reads"
+            );
+        }
+        // Without platform preemption the backend may finish or a per-read
+        // timeout may fire first; either way the result above must be Timeout,
+        // never a session.
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn outer_tls_silent_peer_fails_closed_instead_of_blocking_forever() {
+        const BUDGET: Duration = Duration::from_millis(300);
+        let (listener, address) = listener();
+        let a = identity(0x0101, NodeRole::Edge);
+        let b = identity(0x0201, NodeRole::Core);
+        let server = thread::spawn(move || {
+            let (_tcp, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let client = LinkClient::new(
+            Box::new(SlowOuterConnector {
+                reads: 1,
+                budget: BUDGET,
+                completed,
+            }),
+            Box::new(TestOnlyPlaintextTls { peer: b }),
+        );
+        let started = Instant::now();
+        let error = match client.connect(&target(address), policy(a, b), BUDGET) {
+            Ok(_) => panic!("a silent outer TLS peer must not produce a session"),
+            Err(error) => error,
+        };
+        assert_eq!(error, TunnelError::Timeout);
         assert!(
-            !completed.load(Ordering::SeqCst),
-            "the guard must interrupt outer TLS before the backend can finish all reads"
+            started.elapsed() < Duration::from_secs(3),
+            "the handshake must fail closed on a silent peer, not block indefinitely"
         );
         server.join().expect("server thread");
     }
@@ -1239,6 +1486,10 @@ mod tests {
         let capabilities = runtime_capabilities();
         assert!(capabilities.hop_websocket_h1);
         assert!(capabilities.circuit_forwarding);
+        assert_eq!(
+            capabilities.hard_handshake_deadline,
+            HARD_HANDSHAKE_DEADLINE_SUPPORTED
+        );
         assert!(!capabilities.control_socket);
         assert!(!capabilities.daemon);
         assert!(!capabilities.dns_tcp);

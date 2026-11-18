@@ -41,19 +41,30 @@ These changes are about bounded handshake I/O, not throughput tuning.
      remaining budget before the backend is called. Those are **per-syscall
      socket timeouts**, not an absolute deadline: outer TLS may perform several
      transport calls inside one `connect`/`accept` call.
-2. **An owner-clone shutdown guard supplies the absolute cutoff.**
+2. **An owner-clone shutdown guard supplies the absolute cutoff where the
+   platform supports it.**
    - `HandshakeGuard::arm` duplicates the TCP handle with `try_clone`, starts a
      watchdog thread with a `Condvar` wake-up, and calls `shutdown(Both)` on the
      duplicate when the absolute `Instant` expires. The guard never carries a
      bare integer descriptor.
-   - The guard is armed before outer TLS and covers the WebSocket upgrade, inner
-     TLS, and the session exchange. It is disarmed and the thread is **always
-     joined** after the session handshake returns; every error path also joins
-     through `Drop`. A fired guard is reported as `TunnelError::Timeout`.
+   - `HARD_HANDSHAKE_DEADLINE_SUPPORTED` is true on Unix and false on Windows.
+     Windows CI showed that shutdown on the `try_clone` handle does not wake a
+     blocked read on the original handle, and that clone socket options are not
+     a reliable shared view. Production `HandshakeGuard::arm` therefore returns
+     `io::ErrorKind::Unsupported` on Windows, before outer TLS; it does not
+     silently run the handshake with a weaker bound. Unit tests use an explicit
+     `cfg(test)` placeholder for plaintext protocol coverage only; that fixture
+     is absent from non-test builds and grants no production deadline token.
+   - On supported platforms the guard is armed before outer TLS and covers the
+     WebSocket upgrade, inner TLS, and the session exchange. It is disarmed and
+     the thread is **always joined** after the session handshake returns; every
+     error path also joins through `Drop`. A fired guard is reported as
+     `TunnelError::Timeout`.
    - `DeadlineIo` remains as the operation-boundary check after outer TLS. It
      recomputes the remaining budget, installs it before every read/write, and
      refuses to start an operation after the deadline. It is not the mechanism
-     that interrupts an already-blocked outer-TLS syscall; the guard is.
+     that interrupts an already-blocked outer-TLS syscall; the guard is, where
+     the platform supports it.
    - `ws::client_handshake_until` / `ws::server_handshake_until` accept the
      caller's absolute deadline and clamp it to the protocol upgrade budget.
      They no longer grant a fresh ten-second allowance after outer TLS has
@@ -63,7 +74,8 @@ These changes are about bounded handshake I/O, not throughput tuning.
      healthy data-plane link does not inherit a handshake timeout. The clear is
      forwarded explicitly by `Box`, `WsStream`, `EstablishedStream`,
      `SslStream`, and `DeadlineIo`; every hop-handshake transport layer
-     overrides both the timeout installer and the clear.
+     overrides both the timeout installer and the clear. Tests observe the real
+     wrapper/transport calls, not a duplicated socket's option snapshot.
 3. **The WebSocket frame budget keeps its overall meaning.**
    - `MAX_WS_FRAME_DEADLINE` remains 30 seconds and remains one budget for the
      whole `Read` call, covering every fragment and TLS record consumed by that
@@ -92,21 +104,26 @@ These changes are about bounded handshake I/O, not throughput tuning.
 - The outer-TLS and inner-TLS backends own their handshake loops and may perform
   several transport reads inside one of their own calls. The socket timeouts
   installed from the remaining budget bound each syscall, not the whole backend
-  call. The `HandshakeGuard` shutdown is the absolute cutoff for the hop
-  handshake; if a platform or backend fails to wake from that shutdown, the
-  wall-clock guarantee is not proven for that backend. A CPU-bound step after
-  the last transport operation cannot be interrupted, but a guard that fired
-  rejects the result instead of returning a session.
+  call. On Unix the `HandshakeGuard` shutdown is the absolute cutoff for the hop
+  handshake. On Windows production handshakes fail closed with `Unsupported`
+  before outer TLS because the platform cannot provide that cutoff. This is
+  reported as `RuntimeCapabilities::hard_handshake_deadline = false`; there is
+  no per-syscall fallback and no claim of a hard deadline on Windows.
+  A CPU-bound step after the last transport operation cannot be interrupted, but
+  a guard that fired rejects the result instead of returning a session.
 - The E2E TLS handshake over `CircuitStream` is outside this hop runtime guard.
   It still has no equivalent absolute socket shutdown and is **not** covered by
   the claim above. Adding one requires the E2E/circuit owner, not this slice.
 - No benchmark of these changes has been run in Actions yet. This file must not
   be cited as performance evidence or as a gate pass.
 - The new positive/negative coverage is in `runtime.rs` and `stream.rs`: guard
-  shutdown and disarm, guard-fired timeout classification, socket-timeout clear
-  through every wrapper, a deliberately clear-dropping negative fixture, idle
-  exchange after the budget expires, and an outer-TLS overrun test. Those tests
-  have not been run locally; Actions must supply the result.
+  shutdown (Unix) and disarm, guard-fired timeout classification when supported,
+  real-transport clear forwarding, a deliberately clear-dropping negative
+  fixture, idle exchange after the budget expires, an outer-TLS overrun test, a
+  silent-peer fail-closed test, and a Windows capability test that asserts
+  production `arm` returns `Unsupported` while the explicit `cfg(test)` fixture
+  keeps plaintext protocol tests running. Those tests have not been run locally;
+  Actions must supply the result.
 - There is no claim that the low-throughput failure is caused by handshake
   deadlines, frame deadlines, or buffering. Those remain unproven.
 - Build, test, and format verification must come from the applicable host
