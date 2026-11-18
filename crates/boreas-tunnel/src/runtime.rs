@@ -995,7 +995,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn hard_handshake_deadline_is_explicitly_unsupported_on_windows() {
-        assert!(!HARD_HANDSHAKE_DEADLINE_SUPPORTED);
+        // Compile-time invariant: the platform constant is `!cfg!(windows)`.
+        const _: () = assert!(!HARD_HANDSHAKE_DEADLINE_SUPPORTED);
         assert!(!runtime_capabilities().hard_handshake_deadline);
 
         let (listener, address) = listener();
