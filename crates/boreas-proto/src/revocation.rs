@@ -288,7 +288,7 @@ impl RevocationPayload {
         for entry in &entries {
             entry.validate()?;
         }
-        entries.sort_by(|left, right| left.scope_key().cmp(&right.scope_key()));
+        entries.sort_by_key(|left| left.scope_key());
         let mut previous: Option<(u64, u8, u16, u64)> = None;
         for entry in &entries {
             let key = entry.scope_key();

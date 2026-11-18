@@ -23,7 +23,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! cargo metadata --locked --format-version 1 --no-deps > /dev/null 2> lock-error.txt; then
+          # --no-deps only prints workspace members and skips resolution, so
+          # --locked never compared the lock against the graph; stale locks
+          # passed. Resolve the full graph so --locked is actually enforced.
+          if ! cargo metadata --locked --format-version 1 > /dev/null 2> lock-error.txt; then
             cat lock-error.txt
             echo "::error title=Stale Cargo.lock::Cargo.lock does not satisfy the workspace manifests. Dispatch the 'Refresh Cargo.lock' workflow on main, review its validated diff, then rerun CI."
             exit 1
