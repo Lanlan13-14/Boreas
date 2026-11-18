@@ -84,8 +84,11 @@ fail() { log "FAIL: $*"; exit 1; }
 "$OPENSSL_BIN" list -tls-groups | tee "$SAFE_OUT/tls-groups.txt"
 "$OPENSSL_BIN" ciphers -s -tls1_3 | tee "$SAFE_OUT/tls13-ciphers.txt"
 grep -qi 'ML-DSA-65' "$OUT/signature-algorithms.txt" || fail 'ML-DSA-65 primitive missing'
+grep -qi 'ML-DSA-87' "$OUT/signature-algorithms.txt" || fail 'ML-DSA-87 primitive missing'
 grep -qi 'ML-KEM-768' "$OUT/kem-algorithms.txt" || fail 'ML-KEM-768 primitive missing'
-grep -qi 'X25519MLKEM768' "$OUT/tls-groups.txt" || fail 'hybrid group missing'
+grep -qi 'ML-KEM-1024' "$OUT/kem-algorithms.txt" || fail 'ML-KEM-1024 primitive missing'
+grep -qi 'X25519MLKEM768' "$OUT/tls-groups.txt" || fail 'pq768 hybrid group missing'
+grep -qi 'SecP384r1MLKEM1024' "$OUT/tls-groups.txt" || fail 'pq1024 hybrid group missing'
 grep -q 'TLS_AES_256_GCM_SHA384' "$OUT/tls13-ciphers.txt" || fail 'AES-256-GCM suite missing'
 grep -q 'TLS_CHACHA20_POLY1305_SHA256' "$OUT/tls13-ciphers.txt" || fail 'ChaCha suite missing'
 
@@ -209,4 +212,91 @@ reject_case aead-mismatch 'no ciphers available|no shared cipher|handshake failu
 # Deterministic time check: the short-lived client cert is valid now, but is expired at +2 days.
 reject_case expired-client 'certificate has expired|certificate verify failed|certificate expired|verify error' \
   TLS_AES_256_GCM_SHA384 X25519MLKEM768 expired-client "$(( $(date +%s) + 172800 ))"
-log 'RESULT: backend-only OpenSSL s_server/s_client tests completed. No WebSocket-inner TLS or G-CRYPTO gate claimed.'
+
+# --- Separate Phase 0 pq1024 PoC (SecP384r1MLKEM1024 + ML-DSA-87) -----------
+# Product runtime keeps pq1024 disabled until independent interop and ADR review.
+"$OPENSSL_BIN" genpkey -algorithm ML-DSA-87 -out root1024.key
+"$OPENSSL_BIN" req -new -x509 -key root1024.key -out root1024.pem -days 365 \
+  -subj '/CN=Boreas PoC ML-DSA-87 Root' \
+  -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign'
+make_leaf_1024() {
+  local name="$1" cn="$2" serial="$3" eku="$4"
+  "$OPENSSL_BIN" genpkey -algorithm ML-DSA-87 -out "$name.key"
+  "$OPENSSL_BIN" req -new -key "$name.key" -out "$name.csr" -subj "/CN=$cn"
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=%s\nsubjectAltName=DNS:%s\n' "$eku" "$cn" > "$name.ext"
+  "$OPENSSL_BIN" x509 -req -in "$name.csr" -CA root1024.pem -CAkey root1024.key -set_serial "$serial" -days 14 -extfile "$name.ext" -out "$name.pem"
+  "$OPENSSL_BIN" verify -CAfile root1024.pem "$name.pem"
+}
+make_leaf_1024 server1024 server1024.boreas.invalid 2001 serverAuth
+make_leaf_1024 client1024 client1024.boreas.invalid 2002 clientAuth
+for name in root1024 server1024 client1024; do
+  "$OPENSSL_BIN" x509 -in "$name.pem" -noout -text > "$OUT/$name-certificate.txt"
+  grep -q 'ML-DSA-87' "$OUT/$name-certificate.txt" || fail "expected ML-DSA-87 certificate OID: $name"
+done
+
+start_server_1024() {
+  local cipher="$1" tag="$2" fifo="$WORK/server-$tag.stdin"
+  SERVER_PORT=$((20000 + RANDOM % 30000))
+  mkfifo "$fifo"
+  exec {SERVER_STDIN_FD}<>"$fifo"
+  timeout --signal=TERM --kill-after=3s 40s "$OPENSSL_BIN" s_server -accept "127.0.0.1:$SERVER_PORT" -naccept 1 -WWW \
+    -cert server1024.pem -key server1024.key -CAfile root1024.pem -Verify 1 -verify_return_error -state \
+    -tls1_3 -groups SecP384r1MLKEM1024 -sigalgs mldsa87 -ciphersuites "$cipher" \
+    -no_ticket -num_tickets 0 <&"$SERVER_STDIN_FD" >"$RAW_LOGS/server-$tag.log" 2>&1 &
+  SERVER_PID=$!
+  local ready=0
+  for _ in $(seq 1 150); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    if ss -H -ltn "sport = :$SERVER_PORT" | grep -q .; then ready=1; break; fi
+    sleep 0.1
+  done
+  [[ "$ready" == 1 ]] || fail "pq1024 server failed to listen ($tag)"
+}
+client_test_1024() {
+  local cipher="$1" tag="$2" group="$3" sigalg="$4"
+  local rc=0
+  printf 'GET /tls-response.txt HTTP/1.0\r\nHost: server1024.boreas.invalid\r\nConnection: close\r\n\r\n' |
+    timeout --signal=TERM --kill-after=3s 25s "$OPENSSL_BIN" s_client \
+      -connect "127.0.0.1:$SERVER_PORT" -servername server1024.boreas.invalid \
+      -verify_hostname server1024.boreas.invalid -verify_return_error -CAfile root1024.pem -ign_eof \
+      -cert client1024.pem -key client1024.key \
+      -no_ticket -tls1_3 -groups "$group" -sigalgs "$sigalg" -ciphersuites "$cipher" -brief -state \
+      >"$RAW_LOGS/client-$tag.log" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+success_case_1024() {
+  local cipher="$1" tag="$2"
+  start_server_1024 "$cipher" "$tag"
+  local rc
+  rc="$(client_test_1024 "$cipher" "$tag" SecP384r1MLKEM1024 mldsa87)"
+  [[ "$rc" == 0 ]] || fail "pq1024 mTLS failed or timed out ($tag rc=$rc)"
+  local server_wait=0
+  for _ in $(seq 1 400); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  if kill -0 "$SERVER_PID" 2>/dev/null; then fail "pq1024 server did not finish within 40 seconds ($tag)"; fi
+  wait "$SERVER_PID" || server_wait=$?
+  [[ "$server_wait" == 0 ]] || fail "pq1024 server exited unsuccessfully ($tag rc=$server_wait)"
+  SERVER_PID=""
+  if [[ -n "$SERVER_STDIN_FD" ]]; then exec {SERVER_STDIN_FD}>&-; SERVER_STDIN_FD=""; fi
+  grep -Fq 'Protocol version: TLSv1.3' "$RAW_LOGS/client-$tag.log" || fail "TLS 1.3 not observed ($tag)"
+  grep -Fq "Ciphersuite: $cipher" "$RAW_LOGS/client-$tag.log" || fail "cipher not observed ($tag)"
+  grep -Fq 'Negotiated TLS1.3 group: SecP384r1MLKEM1024' "$RAW_LOGS/client-$tag.log" || fail "pq1024 hybrid group not observed ($tag)"
+  grep -Eiq '^Signature type: mldsa87$' "$RAW_LOGS/client-$tag.log" || fail "server CertificateVerify mldsa87 signature not observed ($tag)"
+  grep -Fq 'Verification: OK' "$RAW_LOGS/client-$tag.log" || fail "server chain not verified ($tag)"
+  grep -Fq 'BOREAS_TLS_PLAINTEXT_OK' "$RAW_LOGS/client-$tag.log" || fail "TLS plaintext response marker missing ($tag)"
+  grep -Eqi '^verify return:1$' "$RAW_LOGS/server-$tag.log" || fail "server did not log successful pq1024 client chain verification ($tag)"
+  log "PASS TLS1.3 mTLS group=SecP384r1MLKEM1024 sigalg=mldsa87 cipher=$cipher HTTP-response ($tag)"
+}
+success_case_1024 TLS_AES_256_GCM_SHA384 pq1024-aes256gcm
+success_case_1024 TLS_CHACHA20_POLY1305_SHA256 pq1024-chacha20
+start_server_1024 TLS_AES_256_GCM_SHA384 negative-pq1024-group-mismatch
+mismatch_rc="$(client_test_1024 TLS_AES_256_GCM_SHA384 negative-pq1024-group-mismatch X25519MLKEM768 mldsa87)"
+stop_server
+[[ "$mismatch_rc" != 0 && "$mismatch_rc" != 124 && "$mismatch_rc" != 137 && "$mismatch_rc" != 143 ]] || fail "pq1024 server did not reject X25519MLKEM768 client"
+grep -Eiq 'no suitable key share|no shared group|handshake failure' "$RAW_LOGS/client-negative-pq1024-group-mismatch.log" "$RAW_LOGS/server-negative-pq1024-group-mismatch.log" || fail "expected group mismatch reason absent"
+log "PASS expected TLS rejection (pq1024-group-mismatch)"
+
+log 'RESULT: backend-only OpenSSL s_server/s_client pq768 + pq1024 PoC tests completed. No WebSocket-inner TLS or G-CRYPTO gate claimed.'

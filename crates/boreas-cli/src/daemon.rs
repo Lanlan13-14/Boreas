@@ -2870,7 +2870,7 @@ mod linux_daemon {
         );
 
         let mut last_dropped = 0u64;
-        let stop = loop {
+        let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
             if let Err(reason) = policy_window.check() {
@@ -2912,69 +2912,104 @@ mod linux_daemon {
 
             // Both packet sources are nonblocking here: TUN reads are zero-time
             // readiness queries and idle waiting happens once per iteration.
-            // Status freshness is owned by the watchdog, so a blocking read can
-            // never stall the section 3.4 deadline.
+            // Drain currently ready packets (bounded per turn, §6.4: never
+            // wait on a coalescing timer) so burst TCP traffic is not
+            // serialized by per-packet poll syscalls.
+            const MAX_READY_BATCH: usize = 16;
             let mut made_progress = false;
-            match path.step_outbound() {
-                Ok(Some(_len)) => {
-                    made_progress = true;
+            for _ in 0..MAX_READY_BATCH {
+                if let Some(reason) = watchdog.fault() {
+                    path.close();
+                    return Err(reason);
+                }
+                if let Some(limit) = max_packets {
                     let stats = path.stats();
-                    counters
-                        .tx_packets
-                        .store(stats.outbound_packets, Ordering::Relaxed);
-                    counters
-                        .tx_bytes
-                        .store(stats.outbound_bytes, Ordering::Relaxed);
-                }
-                Ok(None) => {
-                    // `Ok(None)` covers both "no host packet" and "a valid host
-                    // packet the adapter discarded locally". The latter consumed
-                    // a packet, so it counts as work: sleeping in front of a
-                    // still-ready TUN queue would leak latency for no reason.
-                    let dropped = path.stats().dropped_outbound;
-                    made_progress = iteration_progress(made_progress, last_dropped, dropped);
-                    last_dropped = dropped;
-                }
-                Err(PacketPathError::Denied(_)) => {
-                    // `step_outbound` discards ordinary local traffic itself.
-                    // Reaching here means the packet was malformed or the host
-                    // packet interface failed; that remains terminal.
-                    if let Some(reason) = watchdog.fault() {
-                        path.close();
-                        return Err(reason);
+                    let total = packets_before
+                        .saturating_add(stats.outbound_packets)
+                        .saturating_add(stats.inbound_packets);
+                    if total >= limit {
+                        break;
                     }
-                    return Err(
-                        "daemon: outbound packet path rejected a malformed host packet".to_string(),
-                    );
                 }
-                Err(error) => {
-                    // A watchdog `shutdown()` surfaces here as an I/O error; the
-                    // status reason must win over the symptom it caused.
-                    if let Some(reason) = watchdog.fault() {
-                        path.close();
-                        return Err(reason);
+                match path.step_outbound() {
+                    Ok(Some(_len)) => {
+                        made_progress = true;
+                        let stats = path.stats();
+                        counters
+                            .tx_packets
+                            .store(stats.outbound_packets, Ordering::Relaxed);
+                        counters
+                            .tx_bytes
+                            .store(stats.outbound_bytes, Ordering::Relaxed);
                     }
-                    if host_side_failure(&error) {
-                        return Err(format!("daemon: outbound packet path error: {error:?}"));
+                    Ok(None) => {
+                        let dropped = path.stats().dropped_outbound;
+                        let locally_dropped = iteration_progress(false, last_dropped, dropped);
+                        last_dropped = dropped;
+                        if locally_dropped {
+                            made_progress = true;
+                            continue;
+                        }
+                        break;
                     }
-                    break PathStop::Failed {
-                        kind: path_failure_kind(&error),
-                        reason: format!("outbound circuit error: {error:?}"),
-                    };
+                    Err(PacketPathError::Denied(_)) => {
+                        if let Some(reason) = watchdog.fault() {
+                            path.close();
+                            return Err(reason);
+                        }
+                        return Err(
+                            "daemon: outbound packet path rejected a malformed host packet"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        if let Some(reason) = watchdog.fault() {
+                            path.close();
+                            return Err(reason);
+                        }
+                        if host_side_failure(&error) {
+                            return Err(format!("daemon: outbound packet path error: {error:?}"));
+                        }
+                        break 'outer PathStop::Failed {
+                            kind: path_failure_kind(&error),
+                            reason: format!("outbound circuit error: {error:?}"),
+                        };
+                    }
                 }
             }
 
             // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
             // FrameIo and CircuitStream can all hold bytes after an earlier read.
-            // Drain whenever any layer reports buffered input as well.
-            let buffered = path.has_buffered_input();
-            let socket_ready = if buffered {
-                // Buffered work is already known to be readable; skip the probe.
+            // Drain up to MAX_READY_BATCH buffered/ready frames per turn.
+            let mut buffered = path.has_buffered_input();
+            let mut socket_ready = if buffered {
                 false
             } else {
                 poll_io(sock_fd, None, Duration::ZERO)?.0
             };
-            if buffered || socket_ready {
+            for step in 0..MAX_READY_BATCH {
+                if let Some(reason) = watchdog.fault() {
+                    path.close();
+                    return Err(reason);
+                }
+                if let Some(limit) = max_packets {
+                    let stats = path.stats();
+                    let total = packets_before
+                        .saturating_add(stats.outbound_packets)
+                        .saturating_add(stats.inbound_packets);
+                    if total >= limit {
+                        break;
+                    }
+                }
+                if step > 0 {
+                    buffered = path.has_buffered_input();
+                    socket_ready = false;
+                    if !buffered {
+                        break;
+                    }
+                } else if !buffered && !socket_ready {
+                    break;
+                }
                 match path.step_inbound() {
                     Ok(Some(_len)) => {
                         made_progress = true;
@@ -2987,13 +3022,11 @@ mod linux_daemon {
                             .store(stats.inbound_bytes, Ordering::Relaxed);
                     }
                     Ok(None) => {
-                        // The watchdog's `shutdown()` also surfaces as a clean
-                        // end of stream; the status reason must win.
                         if let Some(reason) = watchdog.fault() {
                             path.close();
                             return Err(reason);
                         }
-                        break PathStop::PeerClosed;
+                        break 'outer PathStop::PeerClosed;
                     }
                     Err(error) => {
                         if let Some(reason) = watchdog.fault() {
@@ -3003,13 +3036,14 @@ mod linux_daemon {
                         if host_side_failure(&error) {
                             return Err(format!("daemon: inbound packet path error: {error:?}"));
                         }
-                        break PathStop::Failed {
+                        break 'outer PathStop::Failed {
                             kind: path_failure_kind(&error),
                             reason: format!("inbound circuit error: {error:?}"),
                         };
                     }
                 }
             }
+            buffered = path.has_buffered_input();
 
             if !made_progress && !buffered {
                 if tun.raw_fd().is_none() && !socket_ready {

@@ -68,6 +68,12 @@
 - 审查开始快照为 `ade6a03`；审查期间 `origin/main` 已变为 `ed02ab1`，本地又出现 `35d2aca`、`b486c69`。这些后续 SHA **未审计**，本文不把 `ade6a03`/`86ca08c`/`fde503d` 的结论外推给它们；`b486c69` 声称 pin openwrt actions，但没有本轮的 exact-SHA Actions 证据。
 - 24 个门禁仍全部 open，`gates.json` 未改（24/24 open、evidence 为空），无 pre4；这些精确 SHA 的通过/失败不改变任何 gate 状态。
 
+### 2026-11-18 round 29：checkpoint 修复合入 `main` 与后续实测（不关闭门禁，不发版）
+
+- `24aab9fe80e9b4e7e22894e343531c5c3552fd22`（修复 TCP DNS `SynReceived` 误判半关闭、`daemon.rs` `path_epoch`/特征对象/Clippy、PKI 持久锁 `Drop::unlock()` 与 `aarch64` `O_NOFOLLOW` 八进制、`rust-tls.yml` `POLICY_FIXTURE`/`OWNER_UID`）在 `checkpoint/phase0-5-20261118` 与合入后的 `main` 上通过：Rust [44341006755](https://github.com/Lanlan13-14/Boreas/actions/runs/44341006755)、TUN [44341006260](https://github.com/Lanlan13-14/Boreas/actions/runs/44341006260)、OpenWrt [44341004154](https://github.com/Lanlan13-14/Boreas/actions/runs/44341004154)、5 平台 [44341004213](https://github.com/Lanlan13-14/Boreas/actions/runs/44341004213)、TLS [44341005167](https://github.com/Lanlan13-14/Boreas/actions/runs/44341005167)，并在 `main` 上通过 Native Wintun+utun（含 arm64）[44342848595](https://github.com/Lanlan13-14/Boreas/actions/runs/44342848595)。安全 [44341004145](https://github.com/Lanlan13-14/Boreas/actions/runs/44341004145) 仅在原生 OpenSSL 4.1.0 8-CVE 门禁按预期阻塞（4.1.1 尚未发布）。
+- `ff6b2b5` / `90003ff` 新增 `boreas pki sign-policy` 并在 `netns_daemon_smoke.sh` 接入回退，在 `main` 上通过 Rust [44345810306](https://github.com/Lanlan13-14/Boreas/actions/runs/44345810306)、TUN [44345810602](https://github.com/Lanlan13-14/Boreas/actions/runs/44345810602)、OpenWrt [44345810343](https://github.com/Lanlan13-14/Boreas/actions/runs/44345810343)、5 平台 [44345810303](https://github.com/Lanlan13-14/Boreas/actions/runs/44345810303)、TLS [44345810273](https://github.com/Lanlan13-14/Boreas/actions/runs/44345810273) 与真实安装回归 Deploy [44347556208](https://github.com/Lanlan13-14/Boreas/actions/runs/44347556208)。
+- Performance [44347546964](https://github.com/Lanlan13-14/Boreas/actions/runs/44347546964)（`ff6b2b5`）：`50ms/0%/10Mbps` 与路由矩阵通过；`200ms/0.1%`（`2.581/1.546 Mbps < 3.0`）、`1 MiB/8 MiB` 诊断（`1.188/1.155` 与 `2.203 Mbps` 超时）、`200ms/3%` 与 `400ms/1%` 仍失败。24 个门禁仍全部 open，无发版。
+
 ## 24 门禁逐行映射
 
 | 门禁 | Phase(计划行) | 已有实现入口(集成状态未复核) | 精确证据(来源 SHA → run) | 剩余 runtime / 外部验收 |
