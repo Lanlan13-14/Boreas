@@ -476,6 +476,11 @@ assert_absent "$PNET/releases/test.9"
 # 1. --dry-run: read-only, never executes the candidate
 # ---------------------------------------------------------------------------
 
+# The network-id mismatch case above intentionally executes config-migrate
+# before refusing the canonical config. Start a new execution-audit window for
+# dry-run and the following pre-execution rejection cases; do not attribute
+# those earlier, expected setup calls to this dry-run.
+: > "$CAND_LOG"
 MAT=$(mkmat dry)
 expect_ok 'dry-run accepts valid local inputs' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir" --dry-run
