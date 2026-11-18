@@ -1215,11 +1215,17 @@ mod attachment_tests {
             Err(AttachmentReject::Duplicate)
         );
         assert_eq!(admission.admit_backup(0x0203), Ok(()));
-        assert_eq!(admission.admit_backup(0x0204), Err(AttachmentReject::BackupFull));
+        assert_eq!(
+            admission.admit_backup(0x0204),
+            Err(AttachmentReject::BackupFull)
+        );
         assert_eq!(admission.primary(), 1);
         assert_eq!(admission.backup_count(), 1);
         assert_eq!(admission.total(), 2);
-        assert_eq!(admission.admit_primary(0), Err(AttachmentReject::InvalidNode));
+        assert_eq!(
+            admission.admit_primary(0),
+            Err(AttachmentReject::InvalidNode)
+        );
     }
 
     #[test]

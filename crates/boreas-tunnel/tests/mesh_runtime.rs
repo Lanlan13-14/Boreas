@@ -48,14 +48,16 @@ use boreas_proto::messages::{
 };
 use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_proto::objects::{
-    AttachmentLease, CoreLsa, Extension, ManagementObject, MldsaParameterSet, NodeRole as ObjectRole,
-    ObjectBody, ObjectType, SubjectIdentity,
+    AttachmentLease, CoreLsa, Extension, ManagementObject, MldsaParameterSet,
+    NodeRole as ObjectRole, ObjectBody, ObjectType, SubjectIdentity,
 };
 use boreas_tunnel::directory::{
     ApplyOutcome, DirectoryIngest, DirectoryKey, DirectoryObjectKind, IngestOutcome, KeyStatus,
     SignedObjectPage, page_snapshot, pki_verifier::PkiObjectVerifier,
 };
-use boreas_tunnel::e2e::{RelayHop, RelayProgress, accept_circuit, accept_e2e, open_circuit, open_e2e};
+use boreas_tunnel::e2e::{
+    RelayHop, RelayProgress, accept_circuit, accept_e2e, open_circuit, open_e2e,
+};
 use boreas_tunnel::relay::{MeshTopology, NodeRef};
 use boreas_tunnel::resource::{Admission, Limits};
 use boreas_tunnel::session::SessionPolicy;
@@ -338,8 +340,8 @@ fn pki() -> &'static Temp {
 fn verified_default_policy() -> VerifiedNetworkContext {
     static POLICY: OnceLock<VerifiedNetworkContext> = OnceLock::new();
     *POLICY.get_or_init(|| {
-        let ed = PKey::private_key_from_raw_bytes(&[0x39; 32], Id::ED25519)
-            .expect("policy Ed root");
+        let ed =
+            PKey::private_key_from_raw_bytes(&[0x39; 32], Id::ED25519).expect("policy Ed root");
         let pq = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[0x73; 32])
             .expect("policy ML-DSA root");
         let pin = boreas_pki::root_authorization::NetworkRootPin::provisioned(
@@ -706,8 +708,9 @@ fn build() -> (
 ) {
     let t = pki();
     let authority = identity_authority();
-    let scope = IssuerScope::for_identity(vec![PkiNodeRole::Edge, PkiNodeRole::Core], vec![1, 2, 3])
-        .expect("bounded identity scope");
+    let scope =
+        IssuerScope::for_identity(vec![PkiNodeRole::Edge, PkiNodeRole::Core], vec![1, 2, 3])
+            .expect("bounded identity scope");
     let authority_record = authority.issuer_record(scope).expect("authority record");
     let core = core_operational_key(2, 0x61);
     let core_record = core.issuer_record();
@@ -759,11 +762,9 @@ fn build() -> (
     let mut trusted = Vec::new();
     for spec in specs {
         let issued = issue_node(t, &authority, &mut trust, spec);
-        let verified = VerifiedNodeIdentity::from_verified_object(
-            &issued.object,
-            &verified_default_policy(),
-        )
-        .expect("policy-bound identity");
+        let verified =
+            VerifiedNodeIdentity::from_verified_object(&issued.object, &verified_default_policy())
+                .expect("policy-bound identity");
         peers.insert(spec.leaf, verified.peer_identity());
         trusted.push(verified);
         nodes.insert(spec.leaf, issued);
@@ -812,15 +813,22 @@ impl Mesh {
     }
 
     fn outer_acceptor(&self) -> Result<OpenSslOuterTlsAcceptor, String> {
-        OpenSslOuterTlsAcceptor::from_pem_files(self.dir.path("outer.pem"), self.dir.path("outer.key"))
-            .map_err(|e| e.to_string())
+        OpenSslOuterTlsAcceptor::from_pem_files(
+            self.dir.path("outer.pem"),
+            self.dir.path("outer.key"),
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn inner_connector(&self, name: &str) -> Result<OpenSslInnerConnector, String> {
         let identity = self.leaf(name).pem();
-        let connector = OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
-            .map_err(|e| e.to_string())?;
-        Ok(OpenSslInnerConnector::new(connector, self.extractor.clone()))
+        let connector =
+            OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
+                .map_err(|e| e.to_string())?;
+        Ok(OpenSslInnerConnector::new(
+            connector,
+            self.extractor.clone(),
+        ))
     }
 
     fn inner_acceptor(&self, name: &str) -> Result<OpenSslInnerAcceptor, String> {
@@ -832,8 +840,9 @@ impl Mesh {
 
     fn e2e_backend(&self, name: &str) -> Result<OpenSslE2eBackend, String> {
         let identity = self.leaf(name).pem();
-        let connector = OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
-            .map_err(|e| e.to_string())?;
+        let connector =
+            OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
+                .map_err(|e| e.to_string())?;
         let acceptor = OpenSslAcceptor::from_pem_identity(&identity, Policy::production_default())
             .map_err(|e| e.to_string())?;
         Ok(OpenSslE2eBackend::new(
@@ -966,10 +975,9 @@ fn authenticated_edge_core_and_core_core_sessions_bind_verified_identities() {
     assert_eq!(b.node_id, 0x0101, "Core 2, VIP octet 1");
     assert_eq!(c.node_id, 0x0201, "Core 3, VIP octet 1");
 
-    for (client, client_peer, server, server_peer) in [
-        ("edge-a", a, "core-b", b),
-        ("core-b", b, "core-c", c),
-    ] {
+    for (client, client_peer, server, server_peer) in
+        [("edge-a", a, "core-b", b), ("core-b", b, "core-c", c)]
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let address = listener.local_addr().expect("listener address");
         let server_thread = {
@@ -1077,7 +1085,11 @@ fn single_hop_relay_forwards_circuit_frames_over_two_tls_sessions() {
             let mut hop = RelayHop::new(admission(), 8, b).map_err(|e| e.to_string())?;
             let mut forwarded = 0usize;
             loop {
-                match hop.relay_once(&mut upstream.session, &mut downstream.session, Instant::now()) {
+                match hop.relay_once(
+                    &mut upstream.session,
+                    &mut downstream.session,
+                    Instant::now(),
+                ) {
                     Ok(RelayProgress::Continue) => forwarded += 1,
                     Ok(RelayProgress::CircuitClosed) => {
                         forwarded += 1;
@@ -1103,7 +1115,10 @@ fn single_hop_relay_forwards_circuit_frames_over_two_tls_sessions() {
         thread::spawn(move || -> Result<Vec<u8>, String> {
             let mut session = connect(&mesh, "edge-d", d, address_b, b)?;
             let (mut circuit, info) = accept_circuit(&mut session).map_err(|e| e.to_string())?;
-            assert_eq!(info.path_hops, hops, "the acceptor learns the declared path");
+            assert_eq!(
+                info.path_hops, hops,
+                "the acceptor learns the declared path"
+            );
             let mut received = Vec::new();
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
@@ -1138,7 +1153,10 @@ fn single_hop_relay_forwards_circuit_frames_over_two_tls_sessions() {
         }
         circuit.finish().expect("close circuit");
     }
-    let received = endpoint_d.join().expect("join edge-d").expect("edge-d path");
+    let received = endpoint_d
+        .join()
+        .expect("join edge-d")
+        .expect("edge-d path");
     let report = relay.join().expect("join core-b").expect("core-b path");
     assert_eq!(sha256(&received), sha256(&expected));
     assert_eq!(received.len(), expected.len());

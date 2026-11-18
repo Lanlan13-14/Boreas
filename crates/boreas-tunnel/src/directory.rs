@@ -1290,7 +1290,8 @@ impl EvidenceStore {
 
 impl<'a> IntoIterator for &'a EvidenceStore {
     type Item = &'a ForkEvidence;
-    type IntoIter = std::collections::btree_map::Values<'a, (DirectoryKey, VersionKey), ForkEvidence>;
+    type IntoIter =
+        std::collections::btree_map::Values<'a, (DirectoryKey, VersionKey), ForkEvidence>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.values()
@@ -1390,7 +1391,12 @@ impl<V: ObjectVerifier> DirectoryIngest<V> {
                 // §3.3: freeze the conflicting object at once, even though the
                 // second body never enters convergence.
                 self.convergence.isolate(facts.key(), facts.version);
-                self.note_fork(facts.key(), facts.version, retained, raw_signed_object.to_vec());
+                self.note_fork(
+                    facts.key(),
+                    facts.version,
+                    retained,
+                    raw_signed_object.to_vec(),
+                );
                 self.stats.equivocated = self.stats.equivocated.saturating_add(1);
                 return IngestOutcome::Equivocated;
             }
@@ -1662,10 +1668,12 @@ pub mod pki_verifier {
                 Ok(verified) => facts_from_object(verified.object(), verified.object_id())
                     .ok_or(VerifyReject::Rejected),
                 Err(PkiError::Equivocation) => match decode_original(raw_signed_object) {
-                    Some((object, content_hash)) => match facts_from_object(&object, content_hash) {
-                        Some(facts) => Err(VerifyReject::Equivocation(facts)),
-                        None => Err(VerifyReject::Rejected),
-                    },
+                    Some((object, content_hash)) => {
+                        match facts_from_object(&object, content_hash) {
+                            Some(facts) => Err(VerifyReject::Equivocation(facts)),
+                            None => Err(VerifyReject::Rejected),
+                        }
+                    }
                     None => Err(VerifyReject::Rejected),
                 },
                 Err(_) => Err(VerifyReject::Rejected),
@@ -2501,14 +2509,8 @@ mod tests {
         let mut reverse = DirectoryConvergence::new();
         let mut smaller_first = lsa(7, 1, 4, 40);
         smaller_first.payload = vec![2];
-        assert_eq!(
-            reverse.apply(smaller_first),
-            Ok(ApplyOutcome::Applied)
-        );
-        assert_eq!(
-            reverse.apply(lsa(7, 1, 4, 40)),
-            Ok(ApplyOutcome::Duplicate)
-        );
+        assert_eq!(reverse.apply(smaller_first), Ok(ApplyOutcome::Applied));
+        assert_eq!(reverse.apply(lsa(7, 1, 4, 40)), Ok(ApplyOutcome::Duplicate));
         assert_eq!(reverse.snapshot(), state.snapshot());
     }
 
@@ -3010,10 +3012,7 @@ mod ingest_tests {
             ingest.evidence().dropped(),
             total - MAX_EVIDENCE_ENTRIES as u64
         );
-        assert_eq!(
-            ingest.stats().evidence_dropped,
-            ingest.evidence().dropped()
-        );
+        assert_eq!(ingest.stats().evidence_dropped, ingest.evidence().dropped());
     }
 
     #[test]
@@ -3152,10 +3151,7 @@ mod ingest_tests {
             records: vec![first.clone(), second.clone()],
         };
         let body = page.encode_wire().expect("candidate page body");
-        assert_eq!(
-            body.len(),
-            1 + 8 + 1 + 2 + first.len() + 2 + second.len()
-        );
+        assert_eq!(body.len(), 1 + 8 + 1 + 2 + first.len() + 2 + second.len());
         assert!(body.len() <= 16 * 1024);
         assert_eq!(SignedObjectPage::decode_wire(&body).expect("decode"), page);
         // The subtype byte is the candidate `ControlType::DirectoryPage` tag.

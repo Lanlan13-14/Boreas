@@ -700,10 +700,7 @@ pub enum DedupDecision {
     KeepBoth,
     /// Both links are authorized and probed. Drain the redundant reverse-dial
     /// link; the primary dialer's link survives.
-    Drain {
-        keep: [u8; 16],
-        drain: [u8; 16],
-    },
+    Drain { keep: [u8; 16], drain: [u8; 16] },
 }
 
 #[derive(Clone, Debug)]
@@ -783,10 +780,7 @@ impl MeshTopology {
     }
 
     pub fn add_core(&mut self, core_id: u8, now: Instant) -> Result<(), MeshError> {
-        if core_id == 0
-            || usize::from(core_id) > MAX_MESH_CORES
-            || core_id == self.local_core
-        {
+        if core_id == 0 || usize::from(core_id) > MAX_MESH_CORES || core_id == self.local_core {
             return Err(MeshError::InvalidCore);
         }
         if self.peers.contains_key(&core_id) {
@@ -905,7 +899,9 @@ impl MeshTopology {
     }
 
     pub fn link(&self, core_id: u8, direction: LinkDirection) -> Option<MeshLink> {
-        self.peers.get(&core_id).and_then(|peer| peer.link(direction))
+        self.peers
+            .get(&core_id)
+            .and_then(|peer| peer.link(direction))
     }
 
     /// §3.1 deduplication: drain a redundant dial only when BOTH directions are
@@ -1326,12 +1322,7 @@ mod tests {
 mod mesh_tests {
     use super::*;
 
-    fn link(
-        instance: u8,
-        direction: LinkDirection,
-        authorized: bool,
-        probe_ok: bool,
-    ) -> MeshLink {
+    fn link(instance: u8, direction: LinkDirection, authorized: bool, probe_ok: bool) -> MeshLink {
         MeshLink {
             connection_instance: [instance; 16],
             conn_slot: 0,
@@ -1373,10 +1364,7 @@ mod mesh_tests {
         // Past the deadline but an authorized inbound link exists: the pair is
         // already up, so a reverse dial would only create a duplicate.
         topology
-            .note_link(
-                2,
-                link(0x21, LinkDirection::Inbound, true, true),
-            )
+            .note_link(2, link(0x21, LinkDirection::Inbound, true, true))
             .expect("inbound link");
         assert_eq!(
             topology.reverse_dial_allowed(2, now + REVERSE_DIAL_AFTER * 2),
@@ -1506,7 +1494,10 @@ mod mesh_tests {
         topology.mark_pair_down(2, 4).expect("pair down");
         assert_eq!(topology.path(2, 5), Err(MeshError::NoPath));
         topology.mark_pair_up(2, 5).expect("pair up");
-        assert_eq!(topology.path(2, 5).expect("restored").cores(), &[2u8, 5][..]);
+        assert_eq!(
+            topology.path(2, 5).expect("restored").cores(),
+            &[2u8, 5][..]
+        );
     }
 
     #[test]
@@ -1557,10 +1548,7 @@ mod mesh_tests {
         assert_eq!(topology.core_count(), MAX_MESH_CORES - 1);
         assert_eq!(topology.add_core(0, now), Err(MeshError::InvalidCore));
         assert_eq!(topology.add_core(17, now), Err(MeshError::InvalidCore));
-        assert_eq!(
-            topology.mark_pair_down(3, 3),
-            Err(MeshError::InvalidCore)
-        );
+        assert_eq!(topology.mark_pair_down(3, 3), Err(MeshError::InvalidCore));
         // Core 16 was just removed from this view.
         assert_eq!(topology.mark_pair_down(3, 16), Err(MeshError::UnknownCore));
     }
