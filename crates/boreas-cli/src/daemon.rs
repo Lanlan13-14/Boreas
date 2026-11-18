@@ -1917,6 +1917,9 @@ mod linux_daemon {
                     "daemon Linux TUN creation failed (need CAP_NET_ADMIN / /dev/net/tun): {e:?}"
                 )
             })?;
+            queue
+                .set_nonblocking(true)
+                .map_err(|e| format!("daemon Linux TUN O_NONBLOCK failed: {e:?}"))?;
             let actual_name = dev.name().to_string();
             TunEndpoint::Real {
                 _device: dev,
@@ -2913,29 +2916,29 @@ mod linux_daemon {
                 manager.maintain(Instant::now());
             }
 
-            // Both packet sources are nonblocking here: TUN reads are zero-time
-            // readiness queries and idle waiting happens once per iteration.
-            // Drain currently ready packets (bounded per turn, §6.4: never
-            // wait on a coalescing timer) so burst TCP traffic is not
-            // serialized by per-packet poll syscalls.
-            const MAX_READY_BATCH: usize = 16;
+            // Both packet sources are nonblocking here: TUN reads are single-syscall
+            // non-blocking reads and idle waiting happens once per iteration.
+            // Drain currently ready packets in a single contiguous TLS/WS write
+            // (bounded per turn, §6.4: never wait on a coalescing timer) so
+            // burst TCP traffic fills full MSS segments instead of splitting
+            // 1613 B single-packet records into 1448 + 165 B tail segments.
+            const MAX_OUTBOUND_BATCH_PACKETS: usize = 16;
+            const MAX_OUTBOUND_BATCH_BYTES: usize = 16_000;
+            const MAX_INBOUND_BATCH_PACKETS: usize = 32;
             let mut made_progress = false;
-            for _ in 0..MAX_READY_BATCH {
-                if let Some(reason) = watchdog.fault() {
-                    path.close();
-                    return Err(reason);
-                }
-                if let Some(limit) = max_packets {
+            let remaining_budget = max_packets
+                .map(|limit| {
                     let stats = path.stats();
                     let total = packets_before
                         .saturating_add(stats.outbound_packets)
                         .saturating_add(stats.inbound_packets);
-                    if total >= limit {
-                        break;
-                    }
-                }
-                match path.step_outbound() {
-                    Ok(Some(_len)) => {
+                    usize::try_from(limit.saturating_sub(total)).unwrap_or(usize::MAX)
+                })
+                .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
+            let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
+            if out_limit > 0 {
+                match path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES) {
+                    Ok(drained) if drained > 0 => {
                         made_progress = true;
                         let stats = path.stats();
                         counters
@@ -2945,15 +2948,12 @@ mod linux_daemon {
                             .tx_bytes
                             .store(stats.outbound_bytes, Ordering::Relaxed);
                     }
-                    Ok(None) => {
+                    Ok(_) => {
                         let dropped = path.stats().dropped_outbound;
-                        let locally_dropped = iteration_progress(false, last_dropped, dropped);
-                        last_dropped = dropped;
-                        if locally_dropped {
+                        if iteration_progress(false, last_dropped, dropped) {
                             made_progress = true;
-                            continue;
                         }
-                        break;
+                        last_dropped = dropped;
                     }
                     Err(PacketPathError::Denied(_)) => {
                         if let Some(reason) = watchdog.fault() {
@@ -2983,14 +2983,14 @@ mod linux_daemon {
 
             // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
             // FrameIo and CircuitStream can all hold bytes after an earlier read.
-            // Drain up to MAX_READY_BATCH buffered/ready frames per turn.
+            // Drain up to MAX_INBOUND_BATCH_PACKETS buffered/ready frames per turn.
             let mut buffered = path.has_buffered_input();
             let mut socket_ready = if buffered {
                 false
             } else {
                 poll_io(sock_fd, None, Duration::ZERO)?.0
             };
-            for step in 0..MAX_READY_BATCH {
+            for step in 0..MAX_INBOUND_BATCH_PACKETS {
                 if let Some(reason) = watchdog.fault() {
                     path.close();
                     return Err(reason);
@@ -3006,8 +3006,12 @@ mod linux_daemon {
                 }
                 if step > 0 {
                     buffered = path.has_buffered_input();
-                    socket_ready = false;
-                    if !buffered {
+                    socket_ready = if buffered {
+                        false
+                    } else {
+                        poll_io(sock_fd, None, Duration::ZERO)?.0
+                    };
+                    if !buffered && !socket_ready {
                         break;
                     }
                 } else if !buffered && !socket_ready {

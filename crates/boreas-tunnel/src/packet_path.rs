@@ -727,6 +727,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     policy: PointToPoint,
     state: PathState,
     stats: PacketStats,
+    outbound_batch: Vec<u8>,
+    inbound_scratch: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

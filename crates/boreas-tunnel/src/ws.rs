@@ -380,7 +380,15 @@ impl<T: Read + Write> WsStream<T> {
             if frames > MAX_FRAMES_PER_READ {
                 return Err(WsError::FrameFlood);
             }
-            let frame = read_frame(&mut self.io, self.role, &self.limits, deadline)?;
+            let frame = {
+                let mut reader = BufferedReader {
+                    io: &mut self.io,
+                    buf: &mut self.read_buf,
+                    pos: &mut self.read_pos,
+                    len: &mut self.read_len,
+                };
+                read_frame(&mut reader, self.role, &self.limits, deadline)?
+            };
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
                     control_frames += 1;
