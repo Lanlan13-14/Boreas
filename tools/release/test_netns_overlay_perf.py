@@ -365,6 +365,287 @@ class LoopbackProbeTests(unittest.TestCase):
         )
 
 
+class BaselineProbeTests(unittest.TestCase):
+    def test_baseline_sender_uses_distinct_port_and_separate_denominator(self):
+        total_bytes = 64 * 1024
+        connection = _FakeSenderConnection()
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [100.0, 100.25, 100.75, 101.0]
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(netns_overlay_perf, "TOTAL_BYTES", total_bytes),
+            mock.patch.object(netns_overlay_perf, "time", clock),
+            mock.patch.object(
+                netns_overlay_perf.socket,
+                "create_connection",
+                return_value=connection,
+            ) as create_connection,
+            contextlib.redirect_stdout(stdout),
+        ):
+            netns_overlay_perf.baseline_sender("127.0.0.1", "127.0.0.2")
+        result = json.loads(stdout.getvalue())
+        self.assertNotEqual(
+            netns_overlay_perf.BASELINE_PORT, netns_overlay_perf.PORT
+        )
+        self.assertEqual(result["role"], "baseline-sender")
+        self.assertEqual(result["scope"], netns_overlay_perf.BASELINE_SCOPE)
+        self.assertEqual(result["gate"], "not-applicable")
+        self.assertEqual(result["acceptance"], "never")
+        self.assertEqual(result["denominator"], "connect-through-digest")
+        self.assertEqual(result["payload_denominator"], "connect-to-shutdown-write")
+        self.assertEqual(result["bytes"], total_bytes)
+        self.assertEqual(
+            result["throughput_mbps"],
+            round(total_bytes * 8 / 1.0 / 1_000_000, 3),
+        )
+        self.assertEqual(
+            result["payload_send_mbps"],
+            round(total_bytes * 8 / 0.5 / 1_000_000, 3),
+        )
+        self.assertEqual(
+            result["sha256"], hashlib.sha256(_payload(total_bytes)).hexdigest()
+        )
+        self.assertEqual(connection.timeout, netns_overlay_perf.BASELINE_TIMEOUT_SECONDS)
+        self.assertEqual(connection.shutdown_how, socket.SHUT_WR)
+        create_connection.assert_called_once_with(
+            ("127.0.0.2", netns_overlay_perf.BASELINE_PORT),
+            timeout=netns_overlay_perf.BASELINE_TIMEOUT_SECONDS,
+            source_address=("127.0.0.1", 0),
+        )
+
+    def test_baseline_receiver_logs_digest_without_a_gate(self):
+        payload = b"baseline-receiver" * 16
+        connection = _FakeReceiverConnection([payload[:17], payload[17:]])
+        listener = _FakeListener(connection)
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [40.0, 40.75]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(netns_overlay_perf, "TOTAL_BYTES", len(payload)),
+            mock.patch.object(netns_overlay_perf, "time", clock),
+            mock.patch.object(
+                netns_overlay_perf.socket, "socket", return_value=listener
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            netns_overlay_perf.baseline_receiver("127.0.0.1")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            listener.address, ("127.0.0.1", netns_overlay_perf.BASELINE_PORT)
+        )
+        self.assertEqual(
+            listener.timeout, netns_overlay_perf.BASELINE_TIMEOUT_SECONDS
+        )
+        log = json.loads(stderr.getvalue())
+        self.assertEqual(log["role"], "baseline-receiver")
+        self.assertEqual(log["scope"], netns_overlay_perf.BASELINE_SCOPE)
+        self.assertEqual(log["gate"], "not-applicable")
+        self.assertEqual(log["acceptance"], "never")
+        self.assertEqual(log["bytes"], len(payload))
+        self.assertEqual(log["first_byte_to_eof_seconds"], 0.75)
+        self.assertEqual(log["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(connection.reply, log["sha256"].encode("ascii"))
+
+
+class BaselineBoundTests(unittest.TestCase):
+    def test_baseline_port_is_distinct_and_timeout_is_bounded(self):
+        self.assertNotEqual(
+            netns_overlay_perf.BASELINE_PORT, netns_overlay_perf.PORT
+        )
+        self.assertGreater(netns_overlay_perf.BASELINE_PORT, 0)
+        self.assertLessEqual(netns_overlay_perf.BASELINE_PORT, 65535)
+        self.assertLessEqual(netns_overlay_perf.BASELINE_TIMEOUT_SECONDS, 30)
+        self.assertEqual(netns_overlay_perf.BASELINE_ACCEPTANCE, "never")
+        self.assertIn("baseline", netns_overlay_perf.BASELINE_SCOPE)
+
+
+class BaselineCompareTests(unittest.TestCase):
+    @staticmethod
+    def _parse(lines):
+        return dict(line.split("=", 1) for line in lines)
+
+    def _write_json(self, payload):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        with handle:
+            json.dump(payload, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_compare_reports_both_denominators_and_never_gates(self):
+        overlay = self._write_json(
+            {
+                "bytes": 1048576,
+                "connect_seconds": 0.4,
+                "digest_seconds": 0.9,
+                "elapsed_seconds": 3.5,
+                "send_seconds": 2.2,
+                "throughput_mbps": 2.4,
+                "payload_send_mbps": 3.8,
+            }
+        )
+        baseline = self._write_json(
+            {
+                "bytes": 1048576,
+                "throughput_mbps": 100.0,
+                "payload_send_mbps": 120.0,
+                "scope": netns_overlay_perf.BASELINE_SCOPE,
+            }
+        )
+        values = self._parse(
+            netns_overlay_perf.compare("edge_to_core", overlay, baseline)
+        )
+        self.assertEqual(values["baseline_compare_acceptance"], "never")
+        self.assertEqual(values["overlay_gate"], "unchanged")
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_status"], "measured"
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_status"], "measured"
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_throughput_mbps"],
+            "2.400",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_payload_send_mbps"],
+            "3.800",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_connect_seconds"],
+            "0.400000",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_send_seconds"],
+            "2.200000",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_digest_seconds"],
+            "0.900000",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_elapsed_seconds"],
+            "3.500000",
+        )
+        self.assertEqual(
+            values[
+                "baseline_compare_edge_to_core_overlay_connect_plus_digest_share"
+            ],
+            "0.371",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_send_share"],
+            "0.629",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_throughput_mbps"],
+            "100.000",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_payload_send_mbps"],
+            "120.000",
+        )
+        self.assertEqual(
+            values[
+                "baseline_compare_edge_to_core_baseline_over_overlay_throughput_ratio"
+            ],
+            "41.667",
+        )
+        self.assertEqual(
+            values[
+                "baseline_compare_edge_to_core_baseline_over_overlay_payload_ratio"
+            ],
+            "31.579",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_bytes_match"], "yes"
+        )
+
+    def test_compare_missing_baseline_is_unmeasured_not_green(self):
+        overlay = self._write_json(
+            {
+                "bytes": 1048576,
+                "throughput_mbps": 0.1,
+                "payload_send_mbps": 0.2,
+            }
+        )
+        with tempfile.NamedTemporaryFile(suffix=".json") as handle:
+            missing = handle.name
+        values = self._parse(
+            netns_overlay_perf.compare("edge_to_core", overlay, missing)
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_status"], "measured"
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_status"], "unmeasured"
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_throughput_mbps"],
+            "0.100",
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_throughput_mbps"],
+            "unavailable",
+        )
+        self.assertEqual(values["overlay_gate"], "unchanged")
+        self.assertNotIn("pass", "\n".join(values.values()).lower())
+
+    def test_compare_dash_marks_baseline_unmeasured(self):
+        overlay = self._write_json(
+            {
+                "bytes": 1048576,
+                "connect_seconds": 0.4,
+                "digest_seconds": 0.9,
+                "elapsed_seconds": 3.5,
+                "send_seconds": 2.2,
+                "throughput_mbps": 2.4,
+            }
+        )
+        values = self._parse(
+            netns_overlay_perf.compare("edge_to_core", overlay, "-")
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_overlay_status"], "measured"
+        )
+        self.assertEqual(
+            values["baseline_compare_edge_to_core_baseline_status"], "unmeasured"
+        )
+        self.assertEqual(
+            values[
+                "baseline_compare_edge_to_core_overlay_connect_plus_digest_share"
+            ],
+            "0.371",
+        )
+
+    def test_compare_cli_returns_zero_for_a_low_overlay_result(self):
+        overlay = self._write_json(
+            {
+                "bytes": 1048576,
+                "throughput_mbps": 0.1,
+                "payload_send_mbps": 0.2,
+            }
+        )
+        baseline = self._write_json(
+            {
+                "bytes": 1048576,
+                "throughput_mbps": 100.0,
+                "payload_send_mbps": 120.0,
+            }
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = netns_overlay_perf._compare_cli(
+                ["edge_to_core", overlay, baseline]
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("overlay_gate=unchanged", stdout.getvalue())
+        self.assertIn("baseline_compare_acceptance=never", stdout.getvalue())
+
+
 class ProtocolConstantsTests(unittest.TestCase):
     def test_smoke_protocol_constants_are_unchanged(self):
         self.assertEqual(netns_overlay_perf.PORT, 18080)

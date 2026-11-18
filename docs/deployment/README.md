@@ -7,10 +7,12 @@
 ### 当前版本边界与已知限制（部署前必读）
 
 - **发布资产与开发主线不是一回事**：目前可下载的最新预发布仍是 **[`v0.1.0-pre.3`](https://github.com/Lanlan13-14/Boreas/releases/tag/v0.1.0-pre.3)**。仓库已有更新开发主线与下一版工作项，但在正式发布资产、校验和就绪前，请勿预设 `pre.4` 版本号、文件名或哈希。此教程中的下载命令严格对应 pre.3。发布页约 510 KB 的基础归档不含 TLS 后端；部署隧道应使用页面实际提供且经核验的 Linux `-pq768` 二进制。
+- **本页 daemon/systemd 命令只对应 `v0.1.0-pre.3`**：pre.3 的 `daemon serve|connect` 只要求 `--config/--material-dir`（serve 另需 `--listen`）。当前 main 构建另外**强制**要求 `--status-state-file <ABS> --status-state-owner-uid <UID>`、`--network-policy-tbs/--network-policy-ed25519-signature/--network-policy-mldsa65-signature`、`--network-root-ed25519-der/--network-root-mldsa65-der`、`--network-policy-state-file <ABS> --network-policy-state-owner-uid <UID>`；状态与策略文件必须是 `[paths].state_dir` 的直接子文件，缺任一参数都会 fail-closed 退出。当前构建请用 `install.sh` 生成的 `boreas-run`（按 `active` 自动传齐），不要直接套用本页 pre.3 命令。
 - **性能证据须对应提交与环境**：精确提交 [`8cf865e`](https://github.com/Lanlan13-14/Boreas/commit/8cf865ec7bc9f974b2db623c6c60917e6af7ec08) 的隔离 netns/veth 基准报告 glibc 平均延迟 `0.228 ms`、`268.450 Mbps`，musl 平均延迟 `0.256 ms`、`194.547 Mbps`（[性能工作流 run 43722214463](https://github.com/Lanlan13-14/Boreas/actions/runs/43722214463)）。这是隔离测试结果，不是公网 SLA、跨地域延迟数据或持续负载容量保证，也不应无条件外推至其他版本/硬件。
 
 - **拓扑与生产门禁状态**：本教程范围是 Linux 双节点（`1 Core <-> 1 Edge`）IPv4 点对点评估；跨多 Core 多跳网格、自动故障切换、生产自动化证书/状态轮换与内建 DNS 运行时未完成。[24 项正式生产门禁](../engineering/gates.json)仍开放，`production_approved: false`，请勿用于高敏生产业务。
 - **安装器与平台边界**：`tools/deploy/install.sh`、procd 模板和 `boreas-easy` 正在开发验证；工作流/源文件存在不能代替目标机验证或产品支持声明。OpenWrt 需单独审查其工具链、procd、Linux TUN、网络配置及架构兼容性，参阅 [ONE_CLICK.md](ONE_CLICK.md)。
+- **策略/根信任输入与状态目录**：安装器要求显式的 `--policy-dir`（恰好三个签名输入）、两个独立预配的 NetworkRoot pin 与匹配的 `--network-id`，按 release id 逐文件原子发布到 `<prefix>/state`，同一 release 不覆盖；`status.state`/`policy.state` 由 daemon 首次启动自建。安装器只校验文件导源，**不验策略签名或 pin 来源**；daemon 每次启动 fail-closed 验签。注意安装器在摘要/ELF 通过后会**执行**候选，因此独立 verifier 的摘要核对与 `pki verify-policy` 预检必须在运行安装器之前完成，运行期验签不能倒推替代。pin 不会自动轮换：同一 release 的 pin 字节不同会作为不同 bundle 拒绝，换 pin 是显式运维动作且受 `policy.state` 的根指纹绑定约束。布局、无覆盖语义、回滚方式与"运行期 versioned 子目录"建议见 [POLICY-STATE.md](POLICY-STATE.md)。
 
 ---
 
@@ -289,11 +291,13 @@ chmod 0600 /etc/boreas/edge.toml /etc/boreas/material/*.key
 boreas config-check /etc/boreas/edge.toml
 ```
 
-确认两台机器的 `boreas config-check` 均输出 `"valid":true` 且退出码为 `0`。
+确认两台机器的 `boreas config-check` 均退出码为 `0`：pre.3 输出含 `"valid":true` 的 JSON；当前 main 输出文本 `config-check: valid`。
 
 ---
 
 ## 第四步：启动 Core 并配置 TUN IP 与对端路由
+
+> **仅 pre.3 示例**：下面的 `daemon serve` 命令缺少当前 main 强制的状态/策略参数（完整列表见文首“本页 daemon/systemd 命令只对应 `v0.1.0-pre.3`”），也需要安装器发布的五个策略输入。当前构建请用安装器生成的 `boreas-run`；直接照抄会在参数校验处以 fail-closed 退出。
 
 在 **Core 服务器**上启动 `boreas daemon serve` 监听 TCP `8443` 并创建 `btun0` 网卡，随后为其分配永久 VIP `10.20.1.1/32` 及指向 Edge VIP `10.20.1.2` 的主机路由：
 
@@ -317,6 +321,8 @@ sudo ip route replace 10.20.1.2 dev btun0
 ---
 
 ## 第五步：启动 Edge 并配置 TUN IP 与对端路由
+
+> **仅 pre.3 示例**：下面的 `daemon connect` 同样缺少当前 main 强制的状态/策略参数；当前构建请用 `boreas-run`（见第四步提示）。
 
 > **重要提醒（用裸 IP 覆盖 `--connect` 时必看）**：
 > 当通过公网裸 IP 指定 `--connect 203.0.113.10:8443` 时，**必须显式传入 `--tls-name wss.example.net`**（与第二步签发 Core 时传入的 `--outer-san` 完全一致），并建议同时传入 `--ws-host wss.example.net:8443`！
@@ -380,6 +386,8 @@ sudo ip route replace 10.20.1.1 dev btun0
 ### 6.2 `systemd` 守护进程托管示例与状态续签
 
 手工验证无误后，先结束后台测试进程（`sudo pkill -f "boreas daemon"`），再配置 `systemd` 托管以实现开机自启、断线自动重连以及 `btun0` 路由自动挂载。
+
+> **仅 pre.3 示例**：下面两个手写单元直接 `ExecStart=... boreas daemon ...`，没有当前 main 强制的状态/策略参数。当前安装器安装的是 `boreas.service` → `<prefix>/boreas-run`（wrapper 传齐全部参数，并以 `78` 防止配置错误热重启）；**不要**把下面的单元用于当前构建。
 
 #### Core 节点：`/etc/systemd/system/boreas-core.service`
 
@@ -475,6 +483,8 @@ scp ./status.signed root@<EDGE_HOST>:/etc/boreas/material/status.signed
 
 ## 附录：单机双 `netns` 本地演练（无需两台公网服务器）
 
+> **版本边界**：方式一的 `tools/release/netns_daemon_smoke.sh` 是当前脚本，会生成**测试专用** policy fixture 并传入全部强制参数（fixture 不是生产根预配）；方式二的手工脚本是 pre.3 示例，当前 daemon 会因缺少状态/策略参数 fail-closed。
+
 如果你手头只有一台 Linux `x86_64` 主机（或虚拟机），可以使用 Linux 网络命名空间（`ip netns`）在同一台机器上隔离模拟 Core 与 Edge 双节点全流程。
 
 ### 方式一：运行仓库内置一键冒烟脚本
@@ -485,7 +495,7 @@ scp ./status.signed root@<EDGE_HOST>:/etc/boreas/material/status.signed
 sudo bash tools/release/netns_daemon_smoke.sh /usr/local/bin/boreas
 ```
 
-看到末尾输出 `REAL NETNS PQ768 E2E OVERLAY PING SUCCEEDED` 即代表离线 PKI、双层 `pq768` mTLS、真实 `/dev/net/tun` 与 ICMP 0% 丢包转发全部通过。
+看到末尾输出 `REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED` 即代表离线 PKI、双层 `pq768` mTLS、真实 `/dev/net/tun`、ICMP 转发与吞吐采样在该环境通过。
 
 ### 方式二：手工分步双 `netns` 演练
 

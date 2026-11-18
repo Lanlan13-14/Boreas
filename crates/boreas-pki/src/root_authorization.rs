@@ -121,6 +121,24 @@ impl NetworkRootPin {
         self.net_id
     }
 
+    /// The pinned Ed25519 SubjectPublicKeyInfo DER, for in-crate verifiers that
+    /// must build an OpenSSL key. This is not a trust decision on its own: the
+    /// caller still verifies against this pin's fingerprint.
+    pub(crate) fn ed25519_public_key_der(&self) -> &[u8] {
+        &self.ed25519_public_key_der
+    }
+
+    /// The pinned ML-DSA SubjectPublicKeyInfo DER.
+    pub(crate) fn mldsa_public_key_der(&self) -> &[u8] {
+        &self.mldsa_public_key_der
+    }
+
+    /// The pinned ML-DSA parameter set; callers must refuse a set they do not
+    /// actually verify.
+    pub(crate) fn mldsa_parameter_set(&self) -> boreas_proto::objects::MldsaParameterSet {
+        self.mldsa_parameter_set
+    }
+
     /// Construct a network-purpose pin from independently provisioned public key DER.
     /// The type prevents accidental API substitution but cannot cryptographically distinguish
     /// copied ReleaseRoot DER; independent provenance is required.

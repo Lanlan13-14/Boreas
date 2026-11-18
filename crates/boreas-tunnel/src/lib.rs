@@ -40,6 +40,11 @@ pub mod circuit;
 pub mod csprng;
 pub mod dataplane;
 pub mod directory;
+/// Authoritative UDP DNS service over a real `PacketIo` endpoint, bound to a
+/// verified signed zone authority and the authenticated local identity. TCP is
+/// refused; it is not a DNS-over-TCP implementation.
+#[cfg(feature = "openssl-inner-tls")]
+pub mod dns_runtime;
 pub mod e2e;
 pub mod error;
 pub mod failover;

@@ -16,6 +16,17 @@
 //!   if `next_update` expires without refresh, business forwarding stops immediately).
 //! - Step 5: Serves an owner-only (`0600`) Unix control socket (`state_dir/control.sock`)
 //!   with `SO_PEERCRED` caller UID verification.
+//! - Step 6 (`connect` only): while the primary path carries business traffic, one
+//!   bounded background dial keeps a standby hop link to the configured backup
+//!   endpoint authenticated. The link is checked with a transport-level poll only
+//!   (no challenge and no Pong, so this is **not** `ProbePing`), and a primary
+//!   path failure promotes it by rebuilding the E2E circuit on it. The promotion
+//!   re-asserts the same verified peer identity and both permanent VIPs, so the
+//!   overlay binding cannot change underneath the host stack. With no
+//!   multi-Core directory there is no authority for a second Core: a backup
+//!   endpoint owned by any other identity cannot pass the pinned-SPKI inner
+//!   handshake, so this slice deliberately fails closed instead of trusting
+//!   `[uplink].backup` for a cross-Core "BackupCdn".
 
 #[cfg(not(unix))]
 use crate::render::StatusSnapshot;
@@ -212,13 +223,13 @@ mod linux_daemon {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     };
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -246,10 +257,11 @@ mod linux_daemon {
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
         OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
         PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
-        e2e::{accept_e2e, open_e2e},
-        packet_path::{PacketPath, PacketPathError},
+        e2e::{E2eCircuit, accept_e2e, open_e2e},
+        failover,
+        packet_path::{PacketPath, PacketPathError, PacketStats},
         resource::{Admission, Limits},
-        session::SessionPolicy,
+        session::{EstablishedSession, SessionPolicy},
     };
 
     use crate::config::{
@@ -262,6 +274,67 @@ mod linux_daemon {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
     const ACCEPT_WAIT: Duration = Duration::from_secs(30);
     const STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// Absolute bound on one blocking read/write of the business socket.
+    ///
+    /// The packet loop starts a read only after readiness, so idle time is never
+    /// spent here. This bound covers the two states readiness cannot: a peer
+    /// stalled in the middle of a frame and a send window that never reopens.
+    /// Both used to park the loop with no escape except a status fault, because
+    /// the only thing that could interrupt the blocking call was the watchdog's
+    /// `shutdown`. Expiry is an ordinary socket error that the path already
+    /// refuses, i.e. a failure deadline, not a tuned wait or a retry budget.
+    const PATH_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Hard ceiling on live upstream sockets in one `connect` process: one
+    /// business connection plus at most one standby dial. Every dial must hold a
+    /// permit and the permit travels inside the link value, so a connection can
+    /// never outlive its reservation.
+    const MAX_LIVE_CONNECTIONS: u8 = 2;
+
+    /// Standby-link cadence and failure counting.
+    ///
+    /// These reuse the plan's initial §8.5 cadence values (`failover::{PROBE_INTERVAL,
+    /// FAIL_THRESHOLD, BACKOFF_MAX}`) unchanged: they are not tuned here, not
+    /// tightened to manufacture a result, and not treated as a latency promise.
+    ///
+    /// The standby check itself is only a `poll(2)` for FIN/RST/unexpected bytes
+    /// on an authenticated link that carries no circuit. It sends no challenge
+    /// and consumes no Pong, so the counters below are liveness polls, **not**
+    /// `ProbePing` samples, RTT measurements or packet-loss statistics.
+    const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(failover::PROBE_INTERVAL);
+    const STANDBY_FAIL_THRESHOLD: u64 = failover::FAIL_THRESHOLD as u64;
+    const STANDBY_DIAL_BACKOFF: Duration = Duration::from_millis(failover::BACKOFF_MAX);
+    /// Bounded wait for an in-flight standby dial before a failover verdict.
+    const STANDBY_READY_WAIT: Duration = Duration::from_millis(failover::PROBE_INTERVAL);
+
+    /// `LiveCounters::active_path` values.
+    const PATH_PRIMARY: u8 = 0;
+    const PATH_BACKUP: u8 = 1;
+
+    fn active_path_label(value: u8) -> &'static str {
+        if value == PATH_BACKUP {
+            "backup"
+        } else {
+            "primary"
+        }
+    }
+
+    /// Published standby verdict: a protocol/identity rejection is terminal for
+    /// this path, otherwise a verified link is held, or the consecutive failure
+    /// count has reached the plan's threshold, or a dial is still being
+    /// established. This reports state; it never relaxes a gate.
+    fn standby_state_label(counters: &LiveCounters) -> &'static str {
+        if counters.standby_rejected.load(Ordering::SeqCst) {
+            "rejected"
+        } else if counters.standby_ready.load(Ordering::SeqCst) {
+            "ready"
+        } else if counters.standby_failures.load(Ordering::SeqCst) >= STANDBY_FAIL_THRESHOLD {
+            "down"
+        } else {
+            "idle"
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Mode {
@@ -282,6 +355,24 @@ mod linux_daemon {
         rx_bytes: AtomicU64,
         status_sequence: AtomicU64,
         status_fresh: AtomicBool,
+        /// A verified standby hop link to the same Core is currently held.
+        standby_ready: AtomicBool,
+        /// The standby endpoint was rejected for a protocol/identity reason, so
+        /// this manager must never dial it again.
+        standby_rejected: AtomicBool,
+        /// Monotonic count of standby dial attempts (never rewinds).
+        standby_attempts: AtomicU64,
+        /// Monotonic count of transport liveness polls (never rewinds). This is
+        /// not a `ProbePing` counter: no challenge is sent and no Pong matched.
+        standby_polls: AtomicU64,
+        /// Consecutive standby failures, reset by a verified session.
+        standby_failures: AtomicU64,
+        /// Completed primary -> backup promotions.
+        failover_events: AtomicU64,
+        /// 1-based business-path epoch; incremented per promotion.
+        path_epoch: AtomicU64,
+        /// Which endpoint currently carries business traffic.
+        active_path: AtomicU8,
     }
 
     struct ControlSocketGuard {
@@ -382,6 +473,60 @@ mod linux_daemon {
         u64::try_from(d.as_micros()).map_err(|_| "system clock overflow".to_string())
     }
 
+    /// Fixed signed-policy window captured once after startup verification.
+    ///
+    /// The signed UTC `expires` is the authority; the paired monotonic deadline
+    /// prevents a wall-clock rollback from widening it. This value is never
+    /// refreshed or recalculated from a later clock reading, so a new policy
+    /// window cannot be silently invented at runtime.
+    #[derive(Clone, Copy)]
+    struct PolicyWindow {
+        expires_utc_us: u64,
+        deadline: Instant,
+    }
+
+    impl PolicyWindow {
+        fn new(expires_utc_us: u64) -> Result<Self, String> {
+            let now_us = now_utc_us()?;
+            if now_us >= expires_utc_us {
+                return Err("daemon: signed network policy is already expired".to_string());
+            }
+            let remaining_us = expires_utc_us
+                .checked_sub(now_us)
+                .ok_or_else(|| "daemon: signed network policy window underflow".to_string())?;
+            let deadline = Instant::now()
+                .checked_add(Duration::from_micros(remaining_us))
+                .ok_or_else(|| "daemon: signed network policy deadline overflow".to_string())?;
+            Ok(Self {
+                expires_utc_us,
+                deadline,
+            })
+        }
+
+        fn deadline(&self) -> Instant {
+            self.deadline
+        }
+
+        /// Fail closed if either the signed UTC window or its monotonic shadow
+        /// has ended. The two checks are independent on purpose.
+        fn check(&self) -> Result<(), String> {
+            let now_us = now_utc_us()?;
+            if now_us >= self.expires_utc_us {
+                return Err(
+                    "daemon: signed network policy expired, business forwarding halted"
+                        .to_string(),
+                );
+            }
+            if Instant::now() >= self.deadline {
+                return Err(
+                    "daemon: signed network policy monotonic window expired, business forwarding halted"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+
     fn verify_peercred_same_uid(fd: i32) -> bool {
         let mut cred = libc::ucred {
             pid: 0,
@@ -444,7 +589,7 @@ mod linux_daemon {
                         let mut reader = BufReader::new((&mut stream).take(256));
                         if reader.read_line(&mut line).is_ok() && line.trim() == "STATUS" {
                             let resp = format!(
-                                "{{\"command\":\"ctl.status\",\"version\":\"{}\",\"node\":\"{}\",\"daemon_connected\":{},\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},\"security_mode\":\"{}\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{},\"status_sequence\":{},\"status_fresh\":{}}}\n",
+                                "{{\"command\":\"ctl.status\",\"version\":\"{}\",\"node\":\"{}\",\"daemon_connected\":{},\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},\"security_mode\":\"{}\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{},\"status_sequence\":{},\"status_fresh\":{},\"standby_ready\":{},\"standby_rejected\":{},\"standby_state\":\"{}\",\"standby_attempts\":{},\"standby_polls\":{},\"standby_failures\":{},\"failover_events\":{},\"path_epoch\":{},\"active_path\":\"{}\"}}\n",
                                 env!("CARGO_PKG_VERSION"),
                                 counters.node_label,
                                 counters.connected.load(Ordering::Relaxed),
@@ -458,6 +603,15 @@ mod linux_daemon {
                                 counters.rx_bytes.load(Ordering::Relaxed),
                                 counters.status_sequence.load(Ordering::Relaxed),
                                 counters.status_fresh.load(Ordering::Relaxed),
+                                counters.standby_ready.load(Ordering::SeqCst),
+                                counters.standby_rejected.load(Ordering::SeqCst),
+                                standby_state_label(&counters),
+                                counters.standby_attempts.load(Ordering::SeqCst),
+                                counters.standby_polls.load(Ordering::SeqCst),
+                                counters.standby_failures.load(Ordering::Relaxed),
+                                counters.failover_events.load(Ordering::Relaxed),
+                                counters.path_epoch.load(Ordering::Relaxed),
+                                active_path_label(counters.active_path.load(Ordering::Relaxed)),
                             );
                             let _ = stream.write_all(resp.as_bytes());
                             let _ = stream.flush();
@@ -510,6 +664,908 @@ mod linux_daemon {
             error.kind(),
             std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
         )
+    }
+
+    fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// One status gate against the process-wide durable store.
+    ///
+    /// The store is a process-wide singleton: a second `StatusStore::open` on the
+    /// same path returns `Busy`. Every boundary — each dial, each handshake, and
+    /// each failover epoch — therefore re-verifies the exact current
+    /// `status.signed` through that one instance instead of reopening it.
+    fn lock_gate(store: &Mutex<StatusStore>, status_path: &Path) -> Result<(u64, Instant), String> {
+        let mut guard = lock_mutex(store);
+        status_gate(&mut guard, status_path, now_utc_us()?, Instant::now())
+    }
+
+    // --- bounded upstream connection management ----------------------------
+
+    /// Hard ceiling on live upstream sockets in one `connect` process.
+    ///
+    /// The permit is carried inside the link value rather than in a side table,
+    /// so a connection cannot outlive its reservation and a failed dial releases
+    /// its slot immediately. This is a local concurrency bound; it does not
+    /// replace the peer's global unauthenticated/authenticated admission limits.
+    struct ConnectionBudget {
+        live: Arc<AtomicU8>,
+    }
+
+    impl ConnectionBudget {
+        fn new() -> Self {
+            Self {
+                live: Arc::new(AtomicU8::new(0)),
+            }
+        }
+
+        fn try_acquire(&self) -> Option<ConnectionPermit> {
+            let mut observed = self.live.load(Ordering::SeqCst);
+            loop {
+                if observed >= MAX_LIVE_CONNECTIONS {
+                    return None;
+                }
+                match self.live.compare_exchange(
+                    observed,
+                    observed + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        return Some(ConnectionPermit {
+                            live: Arc::clone(&self.live),
+                        });
+                    }
+                    Err(current) => observed = current,
+                }
+            }
+        }
+
+        fn live(&self) -> u8 {
+            self.live.load(Ordering::SeqCst)
+        }
+    }
+
+    struct ConnectionPermit {
+        live: Arc<AtomicU8>,
+    }
+
+    impl Drop for ConnectionPermit {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// One established, authenticated hop link plus its socket descriptor.
+    ///
+    /// Replacing the value on failover drops the previous session and releases
+    /// its permit, so the live-connection bound holds across every epoch.
+    struct HopLink {
+        session: EstablishedSession,
+        fd: i32,
+        _permit: ConnectionPermit,
+    }
+
+    // Handshake deadlines belong to exactly one layer: the transport crate.
+    //
+    // `LinkClient::connect_preconnected` and `LinkServer::accept_tls_stream`
+    // derive one absolute `Instant` from the budget passed here, install it on the
+    // socket for outer TLS and then carry it through `DeadlineIo` for every later
+    // handshake operation. The daemon therefore passes `HANDSHAKE_TIMEOUT` and
+    // must never install a second, competing deadline on the same socket: two
+    // mechanisms would race, and whichever fired second could mask a correctly
+    // authenticated handshake or leave a timeout behind.
+    //
+    // The daemon owns exactly two other socket-policy decisions, both at explicit
+    // boundaries:
+    // - `bound_path_io` installs the steady-state business I/O bound *after* the
+    //   handshake and before the first packet, deliberately replacing the
+    //   handshake-shaped socket timeout the crate left behind.
+    // - The status watchdog's `shutdown()` on a fault, which is an interruption,
+    //   not a deadline.
+
+    /// Transport-level health of one socket, without consuming any bytes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SocketHealth {
+        /// Open, with no pending event.
+        Alive,
+        /// Bytes arrived that no layer of this connection is expecting.
+        Unread,
+        /// The peer closed (FIN) or the socket is shut down.
+        PeerClosed,
+        /// `POLLERR`/`POLLNVAL` or a pending `SO_ERROR`, i.e. a reset.
+        Failed,
+    }
+
+    fn pending_socket_error(fd: i32) -> bool {
+        if fd < 0 {
+            return true;
+        }
+        let mut error: libc::c_int = 0;
+        let mut length = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `error` and `length` are valid for one `c_int`; `SO_ERROR`
+        // reads and clears the pending socket error.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut error as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        rc == 0 && error != 0
+    }
+
+    /// Classify one socket without reading from it.
+    ///
+    /// The standby path carries no circuit and no packets, so a byte arriving
+    /// there is a protocol violation and a reset or close means the standby is
+    /// gone. This never blocks and never consumes data the business path owns.
+    fn socket_health(fd: i32) -> SocketHealth {
+        if fd < 0 {
+            return SocketHealth::Failed;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is one initialized `pollfd`; `poll` only writes `revents`.
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+        if rc < 0 {
+            return SocketHealth::Failed;
+        }
+        if pfd.revents & libc::POLLNVAL != 0 || pfd.revents & libc::POLLERR != 0 {
+            return SocketHealth::Failed;
+        }
+        if pfd.revents & libc::POLLHUP != 0 {
+            return SocketHealth::PeerClosed;
+        }
+        if pfd.revents & libc::POLLIN != 0 {
+            if pending_socket_error(fd) {
+                return SocketHealth::Failed;
+            }
+            return SocketHealth::Unread;
+        }
+        SocketHealth::Alive
+    }
+
+    /// Bound blocking reads and writes on the business socket.
+    ///
+    /// See [`PATH_IO_TIMEOUT`]: this is what turns "the peer stalled mid-frame"
+    /// from an unbounded park into a bounded, fail-closed I/O error.
+    fn bound_path_io(fd: i32) -> Result<(), String> {
+        if fd < 0 {
+            return Err("daemon: cannot bound I/O on an invalid socket".to_string());
+        }
+        let timeout = libc::timeval {
+            tv_sec: PATH_IO_TIMEOUT.as_secs() as libc::time_t,
+            tv_usec: 0,
+        };
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: `timeout` is a valid `timeval` and the length matches the
+            // documented `SO_RCVTIMEO`/`SO_SNDTIMEO` argument size.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&timeout as *const libc::timeval).cast(),
+                    core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err("daemon: cannot bound business socket I/O timeouts".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// The authenticated facts a failover must reproduce exactly.
+    ///
+    /// The permanent VIP is a function of the signed identity, so an unchanged
+    /// identity implies an unchanged VIP. Comparing both makes the invariant
+    /// explicit and refuses any circuit whose verified endpoints differ from the
+    /// pre-failure binding.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BusinessIdentity {
+        local_vip: std::net::Ipv4Addr,
+        peer_vip: std::net::Ipv4Addr,
+        peer_node_id: u16,
+        peer_generation: u64,
+        path_hops: u8,
+        mtu_cap: u16,
+    }
+
+    fn business_identity<C: std::io::Read + std::io::Write, P: PacketIo + ?Sized>(
+        path: &PacketPath<'_, C, P>,
+    ) -> BusinessIdentity {
+        let local = path.local_endpoint();
+        let peer = path.peer_endpoint();
+        BusinessIdentity {
+            local_vip: local.vip(),
+            peer_vip: peer.vip(),
+            peer_node_id: peer.node_id(),
+            peer_generation: peer.identity_generation(),
+            path_hops: path.path_hops(),
+            mtu_cap: path.mtu_cap(),
+        }
+    }
+
+    /// Whether a path error is the host-side adapter failing rather than the
+    /// authenticated circuit. Host failures never justify moving to another
+    /// path: the same host adapter would refuse the packets there too.
+    fn host_side_failure(error: &PacketPathError) -> bool {
+        matches!(
+            error,
+            PacketPathError::HostQueueFull
+                | PacketPathError::HostQueueClosed
+                | PacketPathError::HostRejected(_)
+        )
+    }
+
+    /// Whether a circuit failure may justify moving to an alternate ingress.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PathFailureKind {
+        /// The byte stream failed (reset or timeout). A transport failure is the
+        /// only kind that may use a verified standby path.
+        Transport,
+        /// Framing, policy or identity violation. These stay terminal rather than
+        /// being treated as an ordinary failover trigger.
+        Protocol,
+    }
+
+    /// Classify one `PacketPathError`.
+    ///
+    /// Only a circuit I/O failure is transport loss. A truncated frame, length
+    /// disagreement, policy or identity error is a protocol failure and must
+    /// never be auto-promoted as ordinary failover.
+    fn path_failure_kind(error: &PacketPathError) -> PathFailureKind {
+        match error {
+            PacketPathError::CircuitIo(_) => PathFailureKind::Transport,
+            _ => PathFailureKind::Protocol,
+        }
+    }
+
+    /// Why one business path stopped.
+    enum PathStop {
+        /// The owner's own budget ran out: a planned stop, not a failure.
+        Budget(&'static str),
+        /// The peer closed the circuit between frames.
+        PeerClosed,
+        /// The circuit failed. The caller decides whether this kind may promote.
+        Failed {
+            kind: PathFailureKind,
+            reason: String,
+        },
+    }
+
+    struct PathReport {
+        stop: PathStop,
+        identity: BusinessIdentity,
+        stats: PacketStats,
+        local_vip: std::net::Ipv4Addr,
+        peer_vip: std::net::Ipv4Addr,
+    }
+
+    fn print_path_summary(
+        mode_name: &str,
+        tun: &TunEndpoint,
+        report: &PathReport,
+        stop_reason: &str,
+        failover_events: u64,
+        path_epoch: u64,
+    ) {
+        let stats = report.stats;
+        println!(
+            "{{\"command\":\"daemon.{mode_name}\",\"status\":\"ok\",\"stop_reason\":\"{stop_reason}\",\"tun\":\"{}\",\"local_vip\":\"{}\",\"peer_vip\":\"{}\",\"security_mode\":\"e2e-required\",\"suite\":\"pq768\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{},\"failover_events\":{},\"path_epoch\":{}}}",
+            tun.name(),
+            report.local_vip,
+            report.peer_vip,
+            stats.outbound_packets,
+            stats.outbound_bytes,
+            stats.inbound_packets,
+            stats.inbound_bytes,
+            failover_events,
+            path_epoch
+        );
+    }
+
+    // --- standby path (same Core, alternate ingress) ------------------------
+
+    /// Everything the standby dial thread needs. Immutable, so it is shared by
+    /// reference instead of rebuilt per attempt.
+    #[derive(Clone)]
+    struct StandbyConfig {
+        /// Configured endpoint spelling, used only in diagnostics.
+        endpoint: String,
+        /// Fully resolved target. Resolution happens on the manager-owning thread
+        /// before the worker starts: a blocking resolver must never sit between
+        /// `close()`/`Drop` and its bounded join.
+        target: ClientTarget,
+        mat_dir: PathBuf,
+        key_path: PathBuf,
+        policy: SessionPolicy,
+        expected_peer: PeerIdentity,
+        extractor: Arc<PkiIdentityExtractor>,
+        /// Fixed signed-policy window captured at startup.
+        policy_window: PolicyWindow,
+        /// The process-wide durable store is shared, never reopened, so every
+        /// standby dial and every promotion is gated through the same instance.
+        status_store: Arc<Mutex<StatusStore>>,
+        status_path: PathBuf,
+    }
+
+    struct StandbyShared {
+        config: StandbyConfig,
+        budget: Arc<ConnectionBudget>,
+        counters: Arc<LiveCounters>,
+        slot: Arc<Mutex<Option<HopLink>>>,
+        /// Single-flight: at most one standby dial in flight at any moment.
+        dialing: Arc<AtomicBool>,
+        /// Set once by `StandbyManager::close`; no dial may start afterwards.
+        stop: Arc<AtomicBool>,
+        /// Interrupt handle for the *in-flight* dial only.
+        ///
+        /// It is a duplicate descriptor of the socket being handshaked, so
+        /// shutdown can reach that socket without ever naming a closed or
+        /// recycled raw fd, and the duplicate keeps the fd number alive for as
+        /// long as the handle is held. The dial thread retires the handle before
+        /// a session can be published, so a published standby is never
+        /// interrupted by cleanup.
+        interrupt: Arc<Mutex<Option<std::net::TcpStream>>>,
+        /// Monotonic attempt sequence; never rewinds.
+        attempts: Arc<AtomicU64>,
+        /// Consecutive failures (transport dial failures plus lost sessions).
+        misses: Arc<AtomicU64>,
+        /// Monotonic transport-liveness poll sequence; never rewinds.
+        polls: Arc<AtomicU64>,
+        /// Set once on a protocol/identity rejection. Such a rejection is not an
+        /// ordinary transport miss: the endpoint is never dialled again and can
+        /// never be promoted.
+        rejected: Arc<AtomicBool>,
+        /// First terminal rejection reason, for the fail-closed error path.
+        fatal: Arc<Mutex<Option<String>>>,
+    }
+
+    /// Whether the standby path should start a new authenticated dial.
+    ///
+    /// Kept as one predicate so "stopped" and "already dialling" can never be
+    /// forgotten by a caller, and so the rule is testable without a socket.
+    fn should_dial(
+        now: Instant,
+        next_attempt: Instant,
+        ready: bool,
+        dialing: bool,
+        stopped: bool,
+    ) -> bool {
+        !stopped && !dialing && !ready && now >= next_attempt
+    }
+
+    /// Publish a verified standby link at most once.
+    ///
+    /// The slot and the published flag are updated under the same lock, so a
+    /// concurrent [`take_standby_slot`] can never leave `ready == true` with an
+    /// empty slot (the previous publisher race). A session that is already held
+    /// is never replaced: the new link is returned to the caller and dropped.
+    fn publish_standby_slot<T>(
+        slot: &Mutex<Option<T>>,
+        ready: &AtomicBool,
+        value: T,
+    ) -> Option<T> {
+        let mut guard = lock_mutex(slot);
+        if guard.is_some() {
+            return Some(value);
+        }
+        *guard = Some(value);
+        ready.store(true, Ordering::SeqCst);
+        None
+    }
+
+    /// Take a held standby link and clear its published flag atomically.
+    fn take_standby_slot<T>(
+        slot: &Mutex<Option<T>>,
+        ready: &AtomicBool,
+    ) -> Option<T> {
+        let mut guard = lock_mutex(slot);
+        let taken = guard.take();
+        if taken.is_some() {
+            ready.store(false, Ordering::SeqCst);
+        }
+        taken
+    }
+
+    /// Drop any held link and always clear the published flag.
+    fn clear_standby_slot<T>(slot: &Mutex<Option<T>>, ready: &AtomicBool) {
+        let mut guard = lock_mutex(slot);
+        let _ = guard.take();
+        ready.store(false, Ordering::SeqCst);
+    }
+
+    /// Mark this standby endpoint terminally rejected.
+    ///
+    /// Protocol, policy and identity failures are not interchangeable with a
+    /// transport miss: retrying them would treat an authentication failure as an
+    /// ordinary failover candidate. The active business path is left alone, but
+    /// this standby can never become ready or be promoted.
+    fn reject_standby(shared: &StandbyShared, reason: String) {
+        shared.rejected.store(true, Ordering::SeqCst);
+        shared
+            .counters
+            .standby_rejected
+            .store(true, Ordering::SeqCst);
+        clear_standby_slot(&shared.slot, &shared.counters.standby_ready);
+        let mut fatal = lock_mutex(&shared.fatal);
+        if fatal.is_none() {
+            *fatal = Some(reason);
+        }
+    }
+
+    /// Retires the in-flight interrupt handle on every exit path of a dial.
+    ///
+    /// Declared after the socket handle so the guard runs *before* the socket it
+    /// duplicates is dropped: cleanup can therefore never shut down a raw fd that
+    /// has already been closed, and the duplicate descriptor keeps the fd number
+    /// reserved until this guard releases it.
+    struct InterruptGuard<'a> {
+        shared: &'a StandbyShared,
+    }
+
+    impl Drop for InterruptGuard<'_> {
+        fn drop(&mut self) {
+            drop(lock_mutex(&self.shared.interrupt).take());
+        }
+    }
+
+    /// One standby-dial failure, split by trust meaning.
+    enum StandbyDialFailure {
+        /// Pre-authentication transport failure. A later bounded retry is allowed.
+        Transport,
+        /// Protocol, policy or identity rejection. Retrying it would treat an
+        /// authentication failure as an ordinary failover candidate.
+        Protocol(String),
+        /// The manager stopped the dial; nothing may be counted or published.
+        Stopped,
+    }
+
+    /// Classify a hop-handshake error without ever looking at the peer identity.
+    ///
+    /// Only raw I/O, timeout and clean-transport-close errors are retryable
+    /// transport failures. WSS framing, HTTP, session authorization, inner-TLS
+    /// policy and identity mapping errors are terminal for this standby path.
+    fn classify_tunnel_failure(error: TunnelError) -> StandbyDialFailure {
+        match error {
+            TunnelError::Io(_)
+            | TunnelError::Timeout
+            | TunnelError::Closed
+            | TunnelError::Ws(boreas_tunnel::ws::WsError::Io(_))
+            | TunnelError::Ws(boreas_tunnel::ws::WsError::Timeout)
+            | TunnelError::Ws(boreas_tunnel::ws::WsError::Closed) => {
+                StandbyDialFailure::Transport
+            }
+            other => StandbyDialFailure::Protocol(format!(
+                "standby: hop protocol/identity rejected: {other:?}"
+            )),
+        }
+    }
+
+    /// One bounded standby dial: TCP, outer TLS, WSS, inner pq768 hop session and
+    /// the peer identity binding. The result is a fully authenticated link to the
+    /// same Core over the alternate ingress.
+    ///
+    /// Every dial is gated through the process-wide durable status store before
+    /// the TCP connect and again after the handshake. The target is already
+    /// resolved, so neither this worker nor `close()`'s join can wait on DNS.
+    fn dial_standby_link(
+        shared: &StandbyShared,
+        permit: ConnectionPermit,
+    ) -> Result<HopLink, StandbyDialFailure> {
+        let config = &shared.config;
+        if shared.stop.load(Ordering::SeqCst) {
+            return Err(StandbyDialFailure::Stopped);
+        }
+        config
+            .policy_window
+            .check()
+            .map_err(|e| {
+                StandbyDialFailure::Protocol(format!(
+                    "standby {}: policy window failed before dial: {e}",
+                    config.endpoint
+                ))
+            })?;
+        lock_gate(&config.status_store, &config.status_path).map_err(|e| {
+            StandbyDialFailure::Protocol(format!(
+                "standby {}: durable status gate failed before dial: {e}",
+                config.endpoint
+            ))
+        })?;
+
+        let outer_ca_path = config.mat_dir.join("outer-ca.pem");
+        let outer = if outer_ca_path.exists() {
+            let pem = fs::read(&outer_ca_path).map_err(|_| {
+                StandbyDialFailure::Protocol("standby: cannot read outer-ca.pem".to_string())
+            })?;
+            OpenSslOuterTlsConnector::with_root_certificates(&pem).map_err(|_| {
+                StandbyDialFailure::Protocol("standby: invalid outer-ca.pem".to_string())
+            })?
+        } else {
+            OpenSslOuterTlsConnector::web_pki().map_err(|_| {
+                StandbyDialFailure::Protocol("standby: web-PKI roots unavailable".to_string())
+            })?
+        };
+        let inner = OpenSslConnector::from_pem_files(
+            &config.mat_dir.join("identity.pem"),
+            &config.key_path,
+            &config.mat_dir.join("identity-ca.pem"),
+            Policy::production_default(),
+        )
+        .map_err(|_| {
+            StandbyDialFailure::Protocol("standby: pq768 inner connector setup failed".to_string())
+        })?;
+        let link = LinkClient::new(
+            Box::new(outer),
+            Box::new(OpenSslInnerConnector::new(
+                inner,
+                Arc::clone(&config.extractor),
+            )),
+        );
+        let tcp = link
+            .connect_tcp(&config.target, HANDSHAKE_TIMEOUT)
+            .map_err(|_| StandbyDialFailure::Transport)?;
+        config
+            .policy_window
+            .check()
+            .map_err(|e| {
+                StandbyDialFailure::Protocol(format!(
+                    "standby {}: policy window failed after TCP connect: {e}",
+                    config.endpoint
+                ))
+            })?;
+        let fd = tcp.as_raw_fd();
+        // The handshake budget is the crate's single deadline. This handle exists
+        // only so `close()` can interrupt it; it is not a second deadline. It is a
+        // duplicated descriptor, so shutdown can never name the dial's reused fd.
+        let interrupt = tcp
+            .try_clone()
+            .map_err(|_| StandbyDialFailure::Transport)?;
+        *lock_mutex(&shared.interrupt) = Some(interrupt);
+        let _interrupt = InterruptGuard { shared };
+        if shared.stop.load(Ordering::SeqCst) {
+            // `close()` may have raced this install: interrupt our own dial here
+            // so the join it is already waiting on returns promptly.
+            if let Some(stream) = lock_mutex(&shared.interrupt).take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            return Err(StandbyDialFailure::Stopped);
+        }
+        let session = link
+            .connect_preconnected(tcp, &config.target, config.policy.clone())
+            .map_err(classify_tunnel_failure)?;
+        config
+            .policy_window
+            .check()
+            .map_err(|e| {
+                StandbyDialFailure::Protocol(format!(
+                    "standby {}: policy window failed after hop handshake: {e}",
+                    config.endpoint
+                ))
+            })?;
+        lock_gate(&config.status_store, &config.status_path).map_err(|e| {
+            StandbyDialFailure::Protocol(format!(
+                "standby: durable status gate failed after hop handshake: {e}"
+            ))
+        })?;
+        // This session owns its socket from here on, so the interruptible window
+        // is closed *before* the caller can publish it.
+        drop(lock_mutex(&shared.interrupt).take());
+        if shared.stop.load(Ordering::SeqCst) {
+            return Err(StandbyDialFailure::Stopped);
+        }
+        // Defense in depth: the session policy already pins this identity, and a
+        // second Core cannot present a certificate whose SPKI is in the pinned
+        // trust store. Refuse rather than trust the configured endpoint.
+        if session.peer() != config.expected_peer {
+            return Err(StandbyDialFailure::Protocol(
+                "standby: authenticated peer is not the configured Core".to_string(),
+            ));
+        }
+        Ok(HopLink {
+            session,
+            fd,
+            _permit: permit,
+        })
+    }
+
+    fn standby_dial(shared: Arc<StandbyShared>) {
+        /// Clears the single-flight flag on every exit path, including a panic.
+        struct DialGuard(Arc<AtomicBool>);
+        impl Drop for DialGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = DialGuard(Arc::clone(&shared.dialing));
+        if shared.stop.load(Ordering::SeqCst) || shared.rejected.load(Ordering::SeqCst) {
+            return;
+        }
+        let attempt = shared.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        shared
+            .counters
+            .standby_attempts
+            .store(attempt, Ordering::SeqCst);
+        let Some(permit) = shared.budget.try_acquire() else {
+            shared.misses.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
+        let link = match dial_standby_link(&shared, permit) {
+            Ok(link) => link,
+            Err(StandbyDialFailure::Stopped) => return,
+            Err(StandbyDialFailure::Transport) => {
+                let misses = shared.misses.fetch_add(1, Ordering::SeqCst) + 1;
+                shared
+                    .counters
+                    .standby_failures
+                    .store(misses, Ordering::SeqCst);
+                shared
+                    .counters
+                    .standby_ready
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(StandbyDialFailure::Protocol(reason)) => {
+                let misses = shared.misses.fetch_add(1, Ordering::SeqCst) + 1;
+                shared
+                    .counters
+                    .standby_failures
+                    .store(misses, Ordering::SeqCst);
+                reject_standby(&shared, reason);
+                return;
+            }
+        };
+        if shared.stop.load(Ordering::SeqCst) || shared.rejected.load(Ordering::SeqCst) {
+            return;
+        }
+        let published = publish_standby_slot(
+            &shared.slot,
+            &shared.counters.standby_ready,
+            link,
+        );
+        if published.is_some() {
+            // A verified session was already held; keep it and drop this one.
+            return;
+        }
+        shared.misses.store(0, Ordering::SeqCst);
+        shared
+            .counters
+            .standby_failures
+            .store(0, Ordering::SeqCst);
+    }
+
+    /// Owner-side handle for the standby path of one `connect` process.
+    ///
+    /// The session is owned by the dial thread until it is published, then by
+    /// this handle. Promotion takes it out of the slot, so no thread ever polls a
+    /// descriptor that another owner has already dropped.
+    ///
+    /// The dial worker is **owned, never detached**: exactly one handle is kept
+    /// here, a finished one is reaped before the next spawn, and [`Self::close`]
+    /// interrupts the in-flight handshake and joins before the manager can go
+    /// away. That is the whole reason no socket can be created after
+    /// `run_connect_loop` returns.
+    struct StandbyManager {
+        shared: Arc<StandbyShared>,
+        worker: Option<thread::JoinHandle<()>>,
+        next_attempt: Instant,
+        last_poll: Instant,
+    }
+
+    impl StandbyManager {
+        fn new(
+            config: StandbyConfig,
+            budget: Arc<ConnectionBudget>,
+            counters: Arc<LiveCounters>,
+        ) -> Self {
+            Self {
+                shared: Arc::new(StandbyShared {
+                    config,
+                    budget,
+                    counters,
+                    slot: Arc::new(Mutex::new(None)),
+                    dialing: Arc::new(AtomicBool::new(false)),
+                    stop: Arc::new(AtomicBool::new(false)),
+                    interrupt: Arc::new(Mutex::new(None)),
+                    attempts: Arc::new(AtomicU64::new(0)),
+                    misses: Arc::new(AtomicU64::new(0)),
+                    polls: Arc::new(AtomicU64::new(0)),
+                    rejected: Arc::new(AtomicBool::new(false)),
+                    fatal: Arc::new(Mutex::new(None)),
+                }),
+                worker: None,
+                next_attempt: Instant::now(),
+                last_poll: Instant::now(),
+            }
+        }
+
+        /// Rejoin the previous dial worker before starting a new one.
+        ///
+        /// The single-flight flag is cleared by a guard that runs only when the
+        /// worker body has returned, so a clear `dialing` flag means this join
+        /// cannot block on network work. It exists so a `JoinHandle` is never
+        /// dropped while still detached: at most one worker is ever alive, and
+        /// `close` joins the last one.
+        fn join_previous_worker(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+
+        /// Stop dialling, interrupt an in-flight handshake, and wait for the
+        /// worker to exit.
+        ///
+        /// Idempotent. After it returns, no thread of this manager can still run,
+        /// so no socket or descriptor is created or held on its behalf. The wait
+        /// is bounded by the dial's own single budget (`HANDSHAKE_TIMEOUT`): the
+        /// duplicated descriptor covers the whole handshake, and the only step
+        /// with no interruptible descriptor yet is the TCP connect itself. DNS
+        /// resolution happened before this manager was created, so the join never
+        /// sits in a resolver.
+        fn close(&mut self) {
+            self.shared.stop.store(true, Ordering::SeqCst);
+            // The duplicate descriptor keeps the dial socket alive, so this
+            // shutdown can never name a closed or recycled raw fd.
+            if let Some(stream) = lock_mutex(&self.shared.interrupt).take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            clear_standby_slot(&self.shared.slot, &self.shared.counters.standby_ready);
+        }
+
+        /// Whether a verified standby session is currently held.
+        fn is_ready(&self) -> bool {
+            lock_mutex(&self.shared.slot).is_some()
+        }
+
+        /// First terminal protocol/identity rejection, if any.
+        fn rejection(&self) -> Option<String> {
+            let fatal = lock_mutex(&self.shared.fatal);
+            (*fatal).clone()
+        }
+
+        /// Take the held standby session for promotion.
+        fn take(&mut self) -> Option<HopLink> {
+            take_standby_slot(&self.shared.slot, &self.shared.counters.standby_ready)
+        }
+
+        /// One bounded, non-blocking maintenance step.
+        ///
+        /// A held session gets exactly one transport-liveness poll per
+        /// `STANDBY_POLL_INTERVAL`; the poll counter is strictly increasing and
+        /// never rewinds. A lost transport is replaced by a fresh authenticated
+        /// dial after `STANDBY_DIAL_BACKOFF`; consecutive transport failures
+        /// beyond `STANDBY_FAIL_THRESHOLD` stay visible through `ctl status`.
+        fn maintain(&mut self, now: Instant) {
+            if self.shared.rejected.load(Ordering::SeqCst) {
+                self.shared
+                    .counters
+                    .standby_ready
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+            match self.poll_health(now) {
+                Some(SocketHealth::Alive) => {
+                    self.shared.misses.store(0, Ordering::SeqCst);
+                    self.shared
+                        .counters
+                        .standby_failures
+                        .store(0, Ordering::SeqCst);
+                    self.shared
+                        .counters
+                        .standby_ready
+                        .store(true, Ordering::SeqCst);
+                }
+                Some(SocketHealth::Unread) => {
+                    // An authenticated path that carries no circuit must not
+                    // produce bytes. Treat that as a protocol violation, not as an
+                    // ordinary transport miss that may be retried into failover.
+                    drop(self.take());
+                    reject_standby(
+                        &self.shared,
+                        "standby: unexpected bytes on an idle standby link (protocol violation)"
+                            .to_string(),
+                    );
+                }
+                Some(_) => {
+                    // FIN/RST/POLLERR at the transport layer: drop the link and
+                    // re-authenticate after the bounded backoff.
+                    drop(self.take());
+                    let misses = self.shared.misses.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.shared
+                        .counters
+                        .standby_failures
+                        .store(misses, Ordering::SeqCst);
+                    self.shared
+                        .counters
+                        .standby_ready
+                        .store(false, Ordering::SeqCst);
+                    self.next_attempt = now + STANDBY_DIAL_BACKOFF;
+                }
+                None => {}
+            }
+            if should_dial(
+                now,
+                self.next_attempt,
+                self.is_ready(),
+                self.shared.dialing.load(Ordering::SeqCst),
+                self.shared.stop.load(Ordering::SeqCst),
+            ) && !self.shared.dialing.swap(true, Ordering::SeqCst)
+            {
+                self.join_previous_worker();
+                let shared = Arc::clone(&self.shared);
+                // Stored, never detached: `close` joins it.
+                self.worker = Some(thread::spawn(move || standby_dial(shared)));
+            }
+        }
+
+        /// One monotonic transport-liveness poll, at most once per interval.
+        ///
+        /// This is `poll(2)` readiness only. It is not a `ProbePing`: it sends no
+        /// random challenge and never matches a `Pong`.
+        fn poll_health(&mut self, now: Instant) -> Option<SocketHealth> {
+            if now.saturating_duration_since(self.last_poll) < STANDBY_POLL_INTERVAL {
+                return None;
+            }
+            let fd = {
+                let slot = lock_mutex(&self.shared.slot);
+                slot.as_ref().map(|link| link.fd)
+            }?;
+            self.last_poll = now;
+            let polls = self.shared.polls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.shared
+                .counters
+                .standby_polls
+                .store(polls, Ordering::SeqCst);
+            Some(socket_health(fd))
+        }
+
+        /// Bounded wait for a standby session before a failover verdict.
+        ///
+        /// It waits only while a dial is actually in flight: with no dial
+        /// outstanding nothing can become ready, so answering immediately is the
+        /// honest result rather than a sleep that pretends to recover.
+        fn wait_ready(&mut self, budget: Duration) -> bool {
+            if self.shared.rejected.load(Ordering::SeqCst) {
+                return false;
+            }
+            let deadline = Instant::now() + budget;
+            loop {
+                if self.is_ready() {
+                    return true;
+                }
+                if self.shared.rejected.load(Ordering::SeqCst)
+                    || !self.shared.dialing.load(Ordering::SeqCst)
+                    || Instant::now() >= deadline
+                {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+                self.maintain(Instant::now());
+            }
+        }
+    }
+
+    impl Drop for StandbyManager {
+        fn drop(&mut self) {
+            // Every exit path, including a panic, waits for the worker instead of
+            // leaving a detached thread that could still dial and own sockets.
+            self.close();
+        }
     }
 
     fn endpoint_tls_name(endpoint: &str) -> Result<&str, String> {
@@ -786,6 +1842,27 @@ mod linux_daemon {
         )
         .map_err(|error| format!("daemon network policy rejected: {error}"))?;
 
+        // The signed policy is the sole address authority. A config prefix that
+        // does not equal the verified context would let a node derive/use an
+        // unintended overlay, so reject it before any identity or TUN is created.
+        if network_context.net_id() != cfg_net_id {
+            return Err(
+                "daemon: verified network policy belongs to a different net_id".to_string(),
+            );
+        }
+        let config_prefix = config.network.overlay_prefix.base();
+        let signed_prefix = network_context.overlay_base();
+        if config_prefix != signed_prefix {
+            return Err(format!(
+                "daemon: configured overlay_prefix {}.{}.0.0/16 does not match signed policy prefix {}.{}.0.0/16",
+                config_prefix[0], config_prefix[1], signed_prefix[0], signed_prefix[1]
+            ));
+        }
+        // Capture the signed window exactly once. It is checked at every dial,
+        // handshake, promotion and packet-loop iteration; it is never widened by
+        // a later verification or clock observation.
+        let policy_window = PolicyWindow::new(network_context.validity().1)?;
+
         let local_vn =
             VerifiedNodeIdentity::from_verified_object(&verified.local, &network_context)
                 .map_err(|_| "daemon: invalid local VerifiedNodeIdentity".to_string())?;
@@ -894,6 +1971,14 @@ mod linux_daemon {
             rx_bytes: AtomicU64::new(0),
             status_sequence: AtomicU64::new(verified.status_sequence),
             status_fresh: AtomicBool::new(true),
+            standby_ready: AtomicBool::new(false),
+            standby_rejected: AtomicBool::new(false),
+            standby_attempts: AtomicU64::new(0),
+            standby_polls: AtomicU64::new(0),
+            standby_failures: AtomicU64::new(0),
+            failover_events: AtomicU64::new(0),
+            path_epoch: AtomicU64::new(0),
+            active_path: AtomicU8::new(PATH_PRIMARY),
         });
         let _ctl_guard = start_control_socket(&config.paths.state_dir, Arc::clone(&counters))?;
 
@@ -921,14 +2006,18 @@ mod linux_daemon {
             &roots_path,
             now_utc_us()?,
         )?;
+        let status_path = mat_dir.join("status.signed");
         let (gate_seq, _gate_deadline) = status_gate(
             &mut status_store,
-            &mat_dir.join("status.signed"),
+            &status_path,
             now_utc_us()?,
             Instant::now(),
         )
         .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
         counters.status_sequence.store(gate_seq, Ordering::SeqCst);
+        // One process-wide store instance for every later boundary, including
+        // each failover epoch: reopening on the same path would return `Busy`.
+        let status_store = Arc::new(Mutex::new(status_store));
 
         let session_policy = SessionPolicy {
             local: local_peer,
@@ -947,7 +2036,8 @@ mod linux_daemon {
             Mode::Serve => run_serve_loop(
                 listen_spec.ok_or_else(|| "daemon serve: `--listen` is required".to_string())?,
                 &mat_dir,
-                &mat_dir.join("status.signed"),
+                &status_path,
+                policy_window,
                 status_store,
                 inner_acc,
                 extractor,
@@ -975,10 +2065,12 @@ mod linux_daemon {
                     ws_host.as_deref(),
                     &ws_path,
                     &mat_dir,
-                    &mat_dir.join("status.signed"),
+                    &config.identity.private_key,
+                    extractor,
+                    &status_path,
+                    policy_window,
                     status_store,
                     inner_conn,
-                    extractor,
                     e2e_backend,
                     session_policy,
                     remote_peer,
@@ -989,26 +2081,6 @@ mod linux_daemon {
                     &counters,
                 )
             }
-        }
-    }
-
-    /// Outer TLS connector wrapper that records the raw socket `fd` on `connect`
-    /// so the steady-state packet loop can `poll(fd, POLLIN, 20ms)` **before**
-    /// calling `PacketPath::step_inbound()` (preventing idle reads from entering
-    /// `WsStream` and poisoning the stream).
-    struct TrackingOuterConnector {
-        inner: OpenSslOuterTlsConnector,
-        fd_slot: Arc<std::sync::atomic::AtomicI32>,
-    }
-
-    impl boreas_tunnel::OuterTlsConnector for TrackingOuterConnector {
-        fn connect(
-            &self,
-            tcp: std::net::TcpStream,
-            server_name: &str,
-        ) -> Result<Box<dyn boreas_tunnel::Duplex>, TunnelError> {
-            self.fd_slot.store(tcp.as_raw_fd(), Ordering::SeqCst);
-            self.inner.connect(tcp, server_name)
         }
     }
 
@@ -1085,14 +2157,38 @@ mod linux_daemon {
         delivered || dropped_after > dropped_before
     }
 
-    /// §3.4 `StatusSnapshot` freshness watchdog.
+    /// Duplicate the connected socket for the watchdog's shutdown handle.
     ///
-    /// The 500 ms re-check reads and verifies `status.signed` through the
-    /// process-wide durable store, so it cannot live on the packet loop: a
-    /// blocking read/verification would stall it past the deadline. This thread
-    /// runs [`status_gate`], publishes the first failure as an owned string, and
-    /// interrupts any in-flight blocking I/O with `shutdown(SHUT_RDWR)` on the
-    /// outer socket.
+    /// The duplicate owns its own descriptor and keeps the underlying socket
+    /// alive even after the packet path drops the original stream. The watchdog
+    /// therefore never calls `shutdown(2)` on a raw number whose original owner
+    /// has already closed it (and whose number could have been reused). A
+    /// close-on-exec duplicate is used so the descriptor cannot leak into a
+    /// future exec.
+    fn duplicate_shutdown_fd(fd: i32) -> Option<OwnedFd> {
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` is an open socket owned by the caller; `F_DUPFD_CLOEXEC`
+        // returns a new owned descriptor or -1. `OwnedFd::from_raw_fd` then takes
+        // ownership of that new descriptor exactly once.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return None;
+        }
+        Some(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    /// §3.4 `StatusSnapshot` freshness watchdog plus signed-policy expiry guard.
+    ///
+    /// The 500 ms re-check checks the fixed signed-policy window and reads and
+    /// verifies `status.signed` through the process-wide durable store, so it
+    /// cannot live on the packet loop: a blocking read/verification would stall
+    /// it past the deadline. This thread runs [`status_gate`], publishes the
+    /// first failure as an owned string, and interrupts any in-flight blocking
+    /// I/O with `shutdown(SHUT_RDWR)` through an owned duplicate of the outer
+    /// socket, so a concurrently closed original descriptor cannot be reused
+    /// underneath the shutdown.
     ///
     /// It never tears the circuit down and never falls back to hop-only: the
     /// packet loop owns the fail-closed teardown and reports the published
@@ -1110,8 +2206,9 @@ mod linux_daemon {
 
     impl StatusWatchdog {
         fn start(
-            store: StatusStore,
+            store: Arc<Mutex<StatusStore>>,
             status_path: PathBuf,
+            policy_window: PolicyWindow,
             sock_fd: i32,
             counters: Arc<LiveCounters>,
             interval: Duration,
@@ -1122,8 +2219,10 @@ mod linux_daemon {
             let stop_bg = Arc::clone(&stop);
             let stopped_bg = Arc::clone(&stopped);
             let fault_bg = Arc::clone(&fault);
+            // Capture an owned duplicate now, while the caller's session is
+            // still alive. The worker uses only this duplicate, never `sock_fd`.
+            let shutdown_fd = duplicate_shutdown_fd(sock_fd);
             let handle = thread::spawn(move || {
-                let mut store = store;
                 // First check is immediate: business may already have started
                 // when this watchdog is constructed; a 500 ms grace period
                 // would be an unprotected forwarding window.
@@ -1149,36 +2248,48 @@ mod linux_daemon {
                         return;
                     }
 
-                    let failure = match now_utc_us() {
+                    let failure = if let Err(reason) = policy_window.check() {
+                        Some(reason)
+                    } else {
+                        match now_utc_us() {
                         Err(_) => Some(
                             "daemon: StatusSnapshot clock unavailable (system clock before UNIX_EPOCH)"
                                 .to_string(),
                         ),
-                        Ok(now_us) => match status_gate(
-                            &mut store,
-                            &status_path,
-                            now_us,
-                            Instant::now(),
-                        ) {
-                            Ok((seq, status_deadline)) => {
-                                let prev = counters.status_sequence.load(Ordering::Relaxed);
-                                if seq < prev {
-                                    Some(format!(
-                                        "daemon: StatusSnapshot sequence rollback detected (fail-closed): {seq} < {prev}"
-                                    ))
-                                } else {
-                                    counters.status_sequence.store(seq, Ordering::Relaxed);
-                                    // Do not sleep past the captured freshness
-                                    // deadline; the normal 500 ms cadence must
-                                    // never become a post-expiry forwarding window.
-                                    deadline = (Instant::now() + interval).min(status_deadline);
-                                    None
+                        Ok(now_us) => {
+                            // The store lock is held only for the verification;
+                            // business boundaries that also gate on it are on the
+                            // same thread as the loop this watchdog interrupts.
+                            let mut store_guard = lock_mutex(&store);
+                            match status_gate(
+                                &mut store_guard,
+                                &status_path,
+                                now_us,
+                                Instant::now(),
+                            ) {
+                                Ok((seq, status_deadline)) => {
+                                    let prev = counters.status_sequence.load(Ordering::Relaxed);
+                                    if seq < prev {
+                                        Some(format!(
+                                            "daemon: StatusSnapshot sequence rollback detected (fail-closed): {seq} < {prev}"
+                                        ))
+                                    } else {
+                                        counters.status_sequence.store(seq, Ordering::Relaxed);
+                                        // Do not sleep past the captured freshness
+                                        // deadline; the normal 500 ms cadence must
+                                        // never become a post-expiry forwarding window.
+                                        deadline = (Instant::now() + interval)
+                                            .min(status_deadline)
+                                            .min(policy_window.deadline());
+                                        None
+                                    }
                                 }
+                                Err(error) => Some(format!(
+                                    "daemon: StatusSnapshot stale or invalid, business forwarding halted (§3.4): {error}"
+                                )),
                             }
-                            Err(error) => Some(format!(
-                                "daemon: StatusSnapshot stale or invalid, business forwarding halted (§3.4): {error}"
-                            )),
-                        },
+                        }
+                    }
                     };
                     let Some(message) = failure else {
                         // `status_gate` already set the next deadline to
@@ -1197,11 +2308,12 @@ mod linux_daemon {
                             *slot = Some(message);
                         }
                     }
-                    if sock_fd >= 0 {
-                        // SAFETY: `sock_fd` is the connected outer TCP socket, kept
-                        // open for the whole lifetime of `drive_packet_path`; this
-                        // watchdog is stopped and joined before that stream drops.
-                        unsafe { libc::shutdown(sock_fd, libc::SHUT_RDWR) };
+                    if let Some(fd) = shutdown_fd.as_ref() {
+                        // SAFETY: `fd` is an owned duplicate of the connected
+                        // outer socket. It keeps the socket alive even if the
+                        // packet path has already dropped the original stream, so
+                        // this can never target a closed/reused descriptor.
+                        unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
                     }
                     return;
                 }
@@ -1246,7 +2358,8 @@ mod linux_daemon {
         listen_spec: String,
         mat_dir: &Path,
         status_path: &Path,
-        mut status_store: StatusStore,
+        policy_window: PolicyWindow,
+        status_store: Arc<Mutex<StatusStore>>,
         inner_acc: OpenSslAcceptor,
         extractor: Arc<PkiIdentityExtractor>,
         e2e_backend: OpenSslE2eBackend,
@@ -1270,15 +2383,13 @@ mod linux_daemon {
             .set_nonblocking(true)
             .map_err(|_| "daemon serve: listener nonblocking failed".to_string())?;
 
-        // Status must still be fresh at the last boundary before an untrusted
-        // peer is accepted.
-        status_gate(
-            &mut status_store,
-            status_path,
-            now_utc_us()?,
-            Instant::now(),
-        )
-        .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
+        // Status and the signed policy window must still be fresh at the last
+        // boundary before an untrusted peer is accepted.
+        policy_window
+            .check()
+            .map_err(|e| format!("daemon serve: policy window failed before accept: {e}"))?;
+        lock_gate(&status_store, status_path)
+            .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
 
         let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
         let accept_deadline = Instant::now() + wait_limit;
@@ -1290,6 +2401,9 @@ mod linux_daemon {
                     break s;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    policy_window.check().map_err(|e| {
+                        format!("daemon serve: policy window failed while waiting for peer: {e}")
+                    })?;
                     if Instant::now() >= accept_deadline {
                         return Err(
                             "daemon serve: timed out waiting for peer connection".to_string()
@@ -1301,6 +2415,9 @@ mod linux_daemon {
             }
         };
         let sock_fd = tcp.as_raw_fd();
+        policy_window
+            .check()
+            .map_err(|e| format!("daemon serve: policy window failed after accept: {e}"))?;
 
         let admission = Admission::new(Limits {
             handshakes_global: 8,
@@ -1310,6 +2427,8 @@ mod linux_daemon {
         });
         let link_server =
             LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
+        // `HANDSHAKE_TIMEOUT` is the crate's one absolute budget for this
+        // exchange; the daemon installs no second deadline on the same socket.
         let mut accepted = link_server
             .accept_tls_stream(
                 tcp,
@@ -1320,52 +2439,89 @@ mod linux_daemon {
             )
             .map_err(|e| format!("daemon serve: WSS + pq768 hop session rejected: {e}"))?;
 
-        // The peer authenticated, but status may have expired during the
-        // blocking handshake. Recheck before running the E2E handshake.
-        status_gate(
-            &mut status_store,
-            status_path,
-            now_utc_us()?,
-            Instant::now(),
-        )
-        .map_err(|e| {
+        // The peer authenticated, but status or the signed policy may have
+        // expired during the blocking handshake. Recheck before running the E2E
+        // handshake.
+        policy_window
+            .check()
+            .map_err(|e| format!("daemon serve: policy window failed after hop handshake: {e}"))?;
+        lock_gate(&status_store, status_path).map_err(|e| {
             format!("daemon serve: durable status gate failed after hop handshake: {e}")
         })?;
 
         let e2e = accept_e2e(&mut accepted.session, &e2e_backend, remote_peer)
             .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?;
 
-        // Last business-admission boundary: a status that expired during E2E
-        // handshake must stop before any packet is forwarded.
-        status_gate(
-            &mut status_store,
-            status_path,
-            now_utc_us()?,
-            Instant::now(),
-        )
-        .map_err(|e| format!("daemon serve: durable status gate failed before business: {e}"))?;
+        // Last business-admission boundary: a status or policy that expired
+        // during E2E handshake must stop before any packet is forwarded.
+        policy_window
+            .check()
+            .map_err(|e| format!("daemon serve: policy window failed before business: {e}"))?;
+        lock_gate(&status_store, status_path)
+            .map_err(|e| format!("daemon serve: durable status gate failed before business: {e}"))?;
+
+        bound_path_io(sock_fd)?;
 
         counters.inbound_connections.store(1, Ordering::SeqCst);
         counters.connected.store(true, Ordering::SeqCst);
 
-        let res = drive_packet_path(
+        let res = drive_business_path(
             "serve",
             sock_fd,
             tun,
             e2e,
             mtu,
             status_path,
-            status_store,
+            policy_window,
+            Arc::clone(&status_store),
             max_packets,
-            max_seconds,
+            0,
+            max_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds)),
+            None,
+            None,
             counters,
         );
 
         counters.connected.store(false, Ordering::SeqCst);
         counters.inbound_connections.store(0, Ordering::SeqCst);
-        res
+        // `serve` has exactly one authenticated peer and no standby path, so a
+        // transport failure is terminal here.
+        let report = res?;
+        let stop_reason = match &report.stop {
+            PathStop::Budget(reason) => *reason,
+            PathStop::PeerClosed => "peer_closed_cleanly",
+            PathStop::Failed { reason, .. } => {
+                return Err(format!(
+                    "daemon serve: inbound circuit failed (fail-closed): {reason}"
+                ));
+            }
+        };
+        print_path_summary("serve", tun, &report, stop_reason, 0, 1);
+        Ok(())
     }
 
+    /// Connect, then keep business on one authenticated circuit at a time.
+    ///
+    /// The initial dial keeps the pre-authorization fallback: only a transport
+    /// refusal or timeout on the primary may advance to the backup endpoint, and
+    /// a policy or handshake rejection still stops everything. Once business is
+    /// running on the primary, the same backup endpoint becomes a *standby path*:
+    /// one bounded background dial keeps a fully authenticated session to the same
+    /// Core on it, and a transport failure promotes that session by rebuilding the
+    /// E2E circuit on it. If the initial dial already fell back to the backup, no
+    /// standby is opened to that active endpoint: there is no second ingress, and
+    /// its loss is fail-closed.
+    ///
+    /// What is deliberately not here: a second Core. There is no multi-Core
+    /// directory in this tree, so the only authority for a peer identity is the
+    /// mounted `peer.signed`, which is pinned into the inner pq768 trust store. A
+    /// backup endpoint owned by any other identity cannot complete the handshake,
+    /// so the standby never becomes ready and the failure is closed instead of
+    /// being "trusted" because configuration named the endpoint.
+    ///
+    /// Exactly one promotion is allowed: the two configured endpoints are the
+    /// whole path set, so after the backup carries business a further loss is
+    /// fail-closed rather than a re-dial of the endpoint already in use.
     #[allow(clippy::too_many_arguments)]
     fn run_connect_loop(
         primary_spec: &str,
@@ -1374,10 +2530,12 @@ mod linux_daemon {
         ws_host_override: Option<&str>,
         ws_path: &str,
         mat_dir: &Path,
-        status_path: &Path,
-        mut status_store: StatusStore,
-        inner_conn: OpenSslConnector,
+        key_path: &Path,
         extractor: Arc<PkiIdentityExtractor>,
+        status_path: &Path,
+        policy_window: PolicyWindow,
+        status_store: Arc<Mutex<StatusStore>>,
+        inner_conn: OpenSslConnector,
         e2e_backend: OpenSslE2eBackend,
         session_policy: SessionPolicy,
         remote_peer: PeerIdentity,
@@ -1398,26 +2556,30 @@ mod linux_daemon {
                 .map_err(|_| "daemon connect: web-PKI roots unavailable".to_string())?
         };
 
-        let fd_slot = Arc::new(std::sync::atomic::AtomicI32::new(-1));
-        let tracking_outer = TrackingOuterConnector {
-            inner: outer_conn,
-            fd_slot: Arc::clone(&fd_slot),
-        };
+        let budget = Arc::new(ConnectionBudget::new());
         let link_client = LinkClient::new(
-            Box::new(tracking_outer),
-            Box::new(OpenSslInnerConnector::new(inner_conn, extractor)),
+            Box::new(outer_conn),
+            Box::new(OpenSslInnerConnector::new(
+                inner_conn,
+                Arc::clone(&extractor),
+            )),
         );
         let endpoints = connect_endpoints(primary_spec, backup_spec);
-        let mut connected: Option<(boreas_tunnel::EstablishedSession, i32)> = None;
+        let mut link: Option<(usize, HopLink)> = None;
         for (index, endpoint) in endpoints.iter().enumerate() {
-            status_gate(
-                &mut status_store,
-                status_path,
-                now_utc_us()?,
-                Instant::now(),
-            )
-            .map_err(|e| format!("daemon connect: durable status gate failed before dial: {e}"))?;
+            policy_window
+                .check()
+                .map_err(|e| format!("daemon connect: policy window failed before dial: {e}"))?;
+            lock_gate(&status_store, status_path).map_err(|e| {
+                format!("daemon connect: durable status gate failed before dial: {e}")
+            })?;
             let target = client_target(endpoint, tls_name_override, ws_host_override, ws_path)?;
+            let Some(permit) = budget.try_acquire() else {
+                return Err(format!(
+                    "daemon connect: bounded live-connection budget exhausted before dial (live={}/{MAX_LIVE_CONNECTIONS})",
+                    budget.live()
+                ));
+            };
             match attempt_endpoint(
                 index,
                 endpoints.len(),
@@ -1426,34 +2588,43 @@ mod linux_daemon {
             ) {
                 Ok(tcp) => {
                     // TCP connect can take time; recheck before spending the
-                    // blocking WSS/hop handshake on a stale status.
-                    status_gate(
-                        &mut status_store,
-                        status_path,
-                        now_utc_us()?,
-                        Instant::now(),
-                    )
-                    .map_err(|e| {
+                    // blocking WSS/hop handshake on a stale status or policy.
+                    policy_window.check().map_err(|e| {
+                        format!("daemon connect: policy window failed after TCP connect: {e}")
+                    })?;
+                    lock_gate(&status_store, status_path).map_err(|e| {
                         format!("daemon connect: durable status gate failed after TCP connect: {e}")
                     })?;
+                    let fd = tcp.as_raw_fd();
+                    // One deadline, owned by the transport crate (see the note
+                    // above `SocketHealth`): the daemon only supplies the budget.
                     let session = link_client
                         .connect_preconnected(tcp, &target, session_policy.clone())
                         .map_err(|e| {
                             format!("daemon connect: WSS + pq768 hop session rejected: {e}")
                         })?;
-                    // Status may have expired during the blocking handshake.
-                    status_gate(
-                        &mut status_store,
-                        status_path,
-                        now_utc_us()?,
-                        Instant::now(),
-                    )
-                    .map_err(|e| {
+                    // Status or policy may have expired during the blocking
+                    // handshake.
+                    policy_window.check().map_err(|e| {
+                        format!("daemon connect: policy window failed after hop handshake: {e}")
+                    })?;
+                    lock_gate(&status_store, status_path).map_err(|e| {
                         format!(
                             "daemon connect: durable status gate failed after hop handshake: {e}"
                         )
                     })?;
-                    connected = Some((session, fd_slot.load(Ordering::SeqCst)));
+                    counters.active_path.store(
+                        if index == 0 { PATH_PRIMARY } else { PATH_BACKUP },
+                        Ordering::SeqCst,
+                    );
+                    link = Some((
+                        index,
+                        HopLink {
+                            session,
+                            fd,
+                            _permit: permit,
+                        },
+                    ));
                     break;
                 }
                 Err(EndpointAttemptError::TryBackup(_error)) => continue,
@@ -1462,114 +2633,324 @@ mod linux_daemon {
                 }
             }
         }
-        let (mut hop_session, sock_fd) =
-            connected.ok_or_else(|| "daemon connect: no endpoint connected".to_string())?;
+        let (active_index, mut link) =
+            link.ok_or_else(|| "daemon connect: no endpoint connected".to_string())?;
+        let backup_configured = endpoints.len() > 1;
 
-        let e2e = open_e2e(&mut hop_session, &e2e_backend, remote_peer, 1)
-            .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
+        // Only a distinct configured backup endpoint gets a standby path, and only
+        // while the primary carries business. If the initial dial already fell back
+        // to the backup, that endpoint is the active path: opening a standby to it
+        // would leave no other ingress and invite a second "promotion" onto the
+        // same endpoint.
+        let mut standby = if active_index == 0 && backup_configured {
+            let endpoint = endpoints[1];
+            // Resolve here, on the manager-owning thread. The worker and `close()`
+            // join must never block on a resolver with no bound.
+            let target = client_target(endpoint, tls_name_override, ws_host_override, ws_path)?;
+            Some(StandbyManager::new(
+                StandbyConfig {
+                    endpoint: endpoint.to_string(),
+                    target,
+                    mat_dir: mat_dir.to_path_buf(),
+                    key_path: key_path.to_path_buf(),
+                    policy: session_policy.clone(),
+                    expected_peer: remote_peer,
+                    extractor: Arc::clone(&extractor),
+                    policy_window,
+                    status_store: Arc::clone(&status_store),
+                    status_path: status_path.to_path_buf(),
+                },
+                Arc::clone(&budget),
+                Arc::clone(counters),
+            ))
+        } else {
+            None
+        };
 
-        // Last business-admission boundary before the packet loop starts.
-        status_gate(
-            &mut status_store,
-            status_path,
-            now_utc_us()?,
-            Instant::now(),
-        )
-        .map_err(|e| format!("daemon connect: durable status gate failed before business: {e}"))?;
+        let business_started = Instant::now();
+        let deadline = max_seconds.map(|seconds| business_started + Duration::from_secs(seconds));
+        let mut packets_before = 0u64;
+        let mut identity: Option<BusinessIdentity> = None;
+        let mut failover_events = 0u64;
+        let mut epoch = 0u64;
 
-        counters.outbound_upstreams.store(1, Ordering::SeqCst);
-        counters.connected.store(true, Ordering::SeqCst);
+        loop {
+            epoch = epoch.saturating_add(1);
+            // Re-apply the bound per epoch: a promoted session is a different
+            // socket, and it must never run unbounded either.
+            bound_path_io(link.fd)?;
 
-        let res = drive_packet_path(
-            "connect",
-            sock_fd,
-            tun,
-            e2e,
-            mtu,
-            status_path,
-            status_store,
-            max_packets,
-            max_seconds,
-            counters,
-        );
+            let attempt = {
+                // Gate before spending an E2E handshake on this epoch. A promoted
+                // session is not exempt: it was admitted only for the status and
+                // policy window that were current when its standby dial
+                // authenticated.
+                policy_window.check().map_err(|e| {
+                    format!("daemon connect: policy window failed before E2E circuit: {e}")
+                })?;
+                lock_gate(&status_store, status_path).map_err(|e| {
+                    format!(
+                        "daemon connect: durable status gate failed before E2E circuit: {e}"
+                    )
+                })?;
+                // The circuit borrows this session for the whole epoch, so the
+                // standby is a distinct object that this loop only polls.
+                let e2e = open_e2e(&mut link.session, &e2e_backend, remote_peer, 1)
+                    .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
+                // Last business-admission boundary before the packet loop starts.
+                lock_gate(&status_store, status_path).map_err(|e| {
+                    format!("daemon connect: durable status gate failed before business: {e}")
+                })?;
+                if epoch > 1 {
+                    // The rebuilt circuit has passed the final status/policy
+                    // boundary and the E2E handshake. Count it only now, after
+                    // the promotion actually reached a business epoch.
+                    failover_events = failover_events.saturating_add(1);
+                    counters
+                        .failover_events
+                        .store(failover_events, Ordering::SeqCst);
+                    counters.active_path.store(PATH_BACKUP, Ordering::SeqCst);
+                }
+                counters.outbound_upstreams.store(1, Ordering::SeqCst);
+                counters.connected.store(true, Ordering::SeqCst);
+                let result = drive_business_path(
+                    "connect",
+                    link.fd,
+                    tun,
+                    e2e,
+                    mtu,
+                    status_path,
+                    policy_window,
+                    Arc::clone(&status_store),
+                    max_packets,
+                    packets_before,
+                    deadline,
+                    identity,
+                    standby.as_mut(),
+                    counters,
+                );
+                counters.connected.store(false, Ordering::SeqCst);
+                counters.outbound_upstreams.store(0, Ordering::SeqCst);
+                result
+            };
+            let report = attempt?;
+            packets_before = packets_before
+                .saturating_add(report.stats.outbound_packets)
+                .saturating_add(report.stats.inbound_packets);
+            identity = Some(report.identity);
+            if let PathStop::Budget(reason) = &report.stop {
+                print_path_summary("connect", tun, &report, *reason, failover_events, epoch);
+                return Ok(());
+            }
 
-        counters.connected.store(false, Ordering::SeqCst);
-        counters.outbound_upstreams.store(0, Ordering::SeqCst);
-        res
+            // Every promotion boundary is gated through the same durable store
+            // instance and the fixed signed-policy window. A status or policy
+            // that expired while the packet loop was stopping must not be able to
+            // reach a new E2E circuit.
+            policy_window.check().map_err(|e| {
+                format!("daemon connect: policy window failed before promotion: {e}")
+            })?;
+            lock_gate(&status_store, status_path).map_err(|e| {
+                format!("daemon connect: durable status gate failed before promotion: {e}")
+            })?;
+
+            let reason = match &report.stop {
+                PathStop::Failed { reason, .. } => reason.clone(),
+                _ => "the peer closed the authenticated circuit".to_string(),
+            };
+
+            match &report.stop {
+                PathStop::PeerClosed
+                | PathStop::Failed {
+                    kind: PathFailureKind::Transport,
+                    ..
+                } => {}
+                PathStop::Failed {
+                    kind: PathFailureKind::Protocol,
+                    ..
+                } => {
+                    return Err(format!(
+                        "daemon connect: non-transport protocol/identity failure is terminal, not an ordinary failover trigger (fail-closed): {reason}"
+                    ));
+                }
+                PathStop::Budget(reason) => {
+                    print_path_summary("connect", tun, &report, *reason, failover_events, epoch);
+                    return Ok(());
+                }
+            }
+
+            // A standby path exists precisely to keep business running when the
+            // active ingress goes away, so a clean close is also a promotion
+            // trigger. Without a verified standby the close stays terminal, and a
+            // hard failure with no standby is fail-closed with its real reason.
+            let promoted = {
+                let ready = match standby.as_mut() {
+                    Some(manager) => manager.wait_ready(STANDBY_READY_WAIT),
+                    None => false,
+                };
+                if ready {
+                    // The bounded wait can itself outlive the status/policy
+                    // boundary that admitted it. Recheck immediately before
+                    // consuming the standby, so a stale admission can never
+                    // increment the promotion counter.
+                    policy_window.check().map_err(|e| {
+                        format!("daemon connect: policy window failed during standby wait: {e}")
+                    })?;
+                    lock_gate(&status_store, status_path).map_err(|e| {
+                        format!(
+                            "daemon connect: durable status gate failed during standby wait: {e}"
+                        )
+                    })?;
+                    standby.as_mut().and_then(StandbyManager::take)
+                } else {
+                    None
+                }
+            };
+            let Some(next) = promoted else {
+                // A clean close is a planned stop only when no backup endpoint
+                // was configured at all. With one configured, losing the active
+                // path while no verified standby is ready is exactly the
+                // condition that must be reported, not hidden behind
+                // `peer_closed_cleanly`. This also covers an initial fallback
+                // that is already on the backup: there is no second ingress left.
+                if !backup_configured && matches!(&report.stop, PathStop::PeerClosed) {
+                    print_path_summary(
+                        "connect",
+                        tun,
+                        &report,
+                        "peer_closed_cleanly",
+                        failover_events,
+                        epoch,
+                    );
+                    return Ok(());
+                }
+                let rejected = standby
+                    .as_ref()
+                    .and_then(StandbyManager::rejection)
+                    .map(|reason| format!("; standby rejected: {reason}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "daemon connect: active path failed and no authenticated standby path is ready (fail-closed): {reason}{rejected}"
+                ));
+            };
+            // Replaces (and drops) the failed link, releasing its permit.
+            link = next;
+            // There is exactly one alternate ingress. Once it carries business
+            // there is no third path to keep warm, so a further loss is
+            // fail-closed instead of re-dialling the endpoint already in use.
+            // Cleanup happens here, at a defined point: stop, interrupt, join.
+            if let Some(mut manager) = standby.take() {
+                manager.close();
+            }
+        }
     }
 
+    /// Run the packet loop for one established business path.
+    ///
+    /// Returns *why* the path stopped, or a terminal failure. A transport
+    /// failure is reported rather than retried: only the caller knows whether an
+    /// authenticated standby path exists. The path is bound to the circuit it was
+    /// given and can never deliver a packet on another one, so one circuit still
+    /// carries one FIFO.
     #[allow(clippy::too_many_arguments)]
-    fn drive_packet_path(
+    fn drive_business_path(
         mode_name: &str,
         sock_fd: i32,
         tun: &TunEndpoint,
-        e2e: boreas_tunnel::e2e::E2eCircuit<'_>,
+        e2e: E2eCircuit<'_>,
         mtu: usize,
         status_path: &Path,
-        status_store: StatusStore,
+        policy_window: PolicyWindow,
+        status_store: Arc<Mutex<StatusStore>>,
         max_packets: Option<u64>,
-        max_seconds: Option<u64>,
+        packets_before: u64,
+        deadline: Option<Instant>,
+        expected: Option<BusinessIdentity>,
+        mut standby: Option<&mut StandbyManager>,
         counters: &Arc<LiveCounters>,
-    ) -> Result<(), String> {
+    ) -> Result<PathReport, String> {
         let mut path = PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
             .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
+        let identity = business_identity(&path);
+        if let Some(expected) = expected
+            && expected != identity
+        {
+            path.close();
+            return Err(format!(
+                "daemon {mode_name}: fail-closed: a standby path must keep the verified peer identity and VIP binding (expected {expected:?}, observed {identity:?})"
+            ));
+        }
         let local_vip = path.local_endpoint().vip();
         let peer_vip = path.peer_endpoint().vip();
 
         // Declared after `path` on purpose: the watchdog is stopped and joined
-        // before the E2E stream (and its socket) is dropped, so `shutdown()`
-        // can never target a recycled descriptor.
+        // before the E2E stream (and its socket) is dropped, so `shutdown()` can
+        // never target a recycled descriptor.
         let watchdog = StatusWatchdog::start(
             status_store,
             status_path.to_path_buf(),
+            policy_window,
             sock_fd,
             Arc::clone(counters),
             STATUS_RECHECK_INTERVAL,
         );
 
-        let started = Instant::now();
         let mut last_dropped = 0u64;
-        let stop_reason: &'static str;
-
-        loop {
-            // Status first: once the watchdog published a failure, business I/O
+        let stop = loop {
+            // Policy first: an expired signed policy window is a hard stop even
+            // when the status snapshot is still fresh.
+            if let Err(reason) = policy_window.check() {
+                path.close();
+                return Err(format!(
+                    "daemon {mode_name}: policy window failed during business: {reason}"
+                ));
+            }
+            // Status next: once the watchdog published a failure, business I/O
             // is forbidden and that reason must win over every later symptom.
             if let Some(reason) = watchdog.fault() {
                 path.close();
                 return Err(reason);
             }
 
-            if let Some(sec) = max_seconds
-                && started.elapsed() >= Duration::from_secs(sec)
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
             {
                 path.close_gracefully();
-                stop_reason = "max_seconds_reached";
-                break;
+                break PathStop::Budget("max_seconds_reached");
             }
             if let Some(limit) = max_packets {
-                let st = path.stats();
-                if st.outbound_packets.saturating_add(st.inbound_packets) >= limit {
+                let stats = path.stats();
+                let total = packets_before
+                    .saturating_add(stats.outbound_packets)
+                    .saturating_add(stats.inbound_packets);
+                if total >= limit {
                     path.close_gracefully();
-                    stop_reason = "max_packets_reached";
-                    break;
+                    break PathStop::Budget("max_packets_reached");
                 }
+            }
+
+            // Standby maintenance is one non-blocking transport poll plus, at
+            // most, one background dial. It never blocks this loop and never
+            // touches the active circuit; it is not a ProbePing exchange.
+            if let Some(manager) = standby.as_deref_mut() {
+                manager.maintain(Instant::now());
             }
 
             // Both packet sources are nonblocking here: TUN reads are zero-time
             // readiness queries and idle waiting happens once per iteration.
-            // Status freshness is no longer checked inline — the watchdog owns
-            // it, so a blocking read can never stall the §3.4 deadline.
+            // Status freshness is owned by the watchdog, so a blocking read can
+            // never stall the section 3.4 deadline.
             let mut made_progress = false;
             match path.step_outbound() {
                 Ok(Some(_len)) => {
                     made_progress = true;
-                    let st = path.stats();
+                    let stats = path.stats();
                     counters
                         .tx_packets
-                        .store(st.outbound_packets, Ordering::Relaxed);
+                        .store(stats.outbound_packets, Ordering::Relaxed);
                     counters
                         .tx_bytes
-                        .store(st.outbound_bytes, Ordering::Relaxed);
+                        .store(stats.outbound_bytes, Ordering::Relaxed);
                 }
                 Ok(None) => {
                     // `Ok(None)` covers both "no host packet" and "a valid host
@@ -1583,7 +2964,7 @@ mod linux_daemon {
                 Err(PacketPathError::Denied(_)) => {
                     // `step_outbound` discards ordinary local traffic itself.
                     // Reaching here means the packet was malformed or the host
-                    // packet interface failed; that remains fatal.
+                    // packet interface failed; that remains terminal.
                     if let Some(reason) = watchdog.fault() {
                         path.close();
                         return Err(reason);
@@ -1592,20 +2973,26 @@ mod linux_daemon {
                         "daemon: outbound packet path rejected a malformed host packet".to_string(),
                     );
                 }
-                Err(e) => {
+                Err(error) => {
                     // A watchdog `shutdown()` surfaces here as an I/O error; the
                     // status reason must win over the symptom it caused.
                     if let Some(reason) = watchdog.fault() {
                         path.close();
                         return Err(reason);
                     }
-                    return Err(format!("daemon: outbound packet path error: {e:?}"));
+                    if host_side_failure(&error) {
+                        return Err(format!("daemon: outbound packet path error: {error:?}"));
+                    }
+                    break PathStop::Failed {
+                        kind: path_failure_kind(&error),
+                        reason: format!("outbound circuit error: {error:?}"),
+                    };
                 }
             }
 
             // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
-            // FrameIo and CircuitStream can all hold bytes after an earlier
-            // read. Drain whenever any layer reports buffered input as well.
+            // FrameIo and CircuitStream can all hold bytes after an earlier read.
+            // Drain whenever any layer reports buffered input as well.
             let buffered = path.has_buffered_input();
             let socket_ready = if buffered {
                 // Buffered work is already known to be readable; skip the probe.
@@ -1617,11 +3004,13 @@ mod linux_daemon {
                 match path.step_inbound() {
                     Ok(Some(_len)) => {
                         made_progress = true;
-                        let st = path.stats();
+                        let stats = path.stats();
                         counters
                             .rx_packets
-                            .store(st.inbound_packets, Ordering::Relaxed);
-                        counters.rx_bytes.store(st.inbound_bytes, Ordering::Relaxed);
+                            .store(stats.inbound_packets, Ordering::Relaxed);
+                        counters
+                            .rx_bytes
+                            .store(stats.inbound_bytes, Ordering::Relaxed);
                     }
                     Ok(None) => {
                         // The watchdog's `shutdown()` also surfaces as a clean
@@ -1630,15 +3019,20 @@ mod linux_daemon {
                             path.close();
                             return Err(reason);
                         }
-                        stop_reason = "peer_closed_cleanly";
-                        break;
+                        break PathStop::PeerClosed;
                     }
-                    Err(e) => {
+                    Err(error) => {
                         if let Some(reason) = watchdog.fault() {
                             path.close();
                             return Err(reason);
                         }
-                        return Err(format!("daemon: inbound packet path error: {e:?}"));
+                        if host_side_failure(&error) {
+                            return Err(format!("daemon: inbound packet path error: {error:?}"));
+                        }
+                        break PathStop::Failed {
+                            kind: path_failure_kind(&error),
+                            reason: format!("inbound circuit error: {error:?}"),
+                        };
                     }
                 }
             }
@@ -1655,26 +3049,22 @@ mod linux_daemon {
                     poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
                 }
             }
-        }
+        };
 
         // A failure that raced in during a graceful budget stop must still be
-        // reported: never print `"status":"ok"` for a halted §3.4 condition.
+        // reported: never print `"status":"ok"` for a halted section 3.4 condition.
         if let Some(reason) = watchdog.fault() {
             return Err(reason);
         }
 
-        let st = path.stats();
-        println!(
-            "{{\"command\":\"daemon.{mode_name}\",\"status\":\"ok\",\"stop_reason\":\"{stop_reason}\",\"tun\":\"{}\",\"local_vip\":\"{local_vip}\",\"peer_vip\":\"{peer_vip}\",\"security_mode\":\"e2e-required\",\"suite\":\"pq768\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{}}}",
-            tun.name(),
-            st.outbound_packets,
-            st.outbound_bytes,
-            st.inbound_packets,
-            st.inbound_bytes
-        );
-        Ok(())
+        Ok(PathReport {
+            stop,
+            identity,
+            stats: path.stats(),
+            local_vip,
+            peer_vip,
+        })
     }
-
     #[cfg(test)]
     mod watchdog_tests {
         use super::*;
@@ -1758,6 +3148,10 @@ mod linux_daemon {
             }
         }
 
+        fn policy_window() -> PolicyWindow {
+            PolicyWindow::new(now_utc_us().unwrap() + 3_600_000_000).expect("future policy window")
+        }
+
         fn counters() -> Arc<LiveCounters> {
             Arc::new(LiveCounters {
                 node_label: "test".to_string(),
@@ -1772,6 +3166,14 @@ mod linux_daemon {
                 rx_bytes: AtomicU64::new(0),
                 status_sequence: AtomicU64::new(7),
                 status_fresh: AtomicBool::new(true),
+                standby_ready: AtomicBool::new(false),
+                standby_rejected: AtomicBool::new(false),
+                standby_attempts: AtomicU64::new(0),
+                standby_polls: AtomicU64::new(0),
+                standby_failures: AtomicU64::new(0),
+                failover_events: AtomicU64::new(0),
+                path_epoch: AtomicU64::new(1),
+                active_path: AtomicU8::new(PATH_PRIMARY),
             })
         }
 
@@ -1783,8 +3185,9 @@ mod linux_daemon {
             let counters = counters();
             let (dir, store) = store_fixture("publishes");
             let watchdog = StatusWatchdog::start(
-                store,
+                Arc::new(Mutex::new(store)),
                 PathBuf::from("/nonexistent-boreas-status.signed"),
+                policy_window(),
                 -1,
                 Arc::clone(&counters),
                 Duration::from_millis(10),
@@ -1808,6 +3211,87 @@ mod linux_daemon {
             let _ = fs::remove_dir_all(dir);
         }
 
+        /// The watchdog must hold its own socket descriptor, not a raw number
+        /// that the packet path can close and the kernel can reuse.
+        #[test]
+        fn watchdog_shutdown_duplicate_survives_the_original_stream() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr");
+            let client = std::net::TcpStream::connect(address).expect("connect");
+            let (_server, _) = listener.accept().expect("accept");
+            let original = client.as_raw_fd();
+            let duplicate = duplicate_shutdown_fd(original).expect("duplicate the socket");
+            assert_ne!(duplicate.as_raw_fd(), original);
+            drop(client);
+            // SAFETY: `duplicate` is an owned descriptor; `F_GETFD` only reads
+            // its flags and does not close or replace it.
+            let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "the watchdog duplicate must remain open after the original drops"
+            );
+            assert!(duplicate_shutdown_fd(-1).is_none());
+        }
+
+        /// The signed UTC expiry and its monotonic shadow are independent halt
+        /// conditions; neither can widen the other.
+        #[test]
+        fn policy_window_checks_signed_utc_and_monotonic_independently() {
+            let utc_expired = PolicyWindow {
+                expires_utc_us: 1,
+                deadline: Instant::now() + Duration::from_secs(60),
+            };
+            assert!(
+                utc_expired.check().is_err(),
+                "an elapsed signed UTC window must fail closed"
+            );
+            let mono_expired = PolicyWindow {
+                expires_utc_us: now_utc_us().unwrap() + 60_000_000,
+                deadline: Instant::now(),
+            };
+            assert!(
+                mono_expired.check().is_err(),
+                "an elapsed monotonic window must fail closed"
+            );
+            assert!(policy_window().check().is_ok());
+        }
+
+        /// The signed policy window is a second, independent halt condition: a
+        /// still-fresh status snapshot must not keep business alive past it.
+        #[test]
+        fn watchdog_halts_when_the_signed_policy_window_expires() {
+            let counters = counters();
+            let (dir, store) = store_fixture("policy-expiry");
+            let window = PolicyWindow {
+                expires_utc_us: 1,
+                deadline: Instant::now(),
+            };
+            let watchdog = StatusWatchdog::start(
+                Arc::new(Mutex::new(store)),
+                PathBuf::from("/nonexistent-boreas-status.signed"),
+                window,
+                -1,
+                Arc::clone(&counters),
+                Duration::from_secs(3600),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reason = None;
+            while Instant::now() < deadline {
+                if let Some(published) = watchdog.fault() {
+                    reason = Some(published);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let reason = reason.expect("watchdog must publish policy expiry");
+            assert!(
+                reason.contains("network policy") || reason.contains("policy window"),
+                "unexpected policy reason: {reason}"
+            );
+            drop(watchdog);
+            let _ = fs::remove_dir_all(dir);
+        }
+
         /// `Drop` stops and joins promptly even when the immediate first check
         /// has already published a fault.
         #[test]
@@ -1815,8 +3299,9 @@ mod linux_daemon {
             let counters = counters();
             let (dir, store) = store_fixture("drop");
             let watchdog = StatusWatchdog::start(
-                store,
+                Arc::new(Mutex::new(store)),
                 PathBuf::from("/nonexistent-boreas-status.signed"),
+                policy_window(),
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
@@ -1855,8 +3340,9 @@ mod linux_daemon {
             let counters = counters();
             let (dir, store) = store_fixture("immediate");
             let watchdog = StatusWatchdog::start(
-                store,
+                Arc::new(Mutex::new(store)),
                 PathBuf::from("/nonexistent-boreas-status.signed"),
+                policy_window(),
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
@@ -1929,6 +3415,378 @@ mod linux_daemon {
             assert!(!iteration_progress(false, 3, 3));
             assert!(iteration_progress(false, 3, 4));
             assert!(iteration_progress(true, 0, 0));
+        }
+
+        /// Concurrent upstream sockets are bounded: one business connection plus
+        /// at most one standby, and a released permit is immediately reusable.
+        #[test]
+        fn live_connection_budget_bounds_both_slots_and_releases_on_drop() {
+            let budget = ConnectionBudget::new();
+            assert_eq!(budget.live(), 0);
+            let business = budget.try_acquire().expect("business slot");
+            let standby = budget.try_acquire().expect("standby slot");
+            assert_eq!(budget.live(), MAX_LIVE_CONNECTIONS);
+            assert!(
+                budget.try_acquire().is_none(),
+                "a third live upstream socket must be refused, not queued"
+            );
+            drop(business);
+            assert_eq!(budget.live(), 1);
+            let replacement = budget.try_acquire().expect("released slot is reusable");
+            drop(replacement);
+            drop(standby);
+            assert_eq!(budget.live(), 0);
+        }
+
+        /// The daemon installs exactly one steady-state socket bound, and only at
+        /// the post-handshake boundary. Handshake deadlines belong to the
+        /// transport crate; this asserts the daemon does not silently leave a
+        /// handshake-shaped timeout (or no timeout at all) on the business socket.
+        #[test]
+        fn steady_state_io_bound_is_installed_after_the_handshake() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr");
+            let client = std::net::TcpStream::connect(address).expect("connect");
+            let (_server, _) = listener.accept().expect("accept");
+            let fd = client.as_raw_fd();
+            bound_path_io(fd).expect("the business bound must install");
+            for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+                let mut value = libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                };
+                let mut length = core::mem::size_of::<libc::timeval>() as libc::socklen_t;
+                // SAFETY: `value` and `length` are valid for one `timeval`.
+                let rc = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&mut value as *mut libc::timeval).cast(),
+                        &mut length,
+                    )
+                };
+                assert_eq!(rc, 0, "bound must be readable back");
+                assert_eq!(u64::try_from(value.tv_sec).unwrap(), PATH_IO_TIMEOUT.as_secs());
+                assert_eq!(value.tv_usec, 0);
+            }
+            assert!(
+                bound_path_io(-1).is_err(),
+                "an invalid descriptor must be refused, not silently unbound"
+            );
+        }
+
+        /// The cleanup path interrupts a blocked dial through a *duplicate*
+        /// descriptor, then joins. Without this, `Drop` would leave a detached
+        /// thread that keeps dialling and owning sockets after the daemon stops.
+        #[test]
+        fn interrupt_clone_ends_a_blocked_dial_and_join_waits() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr");
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let peer = thread::spawn(move || {
+                let (_peer, _) = listener.accept().expect("accept");
+                // Silent peer: exactly the state an outer-TLS handshake waits in.
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            });
+            let dial = std::net::TcpStream::connect(address).expect("connect");
+            let interrupt = dial.try_clone().expect("duplicate the dial socket");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let mut dial = dial;
+                let mut byte = [0u8; 1];
+                let _ = done_tx.send(dial.read(&mut byte));
+            });
+            thread::sleep(Duration::from_millis(30));
+            interrupt
+                .shutdown(std::net::Shutdown::Both)
+                .expect("the duplicate descriptor must reach the dial socket");
+            let read = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cleanup must end the blocked dial instead of leaking it");
+            assert_eq!(read.expect("read returns after shutdown"), 0);
+            let started = Instant::now();
+            worker.join().expect("worker join");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "joining a stopped dial must be prompt: {:?}",
+                started.elapsed()
+            );
+            let _ = release_tx.send(());
+            peer.join().expect("peer thread");
+        }
+
+        /// A stopped manager can never start another dial, whatever the clock or
+        /// the backoff state says.
+        #[test]
+        fn stopped_manager_never_starts_another_dial() {
+            let now = Instant::now();
+            assert!(should_dial(now, now, false, false, false));
+            assert!(!should_dial(now, now, false, false, true), "stopped");
+            assert!(!should_dial(now, now, false, true, false), "already dialling");
+            assert!(!should_dial(now, now, true, false, false), "standby held");
+            assert!(
+                !should_dial(now, now + Duration::from_secs(1), false, false, false),
+                "backoff not elapsed"
+            );
+        }
+
+        #[test]
+        fn socket_health_never_reports_a_dead_peer_as_alive() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr");
+            let client = std::net::TcpStream::connect(address).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            let fd = client.as_raw_fd();
+            assert_eq!(socket_health(fd), SocketHealth::Alive);
+            drop(server);
+            // A closed peer surfaces as a reset (Failed) or as readable EOF
+            // (Unread/PeerClosed); all of them mean "unusable standby".
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut health = SocketHealth::Alive;
+            while Instant::now() < deadline {
+                health = socket_health(fd);
+                if health != SocketHealth::Alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_ne!(
+                health,
+                SocketHealth::Alive,
+                "a closed peer must never look alive"
+            );
+            assert_eq!(socket_health(-1), SocketHealth::Failed);
+        }
+
+        /// The standby verdict uses the plan's initial threshold: below it the
+        /// path is still "idle", at it the path is reported "down", a held
+        /// verified session wins, and a protocol/identity rejection always wins
+        /// because it can never be promoted.
+        #[test]
+        fn standby_state_uses_the_plan_threshold_without_relaxing_it() {
+            let counters = counters();
+            assert_eq!(standby_state_label(&counters), "idle");
+            counters
+                .standby_failures
+                .store(STANDBY_FAIL_THRESHOLD - 1, Ordering::SeqCst);
+            assert_eq!(standby_state_label(&counters), "idle");
+            counters
+                .standby_failures
+                .store(STANDBY_FAIL_THRESHOLD, Ordering::SeqCst);
+            assert_eq!(standby_state_label(&counters), "down");
+            counters.standby_ready.store(true, Ordering::SeqCst);
+            assert_eq!(standby_state_label(&counters), "ready");
+            counters.standby_rejected.store(true, Ordering::SeqCst);
+            assert_eq!(standby_state_label(&counters), "rejected");
+            // Cadence, threshold and backoff are the plan's initial §8.5 values.
+            // The interval names a transport poll, not a ProbePing sample.
+            assert_eq!(STANDBY_POLL_INTERVAL, Duration::from_millis(2_000));
+            assert_eq!(STANDBY_FAIL_THRESHOLD, 3);
+            assert_eq!(STANDBY_DIAL_BACKOFF, Duration::from_millis(1_000));
+        }
+
+        /// A published flag and its slot must never disagree, even when a
+        /// publisher and a taker run at the same time.
+        #[test]
+        fn standby_publisher_and_taker_keep_ready_in_sync_with_the_slot() {
+            let slot = Arc::new(Mutex::new(None::<()>));
+            let ready = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+
+            let publisher = {
+                let slot = Arc::clone(&slot);
+                let ready = Arc::clone(&ready);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        if done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = publish_standby_slot(&slot, &ready, ());
+                        thread::yield_now();
+                    }
+                })
+            };
+            let taker = {
+                let slot = Arc::clone(&slot);
+                let ready = Arc::clone(&ready);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        if done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = take_standby_slot(&slot, &ready);
+                        thread::yield_now();
+                    }
+                })
+            };
+            let monitor = {
+                let slot = Arc::clone(&slot);
+                let ready = Arc::clone(&ready);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        let guard = lock_mutex(&slot);
+                        assert_eq!(
+                            guard.is_some(),
+                            ready.load(Ordering::SeqCst),
+                            "published flag disagrees with the held slot"
+                        );
+                        drop(guard);
+                        thread::yield_now();
+                    }
+                })
+            };
+
+            publisher.join().expect("publisher");
+            taker.join().expect("taker");
+            done.store(true, Ordering::SeqCst);
+            monitor.join().expect("monitor");
+            assert_eq!(
+                ready.load(Ordering::SeqCst),
+                lock_mutex(&slot).is_some(),
+                "final published flag must match the final slot"
+            );
+        }
+
+        /// Only pre-authentication transport errors are retryable. Inner-TLS
+        /// policy/identity failures are terminal for the standby path and must
+        /// never become an ordinary failover candidate.
+        #[test]
+        fn standby_protocol_and_identity_failures_are_not_transport_misses() {
+            assert!(matches!(
+                classify_tunnel_failure(TunnelError::Io(
+                    std::io::ErrorKind::ConnectionReset
+                )),
+                StandbyDialFailure::Transport
+            ));
+            assert!(matches!(
+                classify_tunnel_failure(TunnelError::Closed),
+                StandbyDialFailure::Transport
+            ));
+            assert!(matches!(
+                classify_tunnel_failure(TunnelError::Ws(
+                    boreas_tunnel::ws::WsError::Io(std::io::ErrorKind::ConnectionReset)
+                )),
+                StandbyDialFailure::Transport
+            ));
+            for error in [
+                TunnelError::InnerTls("handshake"),
+                TunnelError::InnerTls("peer identity mapping"),
+                TunnelError::Ws(boreas_tunnel::ws::WsError::BadAcceptKey),
+            ] {
+                assert!(
+                    matches!(
+                        classify_tunnel_failure(error),
+                        StandbyDialFailure::Protocol(_)
+                    ),
+                    "a protocol/identity error must not be a transport miss"
+                );
+            }
+        }
+
+        /// A protocol or identity failure on the business path is terminal, not a
+        /// failover candidate; only a byte-stream failure may promote.
+        #[test]
+        fn protocol_path_failures_are_not_failover_candidates() {
+            assert_eq!(
+                path_failure_kind(&PacketPathError::CircuitIo(
+                    std::io::ErrorKind::ConnectionReset
+                )),
+                PathFailureKind::Transport,
+                "a circuit I/O failure is transport loss"
+            );
+            for error in [
+                PacketPathError::TruncatedFrame,
+                PacketPathError::EmptyFrame,
+                PacketPathError::FrameTooLarge,
+                PacketPathError::FrameLengthMismatch,
+                PacketPathError::PolicyMismatch,
+                PacketPathError::IdentityMismatch,
+                PacketPathError::Closed,
+                PacketPathError::Poisoned,
+            ] {
+                assert_eq!(
+                    path_failure_kind(&error),
+                    PathFailureKind::Protocol,
+                    "{error:?} must not be promoted as ordinary failover"
+                );
+            }
+        }
+
+        fn identity_fixture() -> BusinessIdentity {
+            BusinessIdentity {
+                local_vip: std::net::Ipv4Addr::new(10, 20, 1, 2),
+                peer_vip: std::net::Ipv4Addr::new(10, 20, 1, 1),
+                peer_node_id: 1,
+                peer_generation: 1,
+                path_hops: 1,
+                mtu_cap: 1400,
+            }
+        }
+
+        /// A failover may change the circuit and its ingress, never the verified
+        /// peer identity or either permanent VIP.
+        #[test]
+        fn failover_identity_must_match_the_pre_failure_binding() {
+            let baseline = identity_fixture();
+            assert_eq!(baseline, identity_fixture());
+            for changed in [
+                BusinessIdentity {
+                    local_vip: std::net::Ipv4Addr::new(10, 20, 2, 2),
+                    ..identity_fixture()
+                },
+                BusinessIdentity {
+                    peer_vip: std::net::Ipv4Addr::new(10, 20, 2, 1),
+                    ..identity_fixture()
+                },
+                BusinessIdentity {
+                    peer_node_id: 0x0101,
+                    ..identity_fixture()
+                },
+                BusinessIdentity {
+                    peer_generation: 2,
+                    ..identity_fixture()
+                },
+                BusinessIdentity {
+                    path_hops: 2,
+                    ..identity_fixture()
+                },
+                BusinessIdentity {
+                    mtu_cap: 1280,
+                    ..identity_fixture()
+                },
+            ] {
+                assert_ne!(
+                    baseline, changed,
+                    "a different verified binding must be refused, not promoted"
+                );
+            }
+        }
+
+        /// Host-side failures are terminal: another path would fail identically,
+        /// so they must never be classified as a failover trigger.
+        #[test]
+        fn host_side_failures_are_terminal_not_failover_candidates() {
+            for error in [
+                PacketPathError::HostQueueFull,
+                PacketPathError::HostQueueClosed,
+            ] {
+                assert!(host_side_failure(&error), "{error:?} is host-side");
+            }
+            for error in [
+                PacketPathError::CircuitIo(std::io::ErrorKind::ConnectionReset),
+                PacketPathError::TruncatedFrame,
+                PacketPathError::Closed,
+                PacketPathError::Poisoned,
+            ] {
+                assert!(
+                    !host_side_failure(&error),
+                    "{error:?} is a circuit failure, not host-side"
+                );
+            }
         }
     }
 }

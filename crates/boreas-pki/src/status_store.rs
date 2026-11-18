@@ -1,10 +1,39 @@
-//! Durable signed-status freshness store (candidate L1).
+//! Durable signed-status freshness store with a bounded, **test-only model** of
+//! revocation entries.
 //!
 //! This module persists the exact signed `StatusSnapshot` envelope plus its
-//! verified freshness metadata, a monotonic trusted-UTC floor and a rollback
-//! latch. It is **freshness storage only**: there is no revocation-entry decoder
-//! in this slice, so a non-empty `revocations` payload is rejected (fail closed)
-//! and nothing here closes a TLS session, circuit, lease or route.
+//! verified freshness metadata, a monotonic trusted-UTC floor and a rollback latch.
+//! A candidate v1 revocation payload may travel in the same envelope, but it is a
+//! model, not an enabled runtime:
+//!
+//! - Production [`StatusStore::open`] authorizes **no** revocation class. A
+//!   snapshot whose `revocations` byte string is non-empty is refused with
+//!   [`Error::RevocationPermission`] before the trusted verifier records replay
+//!   state. A `StatusSnapshot` is signed only by the network `StatusSigner`;
+//!   that signature is **not** evidence that the `IdentityAuthority`,
+//!   `NetworkRoot`, `RouteAuthority` or a Core's `CoreOperationalKey` issued an
+//!   entry (§3.4).
+//! - The accepting entry point is compiled only for Linux unit tests.
+//!   `RevocationRelayPolicy` exposes no constructor that enables a class; its
+//!   fields are private, so a non-`none` policy can only be built inside this
+//!   crate's test modules. None of this is deployment configuration, daemon
+//!   enablement or a production trust input.
+//! - `Direct` is refused by the schema and by [`crate::revoke_cleanup`]: the
+//!   subject's home Core is not the issuer of its `DirectGrant`, and a roaming Core
+//!   may sign a grant for the same subject.
+//! - Revocation state is **in-memory only**. The state image keeps the
+//!   pre-feature `BRSS\0\0\0\x01` format: no new flag and no revocation block, so
+//!   an older decoder cannot silently misread a new image. On open, revocation
+//!   state is rebuilt only from the persisted signed snapshot's exact TBS and is
+//!   re-verified with that envelope. Decisions contributed by earlier payloads are
+//!   not persisted, are not re-verified and are not claimed as `Verified`; after a
+//!   restart they are absent. A same-scope conflict latch is likewise process-local.
+//! - [`StatusStore::peer_revocation`] answers a model query about an already
+//!   authenticated peer. It is not wired into the daemon and this slice does not
+//!   claim the `G-REVOKE` gate.
+//! - This slice does not close sockets, remove kernel routes or verify a live
+//!   handle. [`crate::revoke_cleanup`] applies class-limited drops to an in-memory
+//!   id registry only.
 //!
 //! Linux is the only durable target in this slice. Other targets expose the
 //! same API but every operation fails closed with [`Error::Unsupported`].
@@ -59,12 +88,14 @@ use std::{
 use boreas_proto::{
     messages::SignedObject,
     objects::{self, ObjectBody, ObjectType, SubjectIdentity},
+    revocation::{self, IssuerClass, RevocationEntry, RevocationPayload},
 };
 use openssl::hash::{MessageDigest, hash};
 
 use crate::{
     CLOCK_ROLLBACK_TOLERANCE_US, PolicyError, STATUS_MAX_AGE_US, SnapshotResult,
     management::{self, MAX_SIGNED_OBJECT_BYTES, ManagementTrust, VerifiedObject},
+    revoke_cleanup::VerifiedRevocationScope,
 };
 
 #[cfg(target_os = "linux")]
@@ -81,6 +112,13 @@ const MAGIC: &[u8; 8] = b"BRSS\0\0\0\x01";
 const MAX_ISSUER_ID_BYTES: usize = 64;
 /// Maximum encoded state image accepted by the Linux store.
 pub const MAX_STATUS_STATE_BYTES: usize = 64 * 1024;
+/// Maximum number of distinct revoked scopes retained in the in-memory model.
+///
+/// This is also the schema's per-payload entry bound, so a single snapshot can
+/// always be merged into an empty store. A store that already holds this many
+/// scopes refuses a payload that would add another one. Nothing here is persisted:
+/// after restart only the latest persisted snapshot's payload is rebuilt.
+pub const MAX_REVOCATION_SCOPES: usize = 64;
 
 #[cfg(target_os = "linux")]
 const FLAG_ROLLBACK_LATCHED: u8 = 1 << 0;
@@ -106,6 +144,15 @@ pub enum Error {
     Frozen,
     ClockRollback,
     NotFresh,
+    /// A revocation entry is refused by the current policy, its class/scope rules,
+    /// or the fact that no per-authority issuer evidence exists.
+    RevocationPermission,
+    /// A revocation entry's `epoch` is below the in-memory watermark for its scope.
+    RevocationStale,
+    /// Two verified decisions claim one scope at one epoch; permanently latched.
+    RevocationConflict,
+    /// The bounded revocation state or payload bound was exceeded.
+    RevocationTooLarge,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -130,6 +177,100 @@ struct Snapshot {
     raw: Vec<u8>,
 }
 
+/// One in-memory revoked scope, keyed by `(class, origin_core, node_id, generation)`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RevokedScope {
+    class: IssuerClass,
+    origin_core: u8,
+    node_id: u16,
+    generation: u64,
+    target_id: u64,
+    epoch: u64,
+    /// SHA-256 of the canonical entry bytes that produced this decision.
+    digest: [u8; 32],
+}
+impl RevokedScope {
+    fn key(&self) -> (u64, u8, u16, u64) {
+        (
+            self.class.code(),
+            self.origin_core,
+            self.node_id,
+            self.generation,
+        )
+    }
+
+    fn scope(&self) -> VerifiedRevocationScope {
+        VerifiedRevocationScope {
+            class: self.class,
+            origin_core: self.origin_core,
+            node_id: self.node_id,
+            generation: self.generation,
+            target_id: self.target_id,
+            epoch: self.epoch,
+        }
+    }
+}
+
+/// In-memory evidence that one scope and epoch carried two different decisions.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RevocationConflictRecord {
+    /// The first decision, which stays in force.
+    scope: RevokedScope,
+    second_digest: [u8; 32],
+}
+
+/// In-memory revocation model state.
+///
+/// `scopes` only grows during one process lifetime: a decision is never withdrawn
+/// by a later payload, which is what makes an omission unable to un-revoke a
+/// subject in that process. Nothing here is persisted. Ordering is the schema's
+/// scope-key ordering so lookups are a binary search and the in-memory image is
+/// canonical.
+#[derive(Clone, Default, Eq, PartialEq)]
+struct RevocationState {
+    scopes: Vec<RevokedScope>,
+    conflict: Option<RevocationConflictRecord>,
+}
+
+impl RevocationState {
+    fn position(&self, key: (u64, u8, u16, u64)) -> Result<usize, usize> {
+        self.scopes.binary_search_by(|scope| scope.key().cmp(&key))
+    }
+
+    fn scope(&self, key: (u64, u8, u16, u64)) -> Option<&RevokedScope> {
+        self.position(key).ok().map(|index| &self.scopes[index])
+    }
+
+    fn insert(&mut self, scope: RevokedScope) -> Result<(), Error> {
+        match self.position(scope.key()) {
+            Ok(_) => Err(Error::Corrupt),
+            Err(index) => {
+                if self.scopes.len() >= MAX_REVOCATION_SCOPES {
+                    return Err(Error::RevocationTooLarge);
+                }
+                self.scopes.insert(index, scope);
+                Ok(())
+            }
+        }
+    }
+
+    fn supersede(&mut self, scope: RevokedScope) -> Result<(), Error> {
+        match self.position(scope.key()) {
+            Ok(index) => {
+                self.scopes[index] = scope;
+                Ok(())
+            }
+            Err(_) => Err(Error::Corrupt),
+        }
+    }
+}
+
+/// One planned mutation from a verified payload.
+enum RevocationChange {
+    Insert(RevokedScope),
+    Supersede(RevokedScope),
+}
+
 #[derive(Clone, Eq, PartialEq)]
 struct State {
     net: [u8; 16],
@@ -138,6 +279,7 @@ struct State {
     snapshot: Option<Snapshot>,
     /// The second exact signed envelope of a same-sequence conflict.
     equivocation: Option<Vec<u8>>,
+    revocation: RevocationState,
 }
 #[cfg(target_os = "linux")]
 impl State {
@@ -148,8 +290,184 @@ impl State {
             rollback_latched: false,
             snapshot: None,
             equivocation: None,
+            revocation: RevocationState::default(),
         }
     }
+}
+
+/// Test-only model of which revocation classes a harness may feed to the store.
+///
+/// Authority separation in §3.4 assigns identity revocation to the
+/// `IdentityAuthority`, Core revocation to the `NetworkRoot`, route revocation to
+/// the `RouteAuthority` and direct-grant revocation to a `CoreOperationalKey` of
+/// that Core. A `StatusSnapshot` envelope is signed only by the network's
+/// `StatusSigner` and `ObjectKind::StatusSnapshot` is the single object kind that
+/// authority may issue, so the envelope itself proves nothing about the other four
+/// authorities. A Core's ability to sign its own `CoreLsa` is explicitly **not**
+/// treated as authority to revoke anything.
+///
+/// This type is model plumbing, not deployment configuration:
+/// - [`Self::none`] is the only production value; [`StatusStore::open`] uses it and
+///   refuses every non-empty revocation payload.
+/// - There is no constructor that enables a class. The fields are private, so
+///   production code cannot build a non-`none` value at all; test code constructs
+///   the struct inside this crate's test modules only. No enabling constructor is
+///   part of the public API, and none may be presented as a trust input or daemon
+///   configuration.
+/// - Even in tests, the schema rejects `Direct`, and the class/scope rules are only
+///   structural. Nothing here proves that the `IdentityAuthority`, `NetworkRoot`,
+///   `RouteAuthority` or a Core key signed an entry.
+///
+/// Unifying this with per-authority revocation objects is an open protocol question
+/// recorded in `docs/protocol/revocations-v1.md`; the safe production value is
+/// "none".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RevocationRelayPolicy {
+    identity: bool,
+    core: bool,
+    route: bool,
+}
+impl RevocationRelayPolicy {
+    /// Refuse every revocation class. This is the only production value.
+    pub const fn none() -> Self {
+        Self {
+            identity: false,
+            core: false,
+            route: false,
+        }
+    }
+
+    /// Whether this policy authorizes relaying `class`.
+    ///
+    /// `Direct` is always `false`: the schema refuses it before policy code, and
+    /// the subject's home Core is not the grant issuer.
+    pub const fn allows(&self, class: IssuerClass) -> bool {
+        match class {
+            IssuerClass::Identity => self.identity,
+            IssuerClass::Core => self.core,
+            IssuerClass::Route => self.route,
+            IssuerClass::Direct => false,
+        }
+    }
+
+    /// `true` when no class is authorized.
+    pub const fn is_none(&self) -> bool {
+        !self.identity && !self.core && !self.route
+    }
+}
+
+/// Facts about a peer that the TLS/PKI layer already authenticated.
+///
+/// The daemon must fill this from the verified certificate chain and never from a
+/// peer-supplied message. Revocation is scoped by network, node slot and identity
+/// generation only, so no role, prefix or session handle is part of the query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPeer {
+    net_id: [u8; 16],
+    node_id: u16,
+    identity_generation: u64,
+}
+impl AuthenticatedPeer {
+    /// `None` unless the node id is a permanent overlay slot and the generation is
+    /// non-zero, so a malformed caller value cannot silently match nothing.
+    pub fn new(net_id: [u8; 16], node_id: u16, identity_generation: u64) -> Option<Self> {
+        if !valid_peer_node_id(node_id) || identity_generation == 0 {
+            return None;
+        }
+        Some(Self {
+            net_id,
+            node_id,
+            identity_generation,
+        })
+    }
+
+    pub fn net_id(&self) -> [u8; 16] {
+        self.net_id
+    }
+
+    pub fn node_id(&self) -> u16 {
+        self.node_id
+    }
+
+    pub fn identity_generation(&self) -> u64 {
+        self.identity_generation
+    }
+}
+
+/// Verified revocation state that covers one authenticated peer.
+///
+/// Each class is reported separately on purpose: a route-only or direct-only
+/// decision is not a claim that the peer's sessions were cleared, and one
+/// identity decision is not a claim that every route of the peer was removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerRevocationState {
+    /// Sequence of the verified snapshot that produced this answer.
+    pub sequence: u64,
+    /// An authority-issued identity decision covers this node and generation.
+    pub identity: bool,
+    /// A decision from this node's own home Core covers it.
+    pub core: bool,
+    /// An authority-issued route decision covers this node and generation.
+    pub route: bool,
+    /// Always `false` in v1: `Direct` entries are refused because the subject's
+    /// home Core is not the grant issuer. The field is kept for the query shape.
+    pub direct: bool,
+}
+impl PeerRevocationState {
+    /// `true` when a verified decision covers the peer's sessions, circuits or
+    /// attachment leases. This is the admission-relevant answer.
+    pub const fn sessions_revoked(&self) -> bool {
+        self.identity || self.core
+    }
+
+    /// `true` when any category is covered.
+    pub const fn any(&self) -> bool {
+        self.identity || self.core || self.route || self.direct
+    }
+}
+
+/// Why a revocation question cannot be answered from the verified model state.
+///
+/// Every variant is a fail-closed answer: the daemon must not treat it as
+/// "not revoked".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevocationUnknown {
+    /// No signed snapshot has been accepted yet.
+    NoSnapshot,
+    /// The peer belongs to a different network than this store.
+    WrongNetwork,
+    /// The store is frozen on snapshot or revocation equivocation evidence.
+    Frozen,
+    /// A durable commit failed; the store must be reopened.
+    Poisoned,
+    /// The trusted-UTC rollback latch is set.
+    ClockLatched,
+}
+
+/// Answer to "what does the verified revocation model say about this peer?".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerRevocation {
+    /// The model's verified state covers this exact node and generation.
+    ///
+    /// The verification is of the enclosing snapshot; the entry is not a
+    /// per-authority signature and the state is not durable across restart.
+    Verified(PeerRevocationState),
+    /// Fail closed; the caller must not admit or keep business traffic.
+    Unknown(RevocationUnknown),
+}
+
+/// In-memory revocation equivocation evidence: one scope, one epoch, two decisions.
+///
+/// This is model evidence, not a durable record: only digests are kept and the
+/// revocation model does not persist a state block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RevocationConflict {
+    /// The first decision, which stays in force.
+    pub scope: VerifiedRevocationScope,
+    /// SHA-256 of the canonical bytes of the first decision.
+    pub first_digest: [u8; 32],
+    /// SHA-256 of the canonical bytes of the conflicting decision.
+    pub second_digest: [u8; 32],
 }
 
 /// Exclusive, network-bound durable freshness store.
@@ -166,6 +484,7 @@ pub struct StatusStore {
     owner: u32,
     net: [u8; 16],
     trust: ManagementTrust,
+    revocation_relay: RevocationRelayPolicy,
     state: State,
     poisoned: bool,
     runtime_deadline: Option<Instant>,
@@ -183,19 +502,26 @@ impl fmt::Debug for StatusStore {
             )
             .field("poisoned", &self.poisoned)
             .field("clock_latched", &self.state.rollback_latched)
-            .field("frozen", &self.state.equivocation.is_some())
+            .field("frozen", &self.is_frozen())
+            .field("revoked_scopes", &self.state.revocation.scopes.len())
             .finish()
     }
 }
 
 impl StatusStore {
-    /// Open a Linux-durable store.
+    /// Open a Linux-durable store with every revocation class refused.
     ///
     /// `path` must be absolute. Its canonical parent must be owned by
     /// `trusted_owner_uid` with no group/other permissions; `trusted_owner_uid`
     /// is an independent deployment input and this API never discovers the
     /// process effective UID. `trust` must belong to `net_id` and is owned by
     /// the store for its lifetime.
+    ///
+    /// Production always uses [`RevocationRelayPolicy::none`]. A snapshot carrying
+    /// revocation entries is refused with [`Error::RevocationPermission`] before
+    /// verification/replay mutation instead of being consumed. There is no
+    /// production constructor for a policy that enables a class; the accepting
+    /// helper is `#[cfg(test)]` only.
     ///
     /// On non-Linux this returns [`Error::Unsupported`] without touching the
     /// filesystem.
@@ -205,9 +531,44 @@ impl StatusStore {
         trusted_owner_uid: u32,
         trust: ManagementTrust,
     ) -> Result<Self, Error> {
+        Self::open_inner(
+            path,
+            net_id,
+            trusted_owner_uid,
+            trust,
+            RevocationRelayPolicy::none(),
+        )
+    }
+
+    /// Test-only accepting model with an explicit relay policy.
+    ///
+    /// This is not a production entry point and not deployment configuration. It
+    /// exists only for Linux unit tests so they can exercise the bounded schema and
+    /// merge logic. The `StatusSigner` is not the `IdentityAuthority`,
+    /// `NetworkRoot`, `RouteAuthority` or a Core key, so a policy built here is not
+    /// authority evidence. Production code can only call [`StatusStore::open`],
+    /// which always uses [`RevocationRelayPolicy::none`].
+    #[cfg(all(test, target_os = "linux"))]
+    fn open_with_revocation_relay(
+        path: impl AsRef<Path>,
+        net_id: [u8; 16],
+        trusted_owner_uid: u32,
+        trust: ManagementTrust,
+        revocation_relay: RevocationRelayPolicy,
+    ) -> Result<Self, Error> {
+        Self::open_inner(path, net_id, trusted_owner_uid, trust, revocation_relay)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        net_id: [u8; 16],
+        trusted_owner_uid: u32,
+        trust: ManagementTrust,
+        revocation_relay: RevocationRelayPolicy,
+    ) -> Result<Self, Error> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (path, net_id, trusted_owner_uid, trust);
+            let _ = (path, net_id, trusted_owner_uid, trust, revocation_relay);
             return Err(Error::Unsupported);
         }
         #[cfg(target_os = "linux")]
@@ -234,6 +595,7 @@ impl StatusStore {
                 owner: trusted_owner_uid,
                 net: net_id,
                 trust,
+                revocation_relay,
                 state: State::empty(net_id),
                 poisoned: false,
                 runtime_deadline: None,
@@ -266,10 +628,12 @@ impl StatusStore {
         self.state.rollback_latched
     }
 
-    /// A persisted same-sequence equivocation is latched until an operator
-    /// handles the evidence. It is never cleared by clock recovery.
+    /// A same-sequence snapshot equivocation is persisted and latched until an
+    /// operator handles the evidence. A same-scope revocation conflict is latched
+    /// only in memory: the revocation model does not persist a conflict block.
+    /// Neither is cleared by clock recovery.
     pub fn is_frozen(&self) -> bool {
-        self.state.equivocation.is_some()
+        self.state.equivocation.is_some() || self.state.revocation.conflict.is_some()
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -284,6 +648,95 @@ impl StatusStore {
         let snapshot = self.state.snapshot.as_ref()?;
         let second = self.state.equivocation.as_ref()?;
         Some((snapshot.raw.as_slice(), second.as_slice()))
+    }
+
+    /// `true` when a same-scope, same-epoch revocation conflict is latched in this
+    /// process. The latch is not persisted.
+    pub fn is_revocation_conflicted(&self) -> bool {
+        self.state.revocation.conflict.is_some()
+    }
+
+    /// In-memory revocation equivocation evidence, if latched.
+    ///
+    /// Only the two entry digests are retained. Because the revocation model does
+    /// not persist either signed payload, this is not durable evidence and is not
+    /// re-verified after restart.
+    pub fn revocation_conflict(&self) -> Option<RevocationConflict> {
+        let conflict = self.state.revocation.conflict.as_ref()?;
+        Some(RevocationConflict {
+            scope: conflict.scope.scope(),
+            first_digest: conflict.scope.digest,
+            second_digest: conflict.second_digest,
+        })
+    }
+
+    /// Number of distinct revoked scopes in this process's model state.
+    pub fn revoked_scope_count(&self) -> usize {
+        self.state.revocation.scopes.len()
+    }
+
+    /// Bounded copy of the model's revocation scopes, in schema order.
+    ///
+    /// These are identifiers, not live sockets or installed routes. The list is not
+    /// durable: after restart it contains only entries rebuilt from the persisted
+    /// signed snapshot. An entry contributed by an earlier payload is neither
+    /// present nor claimed verified.
+    pub fn revocation_scopes(&self) -> Vec<VerifiedRevocationScope> {
+        self.state
+            .revocation
+            .scopes
+            .iter()
+            .map(|scope| scope.scope())
+            .collect()
+    }
+
+    /// What the model's verified revocation state says about an authenticated peer.
+    ///
+    /// Read-only and clock-free. A `Verified` answer means this process accepted an
+    /// entry in a dual-signature-verified snapshot, or rebuilt it from the persisted
+    /// signed snapshot at open. It does not mean the entry carries its own
+    /// authority signature, and it does not cover decisions from earlier payloads
+    /// that were not persisted. A `Verified` answer that is *not* revoked is only as
+    /// good as the freshness of the snapshot, so a business admission must also hold
+    /// a live [`FreshStatus`] (its `check` covers freshness) obtained from the same
+    /// boundary. Every [`PeerRevocation::Unknown`] reason is fail-closed.
+    pub fn peer_revocation(&self, peer: &AuthenticatedPeer) -> PeerRevocation {
+        if self.poisoned {
+            return PeerRevocation::Unknown(RevocationUnknown::Poisoned);
+        }
+        if peer.net_id != self.net {
+            return PeerRevocation::Unknown(RevocationUnknown::WrongNetwork);
+        }
+        let Some(snapshot) = self.state.snapshot.as_ref() else {
+            return PeerRevocation::Unknown(RevocationUnknown::NoSnapshot);
+        };
+        if self.is_frozen() {
+            return PeerRevocation::Unknown(RevocationUnknown::Frozen);
+        }
+        if self.state.rollback_latched {
+            return PeerRevocation::Unknown(RevocationUnknown::ClockLatched);
+        }
+        let mut state = PeerRevocationState {
+            sequence: snapshot.seq,
+            identity: false,
+            core: false,
+            route: false,
+            direct: false,
+        };
+        for scope in &self.state.revocation.scopes {
+            if scope.node_id != peer.node_id || scope.generation != peer.identity_generation {
+                continue;
+            }
+            match scope.class {
+                IssuerClass::Identity => state.identity = true,
+                IssuerClass::Core => state.core = true,
+                IssuerClass::Route => state.route = true,
+                // Unreachable: the schema refuses Direct before a scope exists.
+                // Never turn a home-Core coincidence into a direct-grant claim.
+                IssuerClass::Direct => {}
+            }
+        }
+        PeerRevocation::Verified(state)
     }
 
     /// Persist a trusted UTC observation before using it.
@@ -317,7 +770,8 @@ impl StatusStore {
     /// Explicit clock recovery after an independently trusted time decision.
     ///
     /// This can release only the rollback latch. It never lowers the persisted
-    /// floor and never clears a same-sequence equivocation freeze.
+    /// floor and never clears a same-sequence snapshot equivocation freeze or a
+    /// same-scope revocation conflict latch.
     pub fn recover_trusted_utc(&mut self, utc_us: u64) -> Result<u64, Error> {
         self.supported()?;
         self.healthy()?;
@@ -349,13 +803,22 @@ impl StatusStore {
     /// 4. require a real `management::Error::Equivocation` for the evidence path,
     ///    then persist both exact envelopes atomically and freeze;
     /// 5. otherwise persist exact raw envelope + issuer id/generation + seq +
-    ///    TBS SHA-256 + signed issued/next_update + UTC floor atomically.
+    ///    TBS SHA-256 + signed issued/next_update + UTC floor atomically;
+    /// 6. decode the bounded `revocations` payload out of that exact verified TBS and
+    ///    merge it into the in-memory model state, refusing a stale epoch
+    ///    ([`Error::RevocationStale`]), a class the policy does not authorize
+    ///    ([`Error::RevocationPermission`]), or a bound overflow
+    ///    ([`Error::RevocationTooLarge`]) before the snapshot is stored. A same-scope,
+    ///    same-epoch conflict latches in-memory evidence and returns
+    ///    [`Error::RevocationConflict`]; neither the scopes nor the latch are
+    ///    persisted. In production the policy is always `none`, so step 6 refuses
+    ///    any non-empty payload.
     ///
-    /// A non-empty `revocations` payload is rejected with [`Error::BadStatus`]
-    /// until a bounded entry decoder and live-handle cleanup path exist; it is
-    /// never silently ignored. A duplicate (same sequence and same `object_id`)
-    /// returns [`SnapshotResult::DuplicateNotRenewed`] and never extends
-    /// lifetime. A persist failure poisons the store.
+    /// A payload that cannot be decoded is refused with [`Error::BadStatus`] before
+    /// the verifier records replay state; it is never silently ignored. A duplicate
+    /// (same sequence and same `object_id`) returns
+    /// [`SnapshotResult::DuplicateNotRenewed`] and never extends lifetime. A persist
+    /// failure poisons the store.
     pub fn accept_signed_snapshot(
         &mut self,
         raw_signed: &[u8],
@@ -364,19 +827,17 @@ impl StatusStore {
     ) -> Result<SnapshotResult, Error> {
         self.supported()?;
         self.healthy()?;
-        if self.state.equivocation.is_some() {
+        if self.is_frozen() {
             return Err(Error::Frozen);
         }
         if raw_signed.is_empty() || raw_signed.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::TooLarge);
         }
-        // Reject an unsupported revocation payload before the owned
-        // ManagementTrust records replay state. Otherwise a signed object we
-        // must refuse could still advance the verifier's replay slot and make a
-        // later legitimate snapshot look like equivocation.
-        if has_nonempty_revocation_payload(raw_signed) {
-            return Err(Error::BadStatus);
-        }
+        // Reject an unreadable or unauthorized revocation payload before the owned
+        // ManagementTrust records replay state. Otherwise a signed object we must
+        // refuse could still advance the verifier's replay slot and make a later
+        // legitimate snapshot look like equivocation.
+        self.check_revocation_payload(raw_signed)?;
         let now = self.observe_trusted_utc(trusted_utc_us)?;
         let old = self.state.snapshot.clone();
 
@@ -442,6 +903,11 @@ impl StatusStore {
             Err(error) => return Err(map_management_error(error)),
         };
         let snapshot = snapshot_from_verified(&verified, self.net)?;
+        // Decode the bounded payload out of the exact verified TBS bytes and merge
+        // it into the in-memory model. A stale epoch is refused before any
+        // mutation; a same-scope/same-epoch conflict latches in-memory evidence and
+        // freezes this process. The model state is not part of the durable image.
+        let revocations = verified_revocations(&verified)?;
         if let Some(old) = old.as_ref() {
             if old.seq == snapshot.seq {
                 if old.object_id == snapshot.object_id {
@@ -478,6 +944,7 @@ impl StatusStore {
         let deadline = mono_now
             .checked_add(Duration::from_micros(remaining))
             .ok_or(Error::NotFresh)?;
+        self.apply_revocations(&revocations)?;
         self.state.snapshot = Some(snapshot);
         self.commit_or_poison()?;
         self.runtime_deadline = Some(deadline);
@@ -500,7 +967,7 @@ impl StatusStore {
     ) -> Result<FreshStatus<'_>, Error> {
         self.supported()?;
         self.healthy()?;
-        if self.state.equivocation.is_some() {
+        if self.is_frozen() {
             return Err(Error::Frozen);
         }
         let now = self.observe_trusted_utc(trusted_utc_us)?;
@@ -531,6 +998,101 @@ impl StatusStore {
             seq,
             deadline,
         })
+    }
+
+    /// Signature-independent structural gate for a snapshot candidate.
+    ///
+    /// A payload we cannot decode, or a class this store's policy does not allow,
+    /// is refused before the owned verifier can advance its replay slot. The
+    /// production policy is always `none`, so any non-empty payload fails closed.
+    fn check_revocation_payload(&self, raw_signed: &[u8]) -> Result<(), Error> {
+        let Ok(signed) = SignedObject::decode(raw_signed) else {
+            return Ok(());
+        };
+        let Ok(object) = objects::decode_tbs(&signed.raw_tbs) else {
+            return Ok(());
+        };
+        let payload = revocation_payload_bytes(&object);
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let decoded = RevocationPayload::decode(payload).map_err(map_revocation_error)?;
+        self.check_relay_policy(&decoded)
+    }
+
+    fn check_relay_policy(&self, payload: &RevocationPayload) -> Result<(), Error> {
+        for entry in payload.entries() {
+            if !self.revocation_relay.allows(entry.class) {
+                return Err(Error::RevocationPermission);
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge one verified payload into the in-memory revocation model.
+    ///
+    /// Phase 1 is read-only. A stale epoch rejects the whole payload without
+    /// touching state; two different decisions for one scope and epoch latch
+    /// in-memory evidence and freeze the store. Phase 2 applies the planned
+    /// insert/replace operations. The caller commits only the signed snapshot; the
+    /// model state is deliberately not part of the durable image.
+    fn apply_revocations(&mut self, payload: &RevocationPayload) -> Result<(), Error> {
+        self.check_relay_policy(payload)?;
+        let mut changes: Vec<RevocationChange> = Vec::new();
+        let mut inserted: usize = 0;
+        let mut latched: Option<RevocationConflictRecord> = None;
+        for entry in payload.entries() {
+            let digest = entry_digest(entry)?;
+            let scope = RevokedScope {
+                class: entry.class,
+                origin_core: entry.origin_core,
+                node_id: entry.node_id,
+                generation: entry.identity_generation,
+                target_id: entry.target_id,
+                epoch: entry.epoch,
+                digest,
+            };
+            match self.state.revocation.scope(scope.key()) {
+                None => {
+                    inserted += 1;
+                    changes.push(RevocationChange::Insert(scope));
+                }
+                Some(existing) => {
+                    if entry.epoch < existing.epoch {
+                        return Err(Error::RevocationStale);
+                    }
+                    if entry.epoch == existing.epoch {
+                        if existing.digest == digest {
+                            continue;
+                        }
+                        latched = Some(RevocationConflictRecord {
+                            scope: *existing,
+                            second_digest: digest,
+                        });
+                        break;
+                    }
+                    changes.push(RevocationChange::Supersede(scope));
+                }
+            }
+        }
+        if let Some(record) = latched {
+            self.state.revocation.conflict = Some(record);
+            self.runtime_deadline = None;
+            self.commit_or_poison()?;
+            return Err(Error::RevocationConflict);
+        }
+        // Only genuinely new scopes consume the bounded budget; replacing a scope's
+        // epoch is not growth.
+        if self.state.revocation.scopes.len() + inserted > MAX_REVOCATION_SCOPES {
+            return Err(Error::RevocationTooLarge);
+        }
+        for change in changes {
+            match change {
+                RevocationChange::Insert(scope) => self.state.revocation.insert(scope)?,
+                RevocationChange::Supersede(scope) => self.state.revocation.supersede(scope)?,
+            }
+        }
+        Ok(())
     }
 
     fn healthy(&self) -> Result<(), Error> {
@@ -657,6 +1219,39 @@ impl StatusStore {
                 _ => return Err(Error::Corrupt),
             }
         }
+        // Revocation state is not part of the durable image. Rebuild it only from
+        // this re-verified signed snapshot, so the model never presents a
+        // digest-only historical scope as verified.
+        self.rebuild_loaded_revocations(&verified)?;
+        Ok(())
+    }
+
+    /// Rebuild the in-memory model from the persisted, re-verified signed snapshot.
+    ///
+    /// The durable image has no revocation block and no historical scopes. Only
+    /// entries present in this exact TBS are reconstructed, so every model entry at
+    /// this point is covered by the snapshot signature just checked. A digest left
+    /// over from an earlier payload is never treated as verified because it is
+    /// never persisted. A test policy that no longer allows a class fails closed
+    /// with [`Error::RevocationPermission`].
+    #[cfg(target_os = "linux")]
+    fn rebuild_loaded_revocations(&mut self, verified: &VerifiedObject) -> Result<(), Error> {
+        let payload = verified_revocations(verified)?;
+        self.check_relay_policy(&payload)?;
+        let mut state = RevocationState::default();
+        for entry in payload.entries() {
+            let digest = entry_digest(entry)?;
+            state.insert(RevokedScope {
+                class: entry.class,
+                origin_core: entry.origin_core,
+                node_id: entry.node_id,
+                generation: entry.identity_generation,
+                target_id: entry.target_id,
+                epoch: entry.epoch,
+                digest,
+            })?;
+        }
+        self.state.revocation = state;
         Ok(())
     }
 
@@ -740,7 +1335,7 @@ impl FreshStatus<'_> {
         if self.store.poisoned {
             return Err(Error::Poisoned);
         }
-        if self.store.state.equivocation.is_some() {
+        if self.store.is_frozen() {
             return Err(Error::Frozen);
         }
         if self.store.state.rollback_latched {
@@ -762,6 +1357,17 @@ impl FreshStatus<'_> {
             return Err(Error::NotFresh);
         }
         Ok(())
+    }
+
+    /// Revocation answer for an authenticated peer, from the same store snapshot
+    /// that this capability made fresh.
+    ///
+    /// The token's borrow prevents a new snapshot from being accepted while it is
+    /// alive, so this answer describes the sequence the token covers. The caller
+    /// must still run [`FreshStatus::check`] at the same business boundary; this
+    /// method does not re-read the clock.
+    pub fn peer_revocation(&self, peer: &AuthenticatedPeer) -> PeerRevocation {
+        self.store.peer_revocation(peer)
     }
 }
 
@@ -785,13 +1391,9 @@ fn snapshot_from_verified(verified: &VerifiedObject, net: [u8; 16]) -> Result<Sn
     let ObjectBody::StatusSnapshot(body) = &object.body else {
         return Err(Error::BadStatus);
     };
-    // There is no revocation-entry decoder in this slice. Accepting opaque
-    // revocation bytes would let the daemon claim freshness while silently
-    // ignoring a signed revocation, so fail closed until a bounded decoder and
-    // live-handle cleanup path exist. This is not revocation support.
-    if !body.revocations.is_empty() {
-        return Err(Error::BadStatus);
-    }
+    // The revocation payload itself is validated, decoded and merged separately by
+    // `verified_revocations`/`apply_revocations`; it is never accepted as an opaque
+    // byte string and never silently ignored.
     if object.seq != body.sequence
         || object.issued_at != body.issued_at
         || object.expires != body.next_update
@@ -820,17 +1422,58 @@ struct ConflictCandidate {
     object_id: [u8; 32],
 }
 
-fn has_nonempty_revocation_payload(raw_signed: &[u8]) -> bool {
-    let Ok(signed) = SignedObject::decode(raw_signed) else {
-        return false;
-    };
-    let Ok(object) = objects::decode_tbs(&signed.raw_tbs) else {
-        return false;
-    };
-    matches!(
-        object.body,
-        ObjectBody::StatusSnapshot(body) if !body.revocations.is_empty()
-    )
+/// `true` for a permanent overlay node slot: home Core 1..=16 and a host octet of
+/// 1 (Core slot) or 2..=251 (Edge slot).
+fn valid_peer_node_id(node_id: u16) -> bool {
+    let home_core = (node_id >> 8) + 1;
+    let octet = (node_id & 0xff) as u8;
+    (1..=16).contains(&home_core) && (octet == 1 || (2..=251).contains(&octet))
+}
+
+/// The exact signed revocation payload bytes of a decoded snapshot object.
+fn revocation_payload_bytes(object: &objects::ManagementObject) -> &[u8] {
+    match &object.body {
+        ObjectBody::StatusSnapshot(body) => &body.revocations,
+        _ => &[],
+    }
+}
+
+fn map_revocation_error(error: revocation::Error) -> Error {
+    match error {
+        revocation::Error::ScopeNotPermitted | revocation::Error::DirectIssuerUnverifiable => {
+            Error::RevocationPermission
+        }
+        revocation::Error::TooLarge | revocation::Error::TooManyEntries => {
+            Error::RevocationTooLarge
+        }
+        _ => Error::BadStatus,
+    }
+}
+
+fn entry_digest(entry: &RevocationEntry) -> Result<[u8; 32], Error> {
+    let bytes = entry.canonical_bytes().map_err(map_revocation_error)?;
+    sha256(&bytes)
+}
+
+/// Decode the bounded payload from the exact verified TBS bytes.
+///
+/// The payload is taken from the decoded body of the exact signed TBS, and the
+/// decode is only accepted when re-encoding that body reproduces the verified TBS
+/// byte for byte. No re-encoded substitute and no caller-supplied bytes are used.
+fn verified_revocations(verified: &VerifiedObject) -> Result<RevocationPayload, Error> {
+    let object = verified.object();
+    if verified.signed_object().object_type != ObjectType::StatusSnapshot {
+        return Err(Error::BadStatus);
+    }
+    let regenerated = objects::encode_tbs(object).map_err(|_| Error::BadStatus)?;
+    if regenerated.as_slice() != verified.raw_tbs() {
+        return Err(Error::BadStatus);
+    }
+    let payload = revocation_payload_bytes(object);
+    if payload.is_empty() {
+        return Ok(RevocationPayload::empty());
+    }
+    RevocationPayload::decode(payload).map_err(map_revocation_error)
 }
 
 fn decode_conflict_candidate(raw_signed: &[u8], net: [u8; 16]) -> Result<ConflictCandidate, Error> {
@@ -905,12 +1548,14 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     if state.rollback_latched {
         flags |= FLAG_ROLLBACK_LATCHED;
     }
-    if let Some(snapshot) = &state.snapshot {
+    if state.snapshot.is_some() {
         flags |= FLAG_HAS_SNAPSHOT;
-        if state.equivocation.is_some() {
-            flags |= FLAG_HAS_EQUIVOCATION;
-        }
-        bytes.push(flags);
+    }
+    if state.snapshot.is_some() && state.equivocation.is_some() {
+        flags |= FLAG_HAS_EQUIVOCATION;
+    }
+    bytes.push(flags);
+    if let Some(snapshot) = &state.snapshot {
         put_u16_blob(&mut bytes, &snapshot.issuer, MAX_ISSUER_ID_BYTES)?;
         bytes.extend_from_slice(&snapshot.generation.to_be_bytes());
         bytes.extend_from_slice(&snapshot.seq.to_be_bytes());
@@ -921,12 +1566,12 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
         if let Some(second) = &state.equivocation {
             put_u32_blob(&mut bytes, second, MAX_SIGNED_OBJECT_BYTES)?;
         }
-    } else {
-        if state.equivocation.is_some() {
-            return Err(Error::Corrupt);
-        }
-        bytes.push(flags);
+    } else if state.equivocation.is_some() {
+        return Err(Error::Corrupt);
     }
+    // Deliberately no revocation block: scopes and conflict latches are model
+    // state only. Keeping the image at `BRSS\0\0\0\x01` with the same flags means
+    // an older decoder cannot encounter an unknown version or flag.
     if bytes.len() > MAX_STATUS_STATE_BYTES {
         return Err(Error::TooLarge);
     }
@@ -1006,6 +1651,9 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
         rollback_latched,
         snapshot,
         equivocation,
+        // The image carries no revocation block; the caller rebuilds this from
+        // the re-verified snapshot in `verify_loaded`.
+        revocation: RevocationState::default(),
     })
 }
 
@@ -1295,11 +1943,13 @@ mod tests {
         /// Normal fixture: every accepted snapshot in this slice has an empty
         /// revocation payload. The argument is retained so existing call sites
         /// continue to compile; use `sign_snapshot_with_revocations` for the
-        /// explicit rejection test.
+        /// explicit revocation tests.
         fn sign_snapshot(&self, issued: u64, next: u64, seq: u64, _revocations: &[u8]) -> Vec<u8> {
             self.sign_snapshot_with_revocations(issued, next, seq, b"")
         }
 
+        /// Sign a snapshot whose `revocations` byte string is exactly `revocations`.
+        /// Both real signatures cover the TBS that contains those bytes.
         fn sign_snapshot_with_revocations(
             &self,
             issued: u64,
@@ -1389,6 +2039,54 @@ mod tests {
         StatusStore::open(path, NET, owner, trust_for(signer)).unwrap()
     }
 
+    /// Test-only literal for every consumable class. There is deliberately no
+    /// `RevocationRelayPolicy::all()` constructor in the crate API; the private
+    /// fields are reachable only from a descendant test module. `Direct` has no
+    /// field because the schema refuses it.
+    const ALL: RevocationRelayPolicy = RevocationRelayPolicy {
+        identity: true,
+        core: true,
+        route: true,
+    };
+
+    fn try_open_relay(
+        path: &Path,
+        owner: u32,
+        signer: &TestSigner,
+        relay: RevocationRelayPolicy,
+    ) -> Result<StatusStore, Error> {
+        StatusStore::open_with_revocation_relay(path, NET, owner, trust_for(signer), relay)
+    }
+
+    fn open_relay_store(
+        path: &Path,
+        owner: u32,
+        signer: &TestSigner,
+        relay: RevocationRelayPolicy,
+    ) -> StatusStore {
+        try_open_relay(path, owner, signer, relay).unwrap()
+    }
+
+    fn entry(
+        class: IssuerClass,
+        origin_core: u8,
+        node_id: u16,
+        generation: u64,
+        target_id: u64,
+        epoch: u64,
+    ) -> RevocationEntry {
+        RevocationEntry::new(class, origin_core, node_id, generation, target_id, epoch, 1)
+            .unwrap()
+    }
+
+    fn payload_bytes(entries: Vec<RevocationEntry>) -> Vec<u8> {
+        RevocationPayload::new(entries).unwrap().encode().unwrap()
+    }
+
+    fn peer(node_id: u16, generation: u64) -> AuthenticatedPeer {
+        AuthenticatedPeer::new(NET, node_id, generation).unwrap()
+    }
+
     fn write_state(path: &Path, state: &State) {
         fs::write(path, encode(state).unwrap()).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1443,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_revocations_fail_closed_without_decoder() {
+    fn undecodable_revocations_fail_closed_without_replay_mutation() {
         let signer = TestSigner::new(9, Authority::StatusSigner);
         let (directory, path) = dir();
         let uid = owner(&directory);
@@ -1471,11 +2169,13 @@ mod tests {
     }
 
     #[test]
-    fn persisted_nonempty_revocations_are_rejected_on_reopen() {
+    fn persisted_snapshot_with_revocations_is_refused_by_default_open() {
         let signer = TestSigner::new(10, Authority::StatusSigner);
         let (directory, path) = dir();
         let uid = owner(&directory);
-        let raw = signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, b"rev-a");
+        let revocations = payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0207, 2, 0, 1)]);
+        let raw =
+            signer.sign_snapshot_with_revocations(1_000_000, 2_000_000, 1, &revocations);
         let signed = SignedObject::decode(&raw).unwrap();
         let mut state = State::empty(NET);
         state.utc_floor = 1_500_000;
@@ -1489,9 +2189,11 @@ mod tests {
             raw,
         });
         write_state(&path, &state);
+        // The image itself is a normal v1 image; the refusal comes from rebuilding
+        // the non-empty payload under the production policy `none`.
         assert!(matches!(
             StatusStore::open(&path, NET, uid, trust_for(&signer)),
-            Err(Error::Corrupt)
+            Err(Error::RevocationPermission)
         ));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1950,15 +2652,355 @@ mod tests {
         state.utc_floor = 123;
         state.rollback_latched = true;
         let bytes = encode(&state).unwrap();
+        // A non-empty in-memory model must not change the v1 image or add a flag.
+        let mut model_only = state.clone();
+        model_only.revocation.scopes.push(RevokedScope {
+            class: IssuerClass::Identity,
+            origin_core: 0,
+            node_id: 0x0207,
+            generation: 1,
+            target_id: 0,
+            epoch: 1,
+            digest: [0x55; 32],
+        });
+        assert_eq!(encode(&model_only).unwrap(), bytes);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.net, NET);
         assert_eq!(decoded.utc_floor, 123);
         assert!(decoded.rollback_latched);
         assert!(decoded.snapshot.is_none());
         assert!(decoded.equivocation.is_none());
+        assert!(decoded.revocation.scopes.is_empty());
+        assert!(decoded.revocation.conflict.is_none());
         let mut extra = bytes;
         extra.push(0);
         assert!(matches!(decode(&extra), Err(Error::Corrupt)));
+    }
+
+    #[test]
+    fn revocations_require_relay_policy_and_dual_signatures() {
+        let signer = TestSigner::new(30, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let node = 0x0207;
+        let revocations = payload_bytes(vec![
+            entry(IssuerClass::Identity, 0, node, 2, 0, 1),
+            entry(IssuerClass::Core, 3, node, 2, 0, 1),
+        ]);
+        let raw = signer.sign_snapshot_with_revocations(1_000_000, 3_000_000, 1, &revocations);
+
+        // `open` refuses every class, so nothing is consumed.
+        let mut refused = open_store(&path, uid, &signer);
+        let result = refused.accept_signed_snapshot(&raw, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::RevocationPermission)));
+        assert_eq!(refused.revoked_scope_count(), 0);
+        assert_eq!(refused.sequence(), None);
+        drop(refused);
+
+        let mut store = open_relay_store(&path, uid, &signer, ALL);
+        let result = store.accept_signed_snapshot(&raw, 1_500_000, Instant::now());
+        assert!(matches!(result, Ok(SnapshotResult::Accepted)));
+        assert_eq!(store.revoked_scope_count(), 2);
+
+        let verdict = store.peer_revocation(&peer(node, 2));
+        let PeerRevocation::Verified(state) = verdict else {
+            panic!("verified revocation state expected");
+        };
+        assert!(state.identity);
+        assert!(state.core);
+        assert!(!state.route);
+        assert!(!state.direct);
+        assert!(state.sessions_revoked());
+        assert_eq!(state.sequence, 1);
+
+        // A newer identity generation of the same node is not covered.
+        let newer = store.peer_revocation(&peer(node, 3));
+        let PeerRevocation::Verified(newer) = newer else {
+            panic!("verified revocation state expected");
+        };
+        assert!(!newer.any());
+
+        // Bad ML-DSA or bad Ed25519 signature: refused, state unchanged.
+        let mut signed = SignedObject::decode(&raw).unwrap();
+        signed.signers[0].mldsa[0] ^= 1;
+        let bad_mldsa = signed.encode().unwrap();
+        let result = store.accept_signed_snapshot(&bad_mldsa, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::BadStatus)));
+        let mut signed = SignedObject::decode(&raw).unwrap();
+        signed.signers[0].ed25519[0] ^= 1;
+        let bad_ed25519 = signed.encode().unwrap();
+        let result = store.accept_signed_snapshot(&bad_ed25519, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::BadStatus)));
+        assert_eq!(store.revoked_scope_count(), 2);
+        assert_eq!(store.sequence(), Some(1));
+        drop(store);
+
+        // Restart rebuilds the decisions from the persisted signed snapshot and
+        // re-verifies that envelope.
+        let store = open_relay_store(&path, uid, &signer, ALL);
+        assert_eq!(store.revoked_scope_count(), 2);
+        let verdict = store.peer_revocation(&peer(node, 2));
+        let PeerRevocation::Verified(state) = verdict else {
+            panic!("verified revocation state expected");
+        };
+        assert!(state.sessions_revoked());
+        drop(store);
+
+        // A tightened policy refuses the rebuilt classes instead of keeping them.
+        let tightened = try_open_relay(
+            &path,
+            uid,
+            &signer,
+            RevocationRelayPolicy {
+                identity: true,
+                ..RevocationRelayPolicy::none()
+            },
+        );
+        assert!(matches!(tightened, Err(Error::RevocationPermission)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revocation_epochs_are_monotone_and_conflicts_latch() {
+        let signer = TestSigner::new(31, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let node = 0x0207;
+        let first = signer.sign_snapshot_with_revocations(
+            1_000_000,
+            9_000_000,
+            1,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, node, 2, 0, 5)]),
+        );
+        let stale = signer.sign_snapshot_with_revocations(
+            1_100_000,
+            9_000_000,
+            2,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, node, 2, 0, 4)]),
+        );
+        let replay = signer.sign_snapshot_with_revocations(
+            1_200_000,
+            9_000_000,
+            3,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, node, 2, 0, 5)]),
+        );
+        let conflicting =
+            RevocationEntry::new(IssuerClass::Identity, 0, node, 2, 0, 5, 2).unwrap();
+        let conflict = signer.sign_snapshot_with_revocations(
+            1_300_000,
+            9_000_000,
+            4,
+            &payload_bytes(vec![conflicting]),
+        );
+
+        let mut store = open_relay_store(&path, uid, &signer, ALL);
+        let result = store.accept_signed_snapshot(&first, 1_500_000, Instant::now());
+        assert!(matches!(result, Ok(SnapshotResult::Accepted)));
+        assert_eq!(store.sequence(), Some(1));
+
+        // A lower epoch for the same scope is refused and changes nothing.
+        let result = store.accept_signed_snapshot(&stale, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::RevocationStale)));
+        assert_eq!(store.sequence(), Some(1));
+        assert_eq!(store.revoked_scope_count(), 1);
+        assert_eq!(store.revocation_scopes()[0].epoch, 5);
+
+        // Re-delivering the same decision at a higher sequence is idempotent.
+        let result = store.accept_signed_snapshot(&replay, 1_500_000, Instant::now());
+        assert!(matches!(result, Ok(SnapshotResult::Accepted)));
+        assert_eq!(store.sequence(), Some(3));
+        assert_eq!(store.revoked_scope_count(), 1);
+        assert_eq!(store.revocation_scopes()[0].epoch, 5);
+
+        // Same scope and epoch with different bytes latches in-memory evidence.
+        let result = store.accept_signed_snapshot(&conflict, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::RevocationConflict)));
+        assert!(store.is_frozen());
+        assert!(store.is_revocation_conflicted());
+        let evidence = store.revocation_conflict().expect("latched conflict");
+        assert_eq!(evidence.scope.epoch, 5);
+        assert_ne!(evidence.first_digest, evidence.second_digest);
+        assert_eq!(store.sequence(), Some(3));
+        drop(store);
+
+        // The conflict latch is not persisted. Reopening rebuilds only the latest
+        // signed snapshot (`replay`), so no digest-only historical scope or latch
+        // is presented as verified.
+        let mut store = open_relay_store(&path, uid, &signer, ALL);
+        assert!(!store.is_revocation_conflicted());
+        assert!(!store.is_frozen());
+        assert_eq!(store.revoked_scope_count(), 1);
+        assert!(matches!(
+            store.accept_signed_snapshot(&replay, 1_500_000, Instant::now()),
+            Ok(SnapshotResult::DuplicateNotRenewed)
+        ));
+        let verdict = store.peer_revocation(&peer(node, 2));
+        let PeerRevocation::Verified(state) = verdict else {
+            panic!("latest signed snapshot should rebuild a verified scope");
+        };
+        assert!(state.identity);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revocation_state_bound_is_enforced() {
+        let signer = TestSigner::new(32, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let mut full = Vec::new();
+        for index in 0..MAX_REVOCATION_SCOPES {
+            let node = 0x0202 + index as u16;
+            full.push(entry(IssuerClass::Identity, 0, node, 1, 0, 1));
+        }
+        let first = signer.sign_snapshot_with_revocations(
+            1_000_000,
+            9_000_000,
+            1,
+            &payload_bytes(full),
+        );
+        let extra = signer.sign_snapshot_with_revocations(
+            1_100_000,
+            9_000_000,
+            2,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0242, 1, 0, 1)]),
+        );
+        let mut store = open_relay_store(&path, uid, &signer, ALL);
+        let result = store.accept_signed_snapshot(&first, 1_500_000, Instant::now());
+        assert!(matches!(result, Ok(SnapshotResult::Accepted)));
+        assert_eq!(store.revoked_scope_count(), MAX_REVOCATION_SCOPES);
+        let result = store.accept_signed_snapshot(&extra, 1_500_000, Instant::now());
+        assert!(matches!(result, Err(Error::RevocationTooLarge)));
+        assert_eq!(store.revoked_scope_count(), MAX_REVOCATION_SCOPES);
+        assert_eq!(store.sequence(), Some(1));
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revocation_queries_fail_closed_without_verified_state() {
+        let signer = TestSigner::new(33, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let mut store = open_relay_store(&path, uid, &signer, ALL);
+        assert_eq!(
+            store.peer_revocation(&peer(0x0207, 1)),
+            PeerRevocation::Unknown(RevocationUnknown::NoSnapshot)
+        );
+        let raw = signer.sign_snapshot_with_revocations(
+            1_000_000,
+            9_000_000,
+            1,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0207, 1, 0, 1)]),
+        );
+        let result = store.accept_signed_snapshot(&raw, 1_500_000, Instant::now());
+        assert!(matches!(result, Ok(SnapshotResult::Accepted)));
+        assert_eq!(
+            store.peer_revocation(&peer(0x0208, 1)),
+            PeerRevocation::Verified(PeerRevocationState {
+                sequence: 1,
+                identity: false,
+                core: false,
+                route: false,
+                direct: false,
+            })
+        );
+        let foreign = AuthenticatedPeer::new([0x43; 16], 0x0207, 1).unwrap();
+        assert_eq!(
+            store.peer_revocation(&foreign),
+            PeerRevocation::Unknown(RevocationUnknown::WrongNetwork)
+        );
+        assert!(store.observe_trusted_utc(100_000_000_000).is_ok());
+        let result = store.observe_trusted_utc(1_000_000);
+        assert!(matches!(result, Err(Error::ClockRollback)));
+        assert_eq!(
+            store.peer_revocation(&peer(0x0207, 1)),
+            PeerRevocation::Unknown(RevocationUnknown::ClockLatched)
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revocation_state_is_not_persisted_and_rebuilds_only_latest_snapshot() {
+        let signer = TestSigner::new(34, Authority::StatusSigner);
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        // First payload revokes node A. It is retained in memory after a later
+        // payload omits it, but the image must not carry it.
+        let first = signer.sign_snapshot_with_revocations(
+            1_000_000,
+            9_000_000,
+            1,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0207, 2, 0, 1)]),
+        );
+        let second = signer.sign_snapshot_with_revocations(
+            1_100_000,
+            9_000_000,
+            2,
+            &payload_bytes(vec![entry(IssuerClass::Identity, 0, 0x0208, 2, 0, 1)]),
+        );
+        {
+            let mut store = open_relay_store(&path, uid, &signer, ALL);
+            assert!(matches!(
+                store.accept_signed_snapshot(&first, 1_500_000, Instant::now()),
+                Ok(SnapshotResult::Accepted)
+            ));
+            assert_eq!(store.revoked_scope_count(), 1);
+            assert!(matches!(
+                store.accept_signed_snapshot(&second, 1_500_000, Instant::now()),
+                Ok(SnapshotResult::Accepted)
+            ));
+            // In-memory union: the omission did not withdraw node A.
+            assert_eq!(store.revoked_scope_count(), 2);
+        }
+
+        // The durable image is exactly the pre-feature v1 image: no revocations,
+        // no conflict block and no new flag. A digest-only historical scope is
+        // therefore never reopened as verified.
+        let image = fs::read(&path).unwrap();
+        let decoded = decode(&image).unwrap();
+        assert!(decoded.revocation.scopes.is_empty());
+        assert!(decoded.revocation.conflict.is_none());
+        assert_eq!(image, encode(&decoded).unwrap());
+
+        // Reopening rebuilds only entries in the persisted `second` snapshot.
+        let store = open_relay_store(&path, uid, &signer, ALL);
+        assert_eq!(store.revoked_scope_count(), 1);
+        let PeerRevocation::Verified(older) = store.peer_revocation(&peer(0x0207, 2)) else {
+            panic!("a verified answer describes the rebuilt model state");
+        };
+        assert!(!older.any(), "node A is not in the latest signed snapshot");
+        let PeerRevocation::Verified(newer) = store.peer_revocation(&peer(0x0208, 2)) else {
+            panic!("node B is in the latest signed snapshot");
+        };
+        assert!(newer.identity);
+        drop(store);
+
+        // An image written before this feature (empty payload) still opens and
+        // claims no revocation.
+        let legacy_raw = signer.sign_snapshot(1_000_000, 9_000_000, 1, b"");
+        let signed = SignedObject::decode(&legacy_raw).unwrap();
+        let mut legacy = State::empty(NET);
+        legacy.utc_floor = 1_500_000;
+        legacy.snapshot = Some(Snapshot {
+            issuer: signer.key_id.clone(),
+            generation: 1,
+            seq: 1,
+            object_id: sha256(&signed.raw_tbs).unwrap(),
+            issued: 1_000_000,
+            next: 9_000_000,
+            raw: legacy_raw,
+        });
+        write_state(&path, &legacy);
+        let store = try_open_relay(&path, uid, &signer, ALL).unwrap();
+        assert_eq!(store.revoked_scope_count(), 0);
+        assert!(matches!(
+            store.peer_revocation(&peer(0x0207, 2)),
+            PeerRevocation::Verified(_)
+        ));
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 

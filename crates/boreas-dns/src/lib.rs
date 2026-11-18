@@ -1,13 +1,24 @@
 //! Strictly bounded, non-recursive authoritative DNS wire handling.
 //!
-//! This crate only builds DNS-over-UDP wire responses. It does not parse or
-//! synthesize IP/UDP packets, provide a socket, or implement TCP DNS. TCP DNS is
-//! explicitly unsupported until a maintained user-space TCP endpoint is chosen.
-//! Negative answers omit SOA authority records, so negative-cache TTL behavior
-//! is not implemented. Caller must provide an authenticated source-IP mapping;
-//! [`SourceAuthorization`] alone is an allowlist, not peer authentication.
+//! The crate has three packet-facing layers and no operating-system socket:
 //!
-//! A response that would exceed the caller byte cap is
+//! * [`packet`] parses complete IPv4/IPv6 UDP packets and builds replies for the
+//!   existing authoritative resolver;
+//! * [`tcp`] is a real smoltcp TCP DNS server driven by the caller's
+//!   `Interface`/`SocketSet`;
+//! * [`packet_runtime`] owns one bounded medium-IP `Device`, an `Interface`, a
+//!   `SocketSet`, and that TCP server, accepting complete input IP packets and
+//!   producing complete output IP packets through bounded queues. DNS VIPs are
+//!   interface addresses only; no OS socket is bound.
+//!
+//! `packet_runtime` is a packet model, not an authentication authority. Its
+//! [`packet_runtime::AuthenticatedSourceMap`] must be implemented by the trusted
+//! Tunnel/Overlay consumer after peer authentication; a source IP field or a
+//! caller-supplied boolean is never accepted as identity.
+//!
+//! Negative answers omit SOA authority records, so negative-cache TTL behavior
+//! is not implemented. [`SourceAuthorization`] alone is an address allowlist, not
+//! peer authentication. A response that would exceed the caller byte cap is
 //! [`DnsError::TruncatedWouldExceed`]. [`AuthoritativeDns::respond_udp`] and
 //! [`AuthoritativeDns::respond_tcp`] never set TC and never return a partial
 //! RRset. Only [`AuthoritativeDns::udp_truncate`] emits a header-and-question
@@ -20,6 +31,7 @@
 
 pub mod bootstrap;
 pub mod packet;
+pub mod packet_runtime;
 pub mod tcp;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -15,11 +15,14 @@ default = []
 # the in-tree outer HTTPS(WSS) adapter, the `boreas-pki` verified-object
 # identity extractor, and the diagnostic inner-TLS seam helpers. The default
 # build keeps policy types but no TLS backend and cannot negotiate a TLS session.
-openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki"]
+openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki", "dep:boreas-dns"]
 
 [dependencies]
 # Runtime authorization uses these policy types even without a TLS backend.
 boreas-crypto = { path = "../boreas-crypto" }
+# Bounded authoritative DNS wire handling for the UDP service that answers the
+# signed zone on the reserved DNS VIP. No socket/TCP runtime of its own.
+boreas-dns = { path = "../boreas-dns", optional = true }
 boreas-pki = { path = "../boreas-pki", optional = true }
 boreas-proto = { path = "../boreas-proto" }
 # Real bounded L3 packet I/O and `inspect_packet` validation for the E2E packet

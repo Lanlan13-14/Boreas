@@ -17,6 +17,12 @@ pair plus `tc -s qdisc` and `ip -s link` counters; `summarize` turns that NDJSON
 into bounded key=value evidence. They assert no threshold, change no probe byte,
 deadline or gate, and never retry. Those TCP_INFO fields describe the underlay
 outer-TLS socket, not overlay, E2E or application latency.
+
+The `baseline-receive`/`baseline-send` modes run the same payload generator and
+SHA-256 check over direct TCP on a distinct port. They are a separate diagnostic
+for the caller's namespace(s), not part of the overlay probe, and they never
+read the throughput gate. `compare` prints both denominators and ratios without
+turning any overlay result green or red.
 """
 
 import hashlib
@@ -35,6 +41,15 @@ if TOTAL_BYTES <= 0 or TOTAL_BYTES > 64 * 1024 * 1024:
     raise ValueError("BOREAS_PERF_BYTES must be in 1..=67108864")
 PORT = 18080
 TIMEOUT_SECONDS = 30
+
+# Direct-TCP baseline bounds. The baseline is a separate, caller-invoked
+# diagnostic: same payload generator and SHA-256 check, distinct port, fixed
+# byte count, one attempt and the same 30 s socket timeout as the overlay probe.
+# It reads the same BOREAS_PERF_BYTES value but never reads the throughput gate.
+BASELINE_PORT = 18081
+BASELINE_TIMEOUT_SECONDS = 30
+BASELINE_SCOPE = "underlay-direct-tcp-baseline"
+BASELINE_ACCEPTANCE = "never"
 
 # Diagnostic sampler bounds. The sampler is a fixed-rate, self-terminating
 # background reader; these are collection bounds, never acceptance windows.
@@ -227,18 +242,20 @@ def parse_link(text: str) -> dict:
     return stats
 
 
-def receiver(local_ip: str) -> None:
+def _receive_stream(local_ip: str, port: int, timeout: float) -> dict:
+    """Receive one bounded stream and return its digest evidence."""
+
     digest = hashlib.sha256()
     received = 0
     first_byte_at = None
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((local_ip, PORT))
+        listener.bind((local_ip, port))
         listener.listen(1)
-        listener.settimeout(TIMEOUT_SECONDS)
+        listener.settimeout(timeout)
         connection, _ = listener.accept()
         with connection:
-            connection.settimeout(TIMEOUT_SECONDS)
+            connection.settimeout(timeout)
             while True:
                 data = connection.recv(len(CHUNK))
                 if not data:
@@ -254,32 +271,30 @@ def receiver(local_ip: str) -> None:
         first_byte_to_eof = _rounded_seconds(
             _interval(first_byte_at, finished)
         )
-    # This diagnostic line is receiver-only and deliberately goes to stderr:
-    # the smoke parses the sender's stdout as one JSON object.
-    print(
-        json.dumps(
-            {
-                "role": "receiver",
-                "bytes": received,
-                "first_byte_to_eof_seconds": first_byte_to_eof,
-                "sha256": digest.hexdigest(),
-            },
-            sort_keys=True,
-        ),
-        file=sys.stderr,
-    )
-    if received != TOTAL_BYTES:
-        raise SystemExit(f"receiver got {received} bytes, expected {TOTAL_BYTES}")
+    return {
+        "role": "receiver",
+        "bytes": received,
+        "first_byte_to_eof_seconds": first_byte_to_eof,
+        "sha256": digest.hexdigest(),
+    }
 
 
-def sender(local_ip: str, peer_ip: str) -> None:
+def _send_stream(
+    local_ip: str,
+    peer_ip: str,
+    port: int,
+    timeout: float,
+    failure_label: str = "overlay",
+) -> dict:
+    """Send one bounded stream and verify the receiver's digest."""
+
     digest = hashlib.sha256()
     started = time.monotonic()
     with socket.create_connection(
-        (peer_ip, PORT), timeout=TIMEOUT_SECONDS, source_address=(local_ip, 0)
+        (peer_ip, port), timeout=timeout, source_address=(local_ip, 0)
     ) as connection:
         connected = time.monotonic()
-        connection.settimeout(TIMEOUT_SECONDS)
+        connection.settimeout(timeout)
         sent = 0
         while sent < TOTAL_BYTES:
             take = min(len(CHUNK), TOTAL_BYTES - sent)
@@ -293,18 +308,20 @@ def sender(local_ip: str, peer_ip: str) -> None:
         while len(response) < 64:
             part = connection.recv(64 - len(response))
             if not part:
-                raise SystemExit("receiver closed before returning the digest")
+                raise SystemExit(
+                    f"{failure_label} receiver closed before returning the digest"
+                )
             response += part
     finished = time.monotonic()
     elapsed = finished - started
     if response.decode("ascii") != digest.hexdigest():
-        raise SystemExit("overlay payload digest mismatch")
+        raise SystemExit(f"{failure_label} payload digest mismatch")
     if elapsed <= 0:
         raise SystemExit("invalid monotonic elapsed time")
     connect_seconds = _interval(started, connected)
     send_seconds = _interval(connected, sent_at)
     digest_seconds = _interval(sent_at, finished)
-    result = {
+    return {
         "bytes": sent,
         "connect_seconds": _rounded_seconds(connect_seconds),
         "digest_seconds": _rounded_seconds(digest_seconds),
@@ -314,6 +331,61 @@ def sender(local_ip: str, peer_ip: str) -> None:
         "sha256": digest.hexdigest(),
         "throughput_mbps": round(sent * 8 / elapsed / 1_000_000, 3),
     }
+
+
+def receiver(local_ip: str) -> None:
+    result = _receive_stream(local_ip, PORT, TIMEOUT_SECONDS)
+    # This diagnostic line is receiver-only and deliberately goes to stderr:
+    # the smoke parses the sender's stdout as one JSON object.
+    print(json.dumps(result, sort_keys=True), file=sys.stderr)
+    if result["bytes"] != TOTAL_BYTES:
+        raise SystemExit(
+            f"receiver got {result['bytes']} bytes, expected {TOTAL_BYTES}"
+        )
+
+
+def sender(local_ip: str, peer_ip: str) -> None:
+    result = _send_stream(local_ip, peer_ip, PORT, TIMEOUT_SECONDS)
+    print(json.dumps(result, sort_keys=True))
+
+
+def _baseline_fields(role: str) -> dict:
+    """Label a direct-TCP baseline result without inventing a gate."""
+
+    return {
+        "acceptance": BASELINE_ACCEPTANCE,
+        "denominator": "connect-through-digest",
+        "gate": "not-applicable",
+        "payload_denominator": "connect-to-shutdown-write",
+        "role": role,
+        "scope": BASELINE_SCOPE,
+    }
+
+
+def baseline_receiver(local_ip: str) -> None:
+    """Receive the direct-TCP baseline in the caller's namespace."""
+
+    result = _receive_stream(local_ip, BASELINE_PORT, BASELINE_TIMEOUT_SECONDS)
+    result.update(_baseline_fields("baseline-receiver"))
+    print(json.dumps(result, sort_keys=True), file=sys.stderr)
+    if result["bytes"] != TOTAL_BYTES:
+        raise SystemExit(
+            f"baseline receiver got {result['bytes']} bytes, "
+            f"expected {TOTAL_BYTES}"
+        )
+
+
+def baseline_sender(local_ip: str, peer_ip: str) -> None:
+    """Send the direct-TCP baseline in the caller's namespace."""
+
+    result = _send_stream(
+        local_ip,
+        peer_ip,
+        BASELINE_PORT,
+        BASELINE_TIMEOUT_SECONDS,
+        failure_label="baseline",
+    )
+    result.update(_baseline_fields("baseline-sender"))
     print(json.dumps(result, sort_keys=True))
 
 
@@ -627,6 +699,137 @@ def summarize(label: str, path: str) -> list[str]:
     return lines
 
 
+def _load_result(path: str) -> dict | None:
+    """Load one sender JSON object; malformed or partial output is unavailable."""
+
+    if path == "-":
+        return None
+    try:
+        with open(path, encoding="utf-8") as source:
+            value = json.load(source)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _metric(result: dict | None, field: str) -> float | None:
+    if result is None:
+        return None
+    value = result.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _byte_count(result: dict | None) -> int | None:
+    if result is None:
+        return None
+    value = result.get("bytes")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    value = numerator / denominator
+    return value if math.isfinite(value) else None
+
+
+def _compare_label(label: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", label) is None:
+        raise SystemExit("compare labels must match [A-Za-z0-9_.-]{1,64}")
+    return label
+
+
+def compare(label: str, overlay_path: str, baseline_path: str) -> list[str]:
+    """Compare one overlay result with one direct-TCP baseline result.
+
+    Diagnostic only: no gate is read, no threshold is applied, and a missing or
+    low baseline is reported as unmeasured rather than as an overlay pass.
+    """
+
+    label = _compare_label(label)
+    prefix = "baseline_compare_" + label
+    overlay = _load_result(overlay_path)
+    baseline = _load_result(baseline_path)
+    overlay_rate = _metric(overlay, "throughput_mbps")
+    baseline_rate = _metric(baseline, "throughput_mbps")
+    overlay_payload = _metric(overlay, "payload_send_mbps")
+    baseline_payload = _metric(baseline, "payload_send_mbps")
+    overlay_connect = _metric(overlay, "connect_seconds")
+    overlay_send = _metric(overlay, "send_seconds")
+    overlay_digest = _metric(overlay, "digest_seconds")
+    overlay_elapsed = _metric(overlay, "elapsed_seconds")
+    overlay_fixed = None
+    if overlay_connect is not None and overlay_digest is not None:
+        overlay_fixed = overlay_connect + overlay_digest
+    overlay_bytes = _byte_count(overlay)
+    baseline_bytes = _byte_count(baseline)
+    if overlay_bytes is None or baseline_bytes is None:
+        bytes_match = "unavailable"
+    elif overlay_bytes == baseline_bytes:
+        bytes_match = "yes"
+    else:
+        bytes_match = "no"
+    return [
+        "baseline_compare_source=perf-python-direct-tcp-baseline",
+        "baseline_compare_scope=separate-denominator;diagnostic-only",
+        "baseline_compare_acceptance=never",
+        "overlay_gate=unchanged",
+        prefix
+        + "_overlay_status="
+        + ("measured" if overlay_rate is not None else "unmeasured"),
+        prefix
+        + "_baseline_status="
+        + ("measured" if baseline_rate is not None else "unmeasured"),
+        prefix + "_overlay_bytes=" + _plain(overlay_bytes),
+        prefix + "_baseline_bytes=" + _plain(baseline_bytes),
+        prefix + "_bytes_match=" + bytes_match,
+        prefix + "_overlay_throughput_mbps=" + _format(overlay_rate),
+        prefix + "_overlay_payload_send_mbps=" + _format(overlay_payload),
+        prefix + "_overlay_connect_seconds=" + _format(overlay_connect, 6),
+        prefix + "_overlay_send_seconds=" + _format(overlay_send, 6),
+        prefix + "_overlay_digest_seconds=" + _format(overlay_digest, 6),
+        prefix + "_overlay_elapsed_seconds=" + _format(overlay_elapsed, 6),
+        prefix
+        + "_overlay_connect_plus_digest_share="
+        + _format(_ratio(overlay_fixed, overlay_elapsed)),
+        prefix
+        + "_overlay_send_share="
+        + _format(_ratio(overlay_send, overlay_elapsed)),
+        prefix + "_baseline_throughput_mbps=" + _format(baseline_rate),
+        prefix + "_baseline_payload_send_mbps=" + _format(baseline_payload),
+        prefix
+        + "_baseline_over_overlay_throughput_ratio="
+        + _format(_ratio(baseline_rate, overlay_rate)),
+        prefix
+        + "_baseline_over_overlay_payload_ratio="
+        + _format(_ratio(baseline_payload, overlay_payload)),
+    ]
+
+
+def _compare_cli(argv: list[str]) -> int:
+    if len(argv) < 3 or len(argv) % 3 != 0:
+        raise SystemExit(
+            "usage: netns_overlay_perf.py compare "
+            "LABEL OVERLAY_JSON BASELINE_JSON [LABEL ...]"
+        )
+    blocks = [
+        "\n".join(compare(argv[index], argv[index + 1], argv[index + 2]))
+        for index in range(0, len(argv), 3)
+    ]
+    print("\n".join(blocks))
+    return 0
+
+
 def _sampler_cli(argv: list[str]) -> int:
     if len(argv) != 6:
         raise SystemExit(
@@ -652,8 +855,20 @@ if __name__ == "__main__":
         raise SystemExit(_sampler_cli(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "summarize":
         raise SystemExit(_summarize_cli(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "compare":
+        raise SystemExit(_compare_cli(sys.argv[2:]))
+    if len(sys.argv) == 3 and sys.argv[1] == "baseline-receive":
+        baseline_receiver(sys.argv[2])
+        raise SystemExit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == "baseline-send":
+        baseline_sender(sys.argv[2], sys.argv[3])
+        raise SystemExit(0)
     if len(sys.argv) != 4 or sys.argv[1] not in {"receive", "send"}:
-        raise SystemExit("usage: netns_overlay_perf.py receive|send LOCAL_IP PEER_IP")
+        raise SystemExit(
+            "usage: netns_overlay_perf.py receive|send LOCAL_IP PEER_IP | "
+            "baseline-receive LOCAL_IP | baseline-send LOCAL_IP PEER_IP | "
+            "compare LABEL OVERLAY_JSON BASELINE_JSON"
+        )
     if sys.argv[1] == "receive":
         receiver(sys.argv[2])
     else:

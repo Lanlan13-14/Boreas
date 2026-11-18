@@ -1,11 +1,14 @@
 //! Candidate Boreas wire primitives; not a frozen protocol or cryptographic implementation.
 #![forbid(unsafe_code)]
 
+pub mod authority_revocation;
 pub mod batch;
+pub mod dns_authority;
 pub mod h1h2;
 pub mod messages;
 pub mod network_policy;
 pub mod objects;
+pub mod revocation;
 pub mod session_auth;
 
 use std::fmt;

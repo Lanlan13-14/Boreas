@@ -142,6 +142,107 @@ impl PacketConfig {
     pub const fn dns_v6(self) -> Ipv6Addr {
         self.genesis.dns_v6
     }
+    pub const fn max_packet_bytes(self) -> usize {
+        self.max_packet_bytes
+    }
+    pub const fn ipv4_network(self) -> (Ipv4Addr, u8) {
+        self.genesis.ipv4_network()
+    }
+    pub const fn ipv6_ula48(self) -> Ipv6Addr {
+        self.genesis.ipv6_ula48()
+    }
+}
+
+/// Bounded metadata read from a complete IP packet before it is handed to a
+/// transport path. This performs the same header-shape checks as the UDP path:
+/// no fragments, no IPv4 options, no IPv6 extension headers, and a valid IPv4
+/// header checksum. Transport payloads are validated by the consuming path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IpPacketMeta {
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub protocol: u8,
+    pub header_len: usize,
+}
+
+pub(crate) fn inspect_ip_packet(
+    packet: &[u8],
+    max_packet_bytes: usize,
+) -> Result<IpPacketMeta, PacketError> {
+    if packet.is_empty() {
+        return Err(PacketError::Truncated);
+    }
+    if packet.len() > max_packet_bytes {
+        return Err(PacketError::InvalidLength);
+    }
+    match packet[0] >> 4 {
+        4 => {
+            if packet.len() < IPV4_HEADER_LEN {
+                return Err(PacketError::Truncated);
+            }
+            if packet[0] & 0x0f != 5 {
+                return Err(PacketError::UnsupportedExtension);
+            }
+            let total = usize::from(be16(packet, 2)?);
+            if total != packet.len() || total < IPV4_HEADER_LEN + 4 {
+                return Err(PacketError::InvalidLength);
+            }
+            if checksum(&packet[..IPV4_HEADER_LEN]) != 0 {
+                return Err(PacketError::InvalidHeaderChecksum);
+            }
+            if packet[8] == 0 {
+                return Err(PacketError::InvalidLength);
+            }
+            if be16(packet, 6)? & 0xbfff != 0 {
+                return Err(PacketError::Fragmented);
+            }
+            Ok(IpPacketMeta {
+                source: IpAddr::V4(Ipv4Addr::new(
+                    packet[12], packet[13], packet[14], packet[15],
+                )),
+                destination: IpAddr::V4(Ipv4Addr::new(
+                    packet[16], packet[17], packet[18], packet[19],
+                )),
+                protocol: packet[9],
+                header_len: IPV4_HEADER_LEN,
+            })
+        }
+        6 => {
+            if packet.len() < IPV6_HEADER_LEN {
+                return Err(PacketError::Truncated);
+            }
+            let payload_len = usize::from(be16(packet, 4)?);
+            if payload_len == 0 || IPV6_HEADER_LEN + payload_len != packet.len() {
+                return Err(PacketError::InvalidLength);
+            }
+            if packet[7] == 0 {
+                return Err(PacketError::InvalidLength);
+            }
+            let next = packet[6];
+            if !matches!(next, 6 | 17) {
+                return Err(
+                    if matches!(next, 0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140) {
+                        PacketError::UnsupportedExtension
+                    } else {
+                        PacketError::UnsupportedProtocol
+                    },
+                );
+            }
+            Ok(IpPacketMeta {
+                source: IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&packet[8..24])
+                        .map_err(|_| PacketError::Truncated)?,
+                )),
+                destination: IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&packet[24..40])
+                        .map_err(|_| PacketError::Truncated)?,
+                )),
+                protocol: next,
+                header_len: IPV6_HEADER_LEN,
+            })
+        }
+        _ => Err(PacketError::InvalidVersion),
+    }
 }
 
 /// Process one complete IPv4 or IPv6 packet. Returns a complete response IP
@@ -409,7 +510,7 @@ fn be16(p: &[u8], at: usize) -> Result<u16, PacketError> {
     Ok(u16::from_be_bytes([b[0], b[1]]))
 }
 
-fn checksum(data: &[u8]) -> u16 {
+pub(crate) fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     let (chunks, remainder) = data.as_chunks::<2>();
     for c in chunks {
