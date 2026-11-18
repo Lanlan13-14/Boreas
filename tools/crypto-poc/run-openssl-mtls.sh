@@ -116,7 +116,8 @@ for name in root server client expired-client; do
 done
 
 start_server() {
-  local cipher="$1" tag="$2" attime="${3:-}" fifo="$WORK/server-$tag.stdin"
+  local cipher="$1" tag="$2" attime="${3:-}"
+  local fifo="$WORK/server-$tag.stdin"
   SERVER_PORT=$((20000 + RANDOM % 30000))
   mkfifo "$fifo"
   # Open read-write before starting server: no EOF and no test command reaches stdin.
@@ -236,7 +237,8 @@ for name in root1024 server1024 client1024; do
 done
 
 start_server_1024() {
-  local cipher="$1" tag="$2" fifo="$WORK/server-$tag.stdin"
+  local cipher="$1" tag="$2"
+  local fifo="$WORK/server-$tag.stdin"
   SERVER_PORT=$((20000 + RANDOM % 30000))
   mkfifo "$fifo"
   exec {SERVER_STDIN_FD}<>"$fifo"
