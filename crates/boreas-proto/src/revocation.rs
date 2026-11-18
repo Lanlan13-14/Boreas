@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn empty_payload_is_the_zero_length_string() {
-        assert_eq!(RevocationPayload::empty().encode().unwrap(), Vec::new());
+        assert_eq!(RevocationPayload::empty().encode().unwrap(), Vec::<u8>::new());
         let decoded = RevocationPayload::decode(b"").unwrap();
         assert!(decoded.is_empty());
         assert_eq!(decoded.len(), 0);
@@ -709,10 +709,10 @@ mod tests {
     fn decoder_rejects_unsorted_trailing_and_non_shortest_forms() {
         let first = raw_entry([1, 0, 0x0207, 1, 0, 1, 0]);
         let second = raw_entry([1, 0, 0x0208, 1, 0, 1, 0]);
-        let unsorted = raw_payload(&[second, first]);
+        let unsorted = raw_payload(&[second, first.clone()]);
         assert!(RevocationPayload::decode(&unsorted).is_err());
 
-        let mut trailing = raw_payload(&[first]);
+        let mut trailing = raw_payload(&[first.clone()]);
         trailing.push(0);
         assert_eq!(
             RevocationPayload::decode(&trailing),
