@@ -21,6 +21,7 @@ use std::path::Path;
 use boreas_crypto::Policy;
 use boreas_crypto::backend::{OpenSslAcceptor, PemIdentity};
 use boreas_proto::messages::{SignedObject, SignerRole, SignerSignatures};
+use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_proto::objects::{
     self, ManagementObject, MldsaParameterSet, ObjectBody, ObjectType, StatusSnapshot,
     SubjectIdentity,
@@ -319,6 +320,15 @@ pub struct StatusSnapshotSummary {
     pub sequence: u64,
     pub issued_at_us: u64,
     pub next_update_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkPolicySummary {
+    pub net_id_hex: String,
+    pub root_fingerprint_hex: String,
+    pub sequence: u64,
+    pub issued_at_us: u64,
+    pub expires_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -810,6 +820,95 @@ pub fn sign_status_file(
         sequence,
         issued_at_us: now_us,
         next_update_us,
+    })
+}
+
+/// Sign a canonical `NetworkPolicyCandidate` (`Ed25519 + ML-DSA-65` AND) under the
+/// offline `NetworkRoot` keys in `ca_dir` and write the five public verification
+/// artifacts (`tbs.cbor`, `ed25519.sig`, `mldsa65.sig`, `root-ed25519.der`,
+/// `root-mldsa65.der`) into `out_dir`. Private keys never leave `ca_dir`.
+pub fn sign_network_policy_dir(
+    ca_dir: &Path,
+    out_dir: &Path,
+    sequence: u64,
+    now_us: u64,
+    ttl_seconds: u64,
+) -> Result<NetworkPolicySummary, ProvisionError> {
+    if sequence == 0 {
+        return Err(ProvisionError::InvalidParameter(
+            "network policy sequence must be non-zero",
+        ));
+    }
+    if ttl_seconds == 0 || ttl_seconds > 3650 * 86_400 {
+        return Err(ProvisionError::InvalidParameter(
+            "network policy ttl_seconds must be in 1..=315360000",
+        ));
+    }
+    let span_us = ttl_seconds
+        .checked_mul(1_000_000)
+        .ok_or(ProvisionError::InvalidParameter("ttl_seconds overflow"))?;
+    let issued_at_us = now_us.saturating_sub(1_000_000);
+    let expires_us = now_us
+        .checked_add(span_us)
+        .ok_or(ProvisionError::InvalidParameter("expires_us overflow"))?;
+
+    let net_id = read_net_id_hex(&ca_dir.join("net_id.hex"))?;
+    let root_ed_pkcs8 = read_bounded(&ca_dir.join("root.ed25519.key"))?;
+    let root_ml_pkcs8 = read_bounded(&ca_dir.join("root.mldsa65.key"))?;
+    let root_ed = PKey::private_key_from_der(&root_ed_pkcs8)
+        .map_err(|_| ProvisionError::OpenSsl("parse root ed25519 key"))?;
+    let root_ml = PKey::private_key_from_der(&root_ml_pkcs8)
+        .map_err(|_| ProvisionError::OpenSsl("parse root mldsa65 key"))?;
+    if !root_ed.is_a(KeyType::ED25519) || !root_ml.is_a(KeyType::ML_DSA_65) {
+        return Err(ProvisionError::OpenSsl("root key type mismatch"));
+    }
+    let root_ed_pub = root_ed
+        .public_key_to_der()
+        .map_err(|_| ProvisionError::OpenSsl("root ed25519 pub der"))?;
+    let root_ml_pub = root_ml
+        .public_key_to_der()
+        .map_err(|_| ProvisionError::OpenSsl("root mldsa65 pub der"))?;
+    let pin = NetworkRootPin::provisioned(
+        net_id,
+        root_ed_pub.clone(),
+        MldsaParameterSet::Mldsa65,
+        root_ml_pub.clone(),
+    )?;
+    let root_fp = pin.fingerprint()?;
+
+    let candidate = NetworkPolicyCandidate {
+        net_id,
+        root_key_fingerprint: root_fp,
+        overlay_base: [10, 20, 0, 0],
+        version: 1,
+        seq: sequence,
+        issued_at: issued_at_us,
+        expires: expires_us,
+    };
+    let raw_tbs = candidate
+        .encode_tbs()
+        .map_err(|_| ProvisionError::OpenSsl("encode network policy tbs"))?;
+    let sig_msg = NetworkPolicyCandidate::signature_input(&raw_tbs)
+        .map_err(|_| ProvisionError::OpenSsl("network policy sig input"))?;
+    let (ed_sig, ml_sig) = dual_sign(&sig_msg, &root_ed, &root_ml)?;
+
+    // Self-verify against the constructed root pin before publishing to out_dir.
+    crate::verify_network_policy(&raw_tbs, &ed_sig, &ml_sig, &pin, net_id, now_us)
+        .map_err(|_| ProvisionError::OpenSsl("verify generated network policy"))?;
+
+    ensure_private_dir(out_dir)?;
+    write_public_atomic(&out_dir.join("tbs.cbor"), &raw_tbs)?;
+    write_public_atomic(&out_dir.join("ed25519.sig"), &ed_sig)?;
+    write_public_atomic(&out_dir.join("mldsa65.sig"), &ml_sig)?;
+    write_public_atomic(&out_dir.join("root-ed25519.der"), &root_ed_pub)?;
+    write_public_atomic(&out_dir.join("root-mldsa65.der"), &root_ml_pub)?;
+
+    Ok(NetworkPolicySummary {
+        net_id_hex: hex_encode(&net_id),
+        root_fingerprint_hex: hex_encode(&root_fp),
+        sequence,
+        issued_at_us,
+        expires_us,
     })
 }
 
@@ -1761,5 +1860,46 @@ mod tests {
             assert_eq!(&reply, b"pong");
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn sign_network_policy_dir_produces_verifiable_public_bundle_without_private_keys() {
+        let ca = TempDir::new("policy-ca");
+        let out = TempDir::new("policy-out");
+        let net_id = [0x42u8; 16];
+        let now_us = 1_795_000_000_000_000u64;
+        init_ca_dir(
+            &ca.0,
+            &CaInitParams {
+                net_id,
+                issuer_generation: 1,
+                now_us,
+                validity_days: 30,
+            },
+        )
+        .unwrap();
+
+        assert!(sign_network_policy_dir(&ca.0, &out.0, 0, now_us, 3600).is_err());
+        assert!(sign_network_policy_dir(&ca.0, &out.0, 1, now_us, 0).is_err());
+
+        let summary = sign_network_policy_dir(&ca.0, &out.0, 7, now_us, 3600).unwrap();
+        assert_eq!(summary.sequence, 7);
+        assert_eq!(summary.net_id_hex, hex_encode(&net_id));
+
+        assert!(!out.0.join("root.ed25519.key").exists());
+        assert!(!out.0.join("root.mldsa65.key").exists());
+
+        let tbs = fs::read(out.0.join("tbs.cbor")).unwrap();
+        let ed_sig = fs::read(out.0.join("ed25519.sig")).unwrap();
+        let ml_sig = fs::read(out.0.join("mldsa65.sig")).unwrap();
+        let ed_der = fs::read(out.0.join("root-ed25519.der")).unwrap();
+        let ml_der = fs::read(out.0.join("root-mldsa65.der")).unwrap();
+        let pin =
+            NetworkRootPin::provisioned(net_id, ed_der, MldsaParameterSet::Mldsa65, ml_der)
+                .unwrap();
+        let verified =
+            crate::verify_network_policy(&tbs, &ed_sig, &ml_sig, &pin, net_id, now_us).unwrap();
+        assert_eq!(verified.seq(), 7);
+        assert_eq!(verified.overlay_base(), [10, 20, 0, 0]);
     }
 }

@@ -663,20 +663,33 @@ else
   POLICY_FIXTURE_DIR="$WORK/policy-operator"
   mkdir -p "$POLICY_FIXTURE_DIR"
   chmod 0700 "$POLICY_FIXTURE_DIR"
-  POLICY_OPENSSL_BIN="${BOREAS_OPENSSL_BIN:-openssl}"
-  command -v "$POLICY_OPENSSL_BIN" >/dev/null 2>&1 || {
-    echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
-    exit 1
-  }
-  "$POLICY_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
-  "$POLICY_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
-  chmod 0600 "$POLICY_FIXTURE_DIR/root-ed25519.pem" "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
-  export BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN"
-  POLICY_NOW_US="$(($(date +%s) * 1000000))"
-  python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
-    --out-dir "$POLICY_FIXTURE_DIR" \
-    --net-id '0123456789abcdef0123456789abcdef' --sequence 1 \
-    --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
+  POLICY_OPENSSL_BIN="${BOREAS_OPENSSL_BIN:-}"
+  if [[ -n "$POLICY_OPENSSL_BIN" ]]; then
+    command -v "$POLICY_OPENSSL_BIN" >/dev/null 2>&1 || {
+      echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
+      exit 1
+    }
+    "$POLICY_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
+    "$POLICY_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+    chmod 0600 "$POLICY_FIXTURE_DIR/root-ed25519.pem" "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
+    export BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN"
+    POLICY_NOW_US="$(($(date +%s) * 1000000))"
+    python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
+      --out-dir "$POLICY_FIXTURE_DIR" \
+      --net-id '0123456789abcdef0123456789abcdef' --sequence 1 \
+      --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
+  else
+    POLICY_CA_DIR="$WORK/policy-ca"
+    "$BIN" pki init-ca \
+      --ca-dir "$POLICY_CA_DIR" \
+      --net-id '0123456789abcdef0123456789abcdef' \
+      --validity-days 30 >/dev/null
+    "$BIN" pki sign-policy \
+      --ca-dir "$POLICY_CA_DIR" \
+      --out-dir "$POLICY_FIXTURE_DIR" \
+      --sequence 1 \
+      --ttl-seconds 3600 >/dev/null
+  fi
 fi
 for spec in "core:$CORE_STATE" "edge:$EDGE_STATE"; do
   label="${spec%%:*}"

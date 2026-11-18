@@ -5,6 +5,7 @@
 //! - `boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--validity-days <N>]`
 //! - `boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role core|edge --home-core <1..16> --vip-octet <1|2..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]`
 //! - `boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]`
+//! - `boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>]`
 //! - `boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]`
 //! - `boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE>`
 
@@ -22,6 +23,7 @@ pub fn pki_usage() -> &'static str {
   boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--generation <N>] [--validity-days <1..3650>]
   boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role <core|edge> --home-core <1..16> --vip-octet <1..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]
   boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]
+  boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>]
   boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]
   boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE> [--record-state --state-file <ABSOLUTE> (--expect-first-use | --expect-seq <N> --expect-hash <64HEX>)]"
 }
@@ -37,6 +39,7 @@ pub fn run_pki_command(args: &[String]) -> Result<(), String> {
         "init-ca" => cmd_init_ca(&args[1..]),
         "issue-node" => cmd_issue_node(&args[1..]),
         "sign-status" => cmd_sign_status(&args[1..]),
+        "sign-policy" => cmd_sign_policy(&args[1..]),
         "verify-bundle" => cmd_verify_bundle(&args[1..]),
         "verify-policy" => cmd_verify_policy(&args[1..]),
         _ => Err("pki: unknown subcommand (run `boreas pki --help`)".to_string()),
@@ -274,6 +277,61 @@ fn cmd_sign_status(args: &[String]) -> Result<(), String> {
     println!(
         "{{\"command\":\"pki.sign-status\",\"status\":\"ok\",\"net_id\":\"{}\",\"sequence\":{},\"issued_at_us\":{},\"next_update_us\":{}}}",
         summary.net_id_hex, summary.sequence, summary.issued_at_us, summary.next_update_us
+    );
+    Ok(())
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn cmd_sign_policy(args: &[String]) -> Result<(), String> {
+    use boreas_pki::provisioning::sign_network_policy_dir;
+    use std::path::PathBuf;
+
+    let mut ca_dir: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut sequence: Option<u64> = None;
+    let mut ttl_seconds: u64 = 3600;
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = args
+            .get(i + 1)
+            .ok_or_else(|| format!("pki sign-policy: missing value for `{flag}`"))?;
+        match flag {
+            "--ca-dir" => ca_dir = Some(PathBuf::from(val)),
+            "--out-dir" => out_dir = Some(PathBuf::from(val)),
+            "--sequence" => {
+                sequence = Some(
+                    val.parse::<u64>()
+                        .map_err(|_| "pki sign-policy: invalid --sequence".to_string())?,
+                )
+            }
+            "--ttl-seconds" => {
+                ttl_seconds = val
+                    .parse::<u64>()
+                    .map_err(|_| "pki sign-policy: invalid --ttl-seconds".to_string())?
+            }
+            _ => return Err("pki sign-policy: unknown argument".to_string()),
+        }
+        i += 2;
+    }
+
+    let ca_dir = ca_dir.ok_or_else(|| "pki sign-policy: `--ca-dir` is required".to_string())?;
+    let out_dir = out_dir.ok_or_else(|| "pki sign-policy: `--out-dir` is required".to_string())?;
+    let sequence =
+        sequence.ok_or_else(|| "pki sign-policy: `--sequence` is required".to_string())?;
+
+    let summary =
+        sign_network_policy_dir(&ca_dir, &out_dir, sequence, now_utc_us()?, ttl_seconds)
+            .map_err(|e| format!("pki sign-policy failed: {e}"))?;
+
+    println!(
+        "{{\"command\":\"pki.sign-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{}}}",
+        summary.net_id_hex,
+        summary.root_fingerprint_hex,
+        summary.sequence,
+        summary.issued_at_us,
+        summary.expires_us
     );
     Ok(())
 }
@@ -1095,6 +1153,66 @@ mod verify_policy_cli_tests {
                     .contains("invalid or oversized TBS")
             );
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sign_policy_cli_round_trips_into_verify_policy() {
+        let dir = temp_dir();
+        let ca_dir = dir.join("ca");
+        let out_dir = dir.join("out");
+        let ca_str = ca_dir.to_string_lossy().into_owned();
+        let out_str = out_dir.to_string_lossy().into_owned();
+        let net_hex = "03030303030303030303030303030303";
+        run(&[
+            "init-ca",
+            "--ca-dir",
+            &ca_str,
+            "--net-id",
+            net_hex,
+            "--validity-days",
+            "30",
+        ])
+        .expect("init-ca");
+        run(&[
+            "sign-policy",
+            "--ca-dir",
+            &ca_str,
+            "--out-dir",
+            &out_str,
+            "--sequence",
+            "9",
+            "--ttl-seconds",
+            "3600",
+        ])
+        .expect("sign-policy");
+        let tbs = out_dir.join("tbs.cbor").to_string_lossy().into_owned();
+        let ed_sig = out_dir.join("ed25519.sig").to_string_lossy().into_owned();
+        let pq_sig = out_dir.join("mldsa65.sig").to_string_lossy().into_owned();
+        let ed_der = out_dir
+            .join("root-ed25519.der")
+            .to_string_lossy()
+            .into_owned();
+        let pq_der = out_dir
+            .join("root-mldsa65.der")
+            .to_string_lossy()
+            .into_owned();
+        run(&[
+            "verify-policy",
+            "--tbs-file",
+            &tbs,
+            "--ed25519-signature-file",
+            &ed_sig,
+            "--mldsa65-signature-file",
+            &pq_sig,
+            "--net-id",
+            net_hex,
+            "--root-ed25519-der",
+            &ed_der,
+            "--root-mldsa65-der",
+            &pq_der,
+        ])
+        .expect("verify-policy");
         let _ = fs::remove_dir_all(dir);
     }
 }
