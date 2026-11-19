@@ -340,6 +340,10 @@ def parse_signed_object(data: bytes) -> dict:
     if object_type not in OBJECT_TYPE_NAMES:
         raise Reject("bad_object_type")
     schema_version = reader.u16("bad_signed_object")
+    # The envelope pins the management schema it was signed under. A non-zero
+    # but unregistered schema version is a different document, not a valid one.
+    if schema_version != 1:
+        raise Reject("bad_signed_object")
     signer_count = reader.u8("bad_signed_object")
     if signer_count not in (1, 2):
         raise Reject("bad_signed_object")
