@@ -205,6 +205,8 @@ struct FrameIo {
     decoder: FrameDecoder,
     buffer: Vec<u8>,
     write_buf: Vec<u8>,
+    write_pos: usize,
+    needs_flush: bool,
     pending: VecDeque<Frame>,
     pending_bytes: usize,
     failed: bool,
@@ -217,6 +219,8 @@ impl FrameIo {
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
+            write_pos: 0,
+            needs_flush: false,
             pending: VecDeque::new(),
             pending_bytes: 0,
             failed: false,
@@ -227,12 +231,21 @@ impl FrameIo {
         self.failed = true;
         self.pending.clear();
         self.pending_bytes = 0;
+        self.write_buf.clear();
+        self.write_pos = 0;
+        self.needs_flush = false;
     }
 
     fn has_buffered_input(&self) -> bool {
         !self.pending.is_empty()
             || self.decoder.buffered_len() > 0
             || self.stream.has_buffered_input()
+    }
+
+    fn has_pending_write(&self) -> bool {
+        self.write_pos < self.write_buf.len()
+            || self.needs_flush
+            || self.stream.has_pending_write()
     }
 
     /// Disarm the bounded handshake transport deadline now that authorization
@@ -251,7 +264,35 @@ impl FrameIo {
         Ok(())
     }
 
+    fn flush_pending(&mut self) -> Result<(), TunnelError> {
+        while self.write_pos < self.write_buf.len() {
+            match self.stream.write(&self.write_buf[self.write_pos..]) {
+                Ok(0) => return Err(TunnelError::Io(io::ErrorKind::WriteZero)),
+                Ok(n) => {
+                    self.write_pos += n;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.write_buf.clear();
+        self.write_pos = 0;
+        if self.needs_flush {
+            match self.stream.flush() {
+                Ok(()) => self.needs_flush = false,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn send_inner(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
+        self.flush_pending()?;
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
             kind,
@@ -263,12 +304,14 @@ impl FrameIo {
         self.write_buf.reserve(encoded.len() + body.len());
         self.write_buf.extend_from_slice(&encoded);
         self.write_buf.extend_from_slice(body);
-        // One application frame is one TLS write. TLS record boundaries remain
-        // independent of AppHeader framing, but avoiding separate header/body
-        // records halves avoidable encryption and WebSocket overhead.
-        self.stream.write_all(&self.write_buf)?;
-        self.stream.flush()?;
-        Ok(())
+        self.write_pos = 0;
+        self.needs_flush = true;
+        // One application frame is one TLS write. On WouldBlock, keep the
+        // remaining frame bytes buffered here (bounded to one frame) for POLLOUT.
+        match self.flush_pending() {
+            Ok(()) | Err(TunnelError::Io(io::ErrorKind::WouldBlock)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn send(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
@@ -276,8 +319,21 @@ impl FrameIo {
             return Err(TunnelError::Poisoned);
         }
         let result = self.send_inner(kind, body);
-        if result.is_err() {
-            self.poison();
+        match result {
+            Ok(()) | Err(TunnelError::Io(io::ErrorKind::WouldBlock)) => {}
+            Err(_) => self.poison(),
+        }
+        result
+    }
+
+    fn flush(&mut self) -> Result<(), TunnelError> {
+        if self.failed {
+            return Err(TunnelError::Poisoned);
+        }
+        let result = self.flush_pending();
+        match result {
+            Ok(()) | Err(TunnelError::Io(io::ErrorKind::WouldBlock)) => {}
+            Err(_) => self.poison(),
         }
         result
     }
@@ -293,6 +349,9 @@ impl FrameIo {
             }
             let read = match self.stream.read(&mut self.buffer) {
                 Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+                }
                 Err(error) => {
                     self.poison();
                     return Err(error.into());
@@ -375,6 +434,16 @@ impl EstablishedSession {
     /// Whether decoded frames or lower-layer bytes remain buffered locally.
     pub fn has_buffered_input(&self) -> bool {
         self.io.has_buffered_input()
+    }
+
+    /// Whether outbound frame bytes remain buffered waiting on `POLLOUT`.
+    pub fn has_pending_write(&self) -> bool {
+        self.io.has_pending_write()
+    }
+
+    /// Flush any pending outbound frame bytes without poisoning on `WouldBlock`.
+    pub fn flush(&mut self) -> Result<(), TunnelError> {
+        self.io.flush()
     }
 
     /// Send one application frame. Frame-level state transitions are validated

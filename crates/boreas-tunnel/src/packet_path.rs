@@ -730,7 +730,24 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     state: PathState,
     stats: PacketStats,
     outbound_batch: Vec<u8>,
+    outbound_pos: usize,
+    outbound_needs_flush: bool,
     inbound_scratch: Vec<u8>,
+    rx_frame: [u8; MAX_FRAME_BYTES],
+    inbound_filled: usize,
+    inbound_expected: usize,
+}
+
+/// Result of one non-blocking inbound step on [`PacketPath`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundStep {
+    /// One authorized L3 packet of `usize` bytes was delivered to the host.
+    Packet(usize),
+    /// The underlying stream would block before completing the current frame;
+    /// partial bytes remain buffered safely inside [`PacketPath`].
+    WouldBlock,
+    /// The peer closed the circuit cleanly at a frame boundary.
+    Closed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -792,6 +809,22 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             .is_some_and(E2eCircuit::has_buffered_input)
     }
 
+    /// Whether outbound bytes remain buffered waiting on `POLLOUT`.
+    pub fn has_pending_write(&self) -> bool {
+        self.outbound_pos < self.outbound_batch.len()
+            || self.outbound_needs_flush
+            || self
+                .circuit
+                .as_ref()
+                .is_some_and(E2eCircuit::has_pending_write)
+    }
+
+    /// Whether a partial inbound L3 frame is currently buffered waiting for
+    /// the remaining bytes of its frame body.
+    pub fn has_partial_inbound(&self) -> bool {
+        self.inbound_filled > 0
+    }
+
     /// Close the path after telling the peer: TLS `close_notify`, then the
     /// circuit's own `CircuitClose`, then the stream is dropped.
     ///
@@ -837,7 +870,12 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             state: PathState::Open,
             stats: PacketStats::default(),
             outbound_batch: Vec::new(),
+            outbound_pos: 0,
+            outbound_needs_flush: false,
             inbound_scratch: Vec::new(),
+            rx_frame: [0u8; MAX_FRAME_BYTES],
+            inbound_filled: 0,
+            inbound_expected: 0,
         })
     }
 
@@ -942,23 +980,83 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     /// stream write + flush. Zero coalescing timer is used (§6.4).
     ///
     /// Returns the number of packets delivered to the circuit (`0` if none).
+    /// Flush any buffered outbound bytes from an earlier `WouldBlock` without
+    /// pulling additional host packets. Returns `Ok(true)` once fully flushed,
+    /// or `Ok(false)` if the underlying transport still returned `WouldBlock`.
+    pub fn flush_outbound(&mut self) -> Result<bool, PacketPathError> {
+        self.check_open()?;
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let mut interrupts = 0u8;
+        while self.outbound_pos < self.outbound_batch.len() {
+            match circuit.write(&self.outbound_batch[self.outbound_pos..]) {
+                Ok(0) => {
+                    self.outbound_batch.clear();
+                    self.outbound_pos = 0;
+                    return Err(self.fail(PacketPathError::CircuitIo(io::ErrorKind::WriteZero)));
+                }
+                Ok(n) => {
+                    self.outbound_pos += n;
+                    interrupts = 0;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts = interrupts.saturating_add(1);
+                    if interrupts >= MAX_INTERRUPT_RETRIES {
+                        self.outbound_batch.clear();
+                        self.outbound_pos = 0;
+                        return Err(
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.outbound_batch.clear();
+                    self.outbound_pos = 0;
+                    return Err(self.fail(PacketPathError::CircuitIo(error.kind())));
+                }
+            }
+        }
+        self.outbound_batch.clear();
+        self.outbound_pos = 0;
+        if self.outbound_needs_flush {
+            match circuit.flush() {
+                Ok(()) => self.outbound_needs_flush = false,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(false);
+                }
+                Err(error) => {
+                    return Err(self.fail(PacketPathError::CircuitIo(error.kind())));
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub fn step_outbound_batch(
         &mut self,
         max_packets: usize,
         max_bytes: usize,
     ) -> Result<usize, PacketPathError> {
         self.check_open()?;
+        if !self.flush_outbound()? {
+            return Ok(0);
+        }
         if max_packets == 0 || max_bytes == 0 {
             return Ok(0);
         }
-        let Some(circuit) = self.circuit.as_mut() else {
+        if self.circuit.is_none() {
             return Err(PacketPathError::Poisoned);
-        };
+        }
         let mut drained = 0usize;
         let mut payload_bytes = 0u64;
         let mut attempts = 0usize;
         let max_attempts = max_packets.saturating_mul(2);
         self.outbound_batch.clear();
+        self.outbound_pos = 0;
         while drained < max_packets
             && self.outbound_batch.len() < max_bytes
             && attempts < max_attempts
@@ -1000,21 +1098,109 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         if drained == 0 {
             return Ok(0);
         }
-        if let Err(error) = write_all_bounded(circuit, &self.outbound_batch).and_then(|()| {
-            circuit
-                .flush()
-                .map_err(|err| PacketPathError::CircuitIo(err.kind()))
-        }) {
-            self.outbound_batch.clear();
-            return Err(self.fail(error));
-        }
-        self.outbound_batch.clear();
+        self.outbound_needs_flush = true;
         self.stats.outbound_packets = self
             .stats
             .outbound_packets
             .saturating_add(u64::try_from(drained).unwrap_or(u64::MAX));
         self.stats.outbound_bytes = self.stats.outbound_bytes.saturating_add(payload_bytes);
+        let _ = self.flush_outbound()?;
         Ok(drained)
+    }
+
+    /// Non-blocking inbound step preserving partial frame bytes across
+    /// `WouldBlock` without poisoning the circuit.
+    pub fn step_inbound_nonblocking(&mut self) -> Result<InboundStep, PacketPathError> {
+        self.check_open()?;
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let mut interrupts = 0u8;
+        while self.inbound_filled < FRAME_PREFIX_LEN {
+            match circuit.read(&mut self.rx_frame[self.inbound_filled..FRAME_PREFIX_LEN]) {
+                Ok(0) => {
+                    if self.inbound_filled == 0 {
+                        self.close();
+                        return Ok(InboundStep::Closed);
+                    }
+                    return Err(self.fail(PacketPathError::TruncatedFrame));
+                }
+                Ok(n) => {
+                    self.inbound_filled += n;
+                    interrupts = 0;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts = interrupts.saturating_add(1);
+                    if interrupts >= MAX_INTERRUPT_RETRIES {
+                        return Err(
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(InboundStep::WouldBlock);
+                }
+                Err(error) => {
+                    return Err(self.fail(PacketPathError::CircuitIo(error.kind())));
+                }
+            }
+        }
+        if self.inbound_expected == 0 {
+            let body_len = usize::from(u16::from_be_bytes([self.rx_frame[0], self.rx_frame[1]]));
+            if body_len == 0 {
+                return Err(self.fail(PacketPathError::EmptyFrame));
+            }
+            if body_len > self.policy.mtu() {
+                return Err(self.fail(PacketPathError::FrameTooLarge));
+            }
+            self.inbound_expected = FRAME_PREFIX_LEN + body_len;
+        }
+        interrupts = 0;
+        while self.inbound_filled < self.inbound_expected {
+            match circuit.read(&mut self.rx_frame[self.inbound_filled..self.inbound_expected]) {
+                Ok(0) => return Err(self.fail(PacketPathError::TruncatedFrame)),
+                Ok(n) => {
+                    self.inbound_filled += n;
+                    interrupts = 0;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts = interrupts.saturating_add(1);
+                    if interrupts >= MAX_INTERRUPT_RETRIES {
+                        return Err(
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(InboundStep::WouldBlock);
+                }
+                Err(error) => {
+                    return Err(self.fail(PacketPathError::CircuitIo(error.kind())));
+                }
+            }
+        }
+        let end = self.inbound_expected;
+        self.inbound_filled = 0;
+        self.inbound_expected = 0;
+        let packet = &self.rx_frame[FRAME_PREFIX_LEN..end];
+        let length = match self.policy.authorize_inbound(packet) {
+            Ok(info) => info.packet_len,
+            Err(deny) => return Err(self.fail(PacketPathError::Denied(deny))),
+        };
+        if let Err(error) = self.io.write_packet(packet) {
+            let mapped = match error {
+                TunError::QueueFull => PacketPathError::HostQueueFull,
+                TunError::QueueClosed => PacketPathError::HostQueueClosed,
+                other => PacketPathError::HostRejected(other),
+            };
+            return Err(self.fail(mapped));
+        }
+        self.stats.inbound_packets = self.stats.inbound_packets.saturating_add(1);
+        self.stats.inbound_bytes = self
+            .stats
+            .inbound_bytes
+            .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        Ok(InboundStep::Packet(length))
     }
 
     /// Read one frame from the peer and deliver its packet to the host stack.
@@ -1940,5 +2126,89 @@ mod tests {
         );
         assert!(!path.is_open());
         assert!(written.borrow().is_empty());
+    }
+
+    #[test]
+    fn nonblocking_inbound_and_outbound_preserve_partial_progress_across_would_block() {
+        struct NonBlockingCircuit {
+            rx_chunks: Vec<Result<Vec<u8>, io::ErrorKind>>,
+            rx_idx: usize,
+            tx_calls: usize,
+            tx_written: Vec<u8>,
+        }
+        impl Read for NonBlockingCircuit {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.rx_idx >= self.rx_chunks.len() {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let item = &self.rx_chunks[self.rx_idx];
+                self.rx_idx += 1;
+                match item {
+                    Ok(bytes) => {
+                        let take = bytes.len().min(out.len());
+                        out[..take].copy_from_slice(&bytes[..take]);
+                        Ok(take)
+                    }
+                    Err(kind) => Err((*kind).into()),
+                }
+            }
+        }
+        impl Write for NonBlockingCircuit {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.tx_calls += 1;
+                if self.tx_calls == 1 {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let take = buf.len().min(5);
+                self.tx_written.extend_from_slice(&buf[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (device, host) = VirtualTun::try_pair(8, 8, DEFAULT_MTU).expect("bounded pair");
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let mtu = DEFAULT_MTU;
+        let out_pkt = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"outbound-nb");
+        let in_pkt = ipv4([10, 20, 3, 9], [10, 20, 3, 1], b"inbound-nb");
+        let in_frame = encode_packet_frame(&in_pkt, mtu).unwrap();
+        device.inject(&out_pkt).expect("inject outbound");
+
+        let circuit = NonBlockingCircuit {
+            rx_chunks: vec![
+                Ok(in_frame[..1].to_vec()),
+                Err(io::ErrorKind::WouldBlock),
+                Ok(in_frame[1..10].to_vec()),
+                Err(io::ErrorKind::WouldBlock),
+                Ok(in_frame[10..].to_vec()),
+            ],
+            rx_idx: 0,
+            tx_calls: 0,
+            tx_written: Vec::new(),
+        };
+        let mut path =
+            PacketPath::try_new(&device, circuit, endpoints(local, peer), mtu).expect("bound path");
+
+        // Outbound batch hits WouldBlock initially, buffers cleanly, and flushes on retry.
+        assert_eq!(path.step_outbound_batch(16, 16_000), Ok(1));
+        assert!(path.has_pending_write());
+        assert_eq!(path.step_outbound_batch(16, 16_000), Ok(0));
+        assert_eq!(path.flush_outbound(), Ok(true));
+        assert!(!path.has_pending_write());
+
+        // Inbound survives WouldBlock across prefix and body splits without poisoning.
+        assert_eq!(path.step_inbound_nonblocking(), Ok(InboundStep::WouldBlock));
+        assert!(path.has_partial_inbound());
+        assert_eq!(path.step_inbound_nonblocking(), Ok(InboundStep::WouldBlock));
+        assert_eq!(
+            path.step_inbound_nonblocking(),
+            Ok(InboundStep::Packet(in_pkt.len()))
+        );
+        assert!(!path.has_partial_inbound());
+        assert_eq!(host.read_packet().unwrap().as_deref(), Some(in_pkt.as_slice()));
+        assert!(path.is_open());
     }
 }

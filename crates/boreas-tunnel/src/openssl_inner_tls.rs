@@ -29,7 +29,10 @@ use boreas_crypto::backend::{BackendError, EstablishedStream, OpenSslAcceptor, O
 use boreas_crypto::{NodeRole, Policy, PolicyError, Suite};
 use boreas_pki::management::VerifiedObject;
 use boreas_proto::objects::{MldsaParameterSet, NodeRole as ObjectRole, ObjectBody};
-use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use openssl::ssl::{
+    SslAcceptor, SslConnector, SslFiletype, SslMethod, SslOptions, SslSessionCacheMode,
+    SslVerifyMode, SslVersion,
+};
 use openssl::x509::X509;
 
 use crate::e2e::{CircuitStream, E2eEstablished, E2eStream, E2eTlsBackend};
@@ -627,6 +630,14 @@ impl OpenSslOuterTlsAcceptor {
         builder
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder.set_options(SslOptions::NO_TICKET);
+        builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+        builder
+            .set_num_tickets(0)
+            .map_err(|_| TunnelError::InnerTls("outer tls no tickets"))?;
+        builder
+            .set_max_early_data(0)
+            .map_err(|_| TunnelError::InnerTls("outer tls no early data"))?;
         builder
             .set_certificate_chain_file(certificate_chain)
             .map_err(|_| TunnelError::InnerTls("outer certificate"))?;

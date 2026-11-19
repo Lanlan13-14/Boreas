@@ -243,6 +243,11 @@ impl<'a> CircuitStream<'a> {
         !self.inbound.is_empty() || self.session.has_buffered_input()
     }
 
+    /// Whether outbound bytes remain buffered in the underlying hop session.
+    pub fn has_pending_write(&self) -> bool {
+        self.session.has_pending_write()
+    }
+
     /// Send up to [`MAX_FRAGMENT_PAYLOAD`] bytes as one fragment.
     pub fn write_bytes(&mut self, data: &[u8]) -> Result<usize, TunnelError> {
         if data.is_empty() {
@@ -378,19 +383,26 @@ impl Drop for CircuitStream<'_> {
 
 impl Read for CircuitStream<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.read_bytes(out)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        self.read_bytes(out).map_err(|error| match error {
+            TunnelError::Io(io::ErrorKind::WouldBlock) => io::ErrorKind::WouldBlock.into(),
+            other => io::Error::new(io::ErrorKind::InvalidData, other),
+        })
     }
 }
 
 impl Write for CircuitStream<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_bytes(buf)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        self.write_bytes(buf).map_err(|error| match error {
+            TunnelError::Io(io::ErrorKind::WouldBlock) => io::ErrorKind::WouldBlock.into(),
+            other => io::Error::new(io::ErrorKind::InvalidData, other),
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.session.flush().map_err(|error| match error {
+            TunnelError::Io(io::ErrorKind::WouldBlock) => io::ErrorKind::WouldBlock.into(),
+            other => io::Error::new(io::ErrorKind::InvalidData, other),
+        })
     }
 }
 
@@ -737,6 +749,11 @@ impl<'a> E2eCircuit<'a> {
     /// Whether E2E TLS or a lower layer already holds inbound bytes.
     pub fn has_buffered_input(&self) -> bool {
         self.stream.has_buffered_input()
+    }
+
+    /// Whether outbound bytes remain buffered in lower layers waiting on `POLLOUT`.
+    pub fn has_pending_write(&self) -> bool {
+        self.stream.has_pending_write()
     }
 
     pub fn info(&self) -> E2eInfo {
