@@ -811,18 +811,11 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
 
     /// Whether outbound bytes remain buffered waiting on `POLLOUT`.
     pub fn has_pending_write(&self) -> bool {
-        self.outbound_pos < self.outbound_batch.len()
-            || self.outbound_needs_flush
+        self.has_local_pending_write()
             || self
                 .circuit
                 .as_ref()
                 .is_some_and(E2eCircuit::has_pending_write)
-    }
-
-    /// Whether a partial inbound L3 frame is currently buffered waiting for
-    /// the remaining bytes of its frame body.
-    pub fn has_partial_inbound(&self) -> bool {
-        self.inbound_filled > 0
     }
 
     /// Close the path after telling the peer: TLS `close_notify`, then the
@@ -983,6 +976,17 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     /// Flush any buffered outbound bytes from an earlier `WouldBlock` without
     /// pulling additional host packets. Returns `Ok(true)` once fully flushed,
     /// or `Ok(false)` if the underlying transport still returned `WouldBlock`.
+    /// Whether outbound batch bytes remain buffered inside [`PacketPath`] itself.
+    pub fn has_local_pending_write(&self) -> bool {
+        self.outbound_pos < self.outbound_batch.len() || self.outbound_needs_flush
+    }
+
+    /// Whether a partial inbound L3 frame is currently buffered waiting for
+    /// the remaining bytes of its frame body.
+    pub fn has_partial_inbound(&self) -> bool {
+        self.inbound_filled > 0
+    }
+
     pub fn flush_outbound(&mut self) -> Result<bool, PacketPathError> {
         self.check_open()?;
         let Some(circuit) = self.circuit.as_mut() else {
@@ -2194,10 +2198,10 @@ mod tests {
 
         // Outbound batch hits WouldBlock initially, buffers cleanly, and flushes on retry.
         assert_eq!(path.step_outbound_batch(16, 16_000), Ok(1));
-        assert!(path.has_pending_write());
+        assert!(path.has_local_pending_write());
         assert_eq!(path.step_outbound_batch(16, 16_000), Ok(0));
         assert_eq!(path.flush_outbound(), Ok(true));
-        assert!(!path.has_pending_write());
+        assert!(!path.has_local_pending_write());
 
         // Inbound survives WouldBlock across prefix and body splits without poisoning.
         assert_eq!(path.step_inbound_nonblocking(), Ok(InboundStep::WouldBlock));

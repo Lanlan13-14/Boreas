@@ -790,6 +790,7 @@ struct RawFrame {
 /// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
 /// handshake the runtime supplies that transport timeout; the data plane
 /// deliberately has none, so this check bounds progress between reads there.
+#[cfg(test)]
 fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<(), WsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -811,6 +812,7 @@ fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn read_frame<T: Read>(
     io: &mut T,
     role: WsRole,
