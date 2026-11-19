@@ -299,10 +299,20 @@ fn probe_losses_switch_once_and_recovery_does_not_flap() {
 
     let mut watch = ProbeWatch::new(policy);
     let mut switches = 0u32;
+    // A mismatched reply counts as its own failed interval, so it is asserted
+    // separately rather than inside the miss loop, where it would consume one of
+    // the `fail_threshold` intervals and trip `Suspect` a step early.
+    assert_eq!(
+        watch.observe_reply([1; 16], [2; 16], 0, 0),
+        ProbeVerdict::ProbeMiss
+    );
+    assert_eq!(watch.consecutive_failures(), 1);
+    watch.observe_reply([3; 16], [3; 16], 0, 1);
+    assert_eq!(watch.consecutive_failures(), 0);
+
     for step in 1..threshold {
         assert_eq!(watch.observe_missed_interval(), ProbeVerdict::ProbeMiss);
         assert_eq!(watch.consecutive_failures(), step);
-        assert_ne!(watch.observe_reply([1; 16], [2; 16], 0, 0), ProbeVerdict::Success);
     }
     assert_eq!(watch.observe_missed_interval(), ProbeVerdict::Suspect);
     assert_eq!(watch.consecutive_failures(), threshold);
