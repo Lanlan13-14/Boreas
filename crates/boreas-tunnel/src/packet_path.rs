@@ -2137,6 +2137,7 @@ mod tests {
         struct NonBlockingCircuit {
             rx_chunks: Vec<Result<Vec<u8>, io::ErrorKind>>,
             rx_idx: usize,
+            rx_offset: usize,
             tx_calls: usize,
             tx_written: Vec<u8>,
         }
@@ -2145,15 +2146,24 @@ mod tests {
                 if self.rx_idx >= self.rx_chunks.len() {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
-                let item = &self.rx_chunks[self.rx_idx];
-                self.rx_idx += 1;
-                match item {
+                match &self.rx_chunks[self.rx_idx] {
                     Ok(bytes) => {
-                        let take = bytes.len().min(out.len());
-                        out[..take].copy_from_slice(&bytes[..take]);
+                        let rem = &bytes[self.rx_offset..];
+                        let take = rem.len().min(out.len());
+                        out[..take].copy_from_slice(&rem[..take]);
+                        self.rx_offset += take;
+                        if self.rx_offset >= bytes.len() {
+                            self.rx_idx += 1;
+                            self.rx_offset = 0;
+                        }
                         Ok(take)
                     }
-                    Err(kind) => Err((*kind).into()),
+                    Err(kind) => {
+                        let kind = *kind;
+                        self.rx_idx += 1;
+                        self.rx_offset = 0;
+                        Err(kind.into())
+                    }
                 }
             }
         }
@@ -2190,6 +2200,7 @@ mod tests {
                 Ok(in_frame[10..].to_vec()),
             ],
             rx_idx: 0,
+            rx_offset: 0,
             tx_calls: 0,
             tx_written: Vec::new(),
         };

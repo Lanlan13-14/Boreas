@@ -1797,7 +1797,7 @@ mod tests {
         impl Write for FragmentedIo {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.write_calls += 1;
-                if self.write_calls == 1 {
+                if self.write_calls <= 2 {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
                 let take = buf.len().min(3);

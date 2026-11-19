@@ -3129,7 +3129,7 @@ mod linux_daemon {
                 if now.saturating_duration_since(started) >= PATH_IO_TIMEOUT {
                     path.close();
                     break 'outer PathStop::Failed {
-                        kind: std::io::ErrorKind::TimedOut,
+                        kind: PathFailureKind::Transport,
                         reason: "business socket I/O stalled beyond PATH_IO_TIMEOUT".to_string(),
                     };
                 }
