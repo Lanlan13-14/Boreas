@@ -33,7 +33,7 @@ fn must_reserve_handshake(admission: &Admission) -> HandshakeCredit {
     }
 }
 
-fn must_reserve_bytes(admission: &Admission, amount: u64) -> ByteCredit {
+fn must_reserve_bytes(admission: &Admission, amount: usize) -> ByteCredit {
     match admission.reserve_bytes(amount) {
         Ok(credit) => credit,
         Err(_) => panic!("byte reservation of {amount} refused under the budget"),
