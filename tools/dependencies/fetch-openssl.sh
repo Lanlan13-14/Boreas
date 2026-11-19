@@ -28,7 +28,10 @@ url="https://github.com/openssl/openssl/archive/${OPENSSL_COMMIT}.tar.gz"
 curl --fail --location --retry 3 --max-time 180 "$url" -o "$archive"
 echo "${OPENSSL_SHA256}  ${archive}" | sha256sum --check --strict
 
-top=$(tar -tzf "$archive" | head -n 1 | cut -d/ -f1)
+# Listing the whole archive through a pipe trips SIGPIPE once the first line is
+# read, and pipefail turns that into a false failure. Read the listing fully.
+tar -tzf "$archive" > "$archive.list"
+top=$(head -n 1 "$archive.list" | cut -d/ -f1)
 if [[ "$top" != "openssl-${OPENSSL_COMMIT}" ]]; then
     echo "archive root is '${top}', expected openssl-${OPENSSL_COMMIT}" >&2
     exit 1
