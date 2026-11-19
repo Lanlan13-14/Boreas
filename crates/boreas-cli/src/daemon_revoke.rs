@@ -52,10 +52,10 @@ impl RevocationSet {
         self.revoked.contains(&(node_id, identity_generation))
     }
 
-    pub fn len(&self) -> usize {
-        self.revoked.len()
-    }
-
+    // Used by tests/revoke_runtime.rs through the lib target. The bin target
+    // never calls it, and clippy lints that target without seeing the integration
+    // tests, so the use is invisible to it.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.revoked.is_empty()
     }
@@ -77,6 +77,10 @@ impl RevocationSet {
 }
 
 /// Why one snapshot did not change the revocation set.
+///
+/// `dead_code` is allowed because only `tests/revoke_runtime.rs` matches on these
+/// variants, and clippy's bin-target lint does not see that integration test.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevokeApplyError {
     /// The trust layer rejected the envelope: signature, issuer, network, or window.
@@ -92,6 +96,9 @@ pub enum RevokeApplyError {
 }
 
 /// Summary of one accepted snapshot.
+///
+/// Read by `tests/revoke_runtime.rs`; the bin target never constructs it.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppliedStatus {
     /// Signed snapshot sequence.
@@ -109,6 +116,7 @@ pub struct AppliedStatus {
 ///
 /// `now_us` must be trusted UTC microseconds. This function does not read the
 /// system clock and does not extend freshness when the same bytes are applied again.
+#[allow(dead_code)] // exercised by tests/revoke_runtime.rs, not by the bin target
 pub fn apply_signed_status(
     trust: &mut ManagementTrust,
     raw_signed: &[u8],
@@ -150,10 +158,11 @@ pub fn apply_signed_status(
     }
     Ok(AppliedStatus {
         sequence: body.sequence,
-        revoked_peers: set.len(),
+        revoked_peers: set.revoked.len(),
     })
 }
 
+#[allow(dead_code)] // reached only through apply_signed_status
 fn scopes_from_payload(
     payload: &RevocationPayload,
 ) -> Result<Vec<VerifiedRevocationScope>, RevokeApplyError> {
@@ -168,6 +177,7 @@ fn scopes_from_payload(
     Ok(scopes)
 }
 
+#[allow(dead_code)] // reached only through apply_signed_status
 fn scope_from_entry(entry: &RevocationEntry) -> VerifiedRevocationScope {
     VerifiedRevocationScope {
         class: entry.class,
