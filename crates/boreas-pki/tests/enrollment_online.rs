@@ -6,7 +6,7 @@
 #![cfg(feature = "openssl-backend")]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use boreas_pki::enrollment::{
@@ -122,7 +122,7 @@ fn edge_slot() -> Slot {
     }
 }
 
-fn open_store(path: &PathBuf, secret: [u8; 32]) -> EnrollmentStore {
+fn open_store(path: &Path, secret: [u8; 32]) -> EnrollmentStore {
     let policy = CsrPolicy::with_ed25519_pop_oid(EXPERIMENTAL_ED25519_CSR_POP_OID).unwrap();
     EnrollmentStore::open_with_csr_policy(
         path.join("journal"),

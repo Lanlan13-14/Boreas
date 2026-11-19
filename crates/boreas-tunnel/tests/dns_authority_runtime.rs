@@ -28,7 +28,7 @@ use boreas_proto::dns_authority::{
 };
 use boreas_proto::network_policy::NetworkPolicyCandidate;
 use boreas_proto::objects::MldsaParameterSet;
-use openssl::pkey::{Id, PKey, Private};
+use openssl::pkey::{KeyType, PKey, Private};
 use openssl::sign::Signer;
 
 const NET: [u8; 16] = [0x44; 16];
