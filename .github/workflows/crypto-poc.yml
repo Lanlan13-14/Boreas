@@ -26,12 +26,15 @@ concurrency:
 
 jobs:
   openssl-ml-dsa-tls:
-    name: OpenSSL 4.1.0 reduced source build + TLS tests (CVE review pending)
+    name: OpenSSL 4.1.1-dev reduced source build + TLS tests (CVE review pending)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      OPENSSL_VERSION: 4.1.0
-      OPENSSL_SHA256: 50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: 4.1.1
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
       OPENSSL_PREFIX: ${{ github.workspace }}/.poc-openssl
       ARTIFACT_DIR: ${{ github.workspace }}/crypto-poc-artifacts
     steps:
@@ -41,21 +44,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y build-essential perl wget ca-certificates iproute2 binutils
-      - name: Download and verify pinned OpenSSL release
+      - name: Download and verify pinned OpenSSL commit
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 --max-time 120 \
-            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
-            -o openssl.tar.gz
-          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum --check --strict
-          mkdir openssl-src
-          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-src
-          source openssl-src/VERSION.dat
-          test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}" || {
-            cat openssl-src/VERSION.dat
-            exit 1
-          }
+          bash tools/dependencies/fetch-openssl.sh openssl-src
       - name: Build OpenSSL static library and CLI
         timeout-minutes: 30
         run: |

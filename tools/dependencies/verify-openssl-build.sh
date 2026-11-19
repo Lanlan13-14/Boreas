@@ -31,7 +31,10 @@ unset OPENSSL_MODULES
 test -s "$OPENSSL_CONF"
 version_output="$("$bin" version -a)"
 printf '%s\n' "$version_output" | tee "$runtime_report"
-if ! grep -Eq "^OpenSSL ${OPENSSL_VERSION//./\\.} " <<<"$version_output"; then
+# A release prints "OpenSSL 4.1.0 ...". The pinned 4.1.1-dev snapshot prints
+# "OpenSSL 4.1.1-dev ..." with no space before the pre-release tag, so the
+# version token is matched either way and the rest of the line is untouched.
+if ! grep -Eq "^OpenSSL ${OPENSSL_VERSION//./\\.}([[:space:]]|-)" <<<"$version_output"; then
     echo "OpenSSL runtime does not match pinned ${OPENSSL_VERSION}" >&2
     exit 1
 fi

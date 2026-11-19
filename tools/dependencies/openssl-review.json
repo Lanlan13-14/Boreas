@@ -59,15 +59,35 @@
   "fixed_release_availability": {
     "wanted_fixed_version": "4.1.1",
     "available": false,
-    "rechecked_at": "2026-11-17",
+    "rechecked_at": "2026-11-19",
     "evidence": [
       "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-4.1.1 returned HTTP 404",
-      "https://api.github.com/repos/openssl/openssl/releases/latest returned openssl-4.1.0 (published 2026-10-23) with asset digest sha256:50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd, i.e. 4.1.0 is still the newest release"
+      "https://api.github.com/repos/openssl/openssl/releases/latest returned openssl-4.1.0 (published 2026-10-23), i.e. 4.1.0 is still the newest release on the 4.1 line",
+      "https://openssl-library.org/news/secadv/20261117.txt schedules the fixed releases, including 4.1.1, for 2026-12-01 and states they were not available when the advisory was published",
+      "the openssl-4.1 branch at 941390af2ac35f41d2f95bb0bac823dbf0700845 already contains the fix commits listed under fixed_commit and versions itself 4.1.1-dev"
     ],
-    "consequence": "No 4.1.1 pin, SHA-256 or migration can be recorded. The affected_ranges entry with fixed 4.1.1 stays blocking, so the native gate remains red. This is an honest block, not a waiver: no checksum or release asset is inferred from a tag that does not exist.",
+    "consequence": "4.1.1 is still unpublished, so no release pin exists for it. The workflows build the reviewed fix commit instead, which is a development snapshot and not the release. The affected_ranges entry stays in force for every release pin; only the reviewed commit is exempt, and only while its sha and archive digest match.",
     "unblock_condition": "A published, non-prerelease openssl-4.1.1 release with an official digest for the reviewed archive, then a new review of applicability, options and workflow pins."
   },
   "status": "20261110 and 20261117 notices reviewed. OpenSSL 4.1.1 was not published at query time: the official GitHub tag API returned 404 and the official download table still listed 4.1.0, so no fixed-version migration or SHA-256 can honestly be added. The 4.1.0 reduced builds remain unapproved migration candidates, NOT a CVE waiver. All eight 4.1.0 findings through 20261117 remain encoded in affected_ranges and blocking; no-quic can only address the three QUIC paths as a build-removal candidate, while the Suite B TLS and PEM_X509_INFO paths require separate review or an actually released fixed version. New notices require renewed review; no advisory is suppressed.",
+  "fixed_commit": {
+    "sha": "941390af2ac35f41d2f95bb0bac823dbf0700845",
+    "base": "openssl-4.1.0",
+    "branch": "openssl-4.1",
+    "version": "4.1.1-dev",
+    "archive_sha256": "c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d",
+    "note": "Earliest commit on openssl-4.1 that contains every fix from the 2026-11-10 and 2026-11-17 advisories together with its regression test. The tree versions itself 4.1.1-dev. It is not the 4.1.1 release, which OpenSSL scheduled for 2026-12-01 and has not published.",
+    "fixes": [
+      "6747b1a278816dd7db46438040a70b0b5e5e0a90",
+      "7b4f5344aa0401e7b777640050b5257ed2a70e88",
+      "36e15b618decdff1b116eead6747718e6e729ad2",
+      "70a47ac78b6f3be1b22fb1551bd0bfcff4f29613",
+      "dd90ceb99a3c2ddba336bb4a00be9ebabd84c2a1",
+      "c57a5ccf0c060755b5494a6870922b7c6cdd7dd8",
+      "ade64619df04056b3e5fd1c1befe9425a7c80eb6",
+      "ead311df1037e7994a6d86c7e862d71ad59c52c7"
+    ]
+  },
   "sources": [
     "https://openssl-library.org/source/",
     "https://api.github.com/repos/openssl/openssl/releases/tags/openssl-3.6.5",

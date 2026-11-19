@@ -104,24 +104,43 @@ def check_openssl(policy, errors):
     if configuration['status'] != 'APPROVED_WITH_ACTIONS_EVIDENCE':
         errors.append('Native OpenSSL configuration review remains blocking: ' + configuration['status'])
 
+    # A workflow may pin a release (`OPENSSL_VERSION: 4.1.0`) or a reviewed
+    # commit (`OPENSSL_COMMIT` plus `OPENSSL_VERSION: 4.1.1-dev`). The commit
+    # form exists because the fixes for the current advisory shipped as commits
+    # before any release contained them. A commit pin is only accepted when it
+    # matches `fixed_commit` in the review exactly; any other commit, or a
+    # dev version without a commit, stays blocking.
+    fixed_commit = policy.get('fixed_commit') or {}
     pins = {}
+    commit_pins = {}
     for workflow in sorted((ROOT / '.github/workflows').glob('*.yml')):
         workflow_text = workflow.read_text()
-        found = re.findall(r'^\s+OPENSSL_VERSION:\s*[\'"]?(\d+\.\d+\.\d+)', workflow_text, re.M)
+        found = re.findall(r'^\s+OPENSSL_VERSION:\s*[\'"]?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)', workflow_text, re.M)
         if not found:
             continue
         workflow_name = str(workflow.relative_to(ROOT))
         pins[workflow_name] = found
         digests = re.findall(r'^\s+OPENSSL_SHA256:\s*[\'"]?([0-9a-f]{64})[\'"]?\s*$', workflow_text, re.M)
+        commits = re.findall(r'^\s+OPENSSL_COMMIT:\s*[\'"]?([0-9a-f]{40})[\'"]?\s*$', workflow_text, re.M)
         if len(found) != 1 or len(digests) != 1:
             errors.append('Native OpenSSL workflow pin/digest ambiguous or absent: ' + workflow_name)
+        elif commits:
+            commit_pins[workflow_name] = commits[0]
+            if len(commits) != 1 or commits[0] != fixed_commit.get('sha'):
+                errors.append('Native OpenSSL commit pin is not the reviewed fix commit: ' + workflow_name)
+            elif digests[0] != fixed_commit.get('archive_sha256'):
+                errors.append('Native OpenSSL commit archive digest differs from review: ' + workflow_name)
         elif found[0] == policy['version'] and digests[0] != configuration['release_sha256']:
             errors.append('Native OpenSSL workflow digest differs from reviewed release: ' + workflow_name)
     outcome['pins'] = pins
+    outcome['commit_pins'] = commit_pins
     if not pins:
         errors.append('Native OpenSSL workflow pins absent; the native gate cannot be evaluated')
     elif any(v != policy['version'] for values in pins.values() for v in values):
-        errors.append('Native OpenSSL pin changed: update explicit security review evidence')
+        reviewed_snapshot = fixed_commit.get('version')
+        if not (reviewed_snapshot and commit_pins
+                and all(v == reviewed_snapshot for values in pins.values() for v in values)):
+            errors.append('Native OpenSSL pin changed: update explicit security review evidence')
 
     # Cargo audit does not cover native libssl. New upstream security notices must
     # cause human review even if GitHub's latest release pointer is lagging.
@@ -146,7 +165,14 @@ def check_openssl(policy, errors):
     outcome['supported_releases'] = sorted(supported)
 
     supported_branches = supported_release_branches(supported)
+    reviewed_snapshot = fixed_commit.get('version')
     for pin in sorted({v for values in pins.values() for v in values}):
+        # The reviewed fix commit is a development snapshot whose version string
+        # is not a release. Its CVE coverage is established by the commit review
+        # below, not by ordering the snapshot against the release ranges, so the
+        # range comparison does not apply to it.
+        if reviewed_snapshot and pin == reviewed_snapshot and commit_pins:
+            continue
         parsed = openssl_version(pin)
         if parsed is None:
             errors.append('Native OpenSSL pin is not a comparable release: ' + pin)
@@ -160,6 +186,22 @@ def check_openssl(policy, errors):
     new = [notice for notice in notices if notice > policy['reviewed_through_notice']]
     if new:
         errors.append('Native OpenSSL security notices need review: ' + ', '.join(new))
+
+    if commit_pins:
+        try:
+            compare = json.loads(fetch(
+                'https://api.github.com/repos/openssl/openssl/compare/'
+                + fixed_commit['base'] + '...' + fixed_commit['sha'],
+                'openssl-fix-commit.json', True))
+            present = {commit['sha'] for commit in compare.get('commits', [])}
+            present.add(compare.get('merge_base_commit', {}).get('sha'))
+            missing = [sha for sha in fixed_commit.get('fixes', []) if sha not in present]
+            if compare.get('status') not in ('ahead', 'identical') or missing:
+                errors.append(
+                    'Native OpenSSL fix commit does not contain the reviewed fixes: '
+                    + ', '.join(missing) or compare.get('status', 'unknown'))
+        except Exception as exc:
+            errors.append('Native OpenSSL fix commit query failed: ' + describe(exc))
 
     try:
         release = json.loads(fetch('https://api.github.com/repos/openssl/openssl/releases/latest', 'openssl-latest.json', True))

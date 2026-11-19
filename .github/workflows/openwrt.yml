@@ -57,8 +57,11 @@ jobs:
             rootfs_url: https://downloads.openwrt.org/releases/24.10.0/targets/armsr/armv8/openwrt-24.10.0-armsr-armv8-rootfs.tar.gz
             rootfs_sha256: ae9619d2f74d22779655e12764cbfa26625bd81614364197785a1ed3d3bedb36
     env:
-      OPENSSL_VERSION: 4.1.0
-      OPENSSL_SHA256: 50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: 4.1.1
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
       OPENSSL_NO_VENDOR: '1'
       BOREAS_REQUIRE_TLS_TESTS: '1'
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.openwrt-openssl/bin/openssl
@@ -84,14 +87,7 @@ jobs:
           OPENSSL_PREFIX: ${{ github.workspace }}/.openwrt-openssl
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 --max-time 120 \
-            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
-            -o openssl.tar.gz
-          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum --check --strict
-          mkdir openssl-src
-          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-src
-          source openssl-src/VERSION.dat
-          test "${MAJOR}.${MINOR}.${PATCH}" = "${OPENSSL_VERSION}"
+          bash tools/dependencies/fetch-openssl.sh openssl-src
           cd openssl-src
           MUSL_UAPI="${GITHUB_WORKSPACE}/.musl-kernel-headers"
           mkdir -p "$MUSL_UAPI"
@@ -107,7 +103,8 @@ jobs:
               extra_cflags+=(-mno-outline-atomics)
               ;;
           esac
-          # Unpatched 4.1.0: remove advisory surfaces, but do not waive the CVE gate.
+          # 4.1.1-dev carries the advisory fixes but is not the 4.1.1 release.
+          # Removing the advisory surfaces here is not a CVE waiver.
           CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-quic no-cms no-siv no-shared no-tests no-async no-legacy \
             "${extra_cflags[@]}" -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
