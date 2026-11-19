@@ -43,7 +43,7 @@ fn unauthenticated_handshakes_stop_at_the_global_cap_without_charging_bytes() {
     let released = admission.snapshot().unwrap();
     assert_eq!(released.handshakes, 1);
     assert_eq!(released.authenticated, 0);
-    let third = admission.reserve_handshake().unwrap();
+    let third = must_reserve_handshake(&admission);
     assert_eq!(admission.snapshot().unwrap().handshakes, 2);
     drop(second);
     drop(third);
@@ -52,23 +52,30 @@ fn unauthenticated_handshakes_stop_at_the_global_cap_without_charging_bytes() {
 }
 
 #[test]
+fn must_reserve_bytes(admission: &Admission, amount: u64) -> boreas_tunnel::resource::ByteCredit {
+    match admission.reserve_bytes(amount) {
+        Ok(credit) => credit,
+        Err(_) => panic!("byte reservation of {amount} refused under the budget"),
+    }
+}
+
 fn reserve_bytes_fails_closed_at_the_global_budget() {
     let admission = Admission::new(limits());
-    let held = admission.reserve_bytes(40).unwrap();
+    let held = must_reserve_bytes(&admission, 40);
     assert_eq!(held.bytes(), 40);
-    assert_eq!(
-        admission.reserve_bytes(25).unwrap_err(),
-        AdmissionError::ByteLimit
-    );
+    assert!(matches!(
+        admission.reserve_bytes(25),
+        Err(AdmissionError::ByteLimit)
+    ));
     assert_eq!(admission.snapshot().unwrap().bytes, 40);
     assert_eq!(admission.snapshot().unwrap().authenticated, 0);
 
-    let rest = admission.reserve_bytes(24).unwrap();
+    let rest = must_reserve_bytes(&admission, 24);
     assert_eq!(admission.snapshot().unwrap().bytes, 64);
-    assert_eq!(
-        admission.reserve_bytes(1).unwrap_err(),
-        AdmissionError::ByteLimit
-    );
+    assert!(matches!(
+        admission.reserve_bytes(1),
+        Err(AdmissionError::ByteLimit)
+    ));
     drop(rest);
     assert_eq!(admission.snapshot().unwrap().bytes, 40);
     drop(held);
