@@ -259,7 +259,7 @@ mod linux_daemon {
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, accept_e2e, open_e2e},
         failover,
-        packet_path::{InboundStep, PacketPath, PacketPathError, PacketStats},
+        packet_path::{PacketPath, PacketPathError, PacketStats},
         resource::{Admission, Limits},
         session::{EstablishedSession, SessionPolicy},
     };
@@ -2073,48 +2073,18 @@ mod linux_daemon {
     /// forwarding instead of idling on a descriptor that never fills. The outer
     /// socket's `POLLHUP`/`POLLERR` stays readable on purpose, because it is how
     /// a clean peer close (and the watchdog's `shutdown`) surfaces.
-    fn set_socket_nonblocking(fd: i32, nonblocking: bool) -> Result<(), String> {
-        if fd < 0 {
-            return Err("daemon: invalid socket fd for nonblocking toggle".to_string());
-        }
-        // SAFETY: `fd` is a valid open socket descriptor owned by the caller.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err("daemon: cannot read socket status flags".to_string());
-        }
-        let next = if nonblocking {
-            flags | libc::O_NONBLOCK
-        } else {
-            flags & !libc::O_NONBLOCK
-        };
-        if next != flags {
-            // SAFETY: `fd` is a valid open socket descriptor and `next` updates O_NONBLOCK only.
-            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, next) };
-            if rc < 0 {
-                return Err("daemon: cannot update socket O_NONBLOCK flag".to_string());
-            }
-        }
-        Ok(())
-    }
-
     fn poll_io(
         sock_fd: i32,
         tun_fd: Option<i32>,
-        poll_outbound: bool,
         timeout: Duration,
-    ) -> Result<(bool, bool, bool), String> {
+    ) -> Result<(bool, bool), String> {
         if sock_fd < 0 || tun_fd.is_some_and(|fd| fd < 0) {
             return Err("daemon: invalid poll fd".to_string());
         }
-        let sock_events = if poll_outbound {
-            libc::POLLIN | libc::POLLOUT
-        } else {
-            libc::POLLIN
-        };
         let mut fds = [
             libc::pollfd {
                 fd: sock_fd,
-                events: sock_events,
+                events: libc::POLLIN,
                 revents: 0,
             },
             libc::pollfd {
@@ -2131,7 +2101,7 @@ mod linux_daemon {
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok((false, false, false));
+                return Ok((false, false));
             }
             return Err("daemon: socket/TUN poll failed".to_string());
         }
@@ -2144,10 +2114,12 @@ mod linux_daemon {
                     .to_string(),
             );
         }
-        let sock_readable = fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
-        let sock_writable = poll_outbound && (fds[0].revents & libc::POLLOUT != 0);
-        let tun_readable = count == 2 && (fds[1].revents & libc::POLLIN != 0);
-        Ok((sock_readable, sock_writable, tun_readable))
+        let ready =
+            |pfd: &libc::pollfd| pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+        Ok((
+            ready(&fds[0]),
+            count == 2 && fds[1].revents & libc::POLLIN != 0,
+        ))
     }
 
     /// Whether one loop iteration did work.
@@ -2903,11 +2875,7 @@ mod linux_daemon {
             STATUS_RECHECK_INTERVAL,
         );
 
-        set_socket_nonblocking(sock_fd, true)?;
-
         let mut last_dropped = 0u64;
-        let mut stall_since: Option<Instant> = None;
-        let mut inbound_would_block = false;
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -2927,8 +2895,6 @@ mod linux_daemon {
             if let Some(deadline) = deadline
                 && Instant::now() >= deadline
             {
-                let _ = set_socket_nonblocking(sock_fd, false);
-                let _ = path.flush_outbound();
                 path.close_gracefully();
                 break PathStop::Budget("max_seconds_reached");
             }
@@ -2938,8 +2904,6 @@ mod linux_daemon {
                     .saturating_add(stats.outbound_packets)
                     .saturating_add(stats.inbound_packets);
                 if total >= limit {
-                    let _ = set_socket_nonblocking(sock_fd, false);
-                    let _ = path.flush_outbound();
                     path.close_gracefully();
                     break PathStop::Budget("max_packets_reached");
                 }
@@ -2952,21 +2916,55 @@ mod linux_daemon {
                 manager.maintain(Instant::now());
             }
 
-            // Full-duplex non-blocking packet loop:
-            // - Pending outbound bytes are flushed first without stalling inbound reads.
-            // - Ready TUN packets are coalesced into a single E2E write (no timer).
-            // - Inbound frames never block on a partial TCP segment or retransmit.
+            // Both packet sources are nonblocking here: TUN reads are single-syscall
+            // non-blocking reads and idle waiting happens once per iteration.
+            // Drain currently ready packets in a single contiguous TLS/WS write
+            // (bounded per turn, §6.4: never wait on a coalescing timer) so
+            // burst TCP traffic fills full MSS segments instead of splitting
+            // 1613 B single-packet records into 1448 + 165 B tail segments.
             const MAX_OUTBOUND_BATCH_PACKETS: usize = 16;
             const MAX_OUTBOUND_BATCH_BYTES: usize = 16_000;
             const MAX_INBOUND_BATCH_PACKETS: usize = 32;
             let mut made_progress = false;
-
-            if path.has_pending_write() {
-                match path.flush_outbound() {
-                    Ok(true) => {
+            let remaining_budget = max_packets
+                .map(|limit| {
+                    let stats = path.stats();
+                    let total = packets_before
+                        .saturating_add(stats.outbound_packets)
+                        .saturating_add(stats.inbound_packets);
+                    usize::try_from(limit.saturating_sub(total)).unwrap_or(usize::MAX)
+                })
+                .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
+            let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
+            if out_limit > 0 {
+                match path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES) {
+                    Ok(drained) if drained > 0 => {
                         made_progress = true;
+                        let stats = path.stats();
+                        counters
+                            .tx_packets
+                            .store(stats.outbound_packets, Ordering::Relaxed);
+                        counters
+                            .tx_bytes
+                            .store(stats.outbound_bytes, Ordering::Relaxed);
                     }
-                    Ok(false) => {}
+                    Ok(_) => {
+                        let dropped = path.stats().dropped_outbound;
+                        if iteration_progress(false, last_dropped, dropped) {
+                            made_progress = true;
+                        }
+                        last_dropped = dropped;
+                    }
+                    Err(PacketPathError::Denied(_)) => {
+                        if let Some(reason) = watchdog.fault() {
+                            path.close();
+                            return Err(reason);
+                        }
+                        return Err(
+                            "daemon: outbound packet path rejected a malformed host packet"
+                                .to_string(),
+                        );
+                    }
                     Err(error) => {
                         if let Some(reason) = watchdog.fault() {
                             path.close();
@@ -2983,74 +2981,15 @@ mod linux_daemon {
                 }
             }
 
-            if !path.has_pending_write() {
-                let remaining_budget = max_packets
-                    .map(|limit| {
-                        let stats = path.stats();
-                        let total = packets_before
-                            .saturating_add(stats.outbound_packets)
-                            .saturating_add(stats.inbound_packets);
-                        usize::try_from(limit.saturating_sub(total)).unwrap_or(usize::MAX)
-                    })
-                    .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
-                let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
-                if out_limit > 0 {
-                    match path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES) {
-                        Ok(drained) if drained > 0 => {
-                            made_progress = true;
-                            let stats = path.stats();
-                            counters
-                                .tx_packets
-                                .store(stats.outbound_packets, Ordering::Relaxed);
-                            counters
-                                .tx_bytes
-                                .store(stats.outbound_bytes, Ordering::Relaxed);
-                        }
-                        Ok(_) => {
-                            let dropped = path.stats().dropped_outbound;
-                            if iteration_progress(false, last_dropped, dropped) {
-                                made_progress = true;
-                            }
-                            last_dropped = dropped;
-                        }
-                        Err(PacketPathError::Denied(_)) => {
-                            if let Some(reason) = watchdog.fault() {
-                                path.close();
-                                return Err(reason);
-                            }
-                            return Err(
-                                "daemon: outbound packet path rejected a malformed host packet"
-                                    .to_string(),
-                            );
-                        }
-                        Err(error) => {
-                            if let Some(reason) = watchdog.fault() {
-                                path.close();
-                                return Err(reason);
-                            }
-                            if host_side_failure(&error) {
-                                return Err(format!(
-                                    "daemon: outbound packet path error: {error:?}"
-                                ));
-                            }
-                            break 'outer PathStop::Failed {
-                                kind: path_failure_kind(&error),
-                                reason: format!("outbound circuit error: {error:?}"),
-                            };
-                        }
-                    }
-                }
-            }
-
-            let mut buffered = !inbound_would_block && path.has_buffered_input();
+            // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
+            // FrameIo and CircuitStream can all hold bytes after an earlier read.
+            // Drain up to MAX_INBOUND_BATCH_PACKETS buffered/ready frames per turn.
+            let mut buffered = path.has_buffered_input();
             let mut socket_ready = if buffered {
                 false
             } else {
-                poll_io(sock_fd, None, false, Duration::ZERO)?.0
+                poll_io(sock_fd, None, Duration::ZERO)?.0
             };
-            if socket_ready {
-                inbound_would_block = false;
-            }
             for step in 0..MAX_INBOUND_BATCH_PACKETS {
                 if let Some(reason) = watchdog.fault() {
                     path.close();
@@ -3066,25 +3005,21 @@ mod linux_daemon {
                     }
                 }
                 if step > 0 {
-                    buffered = !inbound_would_block && path.has_buffered_input();
+                    buffered = path.has_buffered_input();
                     socket_ready = if buffered {
                         false
                     } else {
-                        poll_io(sock_fd, None, false, Duration::ZERO)?.0
+                        poll_io(sock_fd, None, Duration::ZERO)?.0
                     };
-                    if socket_ready {
-                        inbound_would_block = false;
-                    }
                     if !buffered && !socket_ready {
                         break;
                     }
                 } else if !buffered && !socket_ready {
                     break;
                 }
-                match path.step_inbound_nonblocking() {
-                    Ok(InboundStep::Packet(_len)) => {
+                match path.step_inbound() {
+                    Ok(Some(_len)) => {
                         made_progress = true;
-                        inbound_would_block = false;
                         let stats = path.stats();
                         counters
                             .rx_packets
@@ -3093,11 +3028,7 @@ mod linux_daemon {
                             .rx_bytes
                             .store(stats.inbound_bytes, Ordering::Relaxed);
                     }
-                    Ok(InboundStep::WouldBlock) => {
-                        inbound_would_block = true;
-                        break;
-                    }
-                    Ok(InboundStep::Closed) => {
+                    Ok(None) => {
                         if let Some(reason) = watchdog.fault() {
                             path.close();
                             return Err(reason);
@@ -3119,40 +3050,18 @@ mod linux_daemon {
                     }
                 }
             }
+            buffered = path.has_buffered_input();
 
-            let pending_io = path.has_pending_write() || path.has_partial_inbound();
-            if made_progress || !pending_io {
-                stall_since = None;
-            } else {
-                let now = Instant::now();
-                let started = *stall_since.get_or_insert(now);
-                if now.saturating_duration_since(started) >= PATH_IO_TIMEOUT {
-                    path.close();
-                    break 'outer PathStop::Failed {
-                        kind: PathFailureKind::Transport,
-                        reason: "business socket I/O stalled beyond PATH_IO_TIMEOUT".to_string(),
-                    };
-                }
-            }
-
-            buffered = !inbound_would_block && path.has_buffered_input();
             if !made_progress && !buffered {
-                if tun.raw_fd().is_none() && !socket_ready && !path.has_pending_write() {
+                if tun.raw_fd().is_none() && !socket_ready {
                     // In-memory endpoint: nothing to wait on, so yield briefly
                     // rather than spin at 100% CPU.
                     thread::sleep(VIRTUAL_IDLE_WAIT);
                 } else {
-                    // Wait for inbound socket bytes, outbound socket writability
-                    // (when a partial frame is queued), or a host TUN packet.
-                    let (sr, _sw, _tr) = poll_io(
-                        sock_fd,
-                        tun.raw_fd(),
-                        path.has_pending_write(),
-                        IDLE_POLL_TIMEOUT,
-                    )?;
-                    if sr {
-                        inbound_would_block = false;
-                    }
+                    // One wait on both sources: an outbound packet arriving on
+                    // the TUN wakes the loop immediately, and a TUN HUP/ERR is
+                    // fail-closed inside `poll_io` instead of idling forever.
+                    poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
                 }
             }
         };
@@ -3505,7 +3414,7 @@ mod linux_daemon {
             assert_eq!(unsafe { libc::pipe(tun.as_mut_ptr()) }, 0);
             // Closing the write end makes the TUN read end report POLLHUP.
             unsafe { libc::close(tun[1]) };
-            let result = poll_io(sock[0], Some(tun[0]), false, Duration::ZERO);
+            let result = poll_io(sock[0], Some(tun[0]), Duration::ZERO);
             unsafe {
                 libc::close(sock[0]);
                 libc::close(sock[1]);

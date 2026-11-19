@@ -201,12 +201,6 @@ impl WsLimits {
 /// Bounded per-stream read buffer for WebSocket frame parsing so `read_frame`
 /// does not issue 3–4 tiny TLS/socket reads per frame.
 const WS_READ_BUFFER_BYTES: usize = 32 * 1024;
-const MAX_INTERRUPT_RETRIES: u8 = 8;
-
-enum WsIoError {
-    WouldBlock,
-    Fatal(WsError),
-}
 
 /// A WebSocket connection exposed as a byte stream.
 ///
@@ -221,15 +215,66 @@ pub struct WsStream<T> {
     read_pos: usize,
     read_len: usize,
     write_buf: Vec<u8>,
-    write_pos: usize,
-    needs_flush: bool,
-    pending_pong: Option<Vec<u8>>,
     pending: Vec<u8>,
     pending_pos: usize,
     message: MessageState,
     close_sent: bool,
     close_received: bool,
     failed: bool,
+}
+
+struct BufferedReader<'a, T> {
+    io: &'a mut T,
+    buf: &'a mut Vec<u8>,
+    pos: &'a mut usize,
+    len: &'a mut usize,
+}
+
+impl<T: Read> Read for BufferedReader<'_, T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if *pos_or_reset(self.pos, self.len) < *self.len {
+            let avail = *self.len - *self.pos;
+            let take = avail.min(out.len());
+            out[..take].copy_from_slice(&self.buf[*self.pos..*self.pos + take]);
+            *self.pos += take;
+            if *self.pos == *self.len {
+                *self.pos = 0;
+                *self.len = 0;
+            }
+            return Ok(take);
+        }
+        if out.len() >= WS_READ_BUFFER_BYTES {
+            return self.io.read(out);
+        }
+        if self.buf.len() < WS_READ_BUFFER_BYTES {
+            self.buf.resize(WS_READ_BUFFER_BYTES, 0);
+        }
+        let n = self.io.read(self.buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let take = n.min(out.len());
+        out[..take].copy_from_slice(&self.buf[..take]);
+        if take < n {
+            *self.pos = take;
+            *self.len = n;
+        } else {
+            *self.pos = 0;
+            *self.len = 0;
+        }
+        Ok(take)
+    }
+}
+
+fn pos_or_reset<'a>(pos: &'a mut usize, len: &mut usize) -> &'a mut usize {
+    if *pos >= *len {
+        *pos = 0;
+        *len = 0;
+    }
+    pos
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -249,9 +294,6 @@ impl<T: Read + Write> WsStream<T> {
             read_pos: 0,
             read_len: 0,
             write_buf: Vec::new(),
-            write_pos: 0,
-            needs_flush: false,
-            pending_pong: None,
             pending: Vec::new(),
             pending_pos: 0,
             message: MessageState::default(),
@@ -261,99 +303,24 @@ impl<T: Read + Write> WsStream<T> {
         }
     }
 
-    fn flush_write_buf(&mut self) -> Result<(), WsIoError> {
-        loop {
-            let mut interrupts = 0u8;
-            while self.write_pos < self.write_buf.len() {
-                match self.io.write(&self.write_buf[self.write_pos..]) {
-                    Ok(0) => return Err(WsIoError::Fatal(WsError::Io(io::ErrorKind::WriteZero))),
-                    Ok(n) => {
-                        self.write_pos += n;
-                        interrupts = 0;
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                        interrupts = interrupts.saturating_add(1);
-                        if interrupts >= MAX_INTERRUPT_RETRIES {
-                            return Err(WsIoError::Fatal(WsError::Io(io::ErrorKind::Interrupted)));
-                        }
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        return Err(WsIoError::WouldBlock);
-                    }
-                    Err(err) => return Err(WsIoError::Fatal(map_io(err))),
-                }
-            }
-            self.write_buf.clear();
-            self.write_pos = 0;
-            if let Some(pong) = self.pending_pong.take() {
-                encode_frame_into(
-                    self.role == WsRole::Client,
-                    true,
-                    OpCode::Pong,
-                    &pong,
-                    &mut self.write_buf,
-                )
-                .map_err(WsIoError::Fatal)?;
-                self.needs_flush = true;
-                continue;
-            }
-            break;
-        }
-        if self.needs_flush {
-            match self.io.flush() {
-                Ok(()) => self.needs_flush = false,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(WsIoError::WouldBlock);
-                }
-                Err(err) => return Err(WsIoError::Fatal(map_io(err))),
-            }
-        }
-        Ok(())
-    }
-
-    fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsIoError> {
-        if self.write_pos < self.write_buf.len() {
-            self.flush_write_buf()?;
-        }
+    fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsError> {
         encode_frame_into(
             self.role == WsRole::Client,
             true,
             opcode,
             payload,
             &mut self.write_buf,
-        )
-        .map_err(WsIoError::Fatal)?;
-        self.write_pos = 0;
-        self.needs_flush = true;
-        self.flush_write_buf()
+        )?;
+        self.io.write_all(&self.write_buf).map_err(map_io)?;
+        self.io.flush().map_err(map_io)
     }
 
-    fn queue_pong(&mut self, payload: &[u8]) -> Result<(), WsIoError> {
-        if self.write_pos < self.write_buf.len() {
-            match self.flush_write_buf() {
-                Ok(()) => {}
-                Err(WsIoError::WouldBlock) => {
-                    if self.pending_pong.is_some() {
-                        return Err(WsIoError::Fatal(WsError::ControlFlood));
-                    }
-                    self.pending_pong = Some(payload.to_vec());
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        match self.send_frame(OpCode::Pong, payload) {
-            Ok(()) | Err(WsIoError::WouldBlock) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn respond_close(&mut self, payload: &[u8]) -> Result<(), WsIoError> {
+    fn respond_close(&mut self, payload: &[u8]) -> Result<(), WsError> {
         if self.close_sent {
             return Ok(());
         }
         if !close_payload_valid(payload) {
-            return Err(WsIoError::Fatal(WsError::BadCloseFrame));
+            return Err(WsError::BadCloseFrame);
         }
         self.close_sent = true;
         let echo: &[u8] = if payload.len() >= 2 {
@@ -361,147 +328,7 @@ impl<T: Read + Write> WsStream<T> {
         } else {
             &[]
         };
-        match self.send_frame(OpCode::Close, echo) {
-            Ok(()) | Err(WsIoError::WouldBlock) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn pull_read_buf(&mut self, needed: usize, deadline: Instant) -> Result<(), WsIoError> {
-        if Instant::now() >= deadline {
-            return Err(WsIoError::Fatal(WsError::Timeout));
-        }
-        if self.read_pos > 0 {
-            self.read_buf.copy_within(self.read_pos..self.read_len, 0);
-            self.read_len -= self.read_pos;
-            self.read_pos = 0;
-        }
-        let target_len = WS_READ_BUFFER_BYTES.max(needed);
-        if self.read_buf.len() < target_len {
-            self.read_buf.resize(target_len, 0);
-        }
-        let mut interrupts = 0u8;
-        loop {
-            match self.io.read(&mut self.read_buf[self.read_len..]) {
-                Ok(0) => return Err(WsIoError::Fatal(WsError::Closed)),
-                Ok(n) => {
-                    self.read_len += n;
-                    if Instant::now() >= deadline {
-                        return Err(WsIoError::Fatal(WsError::Timeout));
-                    }
-                    return Ok(());
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    interrupts = interrupts.saturating_add(1);
-                    if interrupts >= MAX_INTERRUPT_RETRIES {
-                        return Err(WsIoError::Fatal(WsError::Io(io::ErrorKind::Interrupted)));
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(WsIoError::WouldBlock);
-                }
-                Err(err) => return Err(WsIoError::Fatal(map_io(err))),
-            }
-        }
-    }
-
-    fn read_frame_buffered(&mut self, deadline: Instant) -> Result<RawFrame, WsIoError> {
-        loop {
-            let avail = self.read_len - self.read_pos;
-            if avail < 2 {
-                self.pull_read_buf(2, deadline)?;
-                continue;
-            }
-            let head = &self.read_buf[self.read_pos..self.read_pos + 2];
-            let fin = head[0] & 0x80 != 0;
-            if head[0] & 0x70 != 0 {
-                return Err(WsIoError::Fatal(WsError::ReservedBits));
-            }
-            let opcode = OpCode::from_bits(head[0] & 0x0f).map_err(WsIoError::Fatal)?;
-            let masked = head[1] & 0x80 != 0;
-            match self.role {
-                WsRole::Server if !masked => {
-                    return Err(WsIoError::Fatal(WsError::UnmaskedClientFrame));
-                }
-                WsRole::Client if masked => {
-                    return Err(WsIoError::Fatal(WsError::MaskedServerFrame));
-                }
-                _ => {}
-            }
-            let length_code = head[1] & 0x7f;
-            let ext_len = match length_code {
-                126 => 2usize,
-                127 => 8usize,
-                _ => 0usize,
-            };
-            let mask_len = if masked { 4usize } else { 0usize };
-            let header_len = 2 + ext_len + mask_len;
-            if avail < header_len {
-                self.pull_read_buf(header_len, deadline)?;
-                continue;
-            }
-            let payload_len = match length_code {
-                126 => {
-                    let b = &self.read_buf[self.read_pos + 2..self.read_pos + 4];
-                    let length = usize::from(u16::from_be_bytes([b[0], b[1]]));
-                    if length < 126 {
-                        return Err(WsIoError::Fatal(WsError::NonCanonicalLength));
-                    }
-                    length
-                }
-                127 => {
-                    let b = &self.read_buf[self.read_pos + 2..self.read_pos + 10];
-                    let length =
-                        u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-                    if length < 65_536 {
-                        return Err(WsIoError::Fatal(WsError::NonCanonicalLength));
-                    }
-                    usize::try_from(length)
-                        .map_err(|_| WsIoError::Fatal(WsError::MessageTooLarge))?
-                }
-                other => usize::from(other),
-            };
-            if opcode.is_control() {
-                if !fin {
-                    return Err(WsIoError::Fatal(WsError::ControlFragmented));
-                }
-                if payload_len > 125 {
-                    return Err(WsIoError::Fatal(WsError::ControlTooLarge));
-                }
-            }
-            if payload_len > self.limits.max_frame_payload {
-                return Err(WsIoError::Fatal(WsError::MessageTooLarge));
-            }
-            let total_len = header_len + payload_len;
-            if avail < total_len {
-                self.pull_read_buf(total_len, deadline)?;
-                continue;
-            }
-            let payload_start = self.read_pos + header_len;
-            let mut payload = self.read_buf[payload_start..payload_start + payload_len].to_vec();
-            if masked {
-                let mask_start = self.read_pos + 2 + ext_len;
-                let mask = [
-                    self.read_buf[mask_start],
-                    self.read_buf[mask_start + 1],
-                    self.read_buf[mask_start + 2],
-                    self.read_buf[mask_start + 3],
-                ];
-                for (index, byte) in payload.iter_mut().enumerate() {
-                    *byte ^= mask[index % 4];
-                }
-            }
-            self.read_pos += total_len;
-            if self.read_pos == self.read_len {
-                self.read_pos = 0;
-                self.read_len = 0;
-            }
-            return Ok(RawFrame {
-                fin,
-                opcode,
-                payload,
-            });
-        }
+        self.send_frame(OpCode::Close, echo)
     }
 
     fn track_message(&mut self, opcode: OpCode, fin: bool, len: usize) -> Result<(), WsError> {
@@ -543,7 +370,7 @@ impl<T: Read + Write> WsStream<T> {
     /// One absolute deadline covers the whole call, and a frame budget bounds
     /// both control floods and empty binary frames. An empty data frame makes no
     /// progress, so it must not restart the deadline or loop forever.
-    fn next_data_payload(&mut self) -> Result<Option<Vec<u8>>, WsIoError> {
+    fn next_data_payload(&mut self) -> Result<Option<Vec<u8>>, WsError> {
         let deadline = Instant::now() + self.limits.message_deadline;
         let mut frames = 0usize;
         let mut control_frames = 0usize;
@@ -551,9 +378,17 @@ impl<T: Read + Write> WsStream<T> {
         loop {
             frames += 1;
             if frames > MAX_FRAMES_PER_READ {
-                return Err(WsIoError::Fatal(WsError::FrameFlood));
+                return Err(WsError::FrameFlood);
             }
-            let frame = self.read_frame_buffered(deadline)?;
+            let frame = {
+                let mut reader = BufferedReader {
+                    io: &mut self.io,
+                    buf: &mut self.read_buf,
+                    pos: &mut self.read_pos,
+                    len: &mut self.read_len,
+                };
+                read_frame(&mut reader, self.role, &self.limits, deadline)?
+            };
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
                     control_frames += 1;
@@ -561,10 +396,10 @@ impl<T: Read + Write> WsStream<T> {
                     if control_frames > MAX_CONTROL_FRAMES_PER_READ
                         || control_bytes > MAX_CONTROL_BYTES_PER_READ
                     {
-                        return Err(WsIoError::Fatal(WsError::ControlFlood));
+                        return Err(WsError::ControlFlood);
                     }
                     match frame.opcode {
-                        OpCode::Ping => self.queue_pong(&frame.payload)?,
+                        OpCode::Ping => self.send_frame(OpCode::Pong, &frame.payload)?,
                         OpCode::Close => {
                             self.close_received = true;
                             self.respond_close(&frame.payload)?;
@@ -574,14 +409,13 @@ impl<T: Read + Write> WsStream<T> {
                     }
                 }
                 OpCode::Binary | OpCode::Continuation => {
-                    self.track_message(frame.opcode, frame.fin, frame.payload.len())
-                        .map_err(WsIoError::Fatal)?;
+                    self.track_message(frame.opcode, frame.fin, frame.payload.len())?;
                     if frame.payload.is_empty() {
                         continue;
                     }
                     return Ok(Some(frame.payload));
                 }
-                OpCode::Text => return Err(WsIoError::Fatal(WsError::TextFrame)),
+                OpCode::Text => return Err(WsError::TextFrame),
             }
         }
     }
@@ -595,14 +429,6 @@ impl<T: crate::stream::Duplex> WsStream<T> {
         self.read_pos < self.read_len
             || self.pending_pos < self.pending.len()
             || self.io.has_buffered_input()
-    }
-
-    /// Whether an outbound frame or Pong remains buffered waiting on `POLLOUT`.
-    pub fn has_pending_write(&self) -> bool {
-        self.write_pos < self.write_buf.len()
-            || self.needs_flush
-            || self.pending_pong.is_some()
-            || self.io.has_pending_write()
     }
 
     /// Forward a transport timeout to the wrapped byte stream.
@@ -654,10 +480,7 @@ impl<T: Read + Write> Read for WsStream<T> {
             match self.next_data_payload() {
                 Ok(Some(payload)) => self.pending = payload,
                 Ok(None) => return Ok(0),
-                Err(WsIoError::WouldBlock) => {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                Err(WsIoError::Fatal(error)) => {
+                Err(error) => {
                     // Any framing/protocol error is fatal: bytes may already be
                     // partially consumed, so a later read must never try to
                     // resynchronise on the same stream.
@@ -688,54 +511,16 @@ impl<T: Read + Write> Write for WsStream<T> {
                 "websocket already closed",
             ));
         }
-        if self.write_pos < self.write_buf.len() {
-            match self.flush_write_buf() {
-                Ok(()) => {}
-                Err(WsIoError::WouldBlock) => {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                Err(WsIoError::Fatal(error)) => {
-                    self.failed = true;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
-                }
-            }
-        }
         let take = buf.len().min(self.limits.max_frame_payload);
-        if let Err(error) = encode_frame_into(
-            self.role == WsRole::Client,
-            true,
-            OpCode::Binary,
-            &buf[..take],
-            &mut self.write_buf,
-        ) {
+        if let Err(error) = self.send_frame(OpCode::Binary, &buf[..take]) {
             self.failed = true;
             return Err(io::Error::new(io::ErrorKind::InvalidData, error));
         }
-        self.write_pos = 0;
-        self.needs_flush = true;
-        match self.flush_write_buf() {
-            Ok(()) | Err(WsIoError::WouldBlock) => Ok(take),
-            Err(WsIoError::Fatal(error)) => {
-                self.failed = true;
-                self.write_buf.clear();
-                self.write_pos = 0;
-                Err(io::Error::new(io::ErrorKind::InvalidData, error))
-            }
-        }
+        Ok(take)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.failed {
-            return Err(poisoned());
-        }
-        match self.flush_write_buf() {
-            Ok(()) => Ok(()),
-            Err(WsIoError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
-            Err(WsIoError::Fatal(error)) => {
-                self.failed = true;
-                Err(io::Error::new(io::ErrorKind::InvalidData, error))
-            }
-        }
+        self.io.flush()
     }
 }
 
@@ -790,7 +575,6 @@ struct RawFrame {
 /// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
 /// handshake the runtime supplies that transport timeout; the data plane
 /// deliberately has none, so this check bounds progress between reads there.
-#[cfg(test)]
 fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<(), WsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -812,7 +596,6 @@ fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<
     Ok(())
 }
 
-#[cfg(test)]
 fn read_frame<T: Read>(
     io: &mut T,
     role: WsRole,
@@ -1769,70 +1552,5 @@ mod tests {
         stream.read_exact(&mut second).expect("second frame");
         assert_eq!(&second, b"beta");
         assert!(!stream.has_buffered_input());
-    }
-
-    #[test]
-    fn nonblocking_would_block_preserves_partial_frame_and_write_buffer() {
-        struct FragmentedIo {
-            chunks: Vec<Vec<u8>>,
-            idx: usize,
-            write_calls: usize,
-            written: Vec<u8>,
-        }
-        impl Read for FragmentedIo {
-            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                if self.idx >= self.chunks.len() {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                let chunk = &self.chunks[self.idx];
-                self.idx += 1;
-                if chunk.is_empty() {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                let take = chunk.len().min(out.len());
-                out[..take].copy_from_slice(&chunk[..take]);
-                Ok(take)
-            }
-        }
-        impl Write for FragmentedIo {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.write_calls += 1;
-                if self.write_calls <= 2 {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                let take = buf.len().min(3);
-                self.written.extend_from_slice(&buf[..take]);
-                Ok(take)
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let frame = encode_frame(false, true, OpCode::Binary, b"hello-nb").unwrap();
-        let split = 4;
-        let io = FragmentedIo {
-            chunks: vec![frame[..split].to_vec(), Vec::new(), frame[split..].to_vec()],
-            idx: 0,
-            write_calls: 0,
-            written: Vec::new(),
-        };
-        let mut ws = WsStream::new(io, WsRole::Client, WsLimits::default());
-        let mut out = [0u8; 16];
-        let err = ws.read(&mut out).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        let n = ws.read(&mut out).expect("second read completes frame");
-        assert_eq!(&out[..n], b"hello-nb");
-
-        assert_eq!(ws.write(b"abc").unwrap(), 3);
-        assert!(ws.write_pos < ws.write_buf.len());
-        assert_eq!(
-            ws.write(b"def").unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        ws.flush().expect("flush completes buffered frame");
-        assert_eq!(ws.write_pos, ws.write_buf.len());
-        let parsed = inbound_frame(&ws.io.written);
-        assert_eq!(parsed.payload, b"abc");
     }
 }

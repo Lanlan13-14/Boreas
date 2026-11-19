@@ -28,12 +28,6 @@ use crate::ws::WsStream;
 pub trait Duplex: Read + Write + Send {
     fn has_buffered_input(&self) -> bool;
 
-    /// Whether encoded bytes remain buffered inside this stream or a lower
-    /// layer waiting for transport writability (`POLLOUT`).
-    fn has_pending_write(&self) -> bool {
-        false
-    }
-
     /// Install a per-operation transport timeout for a bounded handshake.
     ///
     /// This is a transport hint, not a deadline model of its own: the socket
@@ -85,10 +79,6 @@ impl Duplex for TcpStream {
 impl<T: Duplex + ?Sized> Duplex for Box<T> {
     fn has_buffered_input(&self) -> bool {
         (**self).has_buffered_input()
-    }
-
-    fn has_pending_write(&self) -> bool {
-        (**self).has_pending_write()
     }
 
     fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -143,10 +133,6 @@ impl<S: Duplex> Duplex for EstablishedStream<S> {
 impl Duplex for CircuitStream<'_> {
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()
-    }
-
-    fn has_pending_write(&self) -> bool {
-        self.has_pending_write()
     }
 
     fn set_io_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
@@ -299,10 +285,6 @@ impl<T: Duplex> Write for DeadlineIo<T> {
 impl<T: Duplex> Duplex for DeadlineIo<T> {
     fn has_buffered_input(&self) -> bool {
         self.inner.has_buffered_input()
-    }
-
-    fn has_pending_write(&self) -> bool {
-        self.inner.has_pending_write()
     }
 
     fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
