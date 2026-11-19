@@ -1,0 +1,63 @@
+name: '[Test] Independent protocol interop'
+
+# Cross-checks the Rust decoder in boreas-proto against the separate Python
+# decoder in tools/interop. The two share no code: verify.py is written from
+# the byte layouts in docs/protocol, and the Rust crate does not call it. Both
+# are run here and each must agree with the committed vectors; the mutation
+# corpus then checks they accept and reject the same derived inputs.
+#
+# This is structural agreement only. It does not verify signatures, does not
+# exercise the TLS stack, and is not a G-FRAME or G-CRYPTO pass on its own.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'crates/boreas-proto/**'
+      - 'docs/protocol/**'
+      - 'tools/interop/**'
+      - 'tools/control_vectors.py'
+      - 'tools/candidate_bindings.py'
+      - '.github/workflows/interop.yml'
+  pull_request:
+    paths:
+      - 'crates/boreas-proto/**'
+      - 'docs/protocol/**'
+      - 'tools/interop/**'
+      - 'tools/control_vectors.py'
+      - 'tools/candidate_bindings.py'
+      - '.github/workflows/interop.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-decoder:
+    name: Python decoder agrees with committed vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.x'
+      - name: Decode every committed vector independently
+        run: python3 tools/interop/verify.py
+      - name: Mutation corpus is reproducible from the vectors
+        run: python3 tools/interop/mutations.py --check
+
+  rust-differential:
+    name: Rust decoder matches the Python verdicts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+      - name: Differential mutation test
+        run: cargo test --locked -p boreas-proto --lib mutation_corpus_matches_independent_python_decoder
+      - name: Committed control vectors
+        run: cargo test --locked -p boreas-proto --lib fixed_vectors_decode_or_reject_with_expected_categories

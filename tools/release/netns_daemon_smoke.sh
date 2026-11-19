@@ -817,8 +817,19 @@ ip netns exec "$EDGE_NS" ip link set veth-edge up
 run_hook setup
 
 # Optional netem impairment is scoped to the two disposable underlay devices.
-# No host qdisc or global sysctl is touched. RTT is one-way per device.
+# No host qdisc or global sysctl is touched.
+#
+# The delay is installed on BOTH underlay devices, and a round trip crosses each
+# device once, so the effective base RTT is twice the per-device one-way delay.
+# Earlier logs labelled the per-device value as "RTT", which understated the real
+# base RTT by half. Both numbers are printed so the evidence names what it is, and
+# the measured overlay ping is required to land near the effective RTT (see the
+# ping check) so a run where netem silently failed to apply cannot pass.
 if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
+  if ! [[ "${BOREAS_NETEM_RTT_MS}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: BOREAS_NETEM_RTT_MS must be an integer number of milliseconds" >&2
+    exit 1
+  fi
   for spec in "$CORE_NS:veth-core" "$EDGE_NS:veth-edge"; do
     ns="${spec%%:*}"
     dev="${spec##*:}"
@@ -826,6 +837,13 @@ if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
       delay "${BOREAS_NETEM_RTT_MS}ms" loss "${BOREAS_NETEM_LOSS_PERCENT:-0}%" \
       rate "${BOREAS_NETEM_RATE_MBIT:-1000}mbit"
   done
+  NETEM_EFFECTIVE_RTT_MS=$(( BOREAS_NETEM_RTT_MS * 2 ))
+  echo "netem_one_way_per_device_ms=${BOREAS_NETEM_RTT_MS}"
+  echo "netem_devices=2"
+  echo "netem_effective_rtt_ms=${NETEM_EFFECTIVE_RTT_MS}"
+  # Floor: the measured average must reach at least 60% of the effective RTT, so
+  # the impairment is shown to be in effect. The existing ceiling still bounds it.
+  export BOREAS_MIN_PING_MS=$(( NETEM_EFFECTIVE_RTT_MS * 60 / 100 ))
 fi
 
 # Bounded diagnostic sampling starts before the daemons so a run that never
@@ -943,6 +961,10 @@ import re
 import sys
 
 limit = float(os.environ.get("BOREAS_MAX_PING_MS", "15.0"))
+# Optional floor. Set only when netem is applied, to prove the impairment took
+# effect; unset for the unimpaired smoke, which keeps its ceiling-only check.
+floor_text = os.environ.get("BOREAS_MIN_PING_MS", "").strip()
+floor = float(floor_text) if floor_text else None
 
 text = open(sys.argv[1], encoding="utf-8").read()
 problems = []
@@ -965,6 +987,10 @@ else:
     minimum, average, maximum = map(float, match.groups())
     print(f"overlay_ping_average_ms={average:.3f}")
     print(f"overlay_ping_max_ms={maximum:.3f}")
+    if floor is not None and average < floor:
+        problems.append(
+            f"overlay RTT avg={average:.3f} ms is below the {floor:.3f} ms impairment floor; netem did not take effect"
+        )
     if average > limit or maximum > limit:
         problems.append(
             f"overlay RTT avg={average:.3f} ms max={maximum:.3f} ms exceeds {limit:.3f} ms regression bound"

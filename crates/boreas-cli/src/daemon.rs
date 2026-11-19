@@ -2187,6 +2187,7 @@ mod linux_daemon {
             sock_fd: i32,
             counters: Arc<LiveCounters>,
             interval: Duration,
+            revocations: Arc<Mutex<crate::daemon_revoke::RevocationSet>>,
         ) -> Self {
             let stop = Arc::new((Mutex::new(()), Condvar::new()));
             let stopped = Arc::new(AtomicBool::new(false));
@@ -2250,6 +2251,11 @@ mod linux_daemon {
                                         ))
                                     } else {
                                         counters.status_sequence.store(seq, Ordering::Relaxed);
+                                        // Publish only scopes from the snapshot the store
+                                        // just verified. A rejected snapshot never reaches
+                                        // here, so it cannot change the revocation set.
+                                        let scopes = store_guard.revocation_scopes();
+                                        lock_mutex(&revocations).sync_verified_scopes(&scopes);
                                         // Do not sleep past the captured freshness
                                         // deadline; the normal 500 ms cadence must
                                         // never become a post-expiry forwarding window.
@@ -2866,6 +2872,9 @@ mod linux_daemon {
         // Declared after `path` on purpose: the watchdog is stopped and joined
         // before the E2E stream (and its socket) is dropped, so `shutdown()` can
         // never target a recycled descriptor.
+        let revocations = Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new()));
+        let mut revoke_forwarded = 0u64;
+        let mut revoke_failures = 0u64;
         let watchdog = StatusWatchdog::start(
             status_store,
             status_path.to_path_buf(),
@@ -2873,6 +2882,7 @@ mod linux_daemon {
             sock_fd,
             Arc::clone(counters),
             STATUS_RECHECK_INTERVAL,
+            Arc::clone(&revocations),
         );
 
         let mut last_dropped = 0u64;
@@ -2914,6 +2924,30 @@ mod linux_daemon {
             // touches the active circuit; it is not a ProbePing exchange.
             if let Some(manager) = standby.as_deref_mut() {
                 manager.maintain(Instant::now());
+            }
+
+            // Revocation is checked before either direction forwards. The set is
+            // whatever the watchdog published from the last verified snapshot; this
+            // lookup does not itself verify a signature.
+            let peer_revoked = {
+                let set = lock_mutex(&revocations);
+                crate::daemon_revoke::poll_peer_forward(
+                    &set,
+                    identity.peer_node_id,
+                    identity.peer_generation,
+                    &mut revoke_forwarded,
+                    &mut revoke_failures,
+                ) == crate::daemon_revoke::ForwardPoll::Revoked
+            };
+            if peer_revoked {
+                path.close();
+                break 'outer PathStop::Failed {
+                    kind: PathFailureKind::Protocol,
+                    reason: format!(
+                        "peer node {} generation {} revoked; business path closed before forward",
+                        identity.peer_node_id, identity.peer_generation
+                    ),
+                };
             }
 
             // Both packet sources are nonblocking here: TUN reads are single-syscall
@@ -3206,6 +3240,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_millis(10),
+                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
             );
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut reason = None;
@@ -3288,6 +3323,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
+                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
             );
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut reason = None;
@@ -3320,6 +3356,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
+                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
             );
             let started = Instant::now();
             drop(watchdog);
@@ -3361,6 +3398,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
+                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
             );
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {

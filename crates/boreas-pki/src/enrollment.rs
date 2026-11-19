@@ -1,9 +1,13 @@
 //! Durable enrollment transaction engine.
 //!
-//! This module does no CSR parsing or signature verification. The claim API accepts an
-//! opaque verified-request token with private fields and no production constructor; it cannot
-//! be made from an untrusted boolean. Until the reviewed CSR/signing integration is added,
-//! production enrollment cannot be completed through this module.
+//! The claim API accepts an opaque verified-request token with private fields and no public
+//! unchecked constructor. With `openssl-backend`, [`EnrollmentStore::claim_from_request`] is
+//! the only production path from Enrollment control bytes to that token: it decodes the
+//! candidate request, checks the ML-DSA PKCS#10 proof and the Ed25519 CSR extension, then
+//! compares the bearer secret in constant time against the configured invitation.
+//! [`EnrollmentStore::issue`] signs the journaled CSR. Neither call authenticates a transport,
+//! proves the invitation was provisioned by a trusted operator, nor checks that `now_us`
+//! came from a trusted clock.
 //! The journal protects transaction consistency/torn writes, not against a malicious local
 //! filesystem administrator or arbitrary journal rewriting.
 //!
@@ -834,6 +838,101 @@ impl EnrollmentStore {
         )
     }
 
+    /// Admit one candidate Enrollment control message and prepare its slot.
+    ///
+    /// `raw_request` is the exact `Enrollment::encode` body (`ControlType::Enrollment`,
+    /// kind `1`). This verifies:
+    /// - the request framing, version, and non-zero ids/secret/CSR bounds;
+    /// - that `csr_hash` equals SHA-256 of the exact CSR DER after `verify_ml_dsa_csr`
+    ///   accepts the PKCS#10 self-signature and the configured Ed25519 PoP extension;
+    /// - the invitation bearer secret (constant time), expiry, and role/home-core scope.
+    ///
+    /// It does **not** verify a transport, the operator that provisioned the invitation,
+    /// or that `now_us` is a trusted clock. A bad bearer is rejected before a slot or
+    /// watermark is written. A second request for an invitation already bound to different
+    /// bytes returns [`EnrollmentError::InviteBoundToDifferentRequest`] and allocates nothing
+    /// new. The returned phase is [`EnrollmentPhase::Prepared`]; call [`Self::issue`] to sign.
+    #[cfg(feature = "openssl-backend")]
+    pub fn claim_from_request(
+        &mut self,
+        raw_request: &[u8],
+        now_us: u64,
+    ) -> Result<EnrollmentResult, EnrollmentError> {
+        let request = decode_enrollment_request(raw_request)?;
+        let verified = self.verify_csr_request(
+            request.invite_id,
+            request.enrollment_id,
+            &request.invite_secret,
+            &request.csr_der,
+            now_us,
+        )?;
+        if !secret_bytes_equal(&verified.raw_csr_sha256, &request.csr_hash) {
+            return Err(EnrollmentError::InvalidCsr);
+        }
+        self.claim(verified, now_us)
+    }
+
+    /// Sign the CSR already journaled for one prepared enrollment.
+    ///
+    /// The CSR is read back from the journaled transaction and checked again by
+    /// [`crate::management::IdentityAuthority::node_identity_from_csr`] before
+    /// [`crate::management::IdentityAuthority::sign_node_identity`] dual-signs it.
+    /// The encoded `SignedObject` is persisted through [`SignedIdentityResult`].
+    /// Role, home core, node id, generation, and validity come from the prepared
+    /// slot and `validity`, never from the CSR subject.
+    ///
+    /// This does **not** re-check the invitation bearer, the Ed25519 CSR extension,
+    /// or a transport. A transaction that is already [`EnrollmentPhase::Issued`]
+    /// returns the persisted bytes. Any other phase is refused. A crash after the
+    /// issued record is durable returns that same node id and the same bytes; it
+    /// does not allocate another slot.
+    #[cfg(feature = "openssl-backend")]
+    pub fn issue(
+        &mut self,
+        authority: &crate::management::IdentityAuthority,
+        enrollment_id: [u8; 16],
+        now_us: u64,
+        validity: IdentityValidity,
+    ) -> Result<Vec<u8>, EnrollmentError> {
+        if validity.not_before_us >= validity.expires_us
+            || validity.not_before_us > now_us
+            || validity.expires_us <= now_us
+            || validity.scope.len() > 1024
+        {
+            return Err(EnrollmentError::InvalidIdentityValidity);
+        }
+        let (invite_id, prepared) = self.prepared_for_enrollment(enrollment_id)?;
+        if prepared.result.phase == EnrollmentPhase::Issued {
+            return prepared
+                .result
+                .signed_identity
+                .clone()
+                .ok_or(EnrollmentError::InvalidSignedResult);
+        }
+        if prepared.result.phase != EnrollmentPhase::Prepared {
+            return Err(EnrollmentError::WrongPhase);
+        }
+        if now_us > prepared.result.recovery_until_us {
+            return Err(EnrollmentError::InviteRecoveryExpired);
+        }
+        // `claim` only accepts a `VerifiedEnrollmentRequest`, and recovery refuses a
+        // prepared record whose CSR is empty or oversized. The bearer was checked
+        // before that record existed; issuing does not require it again.
+        if prepared.csr_der.is_empty() || prepared.csr_der.len() > MAX_CSR_BYTES {
+            return Err(EnrollmentError::InvalidCsr);
+        }
+        let signed_bytes = sign_prepared_identity(authority, &prepared, validity)?;
+        let issued = self.mark_issued(
+            invite_id,
+            enrollment_id,
+            now_us,
+            SignedIdentityResult::from_identity_authority(signed_bytes)?,
+        )?;
+        issued
+            .signed_identity
+            .ok_or(EnrollmentError::InvalidSignedResult)
+    }
+
     pub fn mark_delivered(
         &mut self,
         invite_id: [u8; 16],
@@ -880,6 +979,27 @@ impl EnrollmentStore {
         })?;
         self.generations.insert(node_id, next_generation);
         Ok(())
+    }
+
+    /// The journal key is `(invite, enrollment)`. Issuing is addressed by enrollment id
+    /// only, so this scans the bounded transaction map. It does not check a bearer,
+    /// a CSR, or a signature.
+    #[cfg(feature = "openssl-backend")]
+    fn prepared_for_enrollment(
+        &self,
+        enrollment_id: [u8; 16],
+    ) -> Result<([u8; 16], Tx), EnrollmentError> {
+        let mut found = None;
+        for ((invite_id, id), tx) in &self.transactions {
+            if *id != enrollment_id {
+                continue;
+            }
+            if found.is_some() {
+                return Err(EnrollmentError::CorruptJournal);
+            }
+            found = Some((*invite_id, tx.clone()));
+        }
+        found.ok_or(EnrollmentError::TransactionNotFound)
     }
 
     fn ensure_healthy(&self) -> Result<(), EnrollmentError> {
@@ -1601,6 +1721,56 @@ fn der_take(der: &[u8], position: &mut usize) -> Result<(u8, usize, usize), Enro
     *position = content_end;
     Ok((tag, content_start, content_end))
 }
+
+#[cfg(feature = "openssl-backend")]
+fn decode_enrollment_request(
+    raw_request: &[u8],
+) -> Result<boreas_proto::messages::EnrollmentRequest, EnrollmentError> {
+    match boreas_proto::messages::Enrollment::decode(raw_request) {
+        Ok(boreas_proto::messages::Enrollment::Request(request)) => Ok(request),
+        Ok(boreas_proto::messages::Enrollment::Response(_)) => Err(EnrollmentError::InvalidCsr),
+        Err(_) => Err(EnrollmentError::InvalidCsr),
+    }
+}
+
+/// Build and dual-sign the node identity for a journaled prepared transaction.
+///
+/// The ML-DSA PKCS#10 proof is verified again by the authority. The Ed25519 PoP
+/// extension is not re-checked here: it was checked when the CSR was admitted.
+/// `validity` is deployment input and is not derived from the CSR.
+#[cfg(feature = "openssl-backend")]
+fn sign_prepared_identity(
+    authority: &crate::management::IdentityAuthority,
+    prepared: &Tx,
+    validity: IdentityValidity,
+) -> Result<Vec<u8>, EnrollmentError> {
+    let role = match prepared.result.slot.role {
+        NodeRole::Edge => crate::NodeRole::Edge,
+        NodeRole::Core => crate::NodeRole::Core,
+        NodeRole::EnrollmentService => crate::NodeRole::EnrollmentService,
+    };
+    let template = crate::management::IdentityTemplate {
+        node_id: prepared.result.node_id,
+        home_core_id: prepared.result.slot.home_core_id,
+        vip_octet: prepared.result.slot.vip_octet,
+        role,
+        identity_generation: prepared.result.identity_generation,
+        identity_pub_ed25519: prepared.identity_pub_ed25519,
+        not_before_us: validity.not_before_us,
+        expires_us: validity.expires_us,
+        scope: validity.scope,
+    };
+    let body = authority
+        .node_identity_from_csr(template, &prepared.csr_der)
+        .map_err(|_| EnrollmentError::IdentityAuthorityRejected)?;
+    let signed = authority
+        .sign_node_identity(body)
+        .map_err(|_| EnrollmentError::IdentityAuthorityRejected)?;
+    signed
+        .encode()
+        .map_err(|_| EnrollmentError::IdentityAuthorityRejected)
+}
+
 
 fn crc32(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
