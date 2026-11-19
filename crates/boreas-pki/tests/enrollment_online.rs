@@ -9,13 +9,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use boreas_pki::enrollment::{
-    CsrPolicy, EnrollmentError, EnrollmentPhase, EnrollmentStore, InviteSpec, NodeRole, Slot,
-    WriterFence, EXPERIMENTAL_ED25519_CSR_POP_OID,
-};
-use boreas_pki::management::{IdentityAuthority, IssuerScope, ManagementTrust, verify_signed_identity};
 use boreas_pki::NodeRole as PolicyRole;
-use boreas_proto::messages::{Enrollment, EnrollmentRequest, ENROLLMENT_VERSION};
+use boreas_pki::enrollment::{
+    CsrPolicy, EXPERIMENTAL_ED25519_CSR_POP_OID, EnrollmentError, EnrollmentPhase, EnrollmentStore,
+    InviteSpec, NodeRole, Slot, WriterFence,
+};
+use boreas_pki::management::{
+    IdentityAuthority, IssuerScope, ManagementTrust, verify_signed_identity,
+};
+use boreas_proto::messages::{ENROLLMENT_VERSION, Enrollment, EnrollmentRequest};
 use boreas_proto::objects::ObjectBody;
 use openssl::asn1::{Asn1Object, Asn1OctetString};
 use openssl::hash::{MessageDigest, hash};
@@ -171,7 +173,9 @@ fn online_request_is_verified_and_issued_from_network_bytes() {
         assert_eq!(prepared.phase, EnrollmentPhase::Prepared);
         assert_eq!(prepared.node_id, 2);
         assert!(prepared.signed_identity.is_none());
-        store.issue(&signer, enrollment_id, NOW_US, validity()).unwrap()
+        store
+            .issue(&signer, enrollment_id, NOW_US, validity())
+            .unwrap()
     };
     let mut trust = ManagementTrust::new(NET);
     trust
@@ -203,11 +207,12 @@ fn second_claim_of_the_same_invite_allocates_nothing() {
     let first_csr = csr_with_pop(&ml_key, &ed_key, EXPERIMENTAL_ED25519_CSR_POP_OID);
     let mut store = open_store(&dir, secret);
     let first = request_bytes([9u8; 16], [1u8; 16], secret, &first_csr);
-    assert_eq!(
-        store.claim_from_request(&first, NOW_US).unwrap().node_id,
-        2
+    assert_eq!(store.claim_from_request(&first, NOW_US).unwrap().node_id, 2);
+    let other_csr = csr_with_pop(
+        &ml_dsa(21),
+        &PKey::generate_ed25519().unwrap(),
+        EXPERIMENTAL_ED25519_CSR_POP_OID,
     );
-    let other_csr = csr_with_pop(&ml_dsa(21), &PKey::generate_ed25519().unwrap(), EXPERIMENTAL_ED25519_CSR_POP_OID);
     let second = request_bytes([8u8; 16], [1u8; 16], secret, &other_csr);
     assert!(matches!(
         store.claim_from_request(&second, NOW_US),
@@ -231,7 +236,10 @@ fn wrong_bearer_is_rejected_without_a_slot() {
     ));
     assert_eq!(store.allocation_watermark(1).unwrap(), 0);
     let honest = request_bytes([9u8; 16], [1u8; 16], [7u8; 32], &csr);
-    assert_eq!(store.claim_from_request(&honest, NOW_US).unwrap().node_id, 2);
+    assert_eq!(
+        store.claim_from_request(&honest, NOW_US).unwrap().node_id,
+        2
+    );
     assert_eq!(store.allocation_watermark(1).unwrap(), 1);
     let _ = fs::remove_dir_all(&dir);
 }

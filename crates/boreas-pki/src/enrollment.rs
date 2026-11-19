@@ -1771,7 +1771,6 @@ fn sign_prepared_identity(
         .map_err(|_| EnrollmentError::IdentityAuthorityRejected)
 }
 
-
 fn crc32(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
     for &b in bytes {

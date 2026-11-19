@@ -14,7 +14,9 @@
 //! Nothing here is a `G-DOS` or `G-RESOURCE` pass. `observe_sample` classifies a
 //! caller-supplied series; it does not sample a process.
 
-use boreas_tunnel::budget::{AdmissionPlan, GrowthVerdict, ResourceBudget, observe_sample, plan_attack};
+use boreas_tunnel::budget::{
+    AdmissionPlan, GrowthVerdict, ResourceBudget, observe_sample, plan_attack,
+};
 use boreas_tunnel::resource::{Admission, AdmissionError, ByteCredit, HandshakeCredit, Limits};
 
 fn limits() -> Limits {

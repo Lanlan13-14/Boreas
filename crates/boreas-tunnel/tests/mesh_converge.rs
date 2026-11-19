@@ -27,9 +27,7 @@ use boreas_tunnel::failover::{
     AttachmentAdmission, AttachmentLimits, CoreAttachment, Health, PathId, PathSet, PathStatus,
     Policy, ProbeVerdict, ProbeWatch, Selection, select_path,
 };
-use boreas_tunnel::{
-    Prefix, RouteCandidate, RouteDecision, RouteDisposition, arbitrate_routes,
-};
+use boreas_tunnel::{Prefix, RouteCandidate, RouteDecision, RouteDisposition, arbitrate_routes};
 
 const CORE_A: u8 = 1;
 const CORE_B: u8 = 2;
@@ -136,15 +134,8 @@ fn three_cores_converge_on_each_others_signed_lsas() {
         boreas_tunnel::directory::home_core_id_for_node(edge_on_c),
         Some(CORE_C)
     );
-    let lease = RecordEnvelope::attachment_lease(
-        edge_on_c,
-        1,
-        1,
-        CORE_C,
-        hash(7),
-        payload(7),
-        false,
-    );
+    let lease =
+        RecordEnvelope::attachment_lease(edge_on_c, 1, 1, CORE_C, hash(7), payload(7), false);
     assert_eq!(core_a.apply(lease.clone()), Ok(ApplyOutcome::Applied));
     assert_eq!(core_b.apply(lease.clone()), Ok(ApplyOutcome::Applied));
     assert_eq!(core_c.apply(lease), Ok(ApplyOutcome::Applied));
@@ -231,8 +222,22 @@ fn expired_core_b_lsa_is_withdrawn_before_the_next_choice() {
 
     // The public arbiter has no "unreachable next hop" input. The closest
     // expression is a route whose lease is no longer healthy: it is not accepted.
-    let via_b = candidate("core-b", node_id(CORE_B, 1), "192.168.20.0/24", 1, 10, hash(21));
-    let via_c = candidate("core-c", node_id(CORE_C, 1), "192.168.20.0/24", 1, 20, hash(22));
+    let via_b = candidate(
+        "core-b",
+        node_id(CORE_B, 1),
+        "192.168.20.0/24",
+        1,
+        10,
+        hash(21),
+    );
+    let via_c = candidate(
+        "core-c",
+        node_id(CORE_C, 1),
+        "192.168.20.0/24",
+        1,
+        20,
+        hash(22),
+    );
     let mut unreachable = via_b.clone();
     unreachable.healthy_lease = false;
     let decisions = arbitrate_routes(&[unreachable, via_c.clone()]).unwrap();
@@ -241,7 +246,10 @@ fn expired_core_b_lsa_is_withdrawn_before_the_next_choice() {
             .iter()
             .all(|decision| decision.object_id != hash(21))
     );
-    assert_eq!(disposition(&decisions, hash(22)), RouteDisposition::Accepted);
+    assert_eq!(
+        disposition(&decisions, hash(22)),
+        RouteDisposition::Accepted
+    );
 }
 
 /// Overlapping grants are not silently overwritten: the loser is returned as
@@ -260,8 +268,12 @@ fn overlapping_grants_are_deterministic_and_explicitly_suppressed() {
         specific_cheap.clone(),
     ])
     .unwrap();
-    let reversed = arbitrate_routes(&[specific_cheap.clone(), specific_costly.clone(), broad.clone()])
-        .unwrap();
+    let reversed = arbitrate_routes(&[
+        specific_cheap.clone(),
+        specific_costly.clone(),
+        broad.clone(),
+    ])
+    .unwrap();
     assert_eq!(forward, reversed);
 
     // Eligible order is metric, so 10 wins, 40 is suppressed by it, and the
@@ -280,7 +292,10 @@ fn overlapping_grants_are_deterministic_and_explicitly_suppressed() {
     let low = candidate("route-authority", 4, "10.8.0.0/16", 1, 5, hash(33));
     let high = candidate("route-authority", 5, "10.8.0.0/16", 1, 9, hash(34));
     let same_length = arbitrate_routes(&[high.clone(), low.clone()]).unwrap();
-    assert_eq!(disposition(&same_length, hash(33)), RouteDisposition::Accepted);
+    assert_eq!(
+        disposition(&same_length, hash(33)),
+        RouteDisposition::Accepted
+    );
     assert_eq!(
         disposition(&same_length, hash(34)),
         RouteDisposition::SuppressedBy(hash(33))

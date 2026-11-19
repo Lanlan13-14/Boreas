@@ -57,7 +57,11 @@ fn filter_accepts_only_af_unix_stream_cloexec_and_rejects_udp() {
     let prog = program(target);
     let killed = eval(
         &prog,
-        &seccomp_data(socket_nr, foreign.audit_arch(), [af_unix, stream_cloexec, 0, 0, 0, 0]),
+        &seccomp_data(
+            socket_nr,
+            foreign.audit_arch(),
+            [af_unix, stream_cloexec, 0, 0, 0, 0],
+        ),
     )
     .unwrap();
     assert_eq!(killed, SECCOMP_RET_KILL_PROCESS);

@@ -3029,10 +3029,9 @@ mod tests {
     /// differently, but both must reject when either rejects.
     #[test]
     fn mutation_corpus_matches_independent_python_decoder() {
-        let corpus: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/interop/mutation-corpus.json"
-        ))
-        .expect("mutation corpus JSON");
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tools/interop/mutation-corpus.json"))
+                .expect("mutation corpus JSON");
         assert_eq!(
             corpus.get("schema").and_then(|v| v.as_str()),
             Some("boreas-mutation-corpus-v1")
@@ -3048,11 +3047,10 @@ mod tests {
             let id = case.get("id").and_then(|v| v.as_str()).unwrap();
             let message = case.get("message").and_then(|v| v.as_str()).unwrap();
             let input = decode_hex(case.get("input_hex").and_then(|v| v.as_str()).unwrap());
-            let python = case
-                .get("python_verdict")
-                .and_then(|v| v.as_str())
-                .unwrap();
-            let rust = structural_verdict(message, &input).err().map(MessageError::category);
+            let python = case.get("python_verdict").and_then(|v| v.as_str()).unwrap();
+            let rust = structural_verdict(message, &input)
+                .err()
+                .map(MessageError::category);
             match (python == "accept", rust) {
                 (true, None) => agree_accept += 1,
                 (false, Some(_)) => agree_reject += 1,
@@ -3062,7 +3060,13 @@ mod tests {
                 (false, None) => panic!("{id}: Python rejected as {python} but Rust accepted"),
             }
         }
-        assert!(agree_reject > agree_accept, "corpus must be mostly rejections");
-        assert!(agree_accept > 0, "corpus must keep some structurally valid mutations");
+        assert!(
+            agree_reject > agree_accept,
+            "corpus must be mostly rejections"
+        );
+        assert!(
+            agree_accept > 0,
+            "corpus must keep some structurally valid mutations"
+        );
     }
 }

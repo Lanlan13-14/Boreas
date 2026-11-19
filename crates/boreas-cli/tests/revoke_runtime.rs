@@ -6,14 +6,12 @@
 
 #![cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 
+use boreas_pki::Authority;
 use boreas_pki::management::{
-    IssuerRecord, IssuerScope, ManagementTrust, MANAGEMENT_SCHEMA_VERSION,
+    IssuerRecord, IssuerScope, MANAGEMENT_SCHEMA_VERSION, ManagementTrust,
 };
 use boreas_pki::revoke_cleanup::CleanupTable;
-use boreas_pki::Authority;
-use boreas_proto::messages::{
-    SignedObject, SignerRole, SignerSignatures, ED25519_SIGNATURE_LEN,
-};
+use boreas_proto::messages::{ED25519_SIGNATURE_LEN, SignedObject, SignerRole, SignerSignatures};
 use boreas_proto::objects::{
     ManagementObject, MldsaParameterSet, ObjectType, StatusSnapshot, SubjectIdentity,
 };
@@ -117,7 +115,10 @@ fn identity_revocation() -> Vec<u8> {
         1,
     )
     .unwrap();
-    RevocationPayload::new(vec![entry]).unwrap().encode().unwrap()
+    RevocationPayload::new(vec![entry])
+        .unwrap()
+        .encode()
+        .unwrap()
 }
 
 #[test]
@@ -134,7 +135,13 @@ fn revocation_stops_only_the_named_peer() {
     let mut failures = 0u64;
 
     assert_eq!(
-        poll_peer_forward(&set, REVOKED_NODE, REVOKED_GENERATION, &mut forwarded, &mut failures),
+        poll_peer_forward(
+            &set,
+            REVOKED_NODE,
+            REVOKED_GENERATION,
+            &mut forwarded,
+            &mut failures
+        ),
         ForwardPoll::Forward
     );
     assert_eq!(forwarded, 1);
@@ -146,14 +153,26 @@ fn revocation_stops_only_the_named_peer() {
     assert!(set.contains(REVOKED_NODE, REVOKED_GENERATION));
 
     assert_eq!(
-        poll_peer_forward(&set, REVOKED_NODE, REVOKED_GENERATION, &mut forwarded, &mut failures),
+        poll_peer_forward(
+            &set,
+            REVOKED_NODE,
+            REVOKED_GENERATION,
+            &mut forwarded,
+            &mut failures
+        ),
         ForwardPoll::Revoked
     );
     assert_eq!(forwarded, 1, "a revoked peer must not be forwarded again");
     assert_eq!(failures, 1, "revocation counts one failed forward");
 
     assert_eq!(
-        poll_peer_forward(&set, OTHER_NODE, REVOKED_GENERATION, &mut forwarded, &mut failures),
+        poll_peer_forward(
+            &set,
+            OTHER_NODE,
+            REVOKED_GENERATION,
+            &mut forwarded,
+            &mut failures
+        ),
         ForwardPoll::Forward
     );
     assert_eq!(forwarded, 2);
