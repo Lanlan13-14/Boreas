@@ -738,7 +738,7 @@ jobs:
           echo "initial_backup_negative.primary_tcp_accepts=$PRIMARY_ACCEPTS"
           echo "initial_backup_negative.backup_tcp_accepts=$BACKUP_ACCEPTS"
           echo "initial_backup_negative.edge_exit_code=$NEG_RC"
-          echo "initial_backup_negative.core_ct          echo "initial_backup_negative.core_ctl=$CORE_CTL"
+          echo "initial_backup_negative.core_ctl=$CORE_CTL"
 
           FAILED=0
           if (( NEG_RC != 2 )); then
