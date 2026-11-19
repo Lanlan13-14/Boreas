@@ -738,4 +738,113 @@ jobs:
           echo "initial_backup_negative.primary_tcp_accepts=$PRIMARY_ACCEPTS"
           echo "initial_backup_negative.backup_tcp_accepts=$BACKUP_ACCEPTS"
           echo "initial_backup_negative.edge_exit_code=$NEG_RC"
-          echo "initial_backup_negative.core_ct
+          echo "initial_backup_negative.core_ct          echo "initial_backup_negative.core_ctl=$CORE_CTL"
+
+          FAILED=0
+          if (( NEG_RC != 2 )); then
+            echo "ERROR: edge daemon exit status $NEG_RC, expected 2 (fail closed)" >&2
+            FAILED=1
+          fi
+          if (( PRIMARY_ACCEPTS < 1 )); then
+            echo 'ERROR: primary endpoint never accepted a TCP connection; the run did not test outer-TLS rejection' >&2
+            FAILED=1
+          fi
+          if (( BACKUP_ACCEPTS != 0 )); then
+            echo "ERROR: edge daemon dialed the configured backup $BACKUP_ACCEPTS time(s) after the primary outer TLS was rejected" >&2
+            FAILED=1
+          fi
+          if ! grep -q '"inbound_connections":0' <<<"$CORE_CTL"; then
+            echo "ERROR: backup core reports a session; core ctl status was: $CORE_CTL" >&2
+            FAILED=1
+          fi
+          if ! grep -q '"daemon_connected":false' <<<"$CORE_CTL"; then
+            echo "ERROR: backup core reports a connected peer; core ctl status was: $CORE_CTL" >&2
+            FAILED=1
+          fi
+          if grep -q '"status":"ok"' "$NEG/negative.out"; then
+            echo 'ERROR: negative edge daemon reported status ok' >&2
+            FAILED=1
+          fi
+          if (( FAILED != 0 )); then
+            echo '--- negative edge stderr ---' >&2
+            cat "$NEG/negative.err" >&2 || true
+            echo '--- negative edge stdout ---' >&2
+            cat "$NEG/negative.out" >&2 || true
+            echo '--- backup core stderr ---' >&2
+            cat "$NEG/core.err" >&2 || true
+            exit 1
+          fi
+
+          # Instrument control: the same backup endpoint, proxy and core process
+          # must carry a real session when it is the only configured endpoint.
+          set +e
+          "$BIN" daemon connect \
+            --config "$NEG/edge-control.toml" \
+            --material-dir "$NEG/edge-mat" \
+            --status-state-file "$CONTROL_STATE/status.state" --status-state-owner-uid "$OWNER_UID" \
+            --network-policy-tbs "$CONTROL_STATE/tbs.cbor" \
+            --network-policy-ed25519-signature "$CONTROL_STATE/ed25519.sig" \
+            --network-policy-mldsa65-signature "$CONTROL_STATE/mldsa65.sig" \
+            --network-root-ed25519-der "$CONTROL_STATE/root-ed25519.der" \
+            --network-root-mldsa65-der "$CONTROL_STATE/root-mldsa65.der" \
+            --network-policy-state-file "$CONTROL_STATE/network-policy.state" \
+            --network-policy-state-owner-uid "$OWNER_UID" \
+            --connect "127.0.0.1:$BACKUP_PORT" \
+            --tls-name "wss.boreas.test" \
+            --ws-host "wss.boreas.test:$BACKUP_PORT" \
+            --virtual-tun \
+            --max-seconds 2 \
+            > "$NEG/control.out" 2> "$NEG/control.err"
+          CONTROL_RC=$?
+          set -e
+          BACKUP_ACCEPTS_AFTER="$(count_accepts "$NEG/backup-accepts.log")"
+          echo "initial_backup_negative.backup_tcp_accepts_after_control=$BACKUP_ACCEPTS_AFTER"
+          echo "initial_backup_negative.control_exit_code=$CONTROL_RC"
+
+          if (( CONTROL_RC != 0 )); then
+            echo "ERROR: control connect to the usable backup failed with status $CONTROL_RC" >&2
+            cat "$NEG/control.err" >&2 || true
+            exit 1
+          fi
+          if (( BACKUP_ACCEPTS_AFTER != 1 )); then
+            echo "ERROR: backup proxy counted $BACKUP_ACCEPTS_AFTER connection(s), expected exactly 1" >&2
+            exit 1
+          fi
+          if ! grep -q '"status":"ok"' "$NEG/control.out"; then
+            echo "ERROR: control connect to the usable backup did not report status ok" >&2
+            cat "$NEG/control.out" >&2 || true
+            exit 1
+          fi
+
+          echo 'initial_backup_negative=pass'
+          echo 'initial_backup_negative.backup_usable=control-connect-through-same-proxy-status-ok'
+      - name: Upload hop-node development binary
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
+          path: hop-node-linux
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload non-secret CI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-${{ github.run_id }}
+          path: |
+            openssl-runtime.txt
+            openssl-build.txt
+            openssl-musl-runtime.txt
+            openssl-musl-build.txt
+            openssl-linkage.txt
+            rust-tls-format.patch
+            rust-tls-tests.log
+            rust-tls-pki-tests.log
+            rust-tls-tunnel-tests.log
+            rust-tls-supervisor-tests.log
+            rust-tls-cli-tests.log
+            rust-tls-netns-e2e.log
+            rust-tls-initial-backup.log
+            rust-tls-initial-backup-negative.log
+          if-no-files-found: warn
+          retention-days: 14
