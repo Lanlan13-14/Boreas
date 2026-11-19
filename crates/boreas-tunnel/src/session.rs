@@ -17,6 +17,7 @@
 //! frozen protocol. `SessionHello` is the only accepted first frame.
 
 use std::collections::VecDeque;
+use std::io;
 
 use boreas_crypto::{NodeRole, Policy};
 use boreas_proto::messages::{
