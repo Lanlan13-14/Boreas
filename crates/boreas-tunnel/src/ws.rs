@@ -451,9 +451,8 @@ impl<T: Read + Write> WsStream<T> {
                 }
                 127 => {
                     let b = &self.read_buf[self.read_pos + 2..self.read_pos + 10];
-                    let length = u64::from_be_bytes([
-                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                    ]);
+                    let length =
+                        u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
                     if length < 65_536 {
                         return Err(WsIoError::Fatal(WsError::NonCanonicalLength));
                     }
@@ -1811,11 +1810,7 @@ mod tests {
         let frame = encode_frame(false, true, OpCode::Binary, b"hello-nb").unwrap();
         let split = 4;
         let io = FragmentedIo {
-            chunks: vec![
-                frame[..split].to_vec(),
-                Vec::new(),
-                frame[split..].to_vec(),
-            ],
+            chunks: vec![frame[..split].to_vec(), Vec::new(), frame[split..].to_vec()],
             idx: 0,
             write_calls: 0,
             written: Vec::new(),

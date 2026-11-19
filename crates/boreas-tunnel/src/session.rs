@@ -243,9 +243,7 @@ impl FrameIo {
     }
 
     fn has_pending_write(&self) -> bool {
-        self.write_pos < self.write_buf.len()
-            || self.needs_flush
-            || self.stream.has_pending_write()
+        self.write_pos < self.write_buf.len() || self.needs_flush || self.stream.has_pending_write()
     }
 
     /// Disarm the bounded handshake transport deadline now that authorization

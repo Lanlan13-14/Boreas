@@ -1006,7 +1006,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                         self.outbound_batch.clear();
                         self.outbound_pos = 0;
                         return Err(
-                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted))
                         );
                     }
                 }
@@ -1133,7 +1133,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                     interrupts = interrupts.saturating_add(1);
                     if interrupts >= MAX_INTERRUPT_RETRIES {
                         return Err(
-                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted))
                         );
                     }
                 }
@@ -1167,7 +1167,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                     interrupts = interrupts.saturating_add(1);
                     if interrupts >= MAX_INTERRUPT_RETRIES {
                         return Err(
-                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted)),
+                            self.fail(PacketPathError::CircuitIo(io::ErrorKind::Interrupted))
                         );
                     }
                 }
@@ -2208,7 +2208,10 @@ mod tests {
             Ok(InboundStep::Packet(in_pkt.len()))
         );
         assert!(!path.has_partial_inbound());
-        assert_eq!(host.read_packet().unwrap().as_deref(), Some(in_pkt.as_slice()));
+        assert_eq!(
+            host.read_packet().unwrap().as_deref(),
+            Some(in_pkt.as_slice())
+        );
         assert!(path.is_open());
     }
 }
