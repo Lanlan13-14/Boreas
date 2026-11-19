@@ -40,7 +40,16 @@ fi
 
 # Exercise the reviewed pin, and notice drift between the review record and the
 # workflow pins that supply OPENSSL_VERSION to the verifier.
-expected_version=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([0-9]+(\.[0-9]+)+)".*$/\1/p' "$review_json" | head -n 1)
+#
+# When the review records a fix commit, the workflows build that snapshot
+# instead of the affected release, so the expected version comes from the
+# commit record. The release version stays in the review for the range check.
+expected_version=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' "$review_json" | head -n 1)
+fixed_commit_version=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' <(sed -n '/"fixed_commit"/,/^  }/p' "$review_json") | head -n 1)
+fixed_commit_sha=$(sed -nE 's/^[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*$/\1/p' "$review_json" | head -n 1)
+if [[ -n $fixed_commit_version ]]; then
+    expected_version=$fixed_commit_version
+fi
 [[ -n $expected_version ]] || fail 'could not read the pinned OpenSSL version from openssl-review.json'
 mapfile -t pinned_workflows < <(sed -nE 's/^.*"workflow"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' "$review_json" | sort -u)
 (( ${#pinned_workflows[@]} > 0 )) || fail 'openssl-review.json records no workflow configurations'
@@ -48,6 +57,10 @@ for workflow in "${pinned_workflows[@]}"; do
     [[ -f $repo_root/$workflow ]] || fail "reviewed workflow $workflow is missing"
     grep -Fq "OPENSSL_VERSION: ${expected_version}" "$repo_root/$workflow" ||
         fail "$workflow does not pin OPENSSL_VERSION: ${expected_version}"
+    if [[ -n $fixed_commit_sha ]]; then
+        grep -Fq "OPENSSL_COMMIT: ${fixed_commit_sha}" "$repo_root/$workflow" ||
+            fail "$workflow does not pin the reviewed fix commit"
+    fi
 done
 ok "pin ${expected_version} matches ${#pinned_workflows[@]} reviewed workflow(s)"
 
