@@ -853,9 +853,13 @@ jobs:
           set -euo pipefail
           failed=0
           for sample in 1 2 3; do
-            if ! sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
-              hop-node-linux/boreas-linux-x86_64-musl-pq768 \
-              2>&1 | tee "rust-tls-netns-gigabit-${sample}.log"; then
+            log="rust-tls-netns-gigabit-${sample}.log"
+            if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "$log"; then
+              printf 'sample_exit=0\n' | tee -a "$log"
+            else
+              sample_exit=$?
+              printf 'sample_exit=%s\n' "$sample_exit" | tee -a "$log"
               failed=1
             fi
           done

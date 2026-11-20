@@ -1022,7 +1022,22 @@ ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" receive 10.20.1.1 10.20.1.2 > "$
 echo $! > "$WORK/perf-receiver-core.pid"
 ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" receive 10.20.1.2 10.20.1.1 > "$WORK/perf-receiver-edge.log" 2>&1 &
 echo $! > "$WORK/perf-receiver-edge.pid"
-sleep 0.1
+# Both listeners must actually be bound before either sender starts. A fixed
+# sleep made slow runner scheduling look like transport connection failure.
+probe_listeners_ready=0
+for _ in $(seq 1 40); do
+  if ip netns exec "$CORE_NS" ss -Hltn sport = :18080 | grep -q '10\.20\.1\.1:18080' &&
+     ip netns exec "$EDGE_NS" ss -Hltn sport = :18080 | grep -q '10\.20\.1\.2:18080'; then
+    probe_listeners_ready=1
+    break
+  fi
+  sleep 0.05
+done
+if (( ! probe_listeners_ready )); then
+  echo 'ERROR: probe infrastructure: both receivers did not reach TCP LISTEN' >&2
+  report_failure_evidence
+  exit 1
+fi
 ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" send 10.20.1.2 10.20.1.1 > "$WORK/perf-sender-edge.log" 2>&1 &
 echo $! > "$WORK/perf-sender-edge.pid"
 ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" send 10.20.1.1 10.20.1.2 > "$WORK/perf-sender-core.log" 2>&1 &
@@ -1063,10 +1078,12 @@ if (( PERF_WORKER_FAILED )); then
 fi
 
 PERF_RESULT=0
-python3 - "$WORK/perf-sender-edge.log" "$WORK/perf-sender-core.log" <<'PY' || PERF_RESULT=$?
+python3 - "$WORK/perf-sender-edge.log" "$WORK/perf-receiver-core.log" \
+  "$WORK/perf-sender-core.log" "$WORK/perf-receiver-edge.log" <<'PY' || PERF_RESULT=$?
 import json
 import math
 import os
+import re
 import sys
 
 labels = ("edge_to_core", "core_to_edge")
@@ -1074,18 +1091,26 @@ minimum = float(os.environ.get("BOREAS_MIN_THROUGHPUT_MBPS", "3.0"))
 expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
 failures = []
 
-for label, path in zip(labels, sys.argv[1:]):
+for label, sender_path, receiver_path in zip(labels, sys.argv[1::2], sys.argv[2::2]):
     try:
-        with open(path, encoding="utf-8") as source:
+        with open(sender_path, encoding="utf-8") as source:
             result = json.load(source)
+        with open(receiver_path, encoding="utf-8") as source:
+            receiver = json.load(source)
+        if not isinstance(result, dict) or not isinstance(receiver, dict):
+            raise ValueError("sender and receiver must each report one JSON object")
     except (OSError, ValueError) as exc:
         print(f"overlay_throughput_{label}_mbps=unavailable")
-        failures.append(f"{label} has no complete sender result: {exc}")
+        failures.append(f"{label} has no complete paired measurement: {exc}")
         continue
-    if not isinstance(result, dict):
+    digest = result.get("sha256")
+    if (receiver.get("role") != "receiver" or receiver.get("bytes") != expected_bytes
+        or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or receiver.get("sha256") != digest):
         print(f"overlay_throughput_{label}_mbps=unavailable")
-        failures.append(f"{label} sender result is not a JSON object")
+        failures.append(f"{label} receiver byte count or SHA-256 evidence did not match")
         continue
+    print(f"overlay_{label}_receiver_integrity=verified")
 
     # Optional diagnostic fields never replace the end-to-end regression bound.
     for field in ("connect_seconds", "send_seconds", "digest_seconds", "payload_send_mbps"):

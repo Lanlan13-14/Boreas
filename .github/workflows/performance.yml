@@ -138,9 +138,16 @@ jobs:
           BOREAS_NETNS_EDGE_LIFETIME_SECONDS: ${{ matrix.edge_lifetime_seconds }}
         run: |
           set -euo pipefail
-          sudo -E bash tools/release/netns_daemon_smoke.sh \
-            "$PWD/artifact/boreas-linux-x86_64-musl-pq768" \
-            2>&1 | tee "netem-${source_sha}.log"
+          {
+            printf 'source_sha=%s\nsource_run=%s\n' "$source_sha" "$source_run"
+            printf 'probe_bytes_per_direction=%s\nthroughput_floor_mbps_per_direction=%s\n' \
+              "$BOREAS_PERF_BYTES" "$BOREAS_MIN_THROUGHPUT_MBPS"
+            # Preserve the existing security and probe I/O deadlines. This
+            # separate outer guard bounds fixture setup, transfer and cleanup.
+            guard_seconds=$((BOREAS_NETNS_EDGE_LIFETIME_SECONDS + 90))
+            sudo -E timeout --kill-after=5s "${guard_seconds}s" bash tools/release/netns_daemon_smoke.sh \
+              "$PWD/artifact/boreas-linux-x86_64-musl-pq768"
+          } 2>&1 | tee "netem-${source_sha}.log"
       - name: Upload exact-commit performance evidence
         if: always()
         uses: actions/upload-artifact@v7
