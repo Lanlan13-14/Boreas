@@ -239,9 +239,10 @@ mod linux_daemon {
         backend::{OpenSslAcceptor, OpenSslConnector},
     };
     use boreas_pki::{
+        Authority,
+        management::ManagementTrust,
         provisioning::{
-            parse_net_id_hex, read_status_snapshot_raw, status_trust_from_roots,
-            verify_material_dir_with_roots,
+            RootsBundle, parse_net_id_hex, read_status_snapshot_raw, verify_material_dir_with_roots,
         },
         status_store::StatusStore,
     };
@@ -1598,19 +1599,44 @@ mod linux_daemon {
             .ok_or_else(|| "daemon: endpoint resolved to zero addresses".to_string())
     }
 
-    /// Open the process-wide durable status store. The store owns its own
-    /// `ManagementTrust`; the caller must not open a second store on this path.
-    fn open_status_store(
-        state_path: &Path,
-        net_id: [u8; 16],
-        owner_uid: u32,
+    /// Bind the exact root bundle used to construct the durable status verifier
+    /// to the fingerprint from identity verification. The path was read once
+    /// for identity; checking that earlier fingerprint alone would not bind
+    /// a second read used to build status trust.
+    fn bound_status_trust(
         roots_path: &Path,
+        net_id: [u8; 16],
+        expected_root_fingerprint: [u8; 32],
         now_us: u64,
-    ) -> Result<StatusStore, String> {
-        let trust = status_trust_from_roots(roots_path, net_id, now_us)
+    ) -> Result<ManagementTrust, String> {
+        // The provisioning material reader caps roots.cbor at 64 KiB.
+        const MAX_ROOTS_FILE_BYTES: usize = 64 * 1024;
+        let mut raw = Vec::new();
+        fs::File::open(roots_path)
+            .and_then(|file| file.take(MAX_ROOTS_FILE_BYTES as u64 + 1).read_to_end(&mut raw))
+            .map_err(|_| "daemon: cannot read status trust root bundle".to_string())?;
+        if raw.len() > MAX_ROOTS_FILE_BYTES {
+            return Err("daemon: status trust root bundle exceeds size limit".to_string());
+        }
+        let (fingerprint, authorizations) = RootsBundle::decode(&raw)
+            .and_then(|bundle| bundle.verify_all(net_id, now_us))
             .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
-        StatusStore::open(state_path, net_id, owner_uid, trust)
-            .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))
+        if fingerprint != expected_root_fingerprint {
+            return Err("daemon: status NetworkRoot fingerprint does not match identity".to_string());
+        }
+        let mut trust = ManagementTrust::new(net_id);
+        let mut has_status = false;
+        for authorization in authorizations {
+            let record = authorization.issuer_record();
+            has_status |= record.authority == Authority::StatusSigner;
+            trust
+                .add_issuer(record)
+                .map_err(|e| format!("daemon: status trust issuer rejected: {e}"))?;
+        }
+        if !has_status {
+            return Err("daemon: status trust missing authorized StatusSigner".to_string());
+        }
+        Ok(trust)
     }
 
     /// One fail-closed status decision at a business admission boundary.
@@ -1799,6 +1825,12 @@ mod linux_daemon {
         let verified =
             verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
                 .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
+        let status_trust = bound_status_trust(
+            &roots_path,
+            cfg_net_id,
+            verified.root_fingerprint,
+            now_utc_us()?,
+        )?;
 
         // The default overlay now also requires a separately pinned, dual-signed
         // policy plus durable anti-rollback state. This helper accepts no raw
@@ -1830,6 +1862,7 @@ mod linux_daemon {
             &policy_state_path,
             &config.paths.state_dir,
             cfg_net_id,
+            verified.root_fingerprint,
             policy_state_owner_uid.ok_or_else(|| {
                 "daemon: `--network-policy-state-owner-uid` is required".to_string()
             })?,
@@ -1996,13 +2029,13 @@ mod linux_daemon {
                     .to_string(),
             );
         }
-        let mut status_store = open_status_store(
+        let mut status_store = StatusStore::open(
             &status_state_file,
             cfg_net_id,
             status_state_owner_uid,
-            &roots_path,
-            now_utc_us()?,
-        )?;
+            status_trust,
+        )
+        .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))?;
         let status_path = mat_dir.join("status.signed");
         let (gate_seq, _gate_deadline) = status_gate(
             &mut status_store,

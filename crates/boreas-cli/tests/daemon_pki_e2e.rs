@@ -12,12 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boreas_pki::root_authorization::NetworkRootPin;
-use boreas_proto::{network_policy::NetworkPolicyCandidate, objects::MldsaParameterSet};
-use openssl::{
-    pkey::{KeyType, PKey, Private},
-    sign::Signer,
-};
+use boreas_pki::provisioning::sign_network_policy_dir;
+use openssl::pkey::PKey;
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -55,62 +51,23 @@ fn owner_uid(path: &Path) -> String {
     fs::metadata(path).unwrap().uid().to_string()
 }
 
-fn policy_fixture(
-    state_dir: &Path,
-    ed: &PKey<Private>,
-    ml: &PKey<Private>,
-    net_id: [u8; 16],
-    seq: u64,
-) {
-    fs::create_dir_all(state_dir).unwrap();
-    fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let pin = NetworkRootPin::provisioned(
-        net_id,
-        ed.public_key_to_der().unwrap(),
-        MldsaParameterSet::Mldsa65,
-        ml.public_key_to_der().unwrap(),
-    )
-    .unwrap();
+fn policy_fixture(ca_dir: &Path, state_dir: &Path) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64;
-    let candidate = NetworkPolicyCandidate {
-        net_id,
-        root_key_fingerprint: pin.fingerprint().unwrap(),
-        overlay_base: [10, 20, 0, 0],
-        version: 1,
-        seq,
-        issued_at: now.saturating_sub(1_000_000),
-        expires: now.saturating_add(3_600_000_000),
-    };
-    let tbs = candidate.encode_tbs().unwrap();
-    let signed = NetworkPolicyCandidate::signature_input(&tbs).unwrap();
-    let mut signer = Signer::new_without_digest(ed).unwrap();
-    let ed_sig = signer.sign_oneshot_to_vec(&signed).unwrap();
-    let mut signer = Signer::new_without_digest(ml).unwrap();
-    let ml_sig = signer.sign_oneshot_to_vec(&signed).unwrap();
-    for (name, bytes) in [
-        ("policy.tbs", tbs),
-        ("policy.ed25519.sig", ed_sig),
-        ("policy.mldsa65.sig", ml_sig),
-        ("root.ed25519.der", ed.public_key_to_der().unwrap()),
-        ("root.mldsa65.der", ml.public_key_to_der().unwrap()),
-    ] {
-        let path = state_dir.join(name);
-        fs::write(&path, bytes).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    // The same offline CA signs both the identity/status grants and this policy.
+    sign_network_policy_dir(ca_dir, state_dir, 1, now, 3600).unwrap();
 }
 
 fn policy_args(state_dir: &Path) -> Vec<String> {
     let mut args = Vec::new();
     for (flag, file) in [
-        ("--network-policy-tbs", "policy.tbs"),
-        ("--network-policy-ed25519-signature", "policy.ed25519.sig"),
-        ("--network-policy-mldsa65-signature", "policy.mldsa65.sig"),
-        ("--network-root-ed25519-der", "root.ed25519.der"),
-        ("--network-root-mldsa65-der", "root.mldsa65.der"),
+        ("--network-policy-tbs", "tbs.cbor"),
+        ("--network-policy-ed25519-signature", "ed25519.sig"),
+        ("--network-policy-mldsa65-signature", "mldsa65.sig"),
+        ("--network-root-ed25519-der", "root-ed25519.der"),
+        ("--network-root-mldsa65-der", "root-mldsa65.der"),
         ("--network-policy-state-file", "policy.state"),
     ] {
         args.push(flag.to_string());
@@ -193,8 +150,6 @@ struct Pair {
     ca_dir: PathBuf,
     core_mat: PathBuf,
     edge_mat: PathBuf,
-    root_ed: PKey<Private>,
-    root_ml: PKey<Private>,
 }
 
 impl Pair {
@@ -203,9 +158,6 @@ impl Pair {
         let ca_dir = root.0.join("ca");
         let core_mat = root.0.join("core-mat");
         let edge_mat = root.0.join("edge-mat");
-        let root_ed = PKey::generate_ed25519().unwrap();
-        let root_ml =
-            PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[73; 32]).unwrap();
         let init = Command::new(bin())
             .args([
                 "pki",
@@ -260,8 +212,6 @@ impl Pair {
             ca_dir,
             core_mat,
             edge_mat,
-            root_ed,
-            root_ml,
         }
     }
 
@@ -271,9 +221,7 @@ impl Pair {
     /// store: the second `StatusStore::open` on one path is `Busy`.
     fn new_state(&self, label: &str) -> PathBuf {
         let dir = self.root.0.join(format!("state-{label}"));
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        policy_fixture(&dir, &self.root_ed, &self.root_ml, [3u8; 16], 1);
+        policy_fixture(&self.ca_dir, &dir);
         dir
     }
 
@@ -919,18 +867,6 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     let edge_state = root.0.join("edge-state");
     let core_status_state = core_state.join("status.state");
     let edge_status_state = edge_state.join("status.state");
-    fs::create_dir_all(&core_state).unwrap();
-    fs::create_dir_all(&edge_state).unwrap();
-    fs::set_permissions(&core_state, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(&edge_state, fs::Permissions::from_mode(0o700)).unwrap();
-    let net_id = [3u8; 16];
-    let root_ed = PKey::generate_ed25519().unwrap();
-    let root_ml = PKey::private_key_from_seed(None, KeyType::ML_DSA_65, None, &[73; 32]).unwrap();
-    policy_fixture(&core_state, &root_ed, &root_ml, net_id, 1);
-    policy_fixture(&edge_state, &root_ed, &root_ml, net_id, 1);
-    // Each daemon status store is independently bound to its state directory owner.
-    let core_state_owner = owner_uid(&core_state);
-    let edge_state_owner = owner_uid(&edge_state);
 
     // 1. Offline CA init (`boreas pki init-ca`).
     let init_out = Command::new(bin())
@@ -952,6 +888,11 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         String::from_utf8_lossy(&init_out.stderr)
     );
     assert!(String::from_utf8_lossy(&init_out.stdout).contains("\"status\":\"ok\""));
+    policy_fixture(&ca_dir, &core_state);
+    policy_fixture(&ca_dir, &edge_state);
+    // Each daemon status store is independently bound to its state directory owner.
+    let core_state_owner = owner_uid(&core_state);
+    let edge_state_owner = owner_uid(&edge_state);
 
     // 2. Issue Core (10.20.1.1, node_id=1) with outer SAN `wss.boreas.test`.
     let core_issue = Command::new(bin())
@@ -1079,7 +1020,37 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("--network-root-mldsa65-der"));
 
-    let ml_sig_path = edge_state.join("policy.mldsa65.sig");
+    // A mistaken independently supplied pin must fail before opening the policy
+    // watermark. Keep all identity, status and signed policy bytes unchanged.
+    let ed_pin_path = edge_state.join("root-ed25519.der");
+    let valid_ed_pin = fs::read(&ed_pin_path).unwrap();
+    let unrelated_public_key = PKey::generate_ed25519().unwrap().public_key_to_der().unwrap();
+    fs::write(&ed_pin_path, unrelated_public_key).unwrap();
+    let mismatched_pin = Command::new(bin())
+        .args([
+            "daemon",
+            "connect",
+            "--config",
+            edge_cfg.to_str().unwrap(),
+            "--material-dir",
+            edge_mat.to_str().unwrap(),
+            "--status-state-file",
+            edge_status_state.to_str().unwrap(),
+            "--status-state-owner-uid",
+            &edge_state_owner,
+        ])
+        .args(&complete_policy_args)
+        .output()
+        .unwrap();
+    fs::write(ed_pin_path, valid_ed_pin).unwrap();
+    assert!(!mismatched_pin.status.success());
+    let details = String::from_utf8_lossy(&mismatched_pin.stderr);
+    assert!(details.contains("does not match the daemon identity/status NetworkRoot fingerprint"), "{details}");
+    for name in ["policy.state", "policy.state.lock", "status.state", "control.sock"] {
+        assert!(!edge_state.join(name).exists(), "unexpected {name}");
+    }
+
+    let ml_sig_path = edge_state.join("mldsa65.sig");
     let valid_ml_sig = fs::read(&ml_sig_path).unwrap();
     fs::write(&ml_sig_path, [0u8; 3309]).unwrap();
     let bad_signature = Command::new(bin())

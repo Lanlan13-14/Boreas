@@ -263,17 +263,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --release -p boreas-cli --features openssl-inner-tls
           sudo modprobe tun || true
-          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
-          mkdir -p "$POLICY_FIXTURE"
-          chmod 0700 "$POLICY_FIXTURE"
-          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE/root-ed25519.pem"
-          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE/root-mldsa65.pem"
-          chmod 0600 "$POLICY_FIXTURE/root-ed25519.pem" "$POLICY_FIXTURE/root-mldsa65.pem"
-          NOW_US="$(($(date +%s) * 1000000))"
-          BOREAS_OPENSSL_BIN="$BOREAS_OPENSSL_BIN" python tools/release/network_policy_test_fixture.py \
-            --out-dir "$POLICY_FIXTURE" --net-id 0123456789abcdef0123456789abcdef \
-            --sequence 1 --issued-at-us "$NOW_US" --expires-us "$((NOW_US + 3600000000))"
-          sudo -E BOREAS_POLICY_FIXTURE_DIR="$POLICY_FIXTURE" bash tools/release/netns_daemon_smoke.sh target/release/boreas \
+          sudo -E bash tools/release/netns_daemon_smoke.sh target/release/boreas \
             2>&1 | tee rust-tls-netns-e2e.log
 
           mkdir -p hop-node-linux
@@ -313,7 +303,7 @@ jobs:
             --binary hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             --target x86_64-unknown-linux-musl \
             --out hop-node-linux/static-linkage-pq768.json
-          sudo -E BOREAS_POLICY_FIXTURE_DIR="$POLICY_FIXTURE" bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+          sudo -E bash tools/release/netns_daemon_smoke.sh hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee -a rust-tls-netns-e2e.log
 
           printf '%s\n' \
@@ -403,10 +393,6 @@ jobs:
           mkdir -p "$NEG"
           chmod 0700 "$NEG_ROOT" "$NEG"
           OWNER_UID="$(id -u)"
-          POLICY_FIXTURE="${GITHUB_WORKSPACE}/network-policy-fixture"
-          test -d "$POLICY_FIXTURE"
-          chmod 0600 "$POLICY_FIXTURE/root-ed25519.pem" "$POLICY_FIXTURE/root-mldsa65.pem"
-          chmod 0700 "$POLICY_FIXTURE"
 
           PRIMARY_PORT=18445
           BACKUP_PORT=18446
@@ -467,7 +453,10 @@ jobs:
           CONTROL_STATE="$NEG/edge-control-state"
           mkdir -p "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"
           chmod 0700 "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"
-          # Reuse public signed inputs; no private NetworkRoot key is on a node.
+          # Use the same offline root as these nodes, and copy only public inputs.
+          POLICY_FIXTURE="$NEG/policy"
+          "$BIN" pki sign-policy --ca-dir "$NEG/ca" --out-dir "$POLICY_FIXTURE" \
+            --sequence 1 --ttl-seconds 3600 >/dev/null
           for state in "$CORE_STATE" "$EDGE_STATE" "$CONTROL_STATE"; do
             for name in tbs.cbor ed25519.sig mldsa65.sig root-ed25519.der root-mldsa65.der; do
               install -m 0600 "$POLICY_FIXTURE/$name" "$state/$name"

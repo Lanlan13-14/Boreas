@@ -102,15 +102,17 @@ fn read_bounded_regular(
 /// Verify and durably record explicitly supplied raw policy and independent root keys.
 /// `expected_net_id` is from active daemon configuration. The installer/operator must
 /// pre-place each candidate/signature/key file directly within `configured_state_dir`;
-/// this is deployment layout, not provenance inferred from the signed candidate. Owner UID
-/// is an independent deployment input. Returns the signed private-prefix context only after fresh
-/// verification and successful anti-replay commit.
+/// this is deployment layout, not provenance inferred from the signed candidate. The independently
+/// provisioned DER pair must match the verified identity/status root fingerprint before opening
+/// the watermark. Returns the signed private-prefix context only after fresh verification and
+/// successful anti-replay commit.
 #[cfg(feature = "openssl-inner-tls")]
 pub fn verify_and_record_default_policy(
     inputs: PolicyInputPaths<'_>,
     state_path: &Path,
     configured_state_dir: &Path,
     expected_net_id: [u8; 16],
+    expected_root_fingerprint: [u8; 32],
     trusted_owner_uid: u32,
 ) -> Result<boreas_pki::VerifiedNetworkContext, PolicyRuntimeError> {
     use boreas_pki::{
@@ -212,6 +214,11 @@ pub fn verify_and_record_default_policy(
     let fingerprint = pin
         .fingerprint()
         .map_err(|e| PolicyRuntimeError::Pin(e.to_string()))?;
+    if fingerprint != expected_root_fingerprint {
+        return Err(PolicyRuntimeError::Pin(
+            "does not match the daemon identity/status NetworkRoot fingerprint".to_string(),
+        ));
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| PolicyRuntimeError::Clock)?
@@ -315,6 +322,7 @@ mod tests {
             state: &Path,
             state_dir: &Path,
             net: [u8; 16],
+            fingerprint: [u8; 32],
             uid: u32,
         ) -> Result<boreas_pki::VerifiedNetworkContext, PolicyRuntimeError> {
             let inputs = PolicyInputPaths {
@@ -324,7 +332,7 @@ mod tests {
                 root_ed25519_der: paths[3].as_path(),
                 root_mldsa65_der: paths[4].as_path(),
             };
-            verify_and_record_default_policy(inputs, state, state_dir, net, uid)
+            verify_and_record_default_policy(inputs, state, state_dir, net, fingerprint, uid)
         }
         let root = dir();
         let state_dir = root.join("state");
@@ -358,10 +366,18 @@ mod tests {
             2,
             (t0, t0 + validity),
         );
-        assert!(invoke(&paths, &state, &state_dir, [9; 16], uid).is_err());
-        assert!(invoke(&paths, &state, &root, net, uid).is_err());
+        assert!(invoke(&paths, &state, &state_dir, [9; 16], fingerprint, uid).is_err());
+        assert!(invoke(&paths, &state, &root, net, fingerprint, uid).is_err());
+        let mut mismatched_fingerprint = fingerprint;
+        mismatched_fingerprint[0] ^= 1;
+        assert!(matches!(
+            invoke(&paths, &state, &state_dir, net, mismatched_fingerprint, uid),
+            Err(PolicyRuntimeError::Pin(_))
+        ));
+        assert!(!state.exists());
+        assert!(!state_dir.join("policy.state.lock").exists());
         assert_eq!(
-            invoke(&paths, &state, &state_dir, net, uid).unwrap().seq(),
+            invoke(&paths, &state, &state_dir, net, fingerprint, uid).unwrap().seq(),
             2
         );
         let anchor = {
@@ -387,7 +403,7 @@ mod tests {
             (t0, t0 + validity),
         );
         assert!(matches!(
-            invoke(&rollback, &state, &state_dir, net, uid),
+            invoke(&rollback, &state, &state_dir, net, fingerprint, uid),
             Err(PolicyRuntimeError::Store(reason)) if reason.contains("SequenceRollback")
         ));
         // Same sequence, same valid issue time, different expiry: a real
@@ -402,7 +418,7 @@ mod tests {
             (t0, t0 + validity + 1_000_000),
         );
         assert!(matches!(
-            invoke(&equivocation, &state, &state_dir, net, uid),
+            invoke(&equivocation, &state, &state_dir, net, fingerprint, uid),
             Err(PolicyRuntimeError::Store(reason)) if reason.contains("Equivocation")
         ));
         // This helper has no external anchor: a missing state file is
@@ -410,7 +426,7 @@ mod tests {
         // requires the independent expected anchor below; this is not a claim of
         // whole-disk rollback detection.
         let fresh = state_dir.join("fresh");
-        assert!(invoke(&equivocation, &fresh, &state_dir, net, uid).is_ok());
+        assert!(invoke(&equivocation, &fresh, &state_dir, net, fingerprint, uid).is_ok());
         let deleted = state_dir.join("deleted");
         assert!(matches!(
             boreas_pki::network_policy_store::NetworkPolicyStore::open_with_expected(
@@ -430,6 +446,7 @@ mod tests {
                 &state_dir.join("wrong-pin.state"),
                 &state_dir,
                 net,
+                fingerprint,
                 uid
             )
             .is_err()
@@ -450,6 +467,7 @@ mod tests {
                 &state_dir.join("private.state"),
                 &state_dir,
                 net,
+                fingerprint,
                 uid
             )
             .unwrap()

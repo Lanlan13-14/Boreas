@@ -660,46 +660,34 @@ EDGE_STATE="$WORK/edge-state"
 mkdir -p "$CORE_STATE" "$EDGE_STATE"
 chmod 0700 "$CORE_STATE" "$EDGE_STATE"
 
-# Explicitly provisioned, signed default-prefix policy. This is test fixture
-# setup, not production root provisioning or custom-prefix activation.
-POLICY_FIXTURE_DIR="${BOREAS_POLICY_FIXTURE_DIR:-}"
-if [[ -n "$POLICY_FIXTURE_DIR" ]]; then
-  POLICY_FIXTURE_DIR="$(realpath -e -- "$POLICY_FIXTURE_DIR")"
-  [[ -d "$POLICY_FIXTURE_DIR" && ! -L "$POLICY_FIXTURE_DIR" ]] || {
-    echo 'ERROR: unsafe policy fixture directory' >&2
+# One offline test CA for the identity/status bundle and the policy root pins.
+TEST_NET_ID='0123456789abcdef0123456789abcdef'
+"$BIN" pki init-ca --ca-dir "$CA_DIR" --net-id "$TEST_NET_ID" --validity-days 30
+POLICY_FIXTURE_DIR="$WORK/policy-operator"
+mkdir -m 0700 "$POLICY_FIXTURE_DIR"
+POLICY_OPENSSL_BIN="${BOREAS_OPENSSL_BIN:-}"
+if [[ -n "$POLICY_OPENSSL_BIN" ]]; then
+  command -v "$POLICY_OPENSSL_BIN" >/dev/null 2>&1 || {
+    echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
     exit 1
   }
+  # Preserve the independent policy encoder and signer in CI, using only the
+  # fixture CA's root keys. The node state below receives public files only.
+  (
+    umask 077
+    for alg in ed25519 mldsa65; do
+      "$POLICY_OPENSSL_BIN" pkey -inform DER -in "$CA_DIR/root.$alg.key" \
+        -out "$POLICY_FIXTURE_DIR/root-$alg.pem"
+    done
+  )
+  POLICY_NOW_US="$(($(date +%s) * 1000000))"
+  BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN" python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
+    --out-dir "$POLICY_FIXTURE_DIR" --net-id "$TEST_NET_ID" --sequence 1 \
+    --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
+  rm -f -- "$POLICY_FIXTURE_DIR/root-ed25519.pem" "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
 else
-  POLICY_FIXTURE_DIR="$WORK/policy-operator"
-  mkdir -p "$POLICY_FIXTURE_DIR"
-  chmod 0700 "$POLICY_FIXTURE_DIR"
-  POLICY_OPENSSL_BIN="${BOREAS_OPENSSL_BIN:-}"
-  if [[ -n "$POLICY_OPENSSL_BIN" ]]; then
-    command -v "$POLICY_OPENSSL_BIN" >/dev/null 2>&1 || {
-      echo 'ERROR: pinned OpenSSL ML-DSA-65 is required for the policy fixture' >&2
-      exit 1
-    }
-    "$POLICY_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$POLICY_FIXTURE_DIR/root-ed25519.pem"
-    "$POLICY_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
-    chmod 0600 "$POLICY_FIXTURE_DIR/root-ed25519.pem" "$POLICY_FIXTURE_DIR/root-mldsa65.pem"
-    export BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN"
-    POLICY_NOW_US="$(($(date +%s) * 1000000))"
-    python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
-      --out-dir "$POLICY_FIXTURE_DIR" \
-      --net-id '0123456789abcdef0123456789abcdef' --sequence 1 \
-      --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
-  else
-    POLICY_CA_DIR="$WORK/policy-ca"
-    "$BIN" pki init-ca \
-      --ca-dir "$POLICY_CA_DIR" \
-      --net-id '0123456789abcdef0123456789abcdef' \
-      --validity-days 30 >/dev/null
-    "$BIN" pki sign-policy \
-      --ca-dir "$POLICY_CA_DIR" \
-      --out-dir "$POLICY_FIXTURE_DIR" \
-      --sequence 1 \
-      --ttl-seconds 3600 >/dev/null
-  fi
+  "$BIN" pki sign-policy --ca-dir "$CA_DIR" --out-dir "$POLICY_FIXTURE_DIR" \
+    --sequence 1 --ttl-seconds 3600 >/dev/null
 fi
 for spec in "core:$CORE_STATE" "edge:$EDGE_STATE"; do
   label="${spec%%:*}"
@@ -727,11 +715,6 @@ for spec in "core:$CORE_STATE" "edge:$EDGE_STATE"; do
     EDGE_POLICY_ARGS=("${POLICY_ARGS[@]}")
   fi
 done
-
-"$BIN" pki init-ca \
-  --ca-dir "$CA_DIR" \
-  --net-id "0123456789abcdef0123456789abcdef" \
-  --validity-days 30
 
 "$BIN" pki issue-node \
   --ca-dir "$CA_DIR" \
