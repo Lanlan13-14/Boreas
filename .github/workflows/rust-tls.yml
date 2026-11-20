@@ -827,6 +827,7 @@ jobs:
           BOREAS_PERF_BYTES: '8388608'
           BOREAS_PERF_TIMEOUT_SECONDS: '25'
           BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '50'
+          BOREAS_DIAGNOSTIC_TIMING: '1'
         run: |
           set -euo pipefail
           sudo -E bash tools/release/netns_daemon_smoke.sh \

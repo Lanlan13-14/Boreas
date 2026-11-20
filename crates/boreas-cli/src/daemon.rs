@@ -2863,6 +2863,41 @@ mod linux_daemon {
         }
     }
 
+    #[derive(Default)]
+    struct PathIoTiming {
+        max_outbound_us: u128,
+        max_inbound_us: u128,
+        outbound_over_1ms: u64,
+        inbound_over_1ms: u64,
+    }
+
+    impl PathIoTiming {
+        fn observe(&mut self, outbound: bool, elapsed: Duration) {
+            let us = elapsed.as_micros();
+            let (max, stalls) = if outbound {
+                (&mut self.max_outbound_us, &mut self.outbound_over_1ms)
+            } else {
+                (&mut self.max_inbound_us, &mut self.inbound_over_1ms)
+            };
+            *max = (*max).max(us);
+            if us >= 1_000 {
+                *stalls = stalls.saturating_add(1);
+            }
+        }
+    }
+
+    impl Drop for PathIoTiming {
+        fn drop(&mut self) {
+            eprintln!(
+                "boreas-io-timing max_outbound_us={} max_inbound_us={} outbound_ge_1ms={} inbound_ge_1ms={}",
+                self.max_outbound_us,
+                self.max_inbound_us,
+                self.outbound_over_1ms,
+                self.inbound_over_1ms,
+            );
+        }
+    }
+
     /// Run the packet loop for one established business path.
     ///
     /// Returns *why* the path stopped, or a terminal failure. A transport
@@ -2917,6 +2952,9 @@ mod linux_daemon {
             Arc::clone(&revocations),
         );
 
+        let mut io_timing = (std::env::var_os("BOREAS_DIAGNOSTIC_TIMING").as_deref()
+            == Some(std::ffi::OsStr::new("1")))
+        .then(PathIoTiming::default);
         let mut last_dropped = 0u64;
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
@@ -3005,7 +3043,12 @@ mod linux_daemon {
                 .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
             let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
             if out_limit > 0 {
-                match path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES) {
+                let started = io_timing.as_ref().map(|_| Instant::now());
+                let result = path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES);
+                if let (Some(timing), Some(started)) = (&mut io_timing, started) {
+                    timing.observe(true, started.elapsed());
+                }
+                match result {
                     Ok(drained) if drained > 0 => {
                         made_progress = true;
                         let stats = path.stats();
@@ -3085,7 +3128,12 @@ mod linux_daemon {
                 } else if !buffered && !socket_ready {
                     break;
                 }
-                match path.step_inbound() {
+                let started = io_timing.as_ref().map(|_| Instant::now());
+                let result = path.step_inbound();
+                if let (Some(timing), Some(started)) = (&mut io_timing, started) {
+                    timing.observe(false, started.elapsed());
+                }
+                match result {
                     Ok(Some(_len)) => {
                         made_progress = true;
                         let stats = path.stats();
