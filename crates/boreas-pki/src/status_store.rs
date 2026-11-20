@@ -53,15 +53,15 @@
 //!   poisoned; it is never used again for business decisions.
 //!
 //! Freshness:
-//! - The signed `issued_at`/`next_update` values are the only source of
-//!   lifetime. Receiving the same old snapshot again never renews it.
+//! - Snapshot lifetime ends at the earlier of signed `next_update` and any
+//!   verified issuer delegation expiry. Receiving the same snapshot never renews it.
 //! - A persisted snapshot is cryptographically re-verified at its own signed
 //!   `issued_at` boundary on restart; that only authenticates stored bytes and
 //!   never grants current freshness.
 //! - [`StatusStore::current_fresh`] takes trusted UTC and re-derives the
 //!   remaining signed lifetime, taking the minimum with an in-process
 //!   `Instant` deadline. A restart therefore does not require a new snapshot
-//!   while the saved snapshot is still inside its signed window.
+//!   while both the snapshot and its issuer delegation are still current.
 //! - [`FreshStatus::check`] is a read-only business check. It cannot persist a
 //!   rollback latch; after it rejects for clock rollback the owner must drop the
 //!   token and call [`StatusStore::observe_trusted_utc`] (or
@@ -505,6 +505,8 @@ pub struct StatusStore {
     revocation_relay: RevocationRelayPolicy,
     state: State,
     poisoned: bool,
+    /// The authenticated snapshot cutoff, recomputed on open rather than read from disk.
+    snapshot_valid_until: Option<u64>,
     runtime_deadline: Option<Instant>,
     #[cfg(all(test, target_os = "linux"))]
     fail_next_commit: bool,
@@ -617,6 +619,7 @@ impl StatusStore {
                 revocation_relay,
                 state: State::empty(net_id),
                 poisoned: false,
+                snapshot_valid_until: None,
                 runtime_deadline: None,
                 #[cfg(all(test, target_os = "linux"))]
                 fail_next_commit: false,
@@ -775,7 +778,8 @@ impl StatusStore {
         let floor = self.state.utc_floor;
         if utc_us.saturating_add(CLOCK_ROLLBACK_TOLERANCE_US) < floor {
             self.state.rollback_latched = true;
-            self.runtime_deadline = None;
+            // Recovery may release the latch, but must not rearm the same
+            // snapshot past its previously captured monotonic deadline.
             self.commit_or_poison()?;
             return Err(Error::ClockRollback);
         }
@@ -789,8 +793,8 @@ impl StatusStore {
     /// Explicit clock recovery after an independently trusted time decision.
     ///
     /// This can release only the rollback latch. It never lowers the persisted
-    /// floor and never clears a same-sequence snapshot equivocation freeze or a
-    /// same-scope revocation conflict latch.
+    /// floor, extends an in-process snapshot deadline, or clears an equivocation
+    /// freeze or revocation conflict latch.
     pub fn recover_trusted_utc(&mut self, utc_us: u64) -> Result<u64, Error> {
         self.supported()?;
         self.healthy()?;
@@ -811,14 +815,15 @@ impl StatusStore {
     /// `raw_signed` is the original `SignedObject` envelope bytes; the verifier
     /// checks both signatures over the original TBS bytes. `trusted_utc_us` must
     /// come from the caller's independent trusted boundary. `mono_now` is used
-    /// only to establish the process-local deadline for `next_update`.
+    /// only to establish the process-local deadline for the effective cutoff.
     ///
     /// Ordering:
     /// 1. persist a trusted UTC observation/rollback latch;
     /// 2. detect a same-sequence/different-content candidate structurally;
     /// 3. let the owned `ManagementTrust` verify authority + both signatures at
     ///    the candidate's signed `issued_at` (evidence path) or at the current
-    ///    UTC (normal path);
+    ///    effective UTC (normal path); the issuer delegation must also be
+    ///    current at effective UTC in both paths;
     /// 4. require a real `management::Error::Equivocation` for the evidence path,
     ///    then persist both exact envelopes atomically and freeze;
     /// 5. otherwise persist exact raw envelope + issuer id/generation + seq +
@@ -881,7 +886,10 @@ impl StatusStore {
                 // normal global-slot path.
                 return Err(Error::BadStatus);
             }
-            // `verify_and_authorize` verifies issuer authority, network,
+            if candidate.issued > now {
+                return Err(Error::Policy(PolicyError::SnapshotFromFuture));
+            }
+            // The verifier checks issuer authority, network,
             // object type, the signed validity window and both Ed25519 +
             // ML-DSA signatures before `record_replay` can return
             // `Equivocation`. Therefore this error is evidence of a valid
@@ -891,7 +899,7 @@ impl StatusStore {
             // storage.
             match self
                 .trust
-                .verify_and_authorize(raw_signed, candidate.issued)
+                .verify_with_issuer_time(raw_signed, candidate.issued, now)
             {
                 Err(management::Error::Equivocation) => {
                     self.persist_equivocation(raw_signed, old.seq)?;
@@ -953,19 +961,18 @@ impl StatusStore {
         if snapshot.issued > now {
             return Err(Error::Policy(PolicyError::SnapshotFromFuture));
         }
-        if now >= snapshot.next {
+        let valid_until = verified.valid_until();
+        if now >= valid_until {
             return Err(Error::Policy(PolicyError::SnapshotExpired));
         }
-        let remaining = snapshot
-            .next
-            .checked_sub(now)
-            .ok_or(Error::Policy(PolicyError::SnapshotExpired))?;
+        let remaining = valid_until - now;
         let deadline = mono_now
             .checked_add(Duration::from_micros(remaining))
             .ok_or(Error::NotFresh)?;
         self.apply_revocations(&revocations)?;
         self.state.snapshot = Some(snapshot);
         self.commit_or_poison()?;
+        self.snapshot_valid_until = Some(valid_until);
         self.runtime_deadline = Some(deadline);
         Ok(SnapshotResult::Accepted)
     }
@@ -973,9 +980,9 @@ impl StatusStore {
     /// Obtain a private, non-Clone freshness capability.
     ///
     /// This first persists the trusted UTC observation (including a rollback
-    /// latch), then derives the remaining signed lifetime from the saved
-    /// `next_update` and tightens any in-process `Instant` deadline. A restart
-    /// with a still-valid persisted snapshot therefore becomes fresh without a
+    /// latch), then uses the earlier of signed `next_update` and the verified
+    /// issuer delegation expiry to tighten any in-process `Instant` deadline.
+    /// A restart with a still-valid persisted snapshot becomes fresh without a
     /// new `accept_signed_snapshot`; an already-expired snapshot remains
     /// expired. This may write the floor, so it is an admission/refresh call,
     /// not a per-packet call.
@@ -990,17 +997,15 @@ impl StatusStore {
             return Err(Error::Frozen);
         }
         let now = self.observe_trusted_utc(trusted_utc_us)?;
-        let (seq, issued, next) = match self.state.snapshot.as_ref() {
-            Some(snapshot) => (snapshot.seq, snapshot.issued, snapshot.next),
-            None => return Err(Error::NotFresh),
-        };
-        // `now` is the returned monotonic floor (the latest trusted observation,
-        // never lowered). The valid interval is `issued <= now < next`; the
-        // floor itself must be at or above `issued`.
-        if now < issued || now >= next {
+        let snapshot = self.state.snapshot.as_ref().ok_or(Error::NotFresh)?;
+        let seq = snapshot.seq;
+        let valid_until = self.snapshot_valid_until.ok_or(Error::NotFresh)?;
+        // `now` is the monotonic UTC floor; a tolerated rollback cannot extend
+        // the lifetime of either the object or its delegation.
+        if now < snapshot.issued || now >= valid_until {
             return Err(Error::NotFresh);
         }
-        let remaining = next.checked_sub(now).ok_or(Error::NotFresh)?;
+        let remaining = valid_until - now;
         let candidate = mono_now
             .checked_add(Duration::from_micros(remaining))
             .ok_or(Error::NotFresh)?;
@@ -1242,6 +1247,7 @@ impl StatusStore {
         // this re-verified signed snapshot, so the model never presents a
         // digest-only historical scope as verified.
         self.rebuild_loaded_revocations(&verified)?;
+        self.snapshot_valid_until = Some(verified.valid_until());
         Ok(())
     }
 
@@ -1368,9 +1374,10 @@ impl FreshStatus<'_> {
         // rejected above.
         let effective_now = trusted_utc_us.max(self.store.state.utc_floor);
         let snapshot = self.store.state.snapshot.as_ref().ok_or(Error::NotFresh)?;
+        let valid_until = self.store.snapshot_valid_until.ok_or(Error::NotFresh)?;
         if snapshot.seq != self.seq
             || effective_now < snapshot.issued
-            || effective_now >= snapshot.next
+            || effective_now >= valid_until
             || mono_now >= self.deadline
         {
             return Err(Error::NotFresh);
@@ -1546,6 +1553,7 @@ fn map_management_error(error: management::Error) -> Error {
             Error::Policy(PolicyError::SnapshotIssuedAtRegression)
         }
         management::Error::Expired => Error::Policy(PolicyError::SnapshotExpired),
+        management::Error::IssuerNotValid => Error::NotFresh,
         management::Error::NotYetValid => Error::Policy(PolicyError::SnapshotFromFuture),
         _ => Error::BadStatus,
     }
@@ -2155,6 +2163,128 @@ mod tests {
             assert_eq!(fresh.sequence(), 1);
             assert!(matches!(
                 store.current_fresh(2_000_000, Instant::now()),
+                Err(Error::NotFresh)
+            ));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn verified_status_delegation_bounds_freshness_and_restart() {
+        use crate::provisioning::{
+            CaInitParams, init_ca_dir, sign_status_file, status_trust_from_roots,
+            verify_status_freshness_from_roots,
+        };
+
+        const SECOND: u64 = 1_000_000;
+        let (directory, path) = dir();
+        let uid = owner(&directory);
+        let ca_dir = directory.join("ca");
+        let summary = init_ca_dir(
+            &ca_dir,
+            &CaInitParams {
+                net_id: NET,
+                issuer_generation: 1,
+                now_us: 1_800_000_000 * SECOND,
+                validity_days: 1,
+            },
+        )
+        .unwrap();
+        let expires = summary.expires_us;
+        let issued = expires - 10 * SECOND;
+        let observed = expires - 9 * SECOND;
+        let roots = ca_dir.join("roots.cbor");
+        let status = directory.join("status.signed");
+        let signed = sign_status_file(&ca_dir, &status, 1, issued, 20).unwrap();
+        assert_eq!(signed.next_update_us, expires + 10 * SECOND);
+        assert!(matches!(
+            verify_status_freshness_from_roots(&roots, &status, NET, issued - 1),
+            Err(crate::provisioning::ProvisionError::Management(
+                management::Error::NotYetValid
+            ))
+        ));
+        assert_eq!(
+            verify_status_freshness_from_roots(&roots, &status, NET, observed).unwrap(),
+            (1, issued, expires)
+        );
+
+        let raw = fs::read(&status).unwrap();
+        let open_at = |now| {
+            let trust = status_trust_from_roots(&roots, NET, now).unwrap();
+            StatusStore::open(&path, NET, uid, trust).unwrap()
+        };
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(9);
+        {
+            let mut store = open_at(observed);
+            assert!(matches!(
+                store.accept_signed_snapshot(&raw, observed, start),
+                Ok(SnapshotResult::Accepted)
+            ));
+            let fresh = store.current_fresh(observed, start).unwrap();
+            assert_eq!(fresh.sequence(), 1);
+            assert_eq!(fresh.deadline(), deadline);
+            assert!(matches!(
+                fresh.check(expires - 1, deadline),
+                Err(Error::NotFresh)
+            ));
+            assert!(
+                fresh
+                    .check(expires - 1, deadline - Duration::from_micros(1))
+                    .is_ok()
+            );
+            assert!(matches!(fresh.check(expires, start), Err(Error::NotFresh)));
+
+            // A later monotonic sample with a lower, tolerated UTC cannot
+            // turn the original deadline into a later wakeup time.
+            let later = start + Duration::from_secs(1);
+            assert!(matches!(
+                store.accept_signed_snapshot(&raw, observed - 1, later),
+                Ok(SnapshotResult::DuplicateNotRenewed)
+            ));
+            let fresh = store.current_fresh(observed - 1, later).unwrap();
+            assert_eq!(fresh.deadline(), deadline);
+        }
+        {
+            let before_expiry = expires - SECOND;
+            let mut store = open_at(before_expiry);
+            let fresh = store.current_fresh(before_expiry, start).unwrap();
+            let deadline = start + Duration::from_secs(1);
+            assert_eq!(fresh.deadline(), deadline);
+            assert!(fresh.check(before_expiry, start).is_ok());
+            assert!(matches!(
+                store.observe_trusted_utc(before_expiry - CLOCK_ROLLBACK_TOLERANCE_US - 1),
+                Err(Error::ClockRollback)
+            ));
+            assert_eq!(
+                store.recover_trusted_utc(before_expiry).unwrap(),
+                before_expiry
+            );
+            assert!(matches!(
+                store.current_fresh(before_expiry, deadline),
+                Err(Error::NotFresh)
+            ));
+        }
+        {
+            // Observe the UTC cutoff and then tolerate a subsequent wall-clock
+            // rollback without bringing the persisted snapshot back to life.
+            let mut store = open_at(expires - 1);
+            let fresh = store.current_fresh(expires - 1, start).unwrap();
+            assert!(fresh.check(expires - 1, start).is_ok());
+            assert!(matches!(
+                store.current_fresh(expires, start),
+                Err(Error::NotFresh)
+            ));
+            assert!(matches!(
+                store.accept_signed_snapshot(&raw, expires - 1, start),
+                Err(Error::NotFresh)
+            ));
+        }
+        {
+            let mut store = open_at(expires - 1);
+            assert_eq!(store.sequence(), Some(1));
+            assert!(matches!(
+                store.current_fresh(expires - 1, start),
                 Err(Error::NotFresh)
             ));
         }

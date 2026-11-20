@@ -339,7 +339,10 @@ pub struct VerifiedBundle {
     pub peer: Option<VerifiedObject>,
     pub status_sequence: u64,
     pub status_issued_at_us: u64,
+    /// The snapshot's signed `next_update`, not an authorization deadline.
     pub status_next_update_us: u64,
+    /// Exclusive freshness cutoff, including the verified StatusSigner grant.
+    pub status_valid_until_us: u64,
 }
 
 /// Initialize a separated offline CA hierarchy (`NetworkRoot`, `IdentityAuthority`,
@@ -937,13 +940,12 @@ pub fn verify_material_dir_with_roots(
     let mut has_status = false;
     let mut trust = ManagementTrust::new(net_id);
     for auth in authorizations {
-        let record = auth.issuer_record();
-        match record.authority {
+        match auth.authority() {
             Authority::IdentityAuthority => has_ia = true,
             Authority::StatusSigner => has_status = true,
             _ => {}
         }
-        trust.add_issuer(record)?;
+        trust.add_verified_issuer(&auth)?;
     }
     if !has_ia {
         return Err(ProvisionError::MissingAuthority("IdentityAuthority"));
@@ -997,7 +999,7 @@ pub fn verify_material_dir_with_roots(
         None
     };
 
-    let (status_sequence, status_issued_at_us, status_next_update_us) =
+    let status =
         verify_status_file_against_trust(&mut trust, &material_dir.join("status.signed"), now_us)?;
 
     Ok(VerifiedBundle {
@@ -1005,9 +1007,10 @@ pub fn verify_material_dir_with_roots(
         root_fingerprint,
         local,
         peer,
-        status_sequence,
-        status_issued_at_us,
-        status_next_update_us,
+        status_sequence: status.sequence,
+        status_issued_at_us: status.issued_at,
+        status_next_update_us: status.next_update,
+        status_valid_until_us: status.valid_until,
     })
 }
 
@@ -1030,8 +1033,8 @@ pub fn verify_material_dir(
 ///
 /// This is the single roots-to-trust construction used by both the one-shot
 /// status verifier and the durable `StatusStore` owner. It requires an
-/// authorized `StatusSigner`; it does not read or grant freshness for any
-/// status file.
+/// authorized `StatusSigner` and retains its verified grant window; it does
+/// not read or grant freshness for any status file.
 pub fn status_trust_from_roots(
     roots_path: &Path,
     expected_net_id: [u8; 16],
@@ -1043,11 +1046,10 @@ pub fn status_trust_from_roots(
     let mut trust = ManagementTrust::new(expected_net_id);
     let mut has_status = false;
     for auth in authorizations {
-        let record = auth.issuer_record();
-        if record.authority == Authority::StatusSigner {
+        if auth.authority() == Authority::StatusSigner {
             has_status = true;
         }
-        trust.add_issuer(record)?;
+        trust.add_verified_issuer(&auth)?;
     }
     if !has_status {
         return Err(ProvisionError::MissingAuthority("StatusSigner"));
@@ -1063,8 +1065,9 @@ pub fn read_status_snapshot_raw(status_path: &Path) -> Result<Vec<u8>, Provision
     read_bounded(status_path)
 }
 
-/// Re-verify `status.signed` from `roots_path` at `now_us` (used by the live daemon poll loop
-/// to enforce §3.4 fail-closed status expiry and hot-reload higher-sequence snapshots).
+/// Re-verify `status.signed` from `roots_path` at `now_us`.
+/// Returns `(sequence, issued_at, valid_until)` in which the exclusive UTC
+/// cutoff is the earlier of signed `next_update` and the verified grant expiry.
 pub fn verify_status_freshness_from_roots(
     roots_path: &Path,
     status_path: &Path,
@@ -1072,14 +1075,22 @@ pub fn verify_status_freshness_from_roots(
     now_us: u64,
 ) -> Result<(u64, u64, u64), ProvisionError> {
     let mut trust = status_trust_from_roots(roots_path, expected_net_id, now_us)?;
-    verify_status_file_against_trust(&mut trust, status_path, now_us)
+    let status = verify_status_file_against_trust(&mut trust, status_path, now_us)?;
+    Ok((status.sequence, status.issued_at, status.valid_until))
+}
+
+struct VerifiedStatusWindow {
+    sequence: u64,
+    issued_at: u64,
+    next_update: u64,
+    valid_until: u64,
 }
 
 fn verify_status_file_against_trust(
     trust: &mut ManagementTrust,
     status_path: &Path,
     now_us: u64,
-) -> Result<(u64, u64, u64), ProvisionError> {
+) -> Result<VerifiedStatusWindow, ProvisionError> {
     let status_raw = read_bounded(status_path)?;
     let verified = trust.verify_and_authorize(&status_raw, now_us)?;
     let obj = verified.object();
@@ -1104,10 +1115,16 @@ fn verify_status_file_against_trust(
     if body.issued_at >= body.next_update || body.next_update - body.issued_at > STATUS_MAX_AGE_US {
         return Err(ProvisionError::StatusWindowInvalid);
     }
-    if now_us < body.issued_at || now_us >= body.next_update {
+    let valid_until = verified.valid_until();
+    if now_us < body.issued_at || now_us >= valid_until {
         return Err(ProvisionError::StatusExpired);
     }
-    Ok((body.sequence, body.issued_at, body.next_update))
+    Ok(VerifiedStatusWindow {
+        sequence: body.sequence,
+        issued_at: body.issued_at,
+        next_update: body.next_update,
+        valid_until,
+    })
 }
 
 // --- Cryptographic & X.509 helpers -------------------------------------------

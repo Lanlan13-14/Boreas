@@ -46,7 +46,7 @@ use openssl::hash::{MessageDigest, hash};
 use openssl::pkey::{Id, KeyType, PKey, Private};
 use openssl::sign::{Signer, Verifier};
 
-use crate::{Authority, NodeRole};
+use crate::{Authority, NodeRole, root_authorization::VerifiedIssuerAuthorization};
 
 /// Candidate management-object schema version used by `boreas-proto`.
 pub const MANAGEMENT_SCHEMA_VERSION: u16 = 1;
@@ -88,6 +88,7 @@ pub enum Error {
     UnknownNodeIdentity,
     StaleNodeIdentity,
     IssuerGenerationMismatch,
+    IssuerNotValid,
     UnauthorizedObjectType,
     OutOfScope,
     InvalidIdentityKey,
@@ -212,6 +213,8 @@ pub struct VerifiedObject {
     raw_signed_object: Vec<u8>,
     /// True when the exact same `(logical slot, seq, TBS)` was already accepted.
     duplicate: bool,
+    /// Exclusive UTC cutoff: the earlier of object and issuer delegation expiry.
+    valid_until: u64,
 }
 impl VerifiedObject {
     pub fn object_id(&self) -> [u8; 32] {
@@ -228,6 +231,10 @@ impl VerifiedObject {
     }
     pub fn raw_signed_object(&self) -> &[u8] {
         &self.raw_signed_object
+    }
+    /// Exclusive UTC cutoff for this object, including any root delegation.
+    pub(crate) fn valid_until(&self) -> u64 {
+        self.valid_until
     }
     pub fn is_duplicate(&self) -> bool {
         self.duplicate
@@ -262,6 +269,13 @@ struct ReplayState {
     conflicted: bool,
 }
 
+#[derive(Clone, Debug)]
+struct TrustedIssuer {
+    record: IssuerRecord,
+    /// `None` is reserved for explicitly provisioned out-of-band anchors.
+    validity: Option<(u64, u64)>,
+}
+
 /// Stateful verifier with provisioned issuer records and per-logical-slot replay watermarks.
 ///
 /// The replay state is process-local in this module. A production directory must persist
@@ -269,7 +283,7 @@ struct ReplayState {
 #[derive(Debug)]
 pub struct ManagementTrust {
     net_id: [u8; 16],
-    issuers: BTreeMap<Vec<u8>, IssuerRecord>,
+    issuers: BTreeMap<Vec<u8>, TrustedIssuer>,
     /// Only NodeIdentity records accepted through this verifier; a Lease Primary key is
     /// never taken from an unsigned caller-supplied map.
     node_identities: BTreeMap<u16, NodeIdentity>,
@@ -303,9 +317,28 @@ impl ManagementTrust {
         self.node_identities.get(&node_id)
     }
 
-    /// Provision one issuer. Key material is parsed and algorithm-checked here, and key IDs
-    /// may not be rebound to different material.
+    /// Provision an out-of-band trust anchor with no root-delegation window.
+    /// Use [`Self::add_verified_issuer`] for root-delegated trust instead.
     pub fn add_issuer(&mut self, issuer: IssuerRecord) -> Result<(), Error> {
+        self.insert_issuer(issuer, None)
+    }
+
+    /// Install a verifier-produced root authorization, retaining its exclusive validity window.
+    pub fn add_verified_issuer(
+        &mut self,
+        authorization: &VerifiedIssuerAuthorization,
+    ) -> Result<(), Error> {
+        if authorization.net_id() != self.net_id {
+            return Err(Error::WrongNetwork);
+        }
+        self.insert_issuer(authorization.issuer_record(), Some(authorization.validity()))
+    }
+
+    fn insert_issuer(
+        &mut self,
+        issuer: IssuerRecord,
+        validity: Option<(u64, u64)>,
+    ) -> Result<(), Error> {
         if issuer.issuer_key_id.is_empty()
             || issuer.issuer_key_id.len() > MAX_ISSUER_KEY_ID_LEN
             || issuer.issuer_generation == 0
@@ -347,7 +380,13 @@ impl ManagementTrust {
         ) {
             return Err(Error::InvalidIssuerKey);
         }
-        self.issuers.insert(issuer.issuer_key_id.clone(), issuer);
+        self.issuers.insert(
+            issuer.issuer_key_id.clone(),
+            TrustedIssuer {
+                record: issuer,
+                validity,
+            },
+        );
         Ok(())
     }
 
@@ -359,6 +398,17 @@ impl ManagementTrust {
         &mut self,
         raw_signed_object: &[u8],
         now_us: u64,
+    ) -> Result<VerifiedObject, Error> {
+        self.verify_with_issuer_time(raw_signed_object, now_us, now_us)
+    }
+
+    /// The status store can authenticate evidence at its signed time while still
+    /// checking delegation expiry against a separate, conservative UTC bound.
+    pub(crate) fn verify_with_issuer_time(
+        &mut self,
+        raw_signed_object: &[u8],
+        object_now_us: u64,
+        issuer_now_us: u64,
     ) -> Result<VerifiedObject, Error> {
         if raw_signed_object.is_empty() || raw_signed_object.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::ObjectTooLarge);
@@ -374,10 +424,10 @@ impl ManagementTrust {
         if object.net_id != self.net_id {
             return Err(Error::WrongNetwork);
         }
-        if now_us < object.issued_at {
+        if object_now_us < object.issued_at {
             return Err(Error::NotYetValid);
         }
-        if now_us >= object.expires {
+        if object_now_us >= object.expires {
             return Err(Error::Expired);
         }
         let issuer = self
@@ -385,6 +435,22 @@ impl ManagementTrust {
             .get(&object.issuer_key_id)
             .cloned()
             .ok_or(Error::UnknownIssuer)?;
+        let valid_until = if let Some((not_before, expires)) = issuer.validity {
+            // For StatusSnapshot, the signed issued_at also anchors historical
+            // verification on reopen; do not accept a pre-delegation snapshot.
+            let not_before_check = if matches!(&object.body, ObjectBody::StatusSnapshot(_)) {
+                object.issued_at
+            } else {
+                object_now_us
+            };
+            if not_before_check < not_before || issuer_now_us.max(object_now_us) >= expires {
+                return Err(Error::IssuerNotValid);
+            }
+            object.expires.min(expires)
+        } else {
+            object.expires
+        };
+        let issuer = issuer.record;
         if object.issuer_generation != issuer.issuer_generation {
             return Err(Error::IssuerGenerationMismatch);
         }
@@ -440,6 +506,7 @@ impl ManagementTrust {
             signed_object: signed,
             raw_signed_object: raw_signed_object.to_vec(),
             duplicate,
+            valid_until,
         })
     }
 

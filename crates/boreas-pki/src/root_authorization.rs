@@ -246,8 +246,11 @@ impl VerifiedIssuerAuthorization {
     pub fn validity(&self) -> (u64, u64) {
         (self.not_before, self.expires)
     }
-    /// Copy out a record for the existing ManagementTrust path; caller must still scope this
-    /// record to the same network/context. Durable storage and rollback protection are external.
+    pub(crate) fn authority(&self) -> Authority {
+        self.record.authority
+    }
+    /// Copy the key and scope record, without the grant window or network binding.
+    /// For delegated management trust, use [`crate::management::ManagementTrust::add_verified_issuer`].
     pub fn issuer_record(&self) -> IssuerRecord {
         self.record.clone()
     }
