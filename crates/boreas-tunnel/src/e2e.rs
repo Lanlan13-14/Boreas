@@ -37,7 +37,7 @@
 //! Fragment payloads are bounded by `messages::MAX_RELAY_PAYLOAD`; offsets must
 //! be exactly contiguous per direction.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::time::Instant;
 
@@ -201,7 +201,12 @@ pub struct CircuitStream<'a> {
     path_hops: u8,
     send_offset: u64,
     recv_offset: u64,
-    inbound: VecDeque<u8>,
+    // The validated fragment payload and how far it has been consumed. The
+    // payload is only stored after its circuit id, direction, hop count and
+    // byte offset have been checked, so reading through the cursor never skips
+    // a check. One copy serves the caller instead of one per byte.
+    inbound: Vec<u8>,
+    inbound_pos: usize,
     write_buf: Vec<u8>,
     closed: bool,
 }
@@ -220,7 +225,8 @@ impl<'a> CircuitStream<'a> {
             path_hops,
             send_offset: 0,
             recv_offset: 0,
-            inbound: VecDeque::new(),
+            inbound: Vec::new(),
+            inbound_pos: 0,
             write_buf: Vec::new(),
             closed: false,
         }
@@ -240,7 +246,7 @@ impl<'a> CircuitStream<'a> {
 
     /// Whether a previous read left bytes above the raw hop socket.
     pub fn has_buffered_input(&self) -> bool {
-        !self.inbound.is_empty() || self.session.has_buffered_input()
+        self.inbound_pos < self.inbound.len() || self.session.has_buffered_input()
     }
 
     /// Send up to [`MAX_FRAGMENT_PAYLOAD`] bytes as one fragment.
@@ -277,10 +283,15 @@ impl<'a> CircuitStream<'a> {
             return Ok(0);
         }
         loop {
-            if !self.inbound.is_empty() {
-                let take = self.inbound.len().min(out.len());
-                for slot in out.iter_mut().take(take) {
-                    *slot = self.inbound.pop_front().expect("length checked");
+            let available = self.inbound.len() - self.inbound_pos;
+            if available > 0 {
+                let take = available.min(out.len());
+                let start = self.inbound_pos;
+                out[..take].copy_from_slice(&self.inbound[start..start + take]);
+                self.inbound_pos = start + take;
+                if self.inbound_pos == self.inbound.len() {
+                    self.inbound.clear();
+                    self.inbound_pos = 0;
                 }
                 return Ok(take);
             }
@@ -318,7 +329,8 @@ impl<'a> CircuitStream<'a> {
                     .recv_offset
                     .checked_add(advance)
                     .ok_or(TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
-                self.inbound.extend(fragment.payload);
+                self.inbound = fragment.payload;
+                self.inbound_pos = 0;
                 Ok(())
             }
             Kind::Control => {
