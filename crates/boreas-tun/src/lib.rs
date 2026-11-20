@@ -16,6 +16,7 @@ pub mod virtio;
 pub mod windows;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -414,6 +415,19 @@ struct Queues {
 }
 pub trait PacketIo {
     fn read_packet(&self) -> Result<Option<Vec<u8>>, Error>;
+
+    /// Read one packet, borrowing caller storage when supported. The default
+    /// keeps the existing owned packet and does not copy into `scratch`.
+    /// Implementations that use `scratch` must not reduce their read size to
+    /// fit it: insufficient storage must fail before consuming a packet.
+    /// On `None` or error, the contents of `scratch` must not be used.
+    fn read_packet_with_scratch<'buf>(
+        &self,
+        _scratch: &'buf mut [u8],
+    ) -> Result<Option<Cow<'buf, [u8]>>, Error> {
+        self.read_packet().map(|packet| packet.map(Cow::Owned))
+    }
+
     fn write_packet(&self, packet: &[u8]) -> Result<(), Error>;
 }
 impl VirtualTun {

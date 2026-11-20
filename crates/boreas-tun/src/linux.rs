@@ -284,26 +284,39 @@ impl LinuxTunQueue {
     }
     /// Non-blocking single-syscall read when `O_NONBLOCK` is enabled on the queue.
     pub fn try_read_packet(&self) -> Result<Option<Vec<u8>>, LinuxTunError> {
+        let mut packet = vec![0; self.mtu()];
+        let len = match self.try_read_packet_into(&mut packet)? {
+            Some(bytes) => bytes.len(),
+            None => return Ok(None),
+        };
+        packet.truncate(len);
+        Ok(Some(packet))
+    }
+    /// Non-blocking read into caller-owned storage when `O_NONBLOCK` is enabled.
+    /// Storage shorter than the device MTU is rejected before reading. Only the
+    /// returned slice holds a validated packet; a read never exceeds the device MTU.
+    pub fn try_read_packet_into<'buf>(
+        &self,
+        scratch: &'buf mut [u8],
+    ) -> Result<Option<&'buf [u8]>, LinuxTunError> {
+        let buf = scratch
+            .get_mut(..self.mtu())
+            .ok_or(LinuxTunError::InvalidConfiguration)?;
         let fd = self
             .fd
             .lock()
             .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        let mut b = vec![0; self.device.mtu];
-        // SAFETY: `b` is writable for its length; `fd` is an owned TUN queue.
-        let n = unsafe { libc::read(fd.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
+        let n = match read_fd(fd.as_raw_fd(), buf) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(LinuxTunError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
                 return Ok(None);
             }
-            return Err(err.into());
-        }
-        if n == 0 {
-            return Ok(None);
-        }
-        b.truncate(n as usize);
-        inspect_packet(&b).map_err(LinuxTunError::Packet)?;
-        Ok(Some(b))
+            Err(err) => return Err(err),
+        };
+        let packet = &buf[..n];
+        inspect_packet(packet).map_err(LinuxTunError::Packet)?;
+        Ok(Some(packet))
     }
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
         if packet.len() > self.device.mtu {
@@ -431,4 +444,70 @@ fn write_fd(fd: RawFd, b: &[u8]) -> Result<usize, LinuxTunError> {
         return Err(io::Error::last_os_error().into());
     }
     Ok(n as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn nonblocking_read_reuses_storage_at_device_mtu() {
+        const MTU: usize = 68;
+        // A datagram socket preserves packet boundaries and exercises the real
+        // read syscall without requiring /dev/net/tun or CAP_NET_ADMIN.
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        let queue = LinuxTunQueue {
+            device: Arc::new(LinuxTunDevice {
+                name: String::new(),
+                flags: IFF_TUN | IFF_NO_PI,
+                mtu: MTU,
+                management: Mutex::new(rx.try_clone().unwrap().into()),
+            }),
+            fd: Mutex::new(rx.into()),
+        };
+        queue.set_nonblocking(true).unwrap();
+        let mut scratch = [0xa5; MTU + 1];
+        let address = scratch.as_ptr();
+        assert!(queue.try_read_packet_into(&mut scratch).unwrap().is_none());
+
+        let mut big = [0u8; MTU];
+        big[0] = 0x60;
+        big[4..6].copy_from_slice(&((MTU - 40) as u16).to_be_bytes());
+        big[6] = 59;
+        tx.send(&big).unwrap();
+        assert!(matches!(
+            queue.try_read_packet_into(&mut scratch[..MTU - 1]),
+            Err(LinuxTunError::InvalidConfiguration)
+        ));
+        let packet = queue.try_read_packet_into(&mut scratch).unwrap().unwrap();
+        assert_eq!(packet.as_ptr(), address);
+        assert_eq!(packet, big.as_slice());
+        assert_eq!(scratch[MTU], 0xa5);
+
+        let mut small = [0u8; 40];
+        small[0] = 0x60;
+        small[6] = 59;
+        tx.send(&small).unwrap();
+        let packet = queue.try_read_packet_into(&mut scratch).unwrap().unwrap();
+        assert_eq!(packet.as_ptr(), address);
+        assert_eq!(packet, small.as_slice());
+        assert!(queue.try_read_packet_into(&mut scratch).unwrap().is_none());
+        tx.send(&[]).unwrap();
+        assert!(queue.try_read_packet_into(&mut scratch).unwrap().is_none());
+
+        // With scratch larger than the MTU, the syscall must still read only
+        // MTU bytes. A packet claiming MTU + 1 bytes thus fails length validation.
+        let mut oversized = [0u8; MTU + 1];
+        oversized[..MTU].copy_from_slice(&big);
+        oversized[4..6].copy_from_slice(&((MTU + 1 - 40) as u16).to_be_bytes());
+        tx.send(&oversized).unwrap();
+        assert!(matches!(
+            queue.try_read_packet_into(&mut scratch),
+            Err(LinuxTunError::Packet(Error::InvalidLength))
+        ));
+        assert_eq!(scratch[MTU], 0xa5);
+        tx.send(&small).unwrap();
+        assert_eq!(queue.try_read_packet().unwrap(), Some(small.to_vec()));
+    }
 }

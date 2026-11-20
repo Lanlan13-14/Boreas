@@ -220,6 +220,7 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 mod linux_daemon {
+    use std::borrow::Cow;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -252,7 +253,7 @@ mod linux_daemon {
     };
     use boreas_tun::{
         Error as TunError, PacketIo, VirtualTun,
-        linux::{LinuxTunDevice, LinuxTunQueue, TunConfig},
+        linux::{LinuxTunDevice, LinuxTunError, LinuxTunQueue, TunConfig},
     };
     use boreas_tunnel::{
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
@@ -408,10 +409,17 @@ mod linux_daemon {
 
     impl PacketIo for NonBlockingLinuxTun {
         fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
-            self.queue.try_read_packet().map_err(|e| match e {
-                boreas_tun::linux::LinuxTunError::Packet(p) => p,
-                _ => TunError::QueueClosed,
-            })
+            self.queue.try_read_packet().map_err(tun_read_error)
+        }
+
+        fn read_packet_with_scratch<'buf>(
+            &self,
+            scratch: &'buf mut [u8],
+        ) -> Result<Option<Cow<'buf, [u8]>>, TunError> {
+            self.queue
+                .try_read_packet_into(scratch)
+                .map(|packet| packet.map(Cow::Borrowed))
+                .map_err(tun_read_error)
         }
 
         fn write_packet(&self, packet: &[u8]) -> Result<(), TunError> {
@@ -424,6 +432,13 @@ mod linux_daemon {
                 }
                 _ => TunError::QueueClosed,
             })
+        }
+    }
+
+    fn tun_read_error(error: LinuxTunError) -> TunError {
+        match error {
+            LinuxTunError::Packet(packet_error) => packet_error,
+            _ => TunError::QueueClosed,
         }
     }
 

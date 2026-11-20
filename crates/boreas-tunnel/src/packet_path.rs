@@ -730,6 +730,7 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     state: PathState,
     stats: PacketStats,
     outbound_batch: Vec<u8>,
+    outbound_scratch: [u8; MAX_MTU],
     inbound_scratch: Vec<u8>,
 }
 
@@ -837,6 +838,9 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             state: PathState::Open,
             stats: PacketStats::default(),
             outbound_batch: Vec::new(),
+            // Keep this independent of the path MTU: the host adapter must read
+            // at its own MTU, then policy checks the complete packet below.
+            outbound_scratch: [0; MAX_MTU],
             inbound_scratch: Vec::new(),
         })
     }
@@ -916,7 +920,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         let Some(circuit) = self.circuit.as_mut() else {
             return Err(PacketPathError::Poisoned);
         };
-        match outbound_once(self.io, circuit, &self.policy) {
+        match outbound_once(self.io, circuit, &self.policy, &mut self.outbound_scratch) {
             Ok(Some(length)) => {
                 self.stats.outbound_packets = self.stats.outbound_packets.saturating_add(1);
                 self.stats.outbound_bytes = self
@@ -937,7 +941,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     }
 
     /// Drain up to `max_packets` currently-ready host packets (stopping
-    /// immediately when `read_packet()` returns `None` or buffered bytes reach
+    /// immediately when the host read returns `None` or buffered bytes reach
     /// `max_bytes`), frame them contiguously, and emit them in a single E2E
     /// stream write + flush. Zero coalescing timer is used (§6.4).
     ///
@@ -958,33 +962,35 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         let mut payload_bytes = 0u64;
         let mut attempts = 0usize;
         let max_attempts = max_packets.saturating_mul(2);
+        let mut failure = None;
         self.outbound_batch.clear();
         while drained < max_packets
             && self.outbound_batch.len() < max_bytes
             && attempts < max_attempts
         {
             attempts += 1;
-            let packet = match self.io.read_packet() {
+            let packet = match self.io.read_packet_with_scratch(&mut self.outbound_scratch) {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
                 Err(error) => {
-                    self.outbound_batch.clear();
-                    return Err(self.fail(PacketPathError::from_host_error(error)));
+                    failure = Some(PacketPathError::from_host_error(error));
+                    break;
                 }
             };
-            match self.policy.authorize_outbound(&packet) {
+            let bytes = packet.as_ref();
+            match self.policy.authorize_outbound(bytes) {
                 Ok(info) => {
-                    let prefix = match packet_frame_prefix(&packet, self.policy.mtu()) {
+                    let prefix = match packet_frame_prefix(bytes, self.policy.mtu()) {
                         Ok(prefix) => prefix,
                         Err(error) => {
-                            self.outbound_batch.clear();
-                            return Err(self.fail(error));
+                            failure = Some(error);
+                            break;
                         }
                     };
                     // Append the verified bytes straight into the existing batch.
                     // Preserve the same size checks and flush/poll boundaries.
                     self.outbound_batch.extend_from_slice(&prefix);
-                    self.outbound_batch.extend_from_slice(&packet);
+                    self.outbound_batch.extend_from_slice(bytes);
                     drained += 1;
                     payload_bytes = payload_bytes
                         .saturating_add(u64::try_from(info.packet_len).unwrap_or(u64::MAX));
@@ -993,10 +999,14 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                     self.stats.dropped_outbound = self.stats.dropped_outbound.saturating_add(1);
                 }
                 Err(deny) => {
-                    self.outbound_batch.clear();
-                    return Err(self.fail(PacketPathError::Denied(deny)));
+                    failure = Some(PacketPathError::Denied(deny));
+                    break;
                 }
             }
+        }
+        if let Some(error) = failure {
+            self.outbound_batch.clear();
+            return Err(self.fail(error));
         }
         if drained == 0 {
             return Ok(0);
@@ -1070,21 +1080,21 @@ fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     io: &P,
     circuit: &mut C,
     policy: &PointToPoint,
+    scratch: &mut [u8],
 ) -> Result<Option<usize>, PacketPathError> {
-    let packet = match io.read_packet() {
+    let packet = match io.read_packet_with_scratch(scratch) {
         Ok(Some(packet)) => packet,
         Ok(None) => return Ok(None),
         Err(error) => return Err(PacketPathError::from_host_error(error)),
     };
+    let bytes = packet.as_ref();
     let length = policy
-        .authorize_outbound(&packet)
+        .authorize_outbound(bytes)
         .map_err(PacketPathError::Denied)?
         .packet_len;
-    // `read_packet` returns the host-owned packet Vec. Assemble the complete
-    // bounded frame on the stack to avoid a second heap allocation. The packet
-    // is still copied once into contiguous bytes for the stream writer.
+    // Copy the packet directly into a contiguous, bounded frame for the stream.
     let mut frame = [0u8; MAX_FRAME_BYTES];
-    let frame_len = encode_packet_frame_into(&packet, policy.mtu(), &mut frame)?;
+    let frame_len = encode_packet_frame_into(bytes, policy.mtu(), &mut frame)?;
     write_all_bounded(circuit, &frame[..frame_len])?;
     circuit
         .flush()
@@ -1890,6 +1900,75 @@ mod tests {
         assert!(dropped.get());
         assert_eq!(path.first_error(), None);
         assert_eq!(path.step_inbound(), Err(PacketPathError::Closed));
+    }
+
+    #[test]
+    fn outbound_reuses_scratch_and_drops_pending_batch_on_read_error() {
+        use std::{borrow::Cow, collections::VecDeque};
+
+        struct ScratchIo<'a> {
+            reads: RefCell<VecDeque<Result<&'a [u8], TunError>>>,
+            address: Cell<Option<*const u8>>,
+        }
+        impl PacketIo for ScratchIo<'_> {
+            fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
+                panic!("outbound must use the scratch-capable read");
+            }
+
+            fn read_packet_with_scratch<'buf>(
+                &self,
+                scratch: &'buf mut [u8],
+            ) -> Result<Option<Cow<'buf, [u8]>>, TunError> {
+                assert_eq!(scratch.len(), MAX_MTU);
+                if let Some(previous) = self.address.replace(Some(scratch.as_ptr())) {
+                    assert_eq!(scratch.as_ptr(), previous);
+                }
+                let Some(bytes) = self.reads.borrow_mut().pop_front().transpose()? else {
+                    return Ok(None);
+                };
+                let dst = &mut scratch[..bytes.len()];
+                dst.copy_from_slice(bytes);
+                Ok(Some(Cow::Borrowed(dst)))
+            }
+
+            fn write_packet(&self, _packet: &[u8]) -> Result<(), TunError> {
+                unreachable!()
+            }
+        }
+
+        let p1 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"longer packet");
+        let p2 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"short");
+        let host = ScratchIo {
+            reads: RefCell::new(VecDeque::from([
+                Ok(p1.as_slice()),
+                Ok(p2.as_slice()),
+                Ok(p1.as_slice()),
+                Err(TunError::InvalidLength),
+            ])),
+            address: Cell::new(None),
+        };
+        let io: &dyn PacketIo = &host;
+        let local = identity(0x0201, NodeRole::Core);
+        let peer = identity(0x0209, NodeRole::Edge);
+        let (sink, written) = OutboundSink::new();
+        let mtu = DEFAULT_MTU;
+        let mut path = PacketPath::try_new(io, sink, endpoints(local, peer), mtu).unwrap();
+        assert_eq!(path.step_outbound_batch(0, 1), Ok(0));
+        assert_eq!(path.step_outbound_batch(1, 0), Ok(0));
+        assert_eq!(path.step_outbound(), Ok(Some(p1.len())));
+        // The byte threshold stops the next read but must not split a frame.
+        assert_eq!(path.step_outbound_batch(16, 1), Ok(1));
+        let mut expected = encode_packet_frame(&p1, mtu).unwrap();
+        expected.extend(encode_packet_frame(&p2, mtu).unwrap());
+        assert_eq!(
+            path.step_outbound_batch(16, 16_000),
+            Err(PacketPathError::HostRejected(TunError::InvalidLength))
+        );
+        assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
+        assert_eq!(path.stats().outbound_packets, 2);
+        assert_eq!(path.stats().failures, 1);
+        assert!(path.circuit.is_none());
+        assert_eq!(written.borrow().as_slice(), expected.as_slice());
     }
 
     #[test]
