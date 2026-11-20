@@ -123,7 +123,9 @@ jobs:
           BOREAS_NETEM_RATE_MBIT: ${{ matrix.rate }}
           BOREAS_MAX_PING_MS: ${{ matrix.max_ping }}
           BOREAS_MIN_THROUGHPUT_MBPS: ${{ matrix.min_mbps }}
-          BOREAS_PERF_BYTES: '1048576'
+          # 64 MiB, not 1 MiB. A 1 MiB transfer over a 200 ms path is a few round
+          # trips and reports slow start as if it were the sustained rate.
+          BOREAS_PERF_BYTES: '67108864'
         run: |
           set -euo pipefail
           sudo -E bash tools/release/netns_daemon_smoke.sh \
@@ -181,16 +183,17 @@ jobs:
   window-diagnostic:
     # Independent read-only diagnostic: same validated source binary, same
     # one-way 200 ms / 0.1% loss / 100 Mbit profile as the strict netem gate,
-    # with the original 1 MiB probe and a longer 8 MiB probe. Both samples run
-    # even if the first fails; the job fails if either sample fails. A single
-    # short window is not steady state and is not an SLA.
+    # with an 8 MiB probe and a 64 MiB probe. Both samples run even if the
+    # first fails; the job fails if either sample fails. The short probe is
+    # dominated by slow start; the long one is the sustained rate. Neither is
+    # an SLA.
     #
     # The smoke also emits a bounded periodic underlay trajectory (ss -tin
     # TCP_INFO plus tc qdisc and TUN counters) from before the daemons start.
     # That evidence is diagnostic only: it changes no threshold, wait, netem
     # profile or byte count, and nothing in it can mark a sample as accepted.
     needs: source
-    name: Diagnostic 1 MiB vs 8 MiB (one-way 200 ms, loss 0.1%, 100 Mbps)
+    name: Diagnostic 8 MiB vs 64 MiB (one-way 200 ms, loss 0.1%, 100 Mbps)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -222,7 +225,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Measure 1 MiB then 8 MiB without masking either result
+      - name: Measure 8 MiB then 64 MiB without masking either result
         env:
           SOURCE_SHA: ${{ needs.source.outputs.sha }}
           SOURCE_RUN: ${{ needs.source.outputs.run }}
@@ -272,8 +275,8 @@ jobs:
               overall=1
             fi
           }
-          run_sample original_1mib 1048576
-          run_sample longer_8mib 8388608
+          run_sample short_8mib 8388608
+          run_sample sustained_64mib 67108864
           cat diagnostic-status.txt
           exit "$overall"
       - name: Report raw evidence and failure reasons
@@ -288,7 +291,7 @@ jobs:
           else
             echo 'diagnostic_status=unavailable'
           fi
-          for label in original_1mib longer_8mib; do
+          for label in short_8mib sustained_64mib; do
             log="diagnostic-${label}.log"
             echo "--- ${label} raw throughput / CPU / RSS ---"
             if [[ ! -f "$log" ]]; then

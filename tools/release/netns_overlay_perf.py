@@ -36,11 +36,17 @@ import sys
 import time
 
 CHUNK = bytes((index % 251 for index in range(64 * 1024)))
-TOTAL_BYTES = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
-if TOTAL_BYTES <= 0 or TOTAL_BYTES > 64 * 1024 * 1024:
-    raise ValueError("BOREAS_PERF_BYTES must be in 1..=67108864")
+# A 1 MiB transfer over a 200 ms path is a handful of round trips, so it
+# measures slow start rather than the rate the path sustains. The default is
+# one full payload large enough for the window to open, bounded so a stalled
+# transfer still ends inside the socket timeout below.
+TOTAL_BYTES = int(os.environ.get("BOREAS_PERF_BYTES", str(64 * 1024 * 1024)))
+if TOTAL_BYTES <= 0 or TOTAL_BYTES > 1024 * 1024 * 1024:
+    raise ValueError("BOREAS_PERF_BYTES must be in 1..=1073741824")
 PORT = 18080
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = float(os.environ.get("BOREAS_PERF_TIMEOUT_SECONDS", "120"))
+if not math.isfinite(TIMEOUT_SECONDS) or TIMEOUT_SECONDS <= 0 or TIMEOUT_SECONDS > 900:
+    raise ValueError("BOREAS_PERF_TIMEOUT_SECONDS must be in (0, 900]")
 
 # Direct-TCP baseline bounds. The baseline is a separate, caller-invoked
 # diagnostic: same payload generator and SHA-256 check, distinct port, fixed
@@ -290,6 +296,7 @@ def _send_stream(
 
     digest = hashlib.sha256()
     started = time.monotonic()
+    first_byte_at = None
     with socket.create_connection(
         (peer_ip, port), timeout=timeout, source_address=(local_ip, 0)
     ) as connection:
@@ -297,6 +304,8 @@ def _send_stream(
         connection.settimeout(timeout)
         sent = 0
         while sent < TOTAL_BYTES:
+            if first_byte_at is None:
+                first_byte_at = time.monotonic()
             take = min(len(CHUNK), TOTAL_BYTES - sent)
             block = CHUNK[:take]
             connection.sendall(block)
@@ -321,12 +330,17 @@ def _send_stream(
     connect_seconds = _interval(started, connected)
     send_seconds = _interval(connected, sent_at)
     digest_seconds = _interval(sent_at, finished)
+    # Steady rate is first byte to last byte. The connect and the digest
+    # round trip are reported separately, so a long handshake cannot be
+    # mistaken for a slow transfer and cannot hide one either.
+    payload_seconds = _interval(first_byte_at, sent_at) if first_byte_at else None
     return {
         "bytes": sent,
         "connect_seconds": _rounded_seconds(connect_seconds),
         "digest_seconds": _rounded_seconds(digest_seconds),
         "elapsed_seconds": round(elapsed, 6),
-        "payload_send_mbps": _mbps(sent, send_seconds),
+        "payload_seconds": _rounded_seconds(payload_seconds),
+        "payload_send_mbps": _mbps(sent, payload_seconds),
         "send_seconds": _rounded_seconds(send_seconds),
         "sha256": digest.hexdigest(),
         "throughput_mbps": round(sent * 8 / elapsed / 1_000_000, 3),

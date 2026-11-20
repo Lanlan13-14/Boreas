@@ -1077,7 +1077,7 @@ import sys
 
 labels = ("edge_to_core", "core_to_edge")
 minimum = float(os.environ.get("BOREAS_MIN_THROUGHPUT_MBPS", "3.0"))
-expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
+expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(64 * 1024 * 1024)))
 failures = []
 
 for label, path in zip(labels, sys.argv[1:]):

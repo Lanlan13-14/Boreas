@@ -865,6 +865,28 @@ mod linux_daemon {
                 return Err("daemon: cannot bound business socket I/O timeouts".to_string());
             }
         }
+        // The kernel default send buffer is far below the bandwidth-delay
+        // product §8.3 computes for a 200 ms path, so the socket stopped
+        // accepting data long before the window could fill. This raises the
+        // buffer on this one connection only and does not touch a global
+        // sysctl. The kernel clamps the request to its own ceiling, so the
+        // granted size can be smaller than asked; a refused call fails here
+        // instead of being ignored.
+        let requested: libc::c_int = 8 * 1024 * 1024;
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&requested as *const libc::c_int).cast(),
+                    core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err("daemon: cannot size the business socket buffer".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -2956,9 +2978,16 @@ mod linux_daemon {
             // (bounded per turn, §6.4: never wait on a coalescing timer) so
             // burst TCP traffic fills full MSS segments instead of splitting
             // 1613 B single-packet records into 1448 + 165 B tail segments.
-            const MAX_OUTBOUND_BATCH_PACKETS: usize = 16;
-            const MAX_OUTBOUND_BATCH_BYTES: usize = 16_000;
-            const MAX_INBOUND_BATCH_PACKETS: usize = 32;
+            // One turn has to hand the kernel enough to keep the pipe full
+            // across a long RTT. §8.3 puts the bandwidth-delay product of a
+            // 200 ms path near 24 MiB, and the previous 16 KiB turn drained the
+            // socket and then waited out the round trip, which is what pinned
+            // throughput near 2 Mbps. The cap is still one turn: the revocation
+            // and status checks run again before the next turn, and nothing is
+            // held back for a timer.
+            const MAX_OUTBOUND_BATCH_PACKETS: usize = 1024;
+            const MAX_OUTBOUND_BATCH_BYTES: usize = 1_572_864;
+            const MAX_INBOUND_BATCH_PACKETS: usize = 1024;
             let mut made_progress = false;
             let remaining_budget = max_packets
                 .map(|limit| {
