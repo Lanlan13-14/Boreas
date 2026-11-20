@@ -587,24 +587,14 @@ impl AuthorizedEndpoints {
 /// Candidate encoding: a big-endian `u16` packet length followed by exactly that
 /// many bytes, nothing else. One frame carries exactly one packet.
 pub fn encode_packet_frame(packet: &[u8], mtu: usize) -> Result<Vec<u8>, PacketPathError> {
-    if packet.is_empty() {
-        return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
-    }
-    if packet.len() > mtu || packet.len() > MAX_MTU {
-        return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
-    }
-    let mut frame = vec![0u8; FRAME_PREFIX_LEN + packet.len()];
-    let frame_len = encode_packet_frame_into(packet, mtu, &mut frame)?;
-    frame.truncate(frame_len);
+    let prefix = packet_frame_prefix(packet, mtu)?;
+    let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + packet.len());
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(packet);
     Ok(frame)
 }
 
-/// Encode one packet into caller-provided storage and return its exact frame size.
-fn encode_packet_frame_into(
-    packet: &[u8],
-    mtu: usize,
-    frame: &mut [u8],
-) -> Result<usize, PacketPathError> {
+fn packet_frame_prefix(packet: &[u8], mtu: usize) -> Result<[u8; FRAME_PREFIX_LEN], PacketPathError> {
     if packet.is_empty() {
         return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
     }
@@ -613,11 +603,21 @@ fn encode_packet_frame_into(
     }
     let length = u16::try_from(packet.len())
         .map_err(|_| PacketPathError::Denied(PacketDeny::MtuExceeded))?;
+    Ok(length.to_be_bytes())
+}
+
+/// Encode one packet into caller-provided storage and return its exact frame size.
+fn encode_packet_frame_into(
+    packet: &[u8],
+    mtu: usize,
+    frame: &mut [u8],
+) -> Result<usize, PacketPathError> {
+    let prefix = packet_frame_prefix(packet, mtu)?;
     let frame_len = FRAME_PREFIX_LEN + packet.len();
     if frame.len() < frame_len {
         return Err(PacketPathError::Denied(PacketDeny::MtuExceeded));
     }
-    frame[..FRAME_PREFIX_LEN].copy_from_slice(&length.to_be_bytes());
+    frame[..FRAME_PREFIX_LEN].copy_from_slice(&prefix);
     frame[FRAME_PREFIX_LEN..frame_len].copy_from_slice(packet);
     Ok(frame_len)
 }
@@ -974,16 +974,17 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             };
             match self.policy.authorize_outbound(&packet) {
                 Ok(info) => {
-                    let mut frame = [0u8; MAX_FRAME_BYTES];
-                    let frame_len =
-                        match encode_packet_frame_into(&packet, self.policy.mtu(), &mut frame) {
-                            Ok(len) => len,
-                            Err(error) => {
-                                self.outbound_batch.clear();
-                                return Err(self.fail(error));
-                            }
-                        };
-                    self.outbound_batch.extend_from_slice(&frame[..frame_len]);
+                    let prefix = match packet_frame_prefix(&packet, self.policy.mtu()) {
+                        Ok(prefix) => prefix,
+                        Err(error) => {
+                            self.outbound_batch.clear();
+                            return Err(self.fail(error));
+                        }
+                    };
+                    // Append the verified bytes straight into the existing batch.
+                    // Preserve the same size checks and flush/poll boundaries.
+                    self.outbound_batch.extend_from_slice(&prefix);
+                    self.outbound_batch.extend_from_slice(&packet);
                     drained += 1;
                     payload_bytes = payload_bytes
                         .saturating_add(u64::try_from(info.packet_len).unwrap_or(u64::MAX));
