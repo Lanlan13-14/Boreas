@@ -894,6 +894,7 @@ for name in policy.tbs policy.ed25519.sig policy.mldsa65.sig root.ed25519.der ro
 done
 cat > "$WP/releases/r1/boreas" <<'EOF'
 #!/bin/sh
+[ "$(ulimit -Sc)" = 0 ] && [ "$(ulimit -Hc)" = 0 ] || exit 97
 printf '%s\n' "$*" >> "${TEST_DAEMON_LOG:?}"
 exit "${TEST_DAEMON_RC:-7}"
 EOF

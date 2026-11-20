@@ -84,10 +84,7 @@ boreas config-check <canonical config.toml>
 boreas pki verify-bundle --material-dir <staged node materials> --require-peer
 ```
 
-安装器**不**调用 `pki verify-policy`（CLI 尚无签发/打包 NetworkPolicy 的命令，真实安装
-harness 无法生成有效输入）；操作员可离线预检（命令见 [POLICY-STATE.md](POLICY-STATE.md)
-§1），daemon 每次启动仍会重新验签并在失败时拒绝承载业务。上述命令成功不等于 route、TUN
-数据面或生产 gate 通过。
+CLI 已支持通过 `pki sign-policy` 离线签发 `NetworkPolicy`。安装器本身**不**独立验证发布或策略签名；操作员应先使用预先受信任的工具验发布清单及制品，并离线预检策略（`pki verify-policy` 示例见 [POLICY-STATE.md](POLICY-STATE.md) §1）。daemon 每次启动仍会重新验策略签名，失败时拒绝承载业务。上述安装自检不等于路由、TUN 数据面或生产门禁通过。
 
 ## 4. systemd 与 OpenWrt procd 模板
 

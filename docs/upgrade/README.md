@@ -144,10 +144,10 @@ Deliberate limits, stated rather than implied:
 
 * the challenge is **not yet bound to the candidate artifact SHA-256** — that
   belongs with the `verify_release` → `prepare` wiring, which is not done;
-* there is **no Boreas daemon** in this workspace yet, so the protocol is
-  exercised against the hidden `__ready-stub` candidate in integration tests
-  (`tests/readiness.rs`). The transport is real; the production integration is
-  not claimed;
+* the Linux Boreas daemon exists, but it does not answer the supervisor's
+  trial-readiness challenge. Integration tests exercise the protocol against
+  the hidden `__ready-stub` candidate (`tests/readiness.rs`); they do not verify
+  readiness or rollback of the deployed daemon;
 * there is no `sd_notify` readiness, no launch timeout beyond the readiness
   deadline, and no health probing after confirmation.
 
