@@ -304,14 +304,14 @@ impl<T: Read + Write> WsStream<T> {
     }
 
     fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsError> {
-        encode_frame_into(
+        let frame = encode_frame_into(
             self.role == WsRole::Client,
             true,
             opcode,
             payload,
             &mut self.write_buf,
         )?;
-        self.io.write_all(&self.write_buf).map_err(map_io)?;
+        self.io.write_all(frame).map_err(map_io)?;
         self.io.flush().map_err(map_io)
     }
 
@@ -672,49 +672,70 @@ fn read_frame<T: Read>(
     })
 }
 
-/// Encode one frame into reusable storage. Client frames are masked with a fresh CSPRNG mask.
-fn encode_frame_into(
+/// Encode one frame into reusable storage. Only the returned prefix is on the wire.
+fn encode_frame_into<'a>(
     masked: bool,
     fin: bool,
     opcode: OpCode,
     payload: &[u8],
-    out: &mut Vec<u8>,
-) -> Result<(), WsError> {
-    out.clear();
-    let first = if fin { 0x80 } else { 0x00 } | opcode.bits();
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8], WsError> {
+    let mut header = [0u8; 14];
+    header[0] = if fin { 0x80 } else { 0x00 } | opcode.bits();
     let mask_bit: u8 = if masked { 0x80 } else { 0x00 };
-    out.reserve(payload.len() + 14);
-    out.push(first);
-    match payload.len() {
-        length @ 0..=125 => out.push(mask_bit | (length as u8)),
+    let header_len = match payload.len() {
+        length @ 0..=125 => {
+            header[1] = mask_bit | length as u8;
+            2
+        }
         length @ 126..=65_535 => {
-            out.push(mask_bit | 126);
-            out.extend_from_slice(&(length as u16).to_be_bytes());
+            header[1] = mask_bit | 126;
+            header[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+            4
         }
         length => {
-            out.push(mask_bit | 127);
-            out.extend_from_slice(&(length as u64).to_be_bytes());
+            header[1] = mask_bit | 127;
+            header[2..10].copy_from_slice(&(length as u64).to_be_bytes());
+            10
         }
-    }
-    if masked {
-        let mask: [u8; 4] = csprng::random_array().map_err(|_| WsError::Entropy)?;
-        out.extend_from_slice(&mask);
-        let start = out.len();
+    };
+    if !masked {
+        out.clear();
+        out.reserve(header_len + payload.len());
+        out.extend_from_slice(&header[..header_len]);
         out.extend_from_slice(payload);
-        let (chunks, rem) = out[start..].as_chunks_mut::<4>();
-        for chunk in chunks {
-            chunk[0] ^= mask[0];
-            chunk[1] ^= mask[1];
-            chunk[2] ^= mask[2];
-            chunk[3] ^= mask[3];
-        }
-        for (idx, byte) in rem.iter_mut().enumerate() {
-            *byte ^= mask[idx];
-        }
-    } else {
-        out.extend_from_slice(payload);
+        return Ok(out);
     }
-    Ok(())
+
+    let mask: [u8; 4] = csprng::random_array().map_err(|_| WsError::Entropy)?;
+    let masked_header_len = header_len + mask.len();
+    header[header_len..masked_header_len].copy_from_slice(&mask);
+    let frame_len = masked_header_len + payload.len();
+    // Initialize only when the frame grows past the high-water mark. For
+    // reused space, copy and mask in one pass without clearing or zero-filling.
+    if out.len() < frame_len {
+        out.resize(frame_len, 0);
+    }
+    let frame = &mut out[..frame_len];
+    let (out_header, out_payload) = frame.split_at_mut(masked_header_len);
+    out_header.copy_from_slice(&header[..masked_header_len]);
+    copy_masked_payload(payload, out_payload, mask);
+    Ok(frame)
+}
+
+fn copy_masked_payload(src: &[u8], dst: &mut [u8], mask: [u8; 4]) {
+    // Native byte conversions preserve mask byte order on either endian.
+    // Each word and the trailing bytes start at mask index zero.
+    let word_mask = u64::from(u32::from_ne_bytes(mask));
+    let word_mask = word_mask | (word_mask << 32);
+    let (src_words, src_tail) = src.as_chunks::<8>();
+    let (dst_words, dst_tail) = dst.as_chunks_mut::<8>();
+    for (src, dst) in src_words.iter().zip(dst_words.iter_mut()) {
+        *dst = (u64::from_ne_bytes(*src) ^ word_mask).to_ne_bytes();
+    }
+    for (index, (src, dst)) in src_tail.iter().zip(dst_tail.iter_mut()).enumerate() {
+        *dst = *src ^ mask[index % 4];
+    }
 }
 
 #[cfg(test)]
@@ -1167,6 +1188,7 @@ mod tests {
     struct MemoryIo {
         input: Cursor<Vec<u8>>,
         output: Vec<u8>,
+        flushes: usize,
     }
 
     impl Read for MemoryIo {
@@ -1182,6 +1204,7 @@ mod tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
             Ok(())
         }
     }
@@ -1190,6 +1213,7 @@ mod tests {
         MemoryIo {
             input: Cursor::new(input.to_vec()),
             output: Vec::new(),
+            flushes: 0,
         }
     }
 
@@ -1316,6 +1340,56 @@ mod tests {
         let (total, received) = server.join().expect("server thread");
         assert_eq!(total, 4096);
         assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn reusable_frame_buffer_preserves_wire_bytes() {
+        for role in [WsRole::Server, WsRole::Client] {
+            let mut stream = WsStream::new(memory(&[]), role, WsLimits::default());
+            let masked = role == WsRole::Client;
+            // Grow to the long header, then reuse the buffer for shorter frames,
+            // including every tail length of an eight-byte masking word.
+            let lengths = [125usize, 126, 65_535, 65_536, 127].into_iter().chain(0..16);
+            for (index, len) in lengths.enumerate() {
+                let payload: Vec<u8> = (0..len).map(|i| (i ^ (i >> 3)) as u8).collect();
+                let start = stream.io.output.len();
+                stream
+                    .send_frame(OpCode::Binary, &payload)
+                    .expect("send frame");
+                assert_eq!(stream.io.flushes, index + 1);
+                let frame = &stream.io.output[start..];
+                assert_eq!(frame[0], 0x82);
+                assert_eq!(frame[1] & 0x80 != 0, masked);
+                let mask_start = match len {
+                    0..=125 => {
+                        assert_eq!(frame[1] & 0x7f, len as u8);
+                        2
+                    }
+                    126..=65_535 => {
+                        assert_eq!(frame[1] & 0x7f, 126);
+                        assert_eq!(&frame[2..4], &(len as u16).to_be_bytes());
+                        4
+                    }
+                    _ => {
+                        assert_eq!(frame[1] & 0x7f, 127);
+                        assert_eq!(&frame[2..10], &(len as u64).to_be_bytes());
+                        10
+                    }
+                };
+                let payload_start = if masked { mask_start + 4 } else { mask_start };
+                assert_eq!(frame.len(), payload_start + len);
+                if masked {
+                    // Compare against RFC 6455's byte-wise rule, not the reader.
+                    // Equal masks on two frames are possible, so don't assert
+                    // anything about the relationship between sampled masks.
+                    for (i, &byte) in payload.iter().enumerate() {
+                        assert_eq!(frame[payload_start + i], byte ^ frame[mask_start + i % 4]);
+                    }
+                } else {
+                    assert_eq!(&frame[payload_start..], payload.as_slice());
+                }
+            }
+        }
     }
 
     #[test]
