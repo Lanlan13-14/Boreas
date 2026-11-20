@@ -1,0 +1,166 @@
+name: '[Diagnostic] Development performance A/B (not a release gate)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: 'Full reviewed baseline commit SHA, on the selected branch history'
+        required: true
+        type: string
+        default: '4fce922a192eb811b6bb901927a081c100431a51'
+      candidate_sha:
+        description: 'Full reviewed candidate commit SHA, on the selected branch history'
+        required: true
+        type: string
+        default: 'b921b68bc58749c01a2755ed3a95a549b5e78246'
+
+permissions:
+  contents: read
+
+jobs:
+  paired-netem:
+    # Same-repository maintainer dispatch only; review both revisions before dispatch.
+    # The smoke runs binaries as root; this must never run on forks or self-hosted runners.
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.repository == 'Lanlan13-14/Boreas' &&
+      (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: '4.1.1'
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
+      TOOLCHAIN: '1.100.0'
+      TARGET: x86_64-unknown-linux-musl
+      LC_ALL: C
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact branch ancestry and lockfile parity
+        env:
+          BASELINE_SHA: ${{ inputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          for sha in "$BASELINE_SHA" "$CANDIDATE_SHA"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ && "$(git cat-file -t "$sha")" == commit ]]
+            git merge-base --is-ancestor "$sha" "$GITHUB_SHA"
+          done
+          [[ "$BASELINE_SHA" != "$CANDIDATE_SHA" ]]
+          git merge-base --is-ancestor "$BASELINE_SHA" "$CANDIDATE_SHA"
+          [[ "$(git rev-parse "$BASELINE_SHA:Cargo.lock")" == "$(git rev-parse "$CANDIDATE_SHA:Cargo.lock")" ]]
+          mkdir -p "$RUNNER_TEMP/ab-binaries" "$RUNNER_TEMP/ab-evidence"
+          printf 'baseline=%s\ncandidate=%s\nharness=%s\nrun=%s/%s\n' \
+            "$BASELINE_SHA" "$CANDIDATE_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/ab-evidence/revisions.txt"
+      - name: Install one shared toolchain and namespace tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential perl curl ca-certificates pkg-config binutils musl-tools \
+            linux-libc-dev file iproute2 iputils-ping
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+          {
+            printf 'runner_image=%s/%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            uname -a
+            lscpu
+            rustc "+$TOOLCHAIN" -vV
+            cargo "+$TOOLCHAIN" --version
+            musl-gcc --version
+            ip -Version
+            tc -Version
+            /usr/bin/python3 --version
+            dpkg-query -W build-essential gcc binutils musl-tools musl-dev linux-libc-dev iproute2 iputils-ping
+          } > "$RUNNER_TEMP/ab-evidence/runner.txt"
+      - name: Build and verify one reviewed static OpenSSL on this runner
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/ab-openssl"
+          uapi="$RUNNER_TEMP/ab-musl-kernel-headers"
+          mkdir -p "$uapi"
+          ln -s /usr/include/linux "$uapi/linux"
+          ln -s /usr/include/asm-generic "$uapi/asm-generic"
+          ln -s /usr/include/x86_64-linux-gnu/asm "$uapi/asm"
+          cd "$RUNNER_TEMP"
+          bash "$GITHUB_WORKSPACE/tools/dependencies/fetch-openssl.sh" ab-openssl-src
+          sha256sum openssl.tar.gz > ab-evidence/openssl-source.sha256
+          cd ab-openssl-src
+          CC=musl-gcc ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests no-async \
+            -isystem "$uapi" --prefix="$prefix" --openssldir="$prefix/ssl"
+          make -j2
+          make install_sw
+          mkdir -p "$prefix/ssl"
+          printf '%s\n' 'openssl_conf = openssl_init' '' '[openssl_init]' \
+            'providers = provider_sect' '' '[provider_sect]' 'default = default_sect' \
+            '' '[default_sect]' 'activate = 1' > "$prefix/ssl/openssl.cnf"
+          bash "$GITHUB_WORKSPACE/tools/dependencies/verify-openssl-build.sh" \
+            "$PWD" "$prefix" "$RUNNER_TEMP/ab-evidence/openssl-runtime.txt" \
+            "$RUNNER_TEMP/ab-evidence/openssl-build.txt"
+      - name: Build versioned development binaries (not uploaded)
+        timeout-minutes: 25
+        env:
+          BASELINE_SHA: ${{ inputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          OPENSSL_STATIC: '1'
+          OPENSSL_NO_VENDOR: '1'
+        run: |
+          set -euo pipefail
+          export OPENSSL_DIR="$RUNNER_TEMP/ab-openssl"
+          for sha in "$BASELINE_SHA" "$CANDIDATE_SHA"; do
+            src="$RUNNER_TEMP/ab-source-$sha"
+            target_dir="$RUNNER_TEMP/ab-target-$sha"
+            git worktree add --detach "$src" "$sha"
+            (
+              cd "$src"
+              sha256sum Cargo.lock > "$RUNNER_TEMP/ab-evidence/$sha-Cargo.lock.sha256"
+              cargo "+$TOOLCHAIN" build --locked --release --target "$TARGET" \
+                --target-dir "$target_dir" -p boreas-cli --features openssl-inner-tls
+            ) 2>&1 | tee "$RUNNER_TEMP/ab-evidence/$sha-build.log"
+            binary="$RUNNER_TEMP/ab-binaries/boreas-$sha"
+            install -m 0555 "$target_dir/$TARGET/release/boreas" "$binary"
+            /usr/bin/python3 tools/release/verify_static_linux.py --binary "$binary" \
+              --target "$TARGET" --out "$RUNNER_TEMP/ab-evidence/$sha-linkage.json"
+          done
+          (cd "$RUNNER_TEMP/ab-binaries" && sha256sum "boreas-$BASELINE_SHA" "boreas-$CANDIDATE_SHA") \
+            > "$RUNNER_TEMP/ab-evidence/SHA256SUMS"
+      - name: Prepare one signed public policy fixture outside evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          export BOREAS_OPENSSL_BIN="$RUNNER_TEMP/ab-openssl/bin/openssl"
+          export OPENSSL_CONF="$RUNNER_TEMP/ab-openssl/ssl/openssl.cnf"
+          fixture="$RUNNER_TEMP/ab-policy-fixture"
+          mkdir -m 0700 "$fixture"
+          trap 'rm -f -- "$fixture/root-ed25519.pem" "$fixture/root-mldsa65.pem"' EXIT
+          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ED25519 -out "$fixture/root-ed25519.pem"
+          "$BOREAS_OPENSSL_BIN" genpkey -algorithm ML-DSA-65 -out "$fixture/root-mldsa65.pem"
+          now_us="$(($(date +%s) * 1000000))"
+          /usr/bin/python3 tools/release/network_policy_test_fixture.py --out-dir "$fixture" \
+            --net-id 0123456789abcdef0123456789abcdef --sequence 1 \
+            --issued-at-us "$now_us" --expires-us "$((now_us + 3600000000))"
+          (cd "$fixture" && sha256sum tbs.cbor ed25519.sig mldsa65.sig root-ed25519.der root-mldsa65.der) \
+            > "$RUNNER_TEMP/ab-evidence/policy.sha256"
+      - name: Compare prebuilt binaries in A/B then B/A order
+        timeout-minutes: 20
+        env:
+          BASELINE_SHA: ${{ inputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          /usr/bin/python3 tools/release/performance_ab.py "$BASELINE_SHA" "$CANDIDATE_SHA"
+      - name: Upload development A/B evidence only (no binaries or keys)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: development-perf-ab-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ab-evidence/
+          retention-days: 14
+          if-no-files-found: warn
