@@ -1,25 +1,15 @@
 name: '[Release] Production promotion gate (fail-closed; never publishes)'
 
-# Manual, fail-closed production promotion verification.
-#
-# This workflow NEVER creates a GitHub Release, tag, signature or production
-# artifact.  It checks the exact-commit gate ledger and, only if that passes,
-# asks tools/release/production_promotion.py to verify an externally produced
-# promotion bundle with an independently supplied signature verifier.
-#
-# The normal state of this repository is a red run: docs/engineering/gates.json
-# deliberately blocks production while master-plan gates lack reviewed evidence
-# and while no independent audit exists.  A red run here is the correct signal,
-# not an outage.
-#
-# CI has no ReleaseRoot private key.  Do not add one as a secret.  Even when
-# this workflow verifies a bundle, publication remains an offline human action.
-
+# CI checks independently approved evidence and signed inputs. No ReleaseRoot
+# private key belongs here. Publication remains an offline human action.
 on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Full 40-character lowercase commit SHA on main
+        description: Full lowercase 40-hex SHA of the candidate on main
+        required: true
+      ledger_commit:
+        description: Full lowercase 40-hex SHA of the separately reviewed ledger commit on main
         required: true
       bundle_run_id:
         description: Actions run ID that contains the signed promotion bundle artifact
@@ -27,14 +17,6 @@ on:
         default: ""
       bundle_artifact:
         description: Artifact name containing the signed promotion bundle
-        required: false
-        default: ""
-      release_root_sha256:
-        description: SHA-256 of the out-of-band release-root/roots.json public key file
-        required: false
-        default: ""
-      offline_verifier:
-        description: Command for the independent signature verifier available on the runner
         required: false
         default: ""
 
@@ -46,55 +28,120 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  gate-ledger:
-    name: Exact-commit gate ledger metadata check
+  promotion-verification:
+    name: Exact-commit evidence and offline-signed bundle (no publication)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
+    environment: production-promotion
     steps:
-      - name: Checkout candidate commit
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.commit }}
-          fetch-depth: 0
-
-      - name: Validate candidate commit
+      - name: Require a main dispatch and full commit IDs
         shell: bash
         env:
           COMMIT: ${{ inputs.commit }}
+          LEDGER_COMMIT: ${{ inputs.ledger_commit }}
         run: |
           set -euo pipefail
-          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo 'Candidate commit must be a full lowercase 40-hex SHA-1.' >&2
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo 'Dispatch this workflow from protected main.' >&2
             exit 1
           fi
-          test "$(git rev-parse HEAD)" = "$COMMIT"
-          git fetch origin main
-          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
-            echo 'Candidate commit is not on main; production promotion is refused.' >&2
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ && "$LEDGER_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Candidate and ledger commits must be full lowercase 40-hex SHA-1s.' >&2
             exit 1
           fi
+
+      - name: Checkout trusted tooling and history at the main dispatch SHA
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: trusted-main
+          persist-credentials: false
+
+      - name: Validate the trusted tooling checkout
+        shell: bash
+        run: test "$(git -C trusted-main rev-parse HEAD)" = "$GITHUB_SHA"
 
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
-      - name: Verify the gate tool itself
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f tools/gates/verify.py
-          test -f docs/engineering/gates.json
-          python -m unittest discover -s tools/gates -p 'test_*.py' -v
-
-      - name: Run the exact-commit gate ledger verifier
+      - name: Verify gate tooling and the reviewed ledger for the exact candidate
         shell: bash
         env:
           COMMIT: ${{ inputs.commit }}
+          LEDGER_COMMIT: ${{ inputs.ledger_commit }}
         run: |
-          set -o pipefail
-          python tools/gates/verify.py \
-            --ledger docs/engineering/gates.json \
-            --commit "$COMMIT" 2>&1 | tee gate-verification.txt
+          set -euo pipefail
+          python -m unittest discover -s trusted-main/tools/gates -p 'test_*.py' -v
+          python trusted-main/tools/release/production_promotion.py \
+            --check-ledger --commit "$COMMIT" --ledger-commit "$LEDGER_COMMIT" \
+            > gate-verification.txt 2>&1
+
+      - name: Checkout the approved candidate separately (never execute its tooling)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify the candidate checkout is exact
+        shell: bash
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: test "$(git -C candidate rev-parse HEAD)" = "$COMMIT"
+
+      - name: Require signed bundle inputs and provision the independently pinned verifier
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_ARTIFACT: ${{ inputs.bundle_artifact }}
+          ROOT_SHA256: ${{ vars.BOREAS_RELEASE_ROOT_SHA256 }}
+          VERIFIER_URL: ${{ vars.BOREAS_PROMOTION_VERIFIER_URL }}
+          VERIFIER_SHA256: ${{ vars.BOREAS_PROMOTION_VERIFIER_SHA256 }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[1-9][0-9]*$ && -n "$BUNDLE_ARTIFACT" ]]; then
+            echo 'An exact Actions run ID and bundle artifact name are required.' >&2
+            exit 1
+          fi
+          if ! [[ "$ROOT_SHA256" =~ ^[0-9a-f]{64}$ && "$VERIFIER_SHA256" =~ ^[0-9a-f]{64}$ && "$VERIFIER_URL" == https://* ]]; then
+            echo 'Configure the independently pinned ReleaseRoot and verifier digests and HTTPS verifier URL.' >&2
+            exit 1
+          fi
+          verifier_dir=$(mktemp -d "${RUNNER_TEMP}/boreas-verifier.XXXXXXXX")
+          verifier_path="$verifier_dir/verify"
+          curl --disable --fail --silent --show-error --location --max-redirs 3 \
+            --proto '=https' --proto-redir '=https' --globoff --max-time 120 \
+            --max-filesize 67108864 --output "$verifier_path" -- "$VERIFIER_URL"
+          printf '%s  %s\n' "$VERIFIER_SHA256" "$verifier_path" | sha256sum --check --status
+          chmod 500 "$verifier_path"
+          printf 'BOREAS_VERIFIER_EXECUTABLE=%s\n' "$verifier_path" >> "$GITHUB_ENV"
+
+      - name: Download signed promotion bundle from the selected run
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.bundle_artifact }}
+          run-id: ${{ inputs.bundle_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/boreas-promotion-bundle
+
+      - name: Verify the signed bundle with trusted tooling and the independent verifier
+        shell: bash
+        env:
+          COMMIT: ${{ inputs.commit }}
+          LEDGER_COMMIT: ${{ inputs.ledger_commit }}
+          ROOT_SHA256: ${{ vars.BOREAS_RELEASE_ROOT_SHA256 }}
+        run: |
+          set -euo pipefail
+          python trusted-main/tools/release/production_promotion.py \
+            --commit "$COMMIT" \
+            --ledger-commit "$LEDGER_COMMIT" \
+            --bundle-dir "$RUNNER_TEMP/boreas-promotion-bundle" \
+            --expected-release-root-sha256 "$ROOT_SHA256" \
+            --verifier-executable "$BOREAS_VERIFIER_EXECUTABLE" \
+            --report production-promotion-report.json
 
       - name: Upload gate verification record
         if: always()
@@ -104,90 +151,6 @@ jobs:
           path: gate-verification.txt
           if-no-files-found: warn
           retention-days: 30
-
-  promotion-verification:
-    name: Offline-signed bundle verification (no publication)
-    needs: gate-ledger
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Checkout candidate commit
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.commit }}
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
-      - name: Refuse when the signed bundle inputs are incomplete
-        shell: bash
-        env:
-          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
-          BUNDLE_ARTIFACT: ${{ inputs.bundle_artifact }}
-          ROOT_SHA256: ${{ inputs.release_root_sha256 }}
-          VERIFIER: ${{ inputs.offline_verifier }}
-          COMMIT: ${{ inputs.commit }}
-        run: |
-          set -euo pipefail
-          missing=()
-          [ -n "$BUNDLE_RUN_ID" ] || missing+=(bundle_run_id)
-          [ -n "$BUNDLE_ARTIFACT" ] || missing+=(bundle_artifact)
-          [ -n "$ROOT_SHA256" ] || missing+=(release_root_sha256)
-          [ -n "$VERIFIER" ] || missing+=(offline_verifier)
-          if [ "${#missing[@]}" -ne 0 ]; then
-            python - "$COMMIT" "${missing[*]}" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          commit, missing = sys.argv[1], sys.argv[2].split()
-          report = {
-              "schema": "boreas.production.promotion-report.v1",
-              "commit": commit,
-              "status": "refused",
-              "promotion_verified": False,
-              "production_release": False,
-              "published": False,
-              "reasons": [
-                  "signed promotion bundle inputs are incomplete: " + ", ".join(missing)
-              ],
-              "publication_note": "CI never generates ReleaseRoot keys or publishes.",
-          }
-          Path("production-promotion-report.json").write_text(
-              json.dumps(report, indent=2) + "\n", encoding="utf-8"
-          )
-          print(json.dumps(report, indent=2))
-          PY
-            exit 1
-          fi
-
-      - name: Download signed promotion bundle from the selected run
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.bundle_artifact }}
-          run-id: ${{ inputs.bundle_run_id }}
-          repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
-          path: promotion-bundle
-
-      - name: Verify the signed bundle with an independent verifier
-        shell: bash
-        env:
-          COMMIT: ${{ inputs.commit }}
-          ROOT_SHA256: ${{ inputs.release_root_sha256 }}
-          VERIFIER: ${{ inputs.offline_verifier }}
-        run: |
-          set -euo pipefail
-          python tools/release/production_promotion.py \
-            --commit "$COMMIT" \
-            --bundle-dir promotion-bundle \
-            --ledger docs/engineering/gates.json \
-            --gate-verifier "python tools/gates/verify.py --ledger docs/engineering/gates.json --commit {commit}" \
-            --expected-release-root-sha256 "$ROOT_SHA256" \
-            --verifier "$VERIFIER" \
-            --report production-promotion-report.json
 
       - name: Upload promotion verification report
         if: always()

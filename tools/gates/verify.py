@@ -31,11 +31,18 @@ def unique_object(pairs):
     return result
 
 
-def read_ledger(path):
-    raw = Path(path).read_bytes()
-    if len(raw) > 1024 * 1024:
+MAX_LEDGER_BYTES = 1024 * 1024
+
+
+def parse_ledger(raw):
+    if len(raw) > MAX_LEDGER_BYTES:
         raise ValueError('ledger exceeds 1 MiB')
     return json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object)
+
+
+def read_ledger(path):
+    with Path(path).open('rb') as handle:
+        return parse_ledger(handle.read(MAX_LEDGER_BYTES + 1))
 
 
 def immutable_actions_url(value):

@@ -16,6 +16,7 @@ offline, signature-requiring path in `production_promotion.py`.
 | `make_index.py` | Assembles five targets, recomputes hashes and writes the development index. |
 | `verify_bundle.py` | Offline integrity check of a downloaded development bundle. |
 | `native_device_guard.py` | Rejects skipped/simulated Wintun/utun/TUN tests; requires real markers/test names. |
+| `promotion_ledger.py` | Reads a fixed, separately reviewed main Git blob and applies the exact-candidate gate policy. |
 | `production_promotion.py` | Fail-closed offline promotion verification; requires the gate ledger and an independent signature verifier. |
 | `test_release_tools.py` | Negative/contract tests; run only in GitHub Actions. |
 
@@ -48,14 +49,17 @@ supervisor-compatible `release-manifest.json`, its detached
 `release-signature-envelope.json`, the outer `promotion-manifest.json`, its
 detached `promotion-signature-envelope.json`, `release-root/roots.json` and
 `artifacts/`. Both manifests are dual-signed; neither contains a hash of
-itself.
+itself. The outer manifest binds the raw SHA-256 of the separately reviewed
+ledger. Run from a clean, pinned trusted-main tooling checkout, not from the
+candidate. The ledger source is a later main commit and not part of the bundle.
 
 ```sh
 python tools/release/production_promotion.py \
-  --commit <40-hex> \
+  --commit <candidate-40-hex> \
+  --ledger-commit <reviewed-main-40-hex> \
   --bundle-dir /path/to/promotion-bundle \
   --expected-release-root-sha256 <64-hex> \
-  --verifier /path/to/independent-verifier \
+  --verifier-executable /path/to/independent-verifier \
   --report promotion-report.json
 ```
 

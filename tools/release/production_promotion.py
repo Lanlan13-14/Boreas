@@ -22,7 +22,8 @@ self-referential fixed point of putting ``signed_sha256`` inside the manifest.
 The tool does not generate a ReleaseRoot private key, does not sign and does not
 publish.  It requires:
 
-* the exact-commit gate ledger to pass ``tools/gates/verify.py``;
+* a reviewed ledger from a later main commit, checked against the exact
+  candidate by the trusted checkout's ``tools/gates/verify.py`` policy;
 * both detached dual signatures over both manifests;
 * the pinned ReleaseRoot hash;
 * all five artifacts with matching sizes and hashes;
@@ -42,6 +43,7 @@ import binascii
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import shlex
 import stat
@@ -61,6 +63,8 @@ from common import (
     sha256_file,
     utc_now_iso,
 )
+
+from promotion_ledger import COMMIT_RE, LEDGER_PATH, gate_policy, load_ledger, verify_ledger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_MAX_BYTES = MAX_JSON_BYTES
@@ -147,7 +151,6 @@ TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._+-]+")
 ASSET_NAME_RE = re.compile(r"[A-Za-z0-9._+-]+")
 ARCH_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -486,7 +489,7 @@ def validate_promotion_manifest(
     release_manifest: dict,
     commit: str,
     release_manifest_sha256: str,
-    ledger_sha256: str | None,
+    ledger_sha256: str,
     root_sha256: str,
     errors: list[str],
 ) -> None:
@@ -522,7 +525,7 @@ def validate_promotion_manifest(
         errors.append("promotion manifest release_manifest_sha256 mismatch")
     if promotion.get("release_manifest_name") != RELEASE_MANIFEST_NAME:
         errors.append("promotion manifest release_manifest_name must be release-manifest.json")
-    if ledger_sha256 is None or promotion.get("gate_ledger_sha256") != ledger_sha256:
+    if promotion.get("gate_ledger_sha256") != ledger_sha256:
         errors.append("promotion manifest gate_ledger_sha256 mismatch")
     if promotion.get("release_root_sha256") != root_sha256:
         errors.append("promotion manifest release_root_sha256 mismatch")
@@ -601,16 +604,6 @@ def validate_artifacts(bundle: Path, release_manifest: dict, errors: list[str]) 
             errors.append(f"artifacts directory contains an unlisted file: {path.name}")
 
 
-def build_gate_command(raw: str, commit: str, ledger: Path) -> list[str]:
-    command = raw.replace("{commit}", commit)
-    tokens = shlex.split(command)
-    if not any(token == "--commit" or token.startswith("--commit=") for token in tokens):
-        tokens.extend(["--commit", commit])
-    if not any(token == "--ledger" or token.startswith("--ledger=") for token in tokens):
-        tokens.extend(["--ledger", str(ledger)])
-    return tokens
-
-
 def run_command(command: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(
         command,
@@ -622,35 +615,6 @@ def run_command(command: list[str], timeout: int = 300) -> subprocess.CompletedP
         timeout=timeout,
         check=False,
     )
-
-
-def run_gate_verifier(raw: str, commit: str, ledger: Path, errors: list[str]) -> None:
-    if not raw.strip():
-        errors.append("gate verifier command is empty")
-        return
-    try:
-        command = build_gate_command(raw, commit, ledger)
-    except ValueError as error:
-        errors.append(f"gate verifier command is malformed: {error}")
-        return
-    for token in command:
-        if token.endswith(".py"):
-            candidate = Path(token)
-            if not candidate.is_absolute():
-                candidate = REPO_ROOT / candidate
-            if not candidate.is_file():
-                errors.append(f"gate verifier script is missing: {token}")
-                return
-    try:
-        result = run_command(command)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        errors.append(f"gate verifier could not run: {error}")
-        return
-    if result.returncode != 0:
-        errors.append(
-            "gate verifier refused promotion (exit "
-            f"{result.returncode}): {result.stderr.strip()[:2000]}"
-        )
 
 
 def run_external_verifier(
@@ -831,8 +795,7 @@ def evaluate(
     bundle_dir: Path,
     commit: str,
     root_sha256: str,
-    ledger_path: Path,
-    gate_verifier: str,
+    ledger: bytes,
     verifier: str,
 ) -> list[str]:
     errors: list[str] = []
@@ -868,11 +831,7 @@ def evaluate(
     )
     roots = read_document(roots_path, f"release-root/{ROOTS_NAME}", errors)
 
-    if ledger_path.is_symlink():
-        errors.append("gate ledger must not be a symlink")
-    if not ledger_path.is_file():
-        errors.append(f"gate ledger is missing: {ledger_path}")
-    ledger_sha256 = sha256_file(ledger_path) if ledger_path.is_file() else None
+    ledger_sha256 = hashlib.sha256(ledger).hexdigest()
     if errors:
         return errors
 
@@ -907,7 +866,7 @@ def evaluate(
     if errors:
         return errors
 
-    run_gate_verifier(gate_verifier, commit, ledger_path, errors)
+    errors.extend(verify_ledger(ledger, commit))
     if errors:
         return errors
 
@@ -942,7 +901,7 @@ def _write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
-def _build_positive_fixture(root: Path):
+def _build_positive_fixture(root: Path, commit: str = "a" * 40):
     """Build a complete synthetic bundle for the *test-only* positive path.
 
     The signatures are zero-filled placeholders of the correct lengths. The
@@ -958,7 +917,6 @@ def _build_positive_fixture(root: Path):
     (bundle / "release-root").mkdir()
     (bundle / "verification").mkdir()
 
-    commit = "a" * 40
     key_id = "fixture-release-root"
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     published = (now - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1013,9 +971,29 @@ def _build_positive_fixture(root: Path):
         },
     )
 
-    ledger = bundle / "gate-ledger.json"
-    ledger.write_text("{}\n", encoding="utf-8")
-    ledger_sha = sha256_file(ledger)
+    # Synthetic evidence stays outside the bundle and exercises the real policy.
+    run_url = "https://github.com/Lanlan13-14/Boreas/actions/runs/1"
+    evidence = {
+        "commit": commit, "command": "fixture", "environment": "fixture",
+        "expected": "fixture", "observed": "fixture", "reviewer": "fixture",
+        "actions_run": run_url, "report_sha256": "a" * 64, "outcome": "pass",
+        "recorded_at": issued,
+    }
+    gates = {name: {"status": "accepted", "evidence": [evidence]} for name in gate_policy.REQUIRED}
+    gates["G-EXTERNAL-REVIEW"]["independent_review"] = {
+        "independent": True, "organization": "fixture", "scope": "fixture",
+        "report_url": "https://example.invalid/audit", "report_sha256": "b" * 64,
+        "open_high_or_critical": 0,
+    }
+    ledger = json.dumps({
+        "schema_version": 1, "release_commit": commit, "production_approved": True,
+        "blocking_findings": [], "gates": gates,
+        "platforms": {name: {
+            "commit": commit, "functional_test": "pass", "actions_run": run_url,
+            "native_execution": True, "real_packet_io": True, "static_linkage": True,
+        } for name in gate_policy.PLATFORMS},
+    }).encode("utf-8")
+    ledger_sha = hashlib.sha256(ledger).hexdigest()
     roots = {
         "schema": "boreas.release.roots.v1",
         "roots": [
@@ -1102,7 +1080,6 @@ def _build_positive_fixture(root: Path):
         commit,
         root_sha,
         ledger,
-        shlex.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
         shlex.join([sys.executable, str(fixture_verifier), str(template)]),
     )
 
@@ -1172,10 +1149,10 @@ def self_test() -> int:
 
         negative("missing release roots", remove_roots)
 
-        def remove_ledger(bundle: Path) -> None:
-            (bundle / "gate-ledger.json").unlink()
-
-        negative("missing gate ledger", remove_ledger)
+        bundle, commit, root_sha, ledger, verifier = positive_args
+        errors = evaluate(bundle, commit, root_sha, ledger + b"\n", verifier)
+        if not any("gate_ledger_sha256 mismatch" in error for error in errors):
+            failures.append("changed gate ledger bytes were not refused by the signed binding")
 
         def wrong_commit(bundle: Path) -> None:
             path = bundle / PROMOTION_MANIFEST_NAME
@@ -1202,57 +1179,79 @@ def self_test() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--commit")
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--commit", help="full SHA of the candidate")
+    parser.add_argument("--ledger-commit", help="full SHA of the reviewed main ledger commit")
     parser.add_argument("--bundle-dir", type=Path)
-    parser.add_argument(
-        "--ledger", type=Path, default=REPO_ROOT / "docs/engineering/gates.json"
-    )
-    parser.add_argument(
-        "--gate-verifier",
-        default=(
-            "python tools/gates/verify.py --ledger docs/engineering/gates.json "
-            "--commit {commit}"
-        ),
-    )
     parser.add_argument("--expected-release-root-sha256")
-    parser.add_argument("--verifier")
+    parser.add_argument(
+        "--verifier-executable", type=Path,
+        help="absolute path to the independently provisioned verifier",
+    )
     parser.add_argument(
         "--report", type=Path, default=Path("production-promotion-report.json")
     )
-    parser.add_argument("--self-test", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check-ledger", action="store_true", help="verify gate metadata only")
+    mode.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
-
-    if (
-        not args.commit
-        or not args.bundle_dir
-        or not args.expected_release_root_sha256
-        or not args.verifier
+    if not args.commit or not args.ledger_commit:
+        parser.error("--commit and --ledger-commit are required")
+    if not args.check_ledger and (
+        not args.bundle_dir or not args.expected_release_root_sha256 or not args.verifier_executable
     ):
-        parser.error(
-            "--commit, --bundle-dir, --expected-release-root-sha256 and --verifier "
-            "are required unless --self-test is used"
-        )
+        parser.error("--bundle-dir, --expected-release-root-sha256 and --verifier-executable are required")
 
-    ledger = args.ledger if args.ledger.is_absolute() else REPO_ROOT / args.ledger
-    errors = evaluate(
-        args.bundle_dir,
-        args.commit,
-        args.expected_release_root_sha256,
-        ledger,
-        args.gate_verifier,
-        args.verifier,
-    )
+    ledger_sha256 = None
+    try:
+        ledger = load_ledger(REPO_ROOT, args.commit, args.ledger_commit)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        errors = [f"could not load reviewed gate ledger: {error}"]
+    else:
+        ledger_sha256 = hashlib.sha256(ledger).hexdigest()
+        if args.check_ledger:
+            errors = verify_ledger(ledger, args.commit)
+        else:
+            verifier = args.verifier_executable
+            try:
+                resolved = verifier.resolve(strict=True)
+                if (
+                    not verifier.is_absolute()
+                    or not resolved.is_file()
+                    or resolved.is_relative_to(REPO_ROOT)
+                    or resolved.is_relative_to(args.bundle_dir.resolve())
+                    or not os.access(resolved, os.X_OK)
+                ):
+                    raise ValueError("expected an absolute executable outside the checkout and bundle")
+            except (OSError, RuntimeError, ValueError) as error:
+                errors = [f"invalid independent verifier: {error}"]
+            else:
+                errors = evaluate(
+                    args.bundle_dir, args.commit, args.expected_release_root_sha256,
+                    ledger, shlex.quote(str(resolved)),
+                )
+
+    if args.check_ledger:
+        print(f"Candidate: {args.commit}; ledger: {args.ledger_commit}:{LEDGER_PATH}")
+        if errors:
+            for error in errors:
+                print(f"RELEASE BLOCKED: {error}", file=sys.stderr)
+            return 2
+        print(f"Gate metadata accepted (ledger SHA-256: {ledger_sha256}); this is not release authorization.")
+        return 0
+
     report = {
         "schema": "boreas.production.promotion-report.v1",
         "checked_at": utc_now_iso(),
         "commit": args.commit,
         "bundle_dir": str(args.bundle_dir),
-        "gate_verifier": args.gate_verifier,
-        "independent_verifier": args.verifier,
+        "ledger_commit": args.ledger_commit,
+        "ledger_path": LEDGER_PATH,
+        "gate_ledger_sha256": ledger_sha256,
+        "independent_verifier": str(args.verifier_executable),
         "production_release": False,
         "published": False,
         "promotion_verified": not errors,

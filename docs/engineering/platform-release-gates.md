@@ -104,23 +104,33 @@ Linux aarch64 real TUN device coverage is not yet present; the current
 
 ### 2.3 `release-promotion-gate.yml` — fail-closed promotion
 
-Manual only. It checks the candidate commit is on `main`, runs the gate tool
-unit tests, then:
+Dispatch manually **from protected `main`** with `commit` (candidate) and
+`ledger_commit` (reviewed ledger source), both full lowercase commit SHAs. A
+separate tooling checkout is pinned to the main dispatch SHA. The workflow
+requires the ledger source to be a strict descendant of the candidate and on the
+first-parent history of that pinned main commit. The ledger source must add
+or update `docs/engineering/release-evidence/gates.json` relative to its first
+parent; the tool reads only that committed regular blob. The workflow checks out the exact candidate separately but never runs
+its tools or reads its ledger. The ledger is not downloaded from the bundle.
 
-```sh
-python tools/gates/verify.py --ledger docs/engineering/gates.json --commit "$COMMIT"
-```
-
-With the checked-in ledger this normally fails: every gate is `open` and
-`production_approved` is `false`. That is the intended state. If the ledger
-passes, the workflow can download an externally produced signed promotion
-bundle and run `tools/release/production_promotion.py` with an independent
-verifier. It still **never publishes** a release, tag or GitHub Release.
+Protect `main` with independent review of the ledger and verification tooling
+(including the workflow), and restrict the `production-promotion` Actions
+environment to protected `main` with independent required reviewers. Configure
+the environment variables `BOREAS_RELEASE_ROOT_SHA256` (public key file pin
+from an independent, out-of-band channel), `BOREAS_PROMOTION_VERIFIER_URL`
+(HTTPS URL to a pre-reviewed executable for the Ubuntu x86-64 runner), and
+`BOREAS_PROMOTION_VERIFIER_SHA256` (its independently reviewed digest). CI
+verifies the executable digest before use, outside the workspace, and does
+not accept either trust pin or a command from dispatch or the bundle. Select
+the signed bundle with `bundle_run_id` and `bundle_artifact`. Missing evidence,
+configuration or signed inputs refuse promotion. The workflow **never publishes**.
 
 ## 3. Gate matrix
 
-The authoritative evidence ledger is
-[`gates.json`](gates.json); the verifier is [`tools/gates/verify.py`](../../tools/gates/verify.py).
+The working gate status ledger is [`gates.json`](gates.json); it is not an
+authorization input. Production evidence must be reviewed and recorded at
+`docs/engineering/release-evidence/gates.json` after the candidate is frozen.
+Both use the policy in [`tools/gates/verify.py`](../../tools/gates/verify.py).
 The verifier checks metadata consistency only. It does not download reports,
 prove an auditor is independent, or validate that a measurement is true. A
 malicious writer can fabricate metadata; protected-branch review, an independent
@@ -194,10 +204,17 @@ Preconditions:
 
 1. Freeze a full 40-hex commit on `main`; no formatter or other bot commit may
    move the candidate afterwards.
-2. `tools/gates/verify.py --ledger docs/engineering/gates.json --commit <sha>`
-   must pass. That requires every gate accepted with exact-commit evidence,
-   immutable Actions run URLs, report SHA-256 values, reviewer, UTC timestamp
-   and an independent-review record with zero unresolved high/critical issues.
+2. Independently review evidence for the frozen candidate and merge a separate
+   change recording it at `docs/engineering/release-evidence/gates.json`. Use
+   the resulting protected-main commit (not the PR head) as `ledger_commit`.
+   The candidate remains unchanged. All gate/platform evidence and the ledger's
+   `release_commit` must identify that exact candidate. Record immutable Actions
+   run URLs, report SHA-256 values, reviewers, UTC timestamps and the independent
+   review with zero unresolved high/critical issues. Before signing, use
+   `production_promotion.py --check-ledger --commit <candidate-sha>
+   --ledger-commit <ledger-sha>` from trusted main to check metadata and obtain
+   the exact Git blob SHA-256. Independently review that digest and put it in
+   `gate_ledger_sha256` in the outer manifest; do not hash re-serialized JSON.
 3. Build and retain the five production archives for that exact commit.
 4. An offline ReleaseRoot signs the raw bytes of **both** the release manifest and
    the outer promotion manifest with Ed25519 **and** ML-DSA-65. Private keys
@@ -235,7 +252,8 @@ the supervisor's release policy ceiling.
 `promotion-manifest.json` is the **outer promotion binding**. It records the
 exact commit, `release_manifest_sha256`, `gate_ledger_sha256`,
 `release_root_sha256`, `signing_key_id` and the five artifact names/sizes/
-hashes. It deliberately contains **no hash of itself**; including a
+hashes. `gate_ledger_sha256` binds the exact reviewed Git blob bytes, not
+its filename or a copy supplied by the bundle. It deliberately contains **no hash of itself**; including a
 `signed_sha256` of the manifest inside the manifest would be a self-referential
 fixed point and cannot be generated. The detached
 `*-signature-envelope.json` files live outside the signed bytes and are allowed
@@ -271,18 +289,24 @@ with `--release-manifest`, `--release-signature-envelope`,
 `--promotion-manifest`, `--promotion-signature-envelope`, `--release-root`,
 `--artifacts`, `--json-out`, `--commit` and `--release-root-sha256`.
 
-Run offline:
+Run offline from a clean, independently trusted tooling checkout at a pinned
+protected-main commit containing both selected commits in its history. Establish
+which main SHA is trusted before going offline; the CLI uses its own checkout's
+`HEAD` as the anchor and cannot establish branch protection or review by itself.
+Independently verify the ReleaseRoot pin and the verifier executable before use:
 
 ```sh
 python tools/release/production_promotion.py \
-  --commit <40-hex> \
+  --commit <candidate-40-hex> \
+  --ledger-commit <reviewed-main-40-hex> \
   --bundle-dir /path/to/promotion-bundle \
   --expected-release-root-sha256 <64-hex> \
-  --verifier /path/to/independent-verifier \
+  --verifier-executable /path/to/independent-verifier \
   --report promotion-report.json
 ```
 
-Exit code `2` means refusal; the report lists every missing/invalid item.
+Exit code `2` means refusal; the report records the reasons found and the
+selected ledger commit, path and SHA-256 (if loaded).
 Exit code `0` means only “this bundle is internally verified for offline
 publication”; the tool sets `published: false` and does not publish. The
 `release-promotion-gate.yml` workflow can perform the same check, but it never

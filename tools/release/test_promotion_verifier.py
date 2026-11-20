@@ -57,7 +57,7 @@ class PromotionVerifierFreshnessTests(unittest.TestCase):
         embedded = self.bundle / "verification" / "verification.json"
         promotion._write_json(embedded, self.template)
         noop = shlex.join([sys.executable, "-c", "import sys; sys.exit(0)"])
-        args = (*self.args[:5], noop)
+        args = (*self.args[:4], noop)
         errors = promotion.evaluate(*args)
         self.assertTrue(any("fresh verification report" in error for error in errors))
         self.assertEqual(json.loads(embedded.read_text(encoding="utf-8")), self.template)
@@ -195,7 +195,7 @@ class PromotionVerifierFreshnessTests(unittest.TestCase):
         # Deliberate boundary: a configured malicious verifier can write lies.
         # This structurally valid fixture uses zero signatures and must never be
         # mistaken for signature verification or a production acceptance test.
-        report, errors = self.invoke(self.args[5])
+        report, errors = self.invoke(self.args[4])
         self.assertEqual(errors, [])
         self.assertEqual(report["verifier"]["version"], "test-only")
 

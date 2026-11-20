@@ -4,11 +4,15 @@ Run the verifier in GitHub Actions:
 
 ```sh
 python -m unittest discover -s tools/gates -p 'test_*.py' -v
-python tools/gates/verify.py --ledger docs/engineering/gates.json --commit "$GITHUB_SHA"
+python tools/release/production_promotion.py --check-ledger \
+  --commit "$CANDIDATE_SHA" --ledger-commit "$REVIEWED_MAIN_LEDGER_SHA"
 ```
 
-The checked-in ledger deliberately blocks production promotion while applicable
-master-plan gates lack reviewed evidence. Development artifacts may be uploaded
+The working status file `docs/engineering/gates.json` is not an authorization
+input. The production ledger must instead be a regular blob at
+`docs/engineering/release-evidence/gates.json` in a later, independently
+reviewed commit on main’s first-parent history. Run the provenance check from
+the trusted main tooling checkout; do not run it from the candidate. Development artifacts may be uploaded
 without claiming production readiness. Never change an open gate to accepted
 because a build, a doctor command, or a simulator alone passed.
 
@@ -29,7 +33,6 @@ retained evidence and offline ReleaseRoot dual signatures remain necessary.
 No production signing private key belongs in Actions secrets. The ledger cannot
 replace the artifact authenticity verifier or the independent security audit.
 
-Evidence must target the exact candidate. If a ledger update changes the source
-commit, run validation on that candidate and record results in the protected
-release-evidence promotion step rather than copying stale acceptance from an
-older build. No local compilation or test execution is authorized by this file.
+Freeze the exact candidate before building it and collecting evidence. A
+subsequent ledger update must not move the candidate; the signed outer promotion
+manifest binds the raw reviewed ledger bytes using `gate_ledger_sha256`. No local compilation or test execution is authorized by this file.

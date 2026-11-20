@@ -143,7 +143,7 @@ Emoji 数据库，结构通过也不证明内容真实、安全、签名或门�
 
 这是**未来满足准入后**的流程，不表示当前有可用生产包、生产密钥或已经验证的 promotion 修复。
 
-1. 冻结 main 上完整 40-hex commit 和真实验收账本。所有适用门禁通过、独立审查闭环且经人批准；不得只修改状态字段或从开发 candidate 复制假证据。
+1. 先冻结受保护 `main` 上完整 40-hex 候选；独立审核后，通过单独的 PR 把真实精确提交证据写入 `docs/engineering/release-evidence/gates.json`。使用该 PR 落到 `main` 第一父链上的完整 SHA 作为 `ledger_commit`，不要改动原候选，也不要用日常状态表 `docs/engineering/gates.json` 或 bundle 中的账本替代。所有适用门禁必须通过、独立审查闭环且经人批准。
 2. 在 Actions 构建并保留五目标生产 archives、SBOM/provenance/source/license/报告，计算全部 hash/size。CI 只构建/测试，不生成或持有 ReleaseRoot 私钥。
 3. 在离线/受控硬件签名环境，用独立于 NetworkRoot 的 ReleaseRoot 对**两份清单各自的精确原始字节**分别做 Ed25519 **和** ML-DSA-65 签名；必须 AND 验证，共四个签名半部。签名前限大小，不能解析重编码后验签。
 4. ReleaseRoot 公钥通过独立带外渠道分发，预先钉住完整 SHA-256；不得从同源下载公钥和 hash 就自称建立独立信任。私钥保管、授权门限、双人复核、轮换/撤销、灾难恢复必须有独立操作规程，秘密绝不进入 CI Secrets/日志/artifact。
@@ -163,16 +163,17 @@ promotion-bundle/
 
 独立 verifier 的报告**不存放在 bundle 内**：promotion 工具每次在 bundle 外创建私有临时目录，将一个初始不存在的输出路径通过 `--json-out` 传给 verifier，只接受本次调用新生成的报告。旧 bundle 内附带的验签报告一律忽略，不能作为成功依据；最终 `--report` 为 promotion 检查摘要，不是可复用的独立验签授权。
 
-release manifest 使用 supervisor 严格 schema：`product:"boreas"`、`manifest_version:1`、正 `sequence`、`published_at <= issued_at < expires`、最长 90 天、`min_compatible_state`、`signing_key_id`、五个唯一平台资产（`name/arch/size/sha256/https url`）。outer promotion manifest 绑定完整 commit、release manifest/账本/ReleaseRoot hash 与五资产。两个 manifest **都不能含自己的 hash**；detached envelope 可含被签 manifest 的 hash、key id 和双签。解析必须有大小/深度/整数边界，拒绝重复 key、歧义平台、路径穿越、未知字段及不合格 URL。
+release manifest 使用 supervisor 严格 schema：`product:"boreas"`、`manifest_version:1`、正 `sequence`、`published_at <= issued_at < expires`、最长 90 天、`min_compatible_state`、`signing_key_id`、五个唯一平台资产（`name/arch/size/sha256/https url`）。outer promotion manifest 绑定完整候选 commit、release manifest/账本/ReleaseRoot hash 与五资产；其中 `gate_ledger_sha256` 必须是单独评审的账本在 Git 中的原始 blob SHA-256，可由可信 main 工具的 `--check-ledger` 模式取得，禁止重新序列化后再散列。两个 manifest **都不能含自己的 hash**；detached envelope 可含被签 manifest 的 hash、key id 和双签。解析必须有大小/深度/整数边界，拒绝重复 key、歧义平台、路径穿越、未知字段及不合格 URL。
 
-独立 verifier 必须产生覆盖本次两个 manifest 的全部四签和五 archive hash/size 的报告，不能仅写一个 `verified:true`。人工审核 verifier 的独立性和报告真实性。离线运行接口（仅在上述前提具备时）：
+独立 verifier 必须产生覆盖本次两个 manifest 的全部四签和五 archive hash/size 的报告，不能仅写一个 `verified:true`。人工审核 verifier 的独立性和报告真实性。以下命令从已独立确认的、固定在受保护 `main` 的干净工具 checkout 执行，而非从候选目录执行：
 
 ```sh
 python tools/release/production_promotion.py \
-  --commit <full-40-hex> \
+  --commit <candidate-40-hex> \
+  --ledger-commit <reviewed-main-40-hex> \
   --bundle-dir /path/to/promotion-bundle \
   --expected-release-root-sha256 <out-of-band-pinned-64-hex> \
-  --verifier /path/to/pretrusted-independent-verifier \
+  --verifier-executable /path/to/pretrusted-independent-verifier \
   --report promotion-report.json
 ```
 
