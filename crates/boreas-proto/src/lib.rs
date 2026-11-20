@@ -144,49 +144,51 @@ impl FrameDecoder {
         self.buf.clear();
         Err(e)
     }
-    pub fn feed(&mut self, input: &[u8]) -> Result<Vec<Frame>, Error> {
+    pub fn feed(&mut self, mut input: &[u8]) -> Result<Vec<Frame>, Error> {
         if self.failed {
             return Err(Error::Poisoned);
         }
         let mut out = Vec::new();
         let mut emitted = 0usize;
-        for byte in input {
-            if self
-                .buf
-                .len()
-                .checked_add(emitted)
-                .and_then(|n| n.checked_add(1))
-                .filter(|n| *n <= self.limit)
-                .is_none()
-            {
-                return self.fail(Error::BufferLimit);
-            }
-            self.buf.push(*byte);
-            if self.buf.len() == HEADER_LEN {
-                let raw: [u8; HEADER_LEN] = self.buf[..].try_into().expect("header length checked");
-                if let Err(e) = AppHeader::parse(&raw) {
-                    return self.fail(e);
-                }
-            }
-            if self.buf.len() >= HEADER_LEN {
-                let raw: [u8; HEADER_LEN] = self.buf[..HEADER_LEN]
-                    .try_into()
-                    .expect("header length checked");
-                let h = match AppHeader::parse(&raw) {
-                    Ok(v) => v,
-                    Err(e) => return self.fail(e),
-                };
-                let n = HEADER_LEN + h.body_len as usize;
-                if n > self.limit {
+        while !input.is_empty() {
+            if self.buf.len() < HEADER_LEN {
+                let take = input.len().min(HEADER_LEN - self.buf.len());
+                if take > self.limit - emitted - self.buf.len() {
                     return self.fail(Error::BufferLimit);
                 }
-                if self.buf.len() == n {
-                    let mut complete = std::mem::take(&mut self.buf);
-                    let body = complete.split_off(HEADER_LEN);
-                    emitted += n;
-                    out.push(Frame { header: h, body });
+                self.buf.extend_from_slice(&input[..take]);
+                input = &input[take..];
+                if self.buf.len() < HEADER_LEN {
+                    break;
                 }
             }
+            // Parse at the header boundary, before charging or accepting any body
+            // bytes. This preserves header-error priority even for a large feed.
+            let raw = self.buf[..HEADER_LEN].try_into().expect("header length checked");
+            let header = match AppHeader::parse(raw) {
+                Ok(header) => header,
+                Err(error) => return self.fail(error),
+            };
+            let wire_len = HEADER_LEN + header.body_len as usize;
+            let take = input.len().min(wire_len - self.buf.len());
+            if wire_len > self.limit || take > self.limit - emitted - self.buf.len() {
+                return self.fail(Error::BufferLimit);
+            }
+            if wire_len == self.buf.len() + take && self.buf.len() == HEADER_LEN {
+                // The complete body is already contiguous in the input.
+                self.buf.clear();
+                out.push(Frame { header, body: input[..take].to_vec() });
+            } else {
+                self.buf.extend_from_slice(&input[..take]);
+                if self.buf.len() < wire_len {
+                    break;
+                }
+                let mut complete = std::mem::take(&mut self.buf);
+                let body = complete.split_off(HEADER_LEN);
+                out.push(Frame { header, body });
+            }
+            emitted += wire_len;
+            input = &input[take..];
         }
         Ok(out)
     }
@@ -1066,6 +1068,38 @@ mod tests {
         let mut d = FrameDecoder::new(1024);
         assert!(d.feed(&[3, 9, 0, 0, 0, 0, 0, 0]).is_err());
         assert_eq!(d.finish(), Err(Error::Poisoned));
+    }
+
+    #[test]
+    fn chunked_feed_preserves_quota_and_header_error_order() {
+        let first = wire(3, b"1234");
+        let mut stream = first.clone();
+        stream.extend_from_slice(&wire(3, b"5678"));
+        let mut exact = FrameDecoder::new(stream.len());
+        assert_eq!(exact.feed(&stream).unwrap().len(), 2);
+        assert_eq!(exact.finish(), Ok(()));
+        let mut short = FrameDecoder::new(stream.len() - 1);
+        assert_eq!(short.feed(&stream), Err(Error::BufferLimit));
+        assert_eq!(short.buffered_len(), 0);
+        assert_eq!(short.feed(&first), Err(Error::Poisoned));
+
+        let mut invalid = first.clone();
+        invalid.extend_from_slice(&[0; HEADER_LEN]);
+        invalid.extend_from_slice(&[0; 128]);
+        let mut header_fits = FrameDecoder::new(first.len() + HEADER_LEN);
+        assert_eq!(header_fits.feed(&invalid), Err(Error::BadVersion(0)));
+        let mut header_does_not_fit = FrameDecoder::new(first.len() + HEADER_LEN - 1);
+        assert_eq!(header_does_not_fit.feed(&invalid), Err(Error::BufferLimit));
+
+        for split in 0..=stream.len() {
+            let mut decoder = FrameDecoder::new(stream.len());
+            let mut frames = decoder.feed(&stream[..split]).unwrap();
+            frames.extend(decoder.feed(&stream[split..]).unwrap());
+            assert_eq!(frames.len(), 2, "split at {split}");
+            assert_eq!(frames[0].body, b"1234");
+            assert_eq!(frames[1].body, b"5678");
+            assert_eq!(decoder.finish(), Ok(()));
+        }
     }
 
     #[test]
