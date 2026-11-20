@@ -26,7 +26,9 @@ runtime_fail() { printf 'boreas-run: %s\n' "$*" >&2; exit 1; }
 
 # Both systemd and procd use this wrapper. Set hard and soft core-file limits
 # before launching. This is not a replacement for making the daemon
-# non-dumpable on hosts with a piped core_pattern.
+# non-dumpable on hosts with a piped core_pattern. Linux dash, bash and
+# BusyBox ash support -c; the cross-shell deployment test checks inheritance.
+# shellcheck disable=SC3045
 ulimit -c 0 || ex_config 'cannot set zero core file limit'
 
 case "$PREFIX" in
