@@ -1627,10 +1627,9 @@ mod linux_daemon {
         let mut trust = ManagementTrust::new(net_id);
         let mut has_status = false;
         for authorization in authorizations {
-            let record = authorization.issuer_record();
-            has_status |= record.authority == Authority::StatusSigner;
+            has_status |= authorization.authority() == Authority::StatusSigner;
             trust
-                .add_issuer(record)
+                .add_verified_issuer(&authorization)
                 .map_err(|e| format!("daemon: status trust issuer rejected: {e}"))?;
         }
         if !has_status {
