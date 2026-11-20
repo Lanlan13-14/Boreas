@@ -815,9 +815,9 @@ jobs:
           path: hop-node-linux
           if-no-files-found: error
           retention-days: 14
-      - name: Diagnose delayed full-duplex transfer once (candidate only)
-        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/fix/v111-release-blockers'
-        timeout-minutes: 3
+      - name: Check three delayed full-duplex samples (candidate only)
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/fix/v111-release-blockers'
+        timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
           BOREAS_NETEM_LOSS_PERCENT: '0.1'
@@ -830,9 +830,15 @@ jobs:
           BOREAS_DIAGNOSTIC_TIMING: '1'
         run: |
           set -euo pipefail
-          sudo -E bash tools/release/netns_daemon_smoke.sh \
-            hop-node-linux/boreas-linux-x86_64-musl-pq768 \
-            2>&1 | tee rust-tls-netns-delayed.log
+          failed=0
+          for sample in 1 2 3; do
+            if ! sudo -E timeout --kill-after=5s 95s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+              2>&1 | tee "rust-tls-netns-delayed-${sample}.log"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Upload non-secret CI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -851,7 +857,7 @@ jobs:
             rust-tls-supervisor-tests.log
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
-            rust-tls-netns-delayed.log
+            rust-tls-netns-delayed-*.log
             rust-tls-initial-backup.log
             rust-tls-initial-backup-negative.log
           if-no-files-found: warn
