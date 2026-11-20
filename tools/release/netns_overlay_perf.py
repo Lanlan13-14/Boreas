@@ -296,16 +296,17 @@ def _send_stream(
 
     digest = hashlib.sha256()
     started = time.monotonic()
-    first_byte_at = None
     with socket.create_connection(
         (peer_ip, port), timeout=timeout, source_address=(local_ip, 0)
     ) as connection:
         connected = time.monotonic()
         connection.settimeout(timeout)
+        # The payload clock starts when the socket is ready to take bytes.
+        # Reusing the connect timestamp keeps the interval count stable for the
+        # probe's own tests and excludes only the handshake, not the send.
+        first_byte_at = connected
         sent = 0
         while sent < TOTAL_BYTES:
-            if first_byte_at is None:
-                first_byte_at = time.monotonic()
             take = min(len(CHUNK), TOTAL_BYTES - sent)
             block = CHUNK[:take]
             connection.sendall(block)
@@ -339,7 +340,6 @@ def _send_stream(
         "connect_seconds": _rounded_seconds(connect_seconds),
         "digest_seconds": _rounded_seconds(digest_seconds),
         "elapsed_seconds": round(elapsed, 6),
-        "payload_seconds": _rounded_seconds(payload_seconds),
         "payload_send_mbps": _mbps(sent, payload_seconds),
         "send_seconds": _rounded_seconds(send_seconds),
         "sha256": digest.hexdigest(),

@@ -649,9 +649,12 @@ class BaselineCompareTests(unittest.TestCase):
 class ProtocolConstantsTests(unittest.TestCase):
     def test_smoke_protocol_constants_are_unchanged(self):
         self.assertEqual(netns_overlay_perf.PORT, 18080)
-        self.assertEqual(netns_overlay_perf.TIMEOUT_SECONDS, 30)
+        # The transfer has to outlast slow start on a 200 ms path, so the
+        # socket timeout and the payload cap are larger than the original
+        # 30 s / 64 MiB probe. Both stay bounded.
+        self.assertEqual(netns_overlay_perf.TIMEOUT_SECONDS, 120)
         self.assertGreater(netns_overlay_perf.TOTAL_BYTES, 0)
-        self.assertLessEqual(netns_overlay_perf.TOTAL_BYTES, 64 * 1024 * 1024)
+        self.assertLessEqual(netns_overlay_perf.TOTAL_BYTES, 1024 * 1024 * 1024)
 
 
 class UnderlayTcpInfoParserTests(unittest.TestCase):
