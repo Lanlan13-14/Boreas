@@ -290,18 +290,27 @@ impl ControlType {
 /// [`messages::parse_control_body`] before applying state transitions so a
 /// structurally malformed `SessionHello` cannot advance the handshake.
 pub fn validate_frame_policy(frame: &Frame, ctx: &mut SessionContext) -> Result<(), Error> {
-    frame.header.encode()?;
-    if frame.header.body_len as usize != frame.body.len() {
+    validate_frame_policy_parts(&frame.header, &frame.body, ctx)
+}
+
+/// Apply the identical frame policy to a borrowed body before serialization.
+pub fn validate_frame_policy_parts(
+    header: &AppHeader,
+    body: &[u8],
+    ctx: &mut SessionContext,
+) -> Result<(), Error> {
+    header.encode()?;
+    if header.body_len as usize != body.len() {
         return Err(Error::InvalidFrameBody);
     }
-    match frame.header.kind {
+    match header.kind {
         Kind::Control => {
-            let Some(&subtype) = frame.body.first() else {
+            let Some(&subtype) = body.first() else {
                 return Err(Error::EmptyControl);
             };
             let t = ControlType::try_from(subtype)?;
-            if frame.body.len() > t.body_cap() {
-                return Err(Error::BodyTooLarge(frame.body.len() as u32));
+            if body.len() > t.body_cap() {
+                return Err(Error::BodyTooLarge(body.len() as u32));
             }
             match t {
                 ControlType::SessionHello
