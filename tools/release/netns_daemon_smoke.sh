@@ -16,6 +16,16 @@ BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+# This is a test-fixture lifetime, not a TLS or authorization timeout. Keep
+# routine sanity runs short; explicit long samples get a separate bounded
+# wall-clock budget. The Core outlives the Edge for orderly teardown.
+EDGE_LIFETIME_SECONDS="${BOREAS_NETNS_EDGE_LIFETIME_SECONDS:-33}"
+if [[ ! "$EDGE_LIFETIME_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || \
+   (( EDGE_LIFETIME_SECONDS < 33 || EDGE_LIFETIME_SECONDS > 660 )); then
+  echo 'ERROR: BOREAS_NETNS_EDGE_LIFETIME_SECONDS must be a canonical integer in 33..660' >&2
+  exit 1
+fi
+CORE_LIFETIME_SECONDS=$(( EDGE_LIFETIME_SECONDS + 2 ))
 # The test harness, not the daemon, creates the explicitly provisioned fixture.
 # No NetworkRoot private key is read or copied by the daemon.
 STATE_OWNER_UID="${BOREAS_TEST_STATE_OWNER_UID:-$(id -u)}"
@@ -861,7 +871,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --listen "192.0.2.1:8443" \
   --tun-name "btun0" \
   --mtu "$TUN_MTU" \
-  --max-seconds 35 \
+  --max-seconds "$CORE_LIFETIME_SECONDS" \
   > "$WORK/core.out" 2> "$WORK/core.err" &
 echo $! > "$WORK/core.pid"
 
@@ -894,7 +904,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --ws-host "wss.boreas.test:8443" \
   --tun-name "btun0" \
   --mtu "$TUN_MTU" \
-  --max-seconds 33 \
+  --max-seconds "$EDGE_LIFETIME_SECONDS" \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &
 echo $! > "$WORK/edge.pid"
 
@@ -1077,7 +1087,7 @@ import sys
 
 labels = ("edge_to_core", "core_to_edge")
 minimum = float(os.environ.get("BOREAS_MIN_THROUGHPUT_MBPS", "3.0"))
-expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(64 * 1024 * 1024)))
+expected_bytes = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
 failures = []
 
 for label, path in zip(labels, sys.argv[1:]):

@@ -74,21 +74,29 @@ jobs:
             rate: 10
             max_ping: 115
             min_mbps: 3
+            payload_bytes: 67108864
+            edge_lifetime_seconds: 230
           - rtt: 200
             loss: 0.1
             rate: 100
             max_ping: 415
             min_mbps: 3
+            payload_bytes: 67108864
+            edge_lifetime_seconds: 230
           - rtt: 400
             loss: 1
             rate: 1000
             max_ping: 815
             min_mbps: 1
+            payload_bytes: 67108864
+            edge_lifetime_seconds: 620
           - rtt: 200
             loss: 3
             rate: 1000
             max_ping: 415
             min_mbps: 0.5
+            payload_bytes: 16777216
+            edge_lifetime_seconds: 330
     steps:
       - name: Record triggering source commit
         run: |
@@ -123,9 +131,11 @@ jobs:
           BOREAS_NETEM_RATE_MBIT: ${{ matrix.rate }}
           BOREAS_MAX_PING_MS: ${{ matrix.max_ping }}
           BOREAS_MIN_THROUGHPUT_MBPS: ${{ matrix.min_mbps }}
-          # 64 MiB, not 1 MiB. A 1 MiB transfer over a 200 ms path is a few round
-          # trips and reports slow start as if it were the sustained rate.
-          BOREAS_PERF_BYTES: '67108864'
+          # Match fixture lifetime to payload at the unchanged goodput floor.
+          # The 0.5 Mbit/s profile uses 16 MiB to stay within the job budget.
+          # These are completion measurements, not steady-state throughput.
+          BOREAS_PERF_BYTES: ${{ matrix.payload_bytes }}
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: ${{ matrix.edge_lifetime_seconds }}
         run: |
           set -euo pipefail
           sudo -E bash tools/release/netns_daemon_smoke.sh \
@@ -250,11 +260,13 @@ jobs:
           run_sample() {
             local label="$1"
             local bytes="$2"
+            local lifetime="$3"
             local log="diagnostic-${label}.log"
             local rc
             local -a pipe_status
-            echo "=== ${label}: ${bytes} bytes ==="
-            BOREAS_PERF_BYTES="$bytes" sudo -E bash tools/release/netns_daemon_smoke.sh \
+            echo "=== ${label}: ${bytes} bytes, Edge lifetime ${lifetime} s ==="
+            BOREAS_PERF_BYTES="$bytes" BOREAS_NETNS_EDGE_LIFETIME_SECONDS="$lifetime" \
+              sudo -E bash tools/release/netns_daemon_smoke.sh \
               "$PWD/artifact/boreas-linux-x86_64-musl-pq768" 2>&1 | tee "$log"
             pipe_status=("${PIPESTATUS[@]}")
             rc="${pipe_status[0]}"
@@ -275,8 +287,8 @@ jobs:
               overall=1
             fi
           }
-          run_sample short_8mib 8388608
-          run_sample sustained_64mib 67108864
+          run_sample short_8mib 8388608 50
+          run_sample sustained_64mib 67108864 230
           cat diagnostic-status.txt
           exit "$overall"
       - name: Report raw evidence and failure reasons

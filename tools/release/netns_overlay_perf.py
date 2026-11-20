@@ -36,11 +36,9 @@ import sys
 import time
 
 CHUNK = bytes((index % 251 for index in range(64 * 1024)))
-# A 1 MiB transfer over a 200 ms path is a handful of round trips, so it
-# measures slow start rather than the rate the path sustains. The default is
-# one full payload large enough for the window to open, bounded so a stalled
-# transfer still ends inside the socket timeout below.
-TOTAL_BYTES = int(os.environ.get("BOREAS_PERF_BYTES", str(64 * 1024 * 1024)))
+# Ordinary connectivity smoke uses a short payload. Longer performance
+# experiments pass an explicit payload and matching fixture lifetime.
+TOTAL_BYTES = int(os.environ.get("BOREAS_PERF_BYTES", str(8 * 1024 * 1024)))
 if TOTAL_BYTES <= 0 or TOTAL_BYTES > 1024 * 1024 * 1024:
     raise ValueError("BOREAS_PERF_BYTES must be in 1..=1073741824")
 PORT = 18080
