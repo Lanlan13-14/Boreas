@@ -72,9 +72,9 @@ def main():
 
     for sha in shas:
         checked_binary(sha)
-    fixture = temp / "ab-policy-fixture"
-    if not fixture.is_dir() or fixture.is_symlink():
-        raise SystemExit("Missing shared signed policy fixture")
+    openssl = temp / "ab-openssl/bin/openssl"
+    if not openssl.is_file() or not os.access(openssl, os.X_OK):
+        raise SystemExit("Missing same-run OpenSSL fixture signer")
     with (evidence / "profile.txt").open("x", encoding="utf-8") as out:
         print("scope=DEVELOPMENT_DIAGNOSTIC_ONLY", "configured_base_rtt_ms=400",
               "pair_order=AB,BA", "sample_guard_seconds=270", *(
@@ -86,7 +86,7 @@ def main():
     # A fresh namespace/PKI per invocation; no broad `sudo -E` or inherited knobs.
     command = ["sudo", "-n", "/usr/bin/env", "-i",
                "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
-               f"BOREAS_POLICY_FIXTURE_DIR={fixture}",
+               f"BOREAS_OPENSSL_BIN={openssl}",
                f"OPENSSL_CONF={temp / 'ab-openssl/ssl/openssl.cnf'}",
                *(f"{key}={value}" for key, value in PROFILE.items()),
                "/usr/bin/timeout", "--kill-after=10s", "270s", "/usr/bin/bash", str(harness)]

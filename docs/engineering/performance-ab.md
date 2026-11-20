@@ -6,12 +6,12 @@ No changes to those workflows or to the strict netns harness are necessary.
 
 ## Dispatch in Actions (never run locally)
 
-A new manual workflow must be registered on the repository's default branch
-before GitHub accepts `workflow_dispatch`. Use normal review to land it on the
-default branch first; check that the selected dispatch branch also contains
-it and both exact commits in its history. A maintainer reviews the dispatch
-revision and both input revisions (including build scripts/dependencies)
-before dispatch. Ancestry and matching lockfiles are safeguards, not evidence
+A push changing the diagnostic workflow or script on the same-repository
+`fix/v111-release-blockers` branch runs the fixed baseline and candidate below.
+Manual dispatch is available once registered on the default branch; the
+selected ref must contain both exact commits. A maintainer reviews both input
+revisions (including build scripts/dependencies) before manual dispatch.
+Ancestry and matching lockfiles are safeguards, not evidence
 of human approval. Do not extend this workflow to PR/fork triggers, external
 artifacts, self-hosted runners, cloud credentials, or repository secrets. The
 existing netns smoke needs root and runs both binaries with that privilege on
@@ -46,8 +46,9 @@ binary paths are used as comparison inputs.
   full-SHA-named executables to their build inputs. No cross-run artifacts
   or caches are consumed and the executables are never uploaded.
 - Two sequential adjacent pairs (`A,B`, then `B,A`); each invocation gives both
-  namespaces fresh state and uses the same strict harness and signed public
-  policy fixture. The real TUN/veth path uses `e2e-required` and `pq768`.
+  namespaces fresh state and uses the same strict harness and signing tools.
+  Each run gets a freshly generated test root shared by identity and policy
+  inside that run. The real TUN/veth path uses `e2e-required` and `pq768`.
   Existing PKI, verification, polling, integrity and daemon checks are not
   bypassed. 64 MiB of identical deterministic payload **per direction** is run
   simultaneously, with the existing 230 s Edge fixture lifetime and the same
@@ -60,7 +61,7 @@ binary paths are used as comparison inputs.
   Random loss realizations and fresh ephemeral keys differ across runs.
 - Download `development-perf-ab-evidence-<run>-<attempt>` from the run even if
   it is red. `revisions.txt`, `runner.txt`, OpenSSL reports, build/linkage logs,
-  `SHA256SUMS`, `policy.sha256`, `profile.txt`, and four smoke logs record the
+  `SHA256SUMS`, `profile.txt`, and four smoke logs record the
   conditions. `samples.csv` separates the daemon launch-to-connected observation
   (coarse polling), each sender's overlay TCP connect, send, digest return and
   end-to-end completion; completion seconds are the sum of rounded phases and
