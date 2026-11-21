@@ -520,7 +520,7 @@ fn run_lane(
             } else {
                 TICK
             };
-            if (poll_io(fd, None, wait)?.0 || path.has_buffered_input())
+            if (poll_io(fd, None, PathPoll::Read, wait)?.socket_readable || path.has_buffered_input())
                 && !cohort.stopped.load(Ordering::Acquire)
                 && !cohort.draining.load(Ordering::Acquire)
             {
@@ -657,7 +657,7 @@ fn dispatch(
         // The existing poll helper checks the second fd for terminal TUN
         // events. The first fd is the same nonblocking TUN; ignore its result.
         let wait = if progressed { Duration::ZERO } else { TICK };
-        if poll_io(tun_fd, Some(tun_fd), wait)?.1
+        if poll_io(tun_fd, Some(tun_fd), PathPoll::Read, wait)?.tun_readable
             && let Some(packet) = io
                 .read_packet_with_scratch(&mut scratch)
                 .map_err(|e| format!("daemon multi-active: TUN read failed: {e:?}"))?
