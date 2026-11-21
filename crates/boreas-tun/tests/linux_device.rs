@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "linux_device/tun_gso.rs"]
+mod tun_gso;
+
 fn root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -38,6 +41,10 @@ fn rerun_in_netns(test_name: &str) -> bool {
         .arg(exe)
         .args(["--exact", test_name, "--nocapture"])
         .env("BOREAS_IN_NETNS", "1")
+        .env(
+            "BOREAS_PARENT_NETNS",
+            fs::read_link("/proc/self/ns/net").expect("parent network namespace"),
+        )
         .status()
         .expect("unshare");
     assert!(

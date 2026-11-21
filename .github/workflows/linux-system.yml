@@ -6,8 +6,8 @@ name: '[Test] Linux TUN real-device tests (netns)'
 # an unprivileged or unavailable harness panics instead of silently skipping.
 #
 # A green run is crate-level real-device evidence (adapter creation, MTU,
-# multi-queue attach, and a kernel-routed ICMP reply through the TUN).  It is
-# not a full VPN data-plane, routing, DNS, failover or release acceptance gate.
+# multi-queue attach, kernel-routed ICMP, and test-only TCPv4 TUN offload).
+# It is not a full VPN data-plane, routing, DNS, failover or release acceptance gate.
 
 on:
   push:
@@ -67,9 +67,11 @@ jobs:
         run: |
           set -euo pipefail
           set -o pipefail
-          sudo -E env "PATH=$PATH" BOREAS_REQUIRE_TUN=1 \
-            cargo test -p boreas-tun --locked -- --test-threads=1 2>&1 |
-            tee native-device-test.log
+          {
+            uname -srmo
+            sudo -E env "PATH=$PATH" BOREAS_REQUIRE_TUN=1 \
+              cargo test -p boreas-tun --locked -- --test-threads=1
+          } 2>&1 | tee native-device-test.log
 
       - name: Guard against skipped or simulated TUN evidence
         if: always()
@@ -81,7 +83,9 @@ jobs:
             --log native-device-test.log \
             --out native-device-evidence.json \
             --require-test create_verify_mtu_multiqueue_and_auto_cleanup \
-            --require-test real_l3_write_and_kernel_routed_reply
+            --require-test real_l3_write_and_kernel_routed_reply \
+            --require-test tun_gso::real_tcpv4_gso_kernel_segmentation \
+            --require-marker 'BOREAS_DEVICE_EVIDENCE platform=linux driver=tun vnet=ok tcpv4_gso=kernel segmented=ok offload_disabled=ok cleanup=ok'
 
       - name: Upload native TUN evidence
         if: always()
