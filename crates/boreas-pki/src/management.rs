@@ -154,7 +154,7 @@ impl AllowedPrefix {
 }
 
 /// Explicit issuer authority scope. Empty role/core/prefix sets authorize nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IssuerScope {
     pub allowed_roles: Vec<NodeRole>,
     pub allowed_home_cores: Vec<u8>,
@@ -188,7 +188,7 @@ impl IssuerScope {
 
 /// Provisioned issuer trust record. The public keys are DER SubjectPublicKeyInfo values
 /// imported and type-checked by `add_issuer`; they are never raw attacker-supplied blobs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuerRecord {
     pub issuer_key_id: Vec<u8>,
     pub issuer_generation: u64,
@@ -269,7 +269,7 @@ struct ReplayState {
     conflicted: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TrustedIssuer {
     record: IssuerRecord,
     /// `None` is reserved for explicitly provisioned out-of-band anchors.
@@ -307,6 +307,9 @@ impl ManagementTrust {
     }
     pub fn issuer_count(&self) -> usize {
         self.issuers.len()
+    }
+    pub(crate) fn same_issuers(&self, expected: &Self) -> bool {
+        self.net_id == expected.net_id && self.issuers == expected.issuers
     }
     /// Full envelope bytes of the most recent equivocation, if any.
     pub fn conflict_evidence(&self) -> Option<&[u8]> {

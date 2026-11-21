@@ -87,6 +87,7 @@ dependencies = [
  "boreas-pki",
  "boreas-proto",
  "boreas-tun",
+ "libc",
  "openssl",
 ]
 

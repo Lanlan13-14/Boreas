@@ -65,10 +65,10 @@ mod linux {
         if !meta.is_file() || meta.len() == 0 || meta.len() > max as u64 {
             return Err("invalid mesh material file".into());
         }
-        if let Some(owner) = secret_owner {
-            if (meta.uid() != owner && meta.uid() != 0) || meta.mode() & 0o077 != 0 {
-                return Err("unsafe mesh private key owner or permissions".into());
-            }
+        if let Some(owner) = secret_owner
+            && ((meta.uid() != owner && meta.uid() != 0) || meta.mode() & 0o077 != 0)
+        {
+            return Err("unsafe mesh private key owner or permissions".into());
         }
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         file.take(max as u64 + 1)

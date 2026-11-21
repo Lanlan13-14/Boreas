@@ -120,7 +120,7 @@ impl Fixture {
         let root_ed = PKey::private_key_from_der(&read(&ca, "root.ed25519.key")).unwrap();
         let root_ml = PKey::private_key_from_der(&read(&ca, "root.mldsa65.key")).unwrap();
         let mut nodes = Vec::new();
-        for id in 1u8..=3 {
+        for id in 1u8..=4 {
             let path = temp.0.join(format!("core-{id}"));
             issue_node_dir(&ca, &path, &NodeIssueParams {
                 role: NodeRole::Core,
@@ -176,7 +176,7 @@ impl Fixture {
                     core_id: id,
                     core_generation: 1,
                     seq: 1,
-                    neighbors: (1..=3)
+                    neighbors: (1..=4)
                         .filter(|other| *other != id)
                         .map(|other| Neighbor {
                             peer_core_id: other,
@@ -370,4 +370,165 @@ fn strict_pq768_signed_adjacency_only_falls_back_before_authentication() {
         assert!(responder.join().unwrap().is_err());
         assert!(matches!(unused.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     });
+}
+
+fn accept_socket(listener: TcpListener) -> std::net::TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                socket.set_nonblocking(false).unwrap();
+                return socket;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) => panic!("loopback accept: {e}"),
+        }
+    }
+}
+
+fn fixed_exchange(f: &Fixture, ids: &[usize], cut_path: bool) -> Result<[u8; 16], Error> {
+    use boreas_tunnel::mesh_relay::{forward_fixed, with_fixed_endpoint};
+    use std::io::{Read, Write};
+    let envelopes: Vec<&[u8]> = ids
+        .iter()
+        .map(|id| f.node(*id).identity.as_slice())
+        .collect();
+    let mut sockets: Vec<_> = (1..ids.len()).map(|_| listener()).collect();
+    let destinations: Vec<_> = sockets.iter().map(|(_, target)| target.clone()).collect();
+    let payload = (0..100_000u32)
+        .map(|i| (i.wrapping_mul(43) >> 7) as u8)
+        .collect::<Vec<_>>();
+    let response = *b"authenticated endpoint response";
+    let outer_client = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let envelopes = &envelopes;
+    let destinations = &destinations;
+    let payload = &payload;
+    let outer_client = &outer_client;
+    thread::scope(|scope| {
+        let mut relays = Vec::new();
+        let mut endpoints = Vec::new();
+        for (index, (socket, _)) in sockets.drain(..).enumerate() {
+            let pos = index + 1;
+            let id = ids[pos];
+            let path = &f.node(id).path;
+            let setup = move || -> Result<_, Error> {
+                let mut status = f.status(id);
+                let mut probe = f.probe(id, &mut status);
+                let route = probe.authorize_fixed_route(envelopes)?;
+                let outer = OpenSslOuterTlsAcceptor::from_pem_files(
+                    path.join("outer.pem"),
+                    path.join("outer.key"),
+                )?;
+                let accepted = accept_socket(socket);
+                let fault = accepted.try_clone().map_err(TunnelError::from)?;
+                let admission = Admission::new(Limits {
+                    handshakes_global: 1,
+                    authenticated_global: 2,
+                    authenticated_per_peer: 1,
+                    bytes_global: 1024 * 1024,
+                });
+                let left =
+                    probe.accept(accepted, &f.node(ids[pos - 1]).identity, &outer, &admission)?;
+                if pos + 1 == ids.len() {
+                    let mut seen = None;
+                    let result = with_fixed_endpoint(&mut probe, &route, left, |c| {
+                        seen = Some(c.circuit_id());
+                        let mut received = vec![0; payload.len()];
+                        c.read_exact(&mut received)?;
+                        assert_eq!(received, *payload);
+                        if cut_path {
+                            fault.shutdown(std::net::Shutdown::Both)?;
+                        } else {
+                            c.write_all(&response)?;
+                        }
+                        Ok(c.circuit_id())
+                    });
+                    if cut_path {
+                        assert!(result.is_err());
+                        return Ok((seen.expect("confirmed before fault"), None));
+                    }
+                    Ok((result?, None))
+                } else {
+                    let right = probe.dial(
+                        &[Candidate {
+                            target: &destinations[pos],
+                            signed_identity: &f.node(ids[pos + 1]).identity,
+                        }],
+                        outer_client,
+                        &admission,
+                    )?;
+                    let forwarded = forward_fixed(&mut probe, &route, left, right, &admission)?;
+                    Ok((forwarded.circuit_id, Some(forwarded.ciphertext_bytes)))
+                }
+            };
+            if pos + 1 == ids.len() {
+                endpoints.push(scope.spawn(setup));
+            } else {
+                relays.push(scope.spawn(setup));
+            }
+        }
+        let mut status = f.status(ids[0]);
+        let mut probe = f.probe(ids[0], &mut status);
+        let route = probe.authorize_fixed_route(envelopes)?;
+        let hop = probe.dial(
+            &[Candidate {
+                target: &destinations[0],
+                signed_identity: &f.node(ids[1]).identity,
+            }],
+            outer_client,
+            &Admission::new(Limits {
+                handshakes_global: 1,
+                authenticated_global: 1,
+                authenticated_per_peer: 1,
+                bytes_global: 1024 * 1024,
+            }),
+        )?;
+        let mut lost_id = None;
+        let result = with_fixed_endpoint(&mut probe, &route, hop, |c| {
+            lost_id = Some(c.circuit_id());
+            c.write_all(payload)?;
+            let mut reply = [0; 31];
+            c.read_exact(&mut reply)?;
+            assert_eq!(reply, response);
+            Ok(c.circuit_id())
+        });
+        let received = endpoints.pop().unwrap().join().unwrap()?;
+        if cut_path {
+            assert!(
+                result.is_err(),
+                "the endpoint must not accept a partial exchange"
+            );
+            assert_eq!(lost_id, Some(received.0));
+            for relay in relays {
+                assert!(relay.join().unwrap().is_err());
+            }
+            return Ok(received.0);
+        }
+        let id = result?;
+        assert_eq!(id, received.0);
+        for relay in relays {
+            let (seen, bytes) = relay.join().unwrap()?;
+            assert_eq!(id, seen);
+            let bytes = bytes.unwrap();
+            assert!(bytes[0] > payload.len() as u64 && bytes[1] > response.len() as u64);
+        }
+        Ok(id)
+    })
+}
+
+#[test]
+fn signed_fixed_route_transfers_bidirectional_e2e_and_rebuilds_after_path_loss() {
+    let f = Fixture::new();
+    // The first route transfers through two distinct relays, then loses its
+    // last link after confirmed application bytes but before the reply.
+    let lost = fixed_exchange(&f, &[1, 2, 3, 4], true).unwrap();
+    // Explicitly reauthorize a shorter alternate path. The endpoints and
+    // their generations are unchanged: links, circuit and TLS are all new.
+    let replacement = fixed_exchange(&f, &[1, 3, 4], false).unwrap();
+    assert_ne!(lost, replacement);
+    let through_two = fixed_exchange(&f, &[1, 2, 3, 4], false).unwrap();
+    assert_ne!(through_two, replacement);
 }

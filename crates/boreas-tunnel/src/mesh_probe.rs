@@ -79,10 +79,10 @@ pub fn utc_now() -> Result<u64, Error> {
     u64::try_from(n.as_micros()).map_err(|_| Error::Clock)
 }
 
-struct Core {
-    id: u8,
-    identity: VerifiedNodeIdentity,
-    until: u64,
+pub(crate) struct Core {
+    pub(crate) id: u8,
+    pub(crate) identity: VerifiedNodeIdentity,
+    pub(crate) until: u64,
 }
 
 impl Core {
@@ -140,6 +140,33 @@ pub struct Selected {
     pub signed_lsa: Vec<u8>,
 }
 
+/// A dedicated live adjacency; not clonable and not constructible from an LSA.
+/// Accepted-link admission credits stay attached until the transport is dropped.
+pub struct Adjacency {
+    pub(crate) session: EstablishedSession,
+    pub(crate) socket: TcpStream,
+    pub(crate) expires: Instant,
+    pub(crate) peer: Core,
+    pub(crate) remote_lsa_expiry: u64,
+    selected: Selected,
+    _credits: (
+        crate::resource::ConnectionCredit,
+        crate::resource::ByteCredit,
+    ),
+}
+
+impl Adjacency {
+    pub fn report(&self) -> &Selected {
+        &self.selected
+    }
+}
+
+impl Drop for Adjacency {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// One operation owner. Keeps management replay state for its lifetime and
 /// borrows the durable status store; no unverified constructor or key loading
 /// from routing inputs. The PEM contains only the local hop credential.
@@ -166,6 +193,9 @@ impl<'a> MeshProbe<'a> {
         }
         let now = utc_now()?.max(status.last_trusted_utc());
         let mut trust = management_trust(roots, &policy, now)?;
+        if !status.has_same_authorities(&trust) {
+            return Err(Error::Status);
+        }
         let local = Core::from_object(
             &trust
                 .verify_and_authorize(local_identity, now)
@@ -206,6 +236,23 @@ impl<'a> MeshProbe<'a> {
         candidates: &[Candidate<'_>],
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
     ) -> Result<Selected, Error> {
+        let admission = Admission::new(crate::resource::Limits {
+            handshakes_global: 1,
+            authenticated_global: 1,
+            authenticated_per_peer: 1,
+            bytes_global: crate::runtime::CONNECTION_BUFFER_BUDGET,
+        });
+        Ok(self.dial(candidates, outer, &admission)?.report().clone())
+    }
+
+    /// Keep an authenticated link and its credits. Use the same shared
+    /// admission ledger for all links and forwarding work in a node.
+    pub fn dial(
+        &mut self,
+        candidates: &[Candidate<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+    ) -> Result<Adjacency, Error> {
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
         }
@@ -233,6 +280,10 @@ impl<'a> MeshProbe<'a> {
         let mut last_dial = Error::NoRoute;
         for (index, (_, _, id, peer, target)) in ordered.into_iter().enumerate() {
             let deadline = self.deadline(&peer)?;
+            let handshake = admission.reserve_handshake().map_err(TunnelError::from)?;
+            let buffer = admission
+                .reserve_bytes(crate::runtime::CONNECTION_BUFFER_BUDGET)
+                .map_err(TunnelError::from)?;
             let connector =
                 OpenSslConnector::from_pem_identity(self.pem, Policy::production_default())
                     .map_err(|_| Error::Identity)?;
@@ -257,8 +308,13 @@ impl<'a> MeshProbe<'a> {
                 SessionPolicy::default_pq768(self.local(), peer.peer()),
                 deadline,
             )?;
+            let peer_credit =
+                crate::resource::AuthenticatedPeer::from_verified_identity(session.peer());
+            let credit = handshake
+                .authenticate(&peer_credit)
+                .map_err(TunnelError::from)?;
             let deadline = deadline.min(self.deadline(&peer)?);
-            let (reply, received) = bounded_link_operation(&socket, deadline, || {
+            let received = bounded_link_operation(&socket, deadline, || {
                 let sent = Probe {
                     kind: ProbeKind::Ping,
                     challenge: crate::csprng::random_array()?,
@@ -274,10 +330,8 @@ impl<'a> MeshProbe<'a> {
                     return Err(TunnelError::Unsupported("invalid Core probe reply"));
                 }
                 send_lsa(&mut session, &self.local_lsa)?;
-                let received = recv_control(&mut session, ControlType::Lsa)?;
-                Ok((reply, received))
+                recv_control(&mut session, ControlType::Lsa)
             })?;
-            debug_assert_eq!(reply.kind, ProbeKind::Pong);
             let now = self.check(&peer)?;
             let raw = &received[1..];
             let remote = self
@@ -285,10 +339,20 @@ impl<'a> MeshProbe<'a> {
                 .verify_and_authorize(raw, now)
                 .map_err(|_| Error::Lsa)?;
             neighbor(lsa(&remote, id, now)?, self.local.id)?;
-            return Ok(Selected {
-                core_id: id,
-                attempts: index + 1,
-                signed_lsa: raw.to_vec(),
+            let remote_lsa_expiry = remote.valid_until();
+            let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
+            return Ok(Adjacency {
+                session,
+                socket,
+                expires,
+                peer,
+                remote_lsa_expiry,
+                selected: Selected {
+                    core_id: id,
+                    attempts: index + 1,
+                    signed_lsa: raw.to_vec(),
+                },
+                _credits: (credit, buffer),
             });
         }
         Err(last_dial)
@@ -303,6 +367,19 @@ impl<'a> MeshProbe<'a> {
         outer: &OpenSslOuterTlsAcceptor,
         admission: &Admission,
     ) -> Result<Selected, Error> {
+        Ok(self
+            .accept(tcp, signed_peer_identity, outer, admission)?
+            .report()
+            .clone())
+    }
+
+    pub fn accept(
+        &mut self,
+        tcp: TcpStream,
+        signed_peer_identity: &[u8],
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+    ) -> Result<Adjacency, Error> {
         let now = effective_utc(self.status)?;
         let peer = Core::from_object(
             &self
@@ -355,11 +432,93 @@ impl<'a> MeshProbe<'a> {
         bounded_link_operation(&socket, deadline, || {
             send_lsa(&mut accepted.session, &self.local_lsa)
         })?;
-        Ok(Selected {
-            core_id: peer.id,
-            attempts: 1,
-            signed_lsa: received[1..].to_vec(),
+        let remote_lsa_expiry = remote.valid_until();
+        let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
+        Ok(Adjacency {
+            session: accepted.session,
+            socket,
+            expires,
+            peer,
+            remote_lsa_expiry,
+            selected: Selected {
+                core_id: peer.id,
+                attempts: 1,
+                signed_lsa: received[1..].to_vec(),
+            },
+            _credits: (accepted.credit, accepted.buffer_credit),
         })
+    }
+
+    pub(crate) fn verified_core(&mut self, signed: &[u8]) -> Result<Core, Error> {
+        let now = effective_utc(self.status)?;
+        Core::from_object(
+            &self
+                .trust
+                .verify_and_authorize(signed, now)
+                .map_err(|_| Error::Identity)?,
+            &self.policy,
+        )
+    }
+
+    // The status store is single-owner while a bounded transaction runs. An
+    // already-issued monotonic cutoff is never extended; this fast check also
+    // rejects UTC jumps without fsync per fragment. Rollback is durably latched.
+    pub(crate) fn check_route_utc(
+        &mut self,
+        route: &[Core],
+        remote_lsa_expiry: u64,
+    ) -> Result<(), Error> {
+        let observed = utc_now()?;
+        let floor = self.status.last_trusted_utc();
+        match self.status.check_active_snapshot(observed, Instant::now()) {
+            Ok(()) => (),
+            Err(boreas_pki::status_store::Error::ClockRollback) => {
+                let _ = self.status.observe_trusted_utc(observed);
+                return Err(Error::Status);
+            }
+            Err(_) => return Err(Error::Status),
+        }
+        let now = observed.max(floor);
+        let cutoff = self
+            .policy
+            .validity()
+            .1
+            .min(self.local_lsa.valid_until())
+            .min(remote_lsa_expiry);
+        if now >= cutoff || route.iter().any(|node| now >= node.until) {
+            return Err(Error::Status);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn endpoint_credential(&self) -> &PemIdentity {
+        self.pem
+    }
+    pub(crate) fn policy_digest(&self) -> [u8; 32] {
+        self.policy.policy_digest()
+    }
+
+    pub(crate) fn route_deadline(
+        &mut self,
+        route: &[Core],
+        links: &[&Adjacency],
+    ) -> Result<Instant, Error> {
+        let mut deadline = Instant::now() + ATTEMPT_LIMIT;
+        for link in links {
+            if link.session.local() != self.local() {
+                return Err(Error::Identity);
+            }
+            deadline = deadline
+                .min(link.expires)
+                .min(self.authority_deadline(&link.peer, link.remote_lsa_expiry)?);
+        }
+        for member in route {
+            deadline = deadline.min(self.authority_deadline(member, u64::MAX)?);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Status);
+        }
+        Ok(deadline)
     }
 
     fn check(&mut self, peer: &Core) -> Result<u64, Error> {
@@ -367,17 +526,35 @@ impl<'a> MeshProbe<'a> {
     }
 
     fn deadline(&mut self, peer: &Core) -> Result<Instant, Error> {
+        Ok(self
+            .authority_deadline(peer, u64::MAX)?
+            .min(Instant::now() + ATTEMPT_LIMIT))
+    }
+
+    fn authority_deadline(
+        &mut self,
+        peer: &Core,
+        remote_lsa_expiry: u64,
+    ) -> Result<Instant, Error> {
         let utc = self
             .policy
             .validity()
             .1
             .min(self.local.until)
             .min(peer.until)
-            .min(self.local_lsa.valid_until());
+            .min(self.local_lsa.valid_until())
+            .min(remote_lsa_expiry);
         self.with_fresh(peer, |fresh, now| {
-            let left = Duration::from_micros(utc.saturating_sub(now)).min(ATTEMPT_LIMIT);
-            fresh.deadline().min(Instant::now() + left)
-        })
+            let left = Duration::from_micros(utc.saturating_sub(now));
+            let now_mono = Instant::now();
+            if left.is_zero() {
+                return Err(Error::Lsa);
+            }
+            Ok(now_mono
+                .checked_add(left)
+                .unwrap_or(fresh.deadline())
+                .min(fresh.deadline()))
+        })?
     }
 
     fn with_fresh<T>(

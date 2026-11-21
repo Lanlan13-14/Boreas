@@ -361,6 +361,24 @@ impl<'a> CircuitStream<'a> {
         }
     }
 
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    pub(crate) fn wait_close(&mut self) -> Result<(), TunnelError> {
+        if self.closed || self.inbound_pos != self.inbound.len() {
+            return Err(CircuitReject::UnexpectedFrame.into());
+        }
+        let frame = self.session.recv_frame()?;
+        if frame.header.kind != Kind::Control
+            || frame.body.first() != Some(&(ControlType::CircuitClose as u8))
+        {
+            return Err(CircuitReject::UnexpectedFrame.into());
+        }
+        if decode_control_id(&frame.body, ControlType::CircuitClose)? != self.circuit_id {
+            return Err(CircuitReject::UnknownCircuit.into());
+        }
+        self.closed = true;
+        Ok(())
+    }
+
     fn reset_best_effort(&mut self) {
         let Ok(body) = encode_reset(self.circuit_id) else {
             return;
@@ -371,6 +389,10 @@ impl<'a> CircuitStream<'a> {
 
     /// Close the circuit and give the hop session borrow back.
     pub fn finish(mut self) -> Result<(), TunnelError> {
+        self.send_close()
+    }
+
+    pub(crate) fn send_close(&mut self) -> Result<(), TunnelError> {
         let body = encode_close(self.circuit_id)?;
         let result = self.session.send_control(ControlType::CircuitClose, &body);
         self.closed = true;
@@ -499,6 +521,16 @@ pub fn accept_circuit<'a>(
 /// TLS shutdown behind a no-op implementation.
 pub trait E2eStream: Duplex {
     fn close_stream(&mut self) -> io::Result<()>;
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
+        Err(TunnelError::Unsupported("dedicated circuit close"))
+    }
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
+        Err(TunnelError::Unsupported("dedicated circuit close"))
+    }
 }
 
 /// E2E TLS session established over a circuit byte stream.
@@ -771,6 +803,16 @@ impl<'a> E2eCircuit<'a> {
 
     pub fn circuit_id(&self) -> [u8; CIRCUIT_ID_LEN] {
         self.info.circuit_id
+    }
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    pub(crate) fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
+        self.stream.finish_dedicated()
+    }
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    pub(crate) fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
+        self.stream.wait_dedicated_close()
     }
 
     /// End the E2E TLS record layer with `close_notify` before the circuit is
