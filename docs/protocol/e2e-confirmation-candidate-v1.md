@@ -25,7 +25,7 @@ Each confirmation is framed by a 2-byte unsigned big-endian length, which must e
 | 64 | 1 | path_hops | Exact nonzero accepted circuit path length (`CircuitAccept` echoes the original total path length; relay fragment `hops_remaining` is a separate, decremented field) |
 | 65 | 8 | optional_capabilities | Exactly zero in v1 (no optional extension negotiated) |
 
-The body is deliberately fixed-size and has no length or unknown-field extension mechanism. A future optional capability registry or changed field set requires an explicitly reviewed new candidate version; do not infer IPv4/IPv6 or any other feature from the zero value. This is not a statement that an L3 encapsulation has been negotiated or that a data-plane consumer exists.
+The body is deliberately fixed-size and has no length or unknown-field extension mechanism. Extensions require a distinct candidate version (see v2 below); do not infer IPv4/IPv6 or any other feature from the zero value. This is not a statement that an L3 encapsulation has been negotiated or that a data-plane consumer exists.
 
 ## Ordering and acceptance
 
@@ -41,4 +41,22 @@ EOF/truncation, read/write error, configured underlying transport timeout, wrong
 
 ## Candidate interoperability and risk
 
-This is a tunnel-local candidate schema pending Phase 0 registry/version review and independent vectors. It must not be represented as frozen, production-ready, or as G-E2E/G-NO-DOWNGRADE evidence. The underlying current backend and daemon integration remain separate gates. The role-byte assignments, fixed length, ordering and exact suite policy require protocol review before freeze. L3 encapsulation capability registry remains unspecified and must be defined before any product data-plane integration claims.
+This is a tunnel-local candidate schema pending Phase 0 registry/version review and independent vectors. It must not be represented as frozen, production-ready, or as G-E2E/G-NO-DOWNGRADE evidence. The underlying current backend and daemon integration remain separate gates. The role-byte assignments, fixed length, ordering and exact suite policy require protocol review before freeze. A general L3 encapsulation capability registry remains unspecified and must be defined before any product data-plane integration claims.
+
+## Opt-in L3 multi-active confirmation candidate v2
+
+The default and explicit `SINGLE_LANE` continue to send and expect the v1 record above, byte for byte. For multi-active, both endpoints must select the **same exact active-lane count**, not a maximum or a range. The locally required record length is checked before reading a fixed-size body; there is no peer-driven version selection or retry. V1-only peers reject v2, and v2 endpoints reject v1. A mismatched Offer does not elicit an Ack. A mismatched Ack does not yield a usable circuit.
+
+| Body offset | Length | v2 field |
+|---:|---:|---|
+| 0 | 4 | Unchanged `BE2E` magic |
+| 4 | 1 | Version `2` |
+| 5 | 60 | Unchanged v1 fields, from message type through path length |
+| 65 | 8 | u64 BE, exactly `0x0102`, `0x0103`, or `0x0104` for 2, 3, or 4 lanes respectively. Bit 8 marks multi-active, the low byte is the count, and all other bits are reserved zero. |
+| 73 | 32 | Exact digest of the already verified signed network policy shared by the two packet endpoints; not a peer-provided authority |
+
+The v2 length prefix is `00 69` (105 body bytes). V2 additionally requires the same signed permanent endpoint binding as the packet adapter, including valid slots and a shared signed policy digest. Endpoint identities, their generations and roles, circuit ID, opener and path length still come from the existing authenticated context. The negotiated hop MTU is still a local ceiling; it is not a whole-path agreement. TLS policy, relay framing and fragment offsets are unchanged.
+
+The `boreas_tunnel::e2e` entry points `open_e2e_with_l3_profile` / `accept_e2e_with_l3_profile` take a local `E2eL3Profile` constructed via `SINGLE_LANE` or `multi_active(2..=4)` (a numeric count passed to the constructor). Linux builds with `openssl-inner-tls` also expose their `_until` forms using the existing absolute deadline guard. Only the returned `E2eCircuit::l3_profile()` is a successful confirmation result. Errors discard the in-progress circuit; the caller must discard the hop session and must not retry with a weaker profile.
+
+This confirms a requirement separately on each circuit. It does not create, group, count, schedule or fail over lanes, authorize another circuit, change L3 framing, or enable any daemon behavior. The one-circuit-per-hop-session invariant remains. V2 is a candidate extension, not a frozen registry assignment or production acceptance result.

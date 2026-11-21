@@ -909,6 +909,146 @@ fn real_loopback_wss_hop_e2e_confirmation_and_multiframe_business_payload() {
     assert_eq!(actual, expected);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn real_loopback_l3_confirmation_requires_exact_opt_in_on_both_ends() {
+    use boreas_tunnel::e2e::{
+        E2eL3Profile, accept_e2e_until, accept_e2e_with_l3_profile_until, open_e2e_until,
+        open_e2e_with_l3_profile_until,
+    };
+
+    let t = Temp::new();
+    setup(&t);
+    let single = E2eL3Profile::SINGLE_LANE;
+    let two = E2eL3Profile::multi_active(2).unwrap();
+    let three = E2eL3Profile::multi_active(3).unwrap();
+    let four = E2eL3Profile::multi_active(4).unwrap();
+    for (opener, acceptor) in [
+        (two, two),
+        (three, three),
+        (four, four),
+        (two, three),
+        (single, two),
+        (four, single),
+    ] {
+        let (client_side, server_side) = sides(&t);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let tcp = bounded_accept(&listener)?;
+            let socket = tcp.try_clone().map_err(|err| err.to_string())?;
+            let ServerSide {
+                hop,
+                e2e,
+                outer,
+                local,
+                peer,
+            } = server_side;
+            let mut accepted = LinkServer::new(hop)
+                .accept_tls_stream(tcp, &outer, policy(local, peer), IO_TIMEOUT, &admission())
+                .map_err(|err| format!("hop: {err}"))?;
+            socket
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .map_err(|err| err.to_string())?;
+            socket
+                .set_write_timeout(Some(IO_TIMEOUT))
+                .map_err(|err| err.to_string())?;
+            let deadline = Instant::now() + IO_TIMEOUT;
+            let result = if acceptor == single {
+                accept_e2e_until(&mut accepted.session, &e2e, peer, &socket, deadline)
+            } else {
+                accept_e2e_with_l3_profile_until(
+                    &mut accepted.session,
+                    &e2e,
+                    peer,
+                    acceptor,
+                    &socket,
+                    deadline,
+                )
+            };
+            if opener != acceptor {
+                // The fixture Core (NodeID 1) offers; the Edge validates it.
+                assert!(result.is_err(), "mismatch must not yield a circuit");
+                return Ok::<_, String>(());
+            }
+            let mut circuit = result.map_err(|err| format!("accept confirmation: {err}"))?;
+            assert_eq!(circuit.l3_profile(), acceptor);
+            let mut byte = [0];
+            circuit
+                .read_exact(&mut byte)
+                .map_err(|err| err.to_string())?;
+            assert_eq!(byte, [0x5a]);
+            circuit.write_all(&[0x9d]).map_err(|err| err.to_string())?;
+            circuit.flush().map_err(|err| err.to_string())?;
+            Ok(())
+        });
+        let link = LinkClient::new(Box::new(client_side.outer), client_side.hop);
+        let target = target(address, "wss.boreas.test");
+        let tcp = link.connect_tcp(&target, IO_TIMEOUT).expect("connect TCP");
+        let socket = tcp.try_clone().expect("client socket handle");
+        let mut hop = link
+            .connect_preconnected(tcp, &target, policy(client_side.local, client_side.peer))
+            .expect("authorized hop");
+        socket
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("read timeout");
+        socket
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("write timeout");
+        let deadline = Instant::now() + IO_TIMEOUT;
+        {
+            let result = if opener == single {
+                open_e2e_until(
+                    &mut hop,
+                    &client_side.e2e,
+                    client_side.peer,
+                    1,
+                    &socket,
+                    deadline,
+                )
+            } else {
+                open_e2e_with_l3_profile_until(
+                    &mut hop,
+                    &client_side.e2e,
+                    client_side.peer,
+                    1,
+                    opener,
+                    &socket,
+                    deadline,
+                )
+            };
+            if opener == acceptor {
+                let mut circuit = result.expect("matching profile");
+                assert_eq!(circuit.l3_profile(), opener);
+                circuit
+                    .write_all(&[0x5a])
+                    .expect("write first business byte");
+                circuit.flush().expect("flush business byte");
+                let mut byte = [0];
+                circuit.read_exact(&mut byte).expect("read reply");
+                assert_eq!(byte, [0x9d]);
+            } else {
+                use boreas_tunnel::{CircuitReject, SessionReject, TunnelError};
+
+                // Core has the lower NodeID and sends the Offer, even though
+                // Edge opened the circuit. Its mismatch error is on the Edge.
+                let expected = if opener == single || acceptor == single {
+                    TunnelError::Circuit(CircuitReject::BadBody)
+                } else {
+                    TunnelError::Session(SessionReject::PeerIdentityMismatch)
+                };
+                match result {
+                    Err(error) => assert_eq!(error, expected),
+                    Ok(_) => panic!("mismatch must not yield a circuit"),
+                }
+            }
+        }
+        drop(hop);
+        drop(socket);
+        server.join().expect("join server").expect("server path");
+    }
+}
+
 #[test]
 fn outer_wrong_name_and_untrusted_ca_are_rejected() {
     let t = Temp::new();

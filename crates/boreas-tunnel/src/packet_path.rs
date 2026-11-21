@@ -613,6 +613,19 @@ impl AuthorizedEndpoints {
         )
     }
 
+    /// Check the same signed endpoint binding before L3 capability confirmation.
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn confirmation_policy_digest(
+        circuit_id: [u8; 16],
+        path_hops: u8,
+        peer: PeerIdentity,
+        local: PeerIdentity,
+        mtu_cap: u16,
+    ) -> Result<[u8; 32], PacketPathError> {
+        let endpoints = Self::bind(circuit_id, path_hops, peer, local, mtu_cap)?;
+        Ok(endpoints.local.policy_digest)
+    }
+
     fn bind(
         circuit_id: [u8; 16],
         path_hops: u8,

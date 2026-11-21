@@ -32,8 +32,9 @@
 //! # Bounds
 //!
 //! One circuit per hop session: the `boreas-proto` application state machine
-//! tracks a single `circuit_opening`/`circuit_established` pair. Multiple
-//! circuits per node pair need a per-circuit table and are a later slice.
+//! tracks a single `circuit_opening`/`circuit_established` pair. An opt-in
+//! [`E2eL3Profile`] confirms the same multi-active requirement on one circuit;
+//! it does not create, group, or schedule circuits across hop sessions.
 //! Fragment payloads are bounded by `messages::MAX_RELAY_PAYLOAD`; offsets must
 //! be exactly contiguous per direction.
 
@@ -567,6 +568,38 @@ pub trait E2eTlsBackend: Send + Sync {
     fn accept<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError>;
 }
 
+/// Local policy for encrypted E2E L3 capability confirmation.
+///
+/// The default single lane preserves legacy wire bytes. Multi-active is an
+/// exact requirement, not an advertised maximum: both endpoints must select
+/// the same count, and mismatch never falls back to a single lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct E2eL3Profile {
+    active_lanes: u8,
+}
+
+impl E2eL3Profile {
+    pub const SINGLE_LANE: Self = Self { active_lanes: 1 };
+
+    /// Explicitly enable two, three, or four active lanes.
+    pub const fn multi_active(active_lanes: u8) -> Option<Self> {
+        match active_lanes {
+            2..=4 => Some(Self { active_lanes }),
+            _ => None,
+        }
+    }
+
+    pub const fn active_lanes(self) -> u8 {
+        self.active_lanes
+    }
+}
+
+impl Default for E2eL3Profile {
+    fn default() -> Self {
+        Self::SINGLE_LANE
+    }
+}
+
 /// An established, policy-checked E2E circuit.
 ///
 /// It owns the E2E TLS stream and the [`VerifiedE2eSession`] token created from
@@ -587,16 +620,30 @@ pub struct E2eCircuit<'a> {
     info: E2eInfo,
     local: PeerIdentity,
     mtu_cap: u16,
+    l3_profile: E2eL3Profile,
 }
 
-/// Candidate confirmation body inside E2E TLS. Not a cryptographic handshake.
-/// Field order/version is documented in docs/protocol/e2e-confirmation-candidate-v1.md.
+// Application confirmation inside E2E TLS, not a cryptographic handshake.
+// See docs/protocol/e2e-confirmation-candidate-v1.md for both layouts.
 const E2E_CONFIRM_MAGIC: [u8; 4] = *b"BE2E";
 const E2E_CONFIRM_VERSION: u8 = 1;
+const E2E_CONFIRM_MULTI_VERSION: u8 = 2;
 const E2E_CONFIRM_OFFER: u8 = 1;
 const E2E_CONFIRM_ACK: u8 = 2;
-const E2E_CONFIRM_BODY_LEN: usize = 73;
-const E2E_CONFIRM_CAPABILITIES: u64 = 0;
+const E2E_CONFIRM_CAPABILITIES_OFFSET: usize = 65;
+const E2E_CONFIRM_BODY_LEN: usize = E2E_CONFIRM_CAPABILITIES_OFFSET + 8;
+const POLICY_DIGEST_LEN: usize = 32;
+const E2E_CONFIRM_MULTI_BODY_LEN: usize = E2E_CONFIRM_BODY_LEN + POLICY_DIGEST_LEN;
+const E2E_CONFIRM_MULTI_ACTIVE: u64 = 1 << 8;
+
+type ConfirmationBody = [u8; E2E_CONFIRM_BODY_LEN];
+type PolicyDigest = [u8; POLICY_DIGEST_LEN];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MultiActiveConfirmation {
+    profile: E2eL3Profile,
+    policy_digest: PolicyDigest,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct E2eConfirmation {
@@ -648,8 +695,21 @@ impl E2eConfirmation {
         cursor += 2;
         bytes[cursor] = self.path_hops;
         cursor += 1;
-        bytes[cursor..cursor + 8].copy_from_slice(&E2E_CONFIRM_CAPABILITIES.to_be_bytes());
-        debug_assert_eq!(cursor + 8, E2E_CONFIRM_BODY_LEN);
+        // The remaining eight bytes stay zero in v1.
+        debug_assert_eq!(cursor, E2E_CONFIRM_CAPABILITIES_OFFSET);
+        bytes
+    }
+}
+
+impl MultiActiveConfirmation {
+    fn encode(self, base: ConfirmationBody) -> [u8; E2E_CONFIRM_MULTI_BODY_LEN] {
+        let mut bytes = [0u8; E2E_CONFIRM_MULTI_BODY_LEN];
+        bytes[..E2E_CONFIRM_BODY_LEN].copy_from_slice(&base);
+        bytes[4] = E2E_CONFIRM_MULTI_VERSION;
+        let capability = E2E_CONFIRM_MULTI_ACTIVE | u64::from(self.profile.active_lanes());
+        bytes[E2E_CONFIRM_CAPABILITIES_OFFSET..E2E_CONFIRM_BODY_LEN]
+            .copy_from_slice(&capability.to_be_bytes());
+        bytes[E2E_CONFIRM_BODY_LEN..].copy_from_slice(&self.policy_digest);
         bytes
     }
 }
@@ -662,27 +722,21 @@ fn node_role_byte(role: NodeRole) -> u8 {
     }
 }
 
-fn write_confirmation(
-    stream: &mut dyn Duplex,
-    message_type: u8,
-    confirmation: E2eConfirmation,
-) -> Result<(), TunnelError> {
-    let record = confirmation.encode(message_type);
+fn write_confirmation(stream: &mut dyn Duplex, record: &[u8]) -> Result<(), TunnelError> {
     let length = u16::try_from(record.len()).map_err(|_| TunnelError::FrameTooLarge)?;
     stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(&record)?;
+    stream.write_all(record)?;
     stream.flush()?;
     Ok(())
 }
 
-fn read_confirmation(stream: &mut dyn Duplex) -> Result<[u8; E2E_CONFIRM_BODY_LEN], TunnelError> {
+fn read_confirmation<const N: usize>(stream: &mut dyn Duplex) -> Result<[u8; N], TunnelError> {
     let mut length = [0u8; 2];
     stream.read_exact(&mut length)?;
-    let length = usize::from(u16::from_be_bytes(length));
-    if length != E2E_CONFIRM_BODY_LEN {
+    if usize::from(u16::from_be_bytes(length)) != N {
         return Err(CircuitReject::BadBody.into());
     }
-    let mut record = [0u8; E2E_CONFIRM_BODY_LEN];
+    let mut record = [0u8; N];
     stream.read_exact(&mut record)?;
     Ok(record)
 }
@@ -693,6 +747,7 @@ fn confirm_e2e_application(
     local: PeerIdentity,
     peer: PeerIdentity,
     suite: MessageSuite,
+    multi: Option<MultiActiveConfirmation>,
 ) -> Result<(), TunnelError> {
     if local.net_id != peer.net_id
         || local.net_id == [0; 16]
@@ -731,21 +786,38 @@ fn confirm_e2e_application(
         opener_node_id,
         path_hops: info.path_hops,
     };
-    let (outgoing, incoming) = if info.tls_role == CircuitTlsRole::Client {
-        (E2E_CONFIRM_OFFER, E2E_CONFIRM_ACK)
-    } else {
-        (E2E_CONFIRM_ACK, E2E_CONFIRM_OFFER)
-    };
-    if outgoing == E2E_CONFIRM_OFFER {
-        write_confirmation(stream, E2E_CONFIRM_OFFER, expected)?;
+    let offer = expected.encode(E2E_CONFIRM_OFFER);
+    let ack = expected.encode(E2E_CONFIRM_ACK);
+    match multi {
+        Some(multi) => exchange_confirmation(
+            stream,
+            info.tls_role,
+            multi.encode(offer),
+            multi.encode(ack),
+        ),
+        None => exchange_confirmation(stream, info.tls_role, offer, ack),
     }
-    let received = read_confirmation(stream)?;
-    let expected_bytes = expected.encode(incoming);
-    if !constant_time_record_eq(&received, &expected_bytes) {
+}
+
+fn exchange_confirmation<const N: usize>(
+    stream: &mut dyn Duplex,
+    tls_role: CircuitTlsRole,
+    offer: [u8; N],
+    ack: [u8; N],
+) -> Result<(), TunnelError> {
+    let expected = match tls_role {
+        CircuitTlsRole::Client => {
+            write_confirmation(stream, &offer)?;
+            &ack
+        }
+        CircuitTlsRole::Server => &offer,
+    };
+    let received = read_confirmation::<N>(stream)?;
+    if !constant_time_record_eq(&received, expected) {
         return Err(SessionReject::PeerIdentityMismatch.into());
     }
-    if outgoing == E2E_CONFIRM_ACK {
-        write_confirmation(stream, E2E_CONFIRM_ACK, expected)?;
+    if tls_role == CircuitTlsRole::Server {
+        write_confirmation(stream, &ack)?;
     }
     Ok(())
 }
@@ -780,6 +852,14 @@ impl<'a> E2eCircuit<'a> {
 
     pub fn info(&self) -> E2eInfo {
         self.info
+    }
+
+    /// The exact L3 profile agreed on this authenticated circuit.
+    ///
+    /// The legacy single-lane result does not itself authorize L3 packets.
+    /// No result proves that any other circuit is established or authorized.
+    pub fn l3_profile(&self) -> E2eL3Profile {
+        self.l3_profile
     }
 
     /// The authenticated local identity of the hop session this circuit runs on.
@@ -854,6 +934,38 @@ struct E2ePolicy {
     allow_pq1024: bool,
     /// Hop-local negotiated MTU ceiling, not a full end-to-end PMTU.
     mtu_cap: u16,
+    l3_profile: E2eL3Profile,
+}
+
+fn multi_active_confirmation(
+    profile: E2eL3Profile,
+    info: E2eInfo,
+    local: PeerIdentity,
+    mtu_cap: u16,
+) -> Result<Option<MultiActiveConfirmation>, TunnelError> {
+    if profile == E2eL3Profile::SINGLE_LANE {
+        return Ok(None);
+    }
+    #[cfg(feature = "openssl-inner-tls")]
+    {
+        let policy_digest = crate::packet_path::AuthorizedEndpoints::confirmation_policy_digest(
+            info.circuit_id,
+            info.path_hops,
+            info.peer,
+            local,
+            mtu_cap,
+        )
+        .map_err(|_| SessionReject::PeerIdentityMismatch)?;
+        Ok(Some(MultiActiveConfirmation {
+            profile,
+            policy_digest,
+        }))
+    }
+    #[cfg(not(feature = "openssl-inner-tls"))]
+    {
+        let _ = (info, local, mtu_cap);
+        Err(TunnelError::Unsupported("multi-active L3 confirmation"))
+    }
 }
 
 fn finish_e2e<'a>(
@@ -868,6 +980,7 @@ fn finish_e2e<'a>(
         suite,
         allow_pq1024,
         mtu_cap,
+        l3_profile,
     } = policy;
     let (mut stream, tls) = established.into_parts();
     if tls.peer() != expected_peer {
@@ -878,7 +991,8 @@ fn finish_e2e<'a>(
     crate::tls::check_inner_tls(&tls, suite, allow_pq1024)?;
     {
         let _timer = DiagnosticTimer::start("confirmation", diagnostics);
-        confirm_e2e_application(&mut *stream, info, local, expected_peer, suite)?;
+        let multi = multi_active_confirmation(l3_profile, info, local, mtu_cap)?;
+        confirm_e2e_application(&mut *stream, info, local, expected_peer, suite, multi)?;
     }
     let token =
         VerifiedE2eSession::from_verified_e2e_tls(&tls, expected_peer, suite, allow_pq1024)?;
@@ -888,6 +1002,7 @@ fn finish_e2e<'a>(
         info,
         local,
         mtu_cap,
+        l3_profile,
     })
 }
 
@@ -913,6 +1028,25 @@ pub fn open_e2e<'a>(
     backend: &dyn E2eTlsBackend,
     expected_peer: PeerIdentity,
     path_hops: u8,
+) -> Result<E2eCircuit<'a>, TunnelError> {
+    open_e2e_with_l3_profile(
+        session,
+        backend,
+        expected_peer,
+        path_hops,
+        E2eL3Profile::SINGLE_LANE,
+    )
+}
+
+/// Open an E2E circuit and require the exact locally configured L3 profile.
+/// Multi-active requires two signed packet endpoints and the peer's matching
+/// opt-in. On error, discard the hop session; do not retry with a lower profile.
+pub fn open_e2e_with_l3_profile<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    path_hops: u8,
+    profile: E2eL3Profile,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
@@ -948,6 +1082,7 @@ pub fn open_e2e<'a>(
             suite,
             allow_pq1024,
             mtu_cap,
+            l3_profile: profile,
         },
         diagnostics,
     )
@@ -959,6 +1094,18 @@ pub fn accept_e2e<'a>(
     session: &'a mut EstablishedSession,
     backend: &dyn E2eTlsBackend,
     expected_peer: PeerIdentity,
+) -> Result<E2eCircuit<'a>, TunnelError> {
+    accept_e2e_with_l3_profile(session, backend, expected_peer, E2eL3Profile::SINGLE_LANE)
+}
+
+/// Accept an E2E circuit only at the exact locally configured L3 profile.
+/// The Offer never sets local policy. On error, discard the hop session;
+/// do not retry at a lower profile.
+pub fn accept_e2e_with_l3_profile<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    profile: E2eL3Profile,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
     let suite = session.security_suite();
     let allow_pq1024 = session.pq1024_enabled();
@@ -990,6 +1137,7 @@ pub fn accept_e2e<'a>(
             suite,
             allow_pq1024,
             mtu_cap,
+            l3_profile: profile,
         },
         diagnostics,
     )
@@ -1008,8 +1156,31 @@ pub fn open_e2e_until<'a>(
     tcp: &std::net::TcpStream,
     deadline: Instant,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
+    open_e2e_with_l3_profile_until(
+        session,
+        backend,
+        expected_peer,
+        path_hops,
+        E2eL3Profile::SINGLE_LANE,
+        tcp,
+        deadline,
+    )
+}
+
+/// Deadline-bounded form of [`open_e2e_with_l3_profile`]. `tcp` must be an
+/// owned handle to the same socket as `session`. Discard the session on error.
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub fn open_e2e_with_l3_profile_until<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    path_hops: u8,
+    profile: E2eL3Profile,
+    tcp: &std::net::TcpStream,
+    deadline: Instant,
+) -> Result<E2eCircuit<'a>, TunnelError> {
     crate::runtime::bounded_link_operation(tcp, deadline, || {
-        open_e2e(session, backend, expected_peer, path_hops)
+        open_e2e_with_l3_profile(session, backend, expected_peer, path_hops, profile)
     })
 }
 
@@ -1025,8 +1196,29 @@ pub fn accept_e2e_until<'a>(
     tcp: &std::net::TcpStream,
     deadline: Instant,
 ) -> Result<E2eCircuit<'a>, TunnelError> {
+    accept_e2e_with_l3_profile_until(
+        session,
+        backend,
+        expected_peer,
+        E2eL3Profile::SINGLE_LANE,
+        tcp,
+        deadline,
+    )
+}
+
+/// Deadline-bounded form of [`accept_e2e_with_l3_profile`]. `tcp` must be an
+/// owned handle to the same socket as `session`. Discard the session on error.
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub fn accept_e2e_with_l3_profile_until<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    profile: E2eL3Profile,
+    tcp: &std::net::TcpStream,
+    deadline: Instant,
+) -> Result<E2eCircuit<'a>, TunnelError> {
     crate::runtime::bounded_link_operation(tcp, deadline, || {
-        accept_e2e(session, backend, expected_peer)
+        accept_e2e_with_l3_profile(session, backend, expected_peer, profile)
     })
 }
 
@@ -1389,6 +1581,165 @@ mod tests {
     }
 
     #[test]
+    fn l3_profile_has_one_default_and_only_three_opt_in_counts() {
+        assert_eq!(E2eL3Profile::default(), E2eL3Profile::SINGLE_LANE);
+        assert_eq!(E2eL3Profile::default().active_lanes(), 1);
+        for count in 0..=u8::MAX {
+            assert_eq!(
+                E2eL3Profile::multi_active(count).map(E2eL3Profile::active_lanes),
+                (2..=4).contains(&count).then_some(count),
+            );
+        }
+    }
+
+    #[test]
+    fn multi_active_confirmation_preserves_bindings_and_never_acks_a_mismatch() {
+        let local = identity(0x0201, 9, NodeRole::Core);
+        let peer = identity(0x0102, 4, NodeRole::Edge);
+        let info = E2eInfo {
+            circuit_id: [0x5a; CIRCUIT_ID_LEN],
+            path_hops: 3,
+            role: CircuitRole::Initiator,
+            tls_role: CircuitTlsRole::Server,
+            peer,
+        };
+        let base = E2eConfirmation {
+            net_id: local.net_id,
+            initiator_node_id: peer.node_id,
+            initiator_generation: peer.identity_generation,
+            initiator_role: peer.role,
+            acceptor_node_id: local.node_id,
+            acceptor_generation: local.identity_generation,
+            acceptor_role: local.role,
+            circuit_id: info.circuit_id,
+            suite: MessageSuite::Pq768,
+            opener_node_id: local.node_id,
+            path_hops: info.path_hops,
+        };
+        let multi = MultiActiveConfirmation {
+            profile: E2eL3Profile::multi_active(3).unwrap(),
+            policy_digest: [0x9d; POLICY_DIGEST_LEN],
+        };
+        let legacy = base.encode(E2E_CONFIRM_OFFER);
+        let valid = multi.encode(legacy);
+        assert_eq!(valid.len(), 105);
+        assert_eq!(&valid[..4], b"BE2E");
+        assert_eq!(valid[4], 2);
+        assert_eq!(&valid[5..65], &legacy[5..65]);
+        assert_eq!(&valid[65..73], &0x0103u64.to_be_bytes());
+        assert_eq!(&valid[73..], &[0x9d; 32]);
+
+        for (offset, replacement) in [
+            (4, 1),   // wrong version
+            (5, 2),   // Ack instead of Offer
+            (22, 2),  // wrong authenticated endpoint
+            (44, 0),  // wrong circuit
+            (65, 1),  // unknown capability
+            (71, 0),  // missing multi-active marker
+            (72, 0),  // invalid count
+            (72, 1),  // downgrade
+            (72, 2),  // different valid count
+            (72, 5),  // out of bounds
+            (73, 0),  // different signed policy
+            (104, 0), // compare the full digest
+        ] {
+            let mut record = valid;
+            record[offset] = replacement;
+            let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+            write_confirmation(&mut stream, &record).unwrap();
+            stream.set_position(0);
+            assert_eq!(
+                confirm_e2e_application(
+                    &mut stream,
+                    info,
+                    local,
+                    peer,
+                    MessageSuite::Pq768,
+                    Some(multi),
+                ),
+                Err(SessionReject::PeerIdentityMismatch.into()),
+                "wire mutation at {offset} must fail",
+            );
+            assert_eq!(stream.get_ref().len(), 107, "must not append an Ack");
+        }
+
+        let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+        write_confirmation(&mut stream, &valid).unwrap();
+        assert_eq!(&stream.get_ref()[..2], &[0, 105]);
+        stream.set_position(0);
+        confirm_e2e_application(
+            &mut stream,
+            info,
+            local,
+            peer,
+            MessageSuite::Pq768,
+            Some(multi),
+        )
+        .expect("exact v2 Offer");
+        stream.set_position(107);
+        assert_eq!(
+            read_confirmation::<E2E_CONFIRM_MULTI_BODY_LEN>(&mut stream).unwrap(),
+            multi.encode(base.encode(E2E_CONFIRM_ACK)),
+        );
+    }
+
+    #[test]
+    fn multi_active_client_rejects_wrong_ack_without_retrying() {
+        // Reserve exactly one outbound record before the scripted Ack. Cursor
+        // overwrites that prefix on write and reads the following record.
+        let offer = [0x11; E2E_CONFIRM_MULTI_BODY_LEN];
+        let expected_ack = [0x22; E2E_CONFIRM_MULTI_BODY_LEN];
+        let mut mismatched_ack = expected_ack;
+        mismatched_ack[72] ^= 1;
+        for (ack, error) in [
+            (
+                mismatched_ack.as_slice(),
+                TunnelError::Session(SessionReject::PeerIdentityMismatch),
+            ),
+            (
+                &[0; E2E_CONFIRM_BODY_LEN],
+                TunnelError::Circuit(CircuitReject::BadBody),
+            ),
+        ] {
+            let prefix_len = 2 + E2E_CONFIRM_MULTI_BODY_LEN;
+            let mut stream = std::io::Cursor::new(vec![0; prefix_len]);
+            stream.set_position(prefix_len as u64);
+            write_confirmation(&mut stream, ack).unwrap();
+            stream.set_position(0);
+            assert_eq!(
+                exchange_confirmation(&mut stream, CircuitTlsRole::Client, offer, expected_ack),
+                Err(error),
+            );
+            let wire = stream.into_inner();
+            assert_eq!(&wire[..2], &[0, 105]);
+            assert_eq!(&wire[2..prefix_len], &offer);
+            assert_eq!(&wire[prefix_len + 2..], ack);
+        }
+    }
+
+    #[test]
+    fn multi_active_requires_signed_endpoints() {
+        let local = identity(0x0102, 4, NodeRole::Edge);
+        let peer = identity(0x0201, 9, NodeRole::Core);
+        let info = E2eInfo {
+            circuit_id: [0x5a; CIRCUIT_ID_LEN],
+            path_hops: 1,
+            role: CircuitRole::Initiator,
+            tls_role: CircuitTlsRole::Client,
+            peer,
+        };
+        let profile = E2eL3Profile::multi_active(2).unwrap();
+        let result = multi_active_confirmation(profile, info, local, 1500);
+        #[cfg(feature = "openssl-inner-tls")]
+        assert_eq!(result, Err(SessionReject::PeerIdentityMismatch.into()));
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        assert_eq!(
+            result,
+            Err(TunnelError::Unsupported("multi-active L3 confirmation")),
+        );
+    }
+
+    #[test]
     fn confirmation_rejects_tampered_fields_from_peer() {
         let local = identity(0x0101, 4, NodeRole::Edge);
         let peer = identity(0x0201, 9, NodeRole::Core);
@@ -1421,7 +1772,7 @@ mod tests {
             let (listener, address) = listener();
             let responder = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept");
-                let _offer = read_confirmation(&mut stream).expect("offer");
+                let _offer = read_confirmation::<E2E_CONFIRM_BODY_LEN>(&mut stream).expect("offer");
                 let mut ack = base.encode(E2E_CONFIRM_ACK);
                 ack[offset] ^= 1;
                 stream
@@ -1437,7 +1788,7 @@ mod tests {
                 .set_write_timeout(Some(TIMEOUT))
                 .expect("write timeout");
             assert!(
-                confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768)
+                confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768, None)
                     .is_err(),
                 "mutation at byte offset {offset} must reject"
             );
@@ -1448,8 +1799,15 @@ mod tests {
         other_network.net_id = [8; 16];
         let mut stream = std::io::Cursor::new(Vec::<u8>::new());
         assert!(
-            confirm_e2e_application(&mut stream, info, local, other_network, MessageSuite::Pq768)
-                .is_err()
+            confirm_e2e_application(
+                &mut stream,
+                info,
+                local,
+                other_network,
+                MessageSuite::Pq768,
+                None
+            )
+            .is_err()
         );
     }
 
@@ -1457,16 +1815,19 @@ mod tests {
     fn confirmation_read_rejects_short_length_and_truncation() {
         let mut short = std::io::Cursor::new(72u16.to_be_bytes().to_vec());
         assert_eq!(
-            read_confirmation(&mut short),
+            read_confirmation::<E2E_CONFIRM_BODY_LEN>(&mut short),
             Err(TunnelError::Circuit(CircuitReject::BadBody))
         );
         let mut oversized = std::io::Cursor::new(74u16.to_be_bytes().to_vec());
         assert_eq!(
-            read_confirmation(&mut oversized),
+            read_confirmation::<E2E_CONFIRM_BODY_LEN>(&mut oversized),
             Err(TunnelError::Circuit(CircuitReject::BadBody))
         );
         let mut truncated = std::io::Cursor::new(73u16.to_be_bytes().to_vec());
-        assert_eq!(read_confirmation(&mut truncated), Err(TunnelError::Closed));
+        assert_eq!(
+            read_confirmation::<E2E_CONFIRM_BODY_LEN>(&mut truncated),
+            Err(TunnelError::Closed)
+        );
     }
 
     #[test]
@@ -1495,7 +1856,7 @@ mod tests {
             peer,
         };
         assert_eq!(
-            confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768),
+            confirm_e2e_application(&mut stream, info, local, peer, MessageSuite::Pq768, None),
             Err(TunnelError::Timeout)
         );
         responder.join().expect("responder");
@@ -1580,6 +1941,7 @@ mod tests {
                     .session;
                 let backend = TestE2eBackend { peer: higher };
                 let mut e2e = accept_e2e(&mut hop, &backend, higher).expect("confirmed E2E");
+                assert_eq!(e2e.l3_profile(), E2eL3Profile::SINGLE_LANE);
                 let mut received = [0u8; 5];
                 e2e.read_exact(&mut received).expect("read business bytes");
                 assert_eq!(&received, b"hello");
@@ -1597,6 +1959,7 @@ mod tests {
         // The higher NodeID opens; the lower NodeID is nevertheless the E2E TLS
         // client. Opener identity is not confused with TLS client/server role.
         let mut e2e = open_e2e(&mut hop, &backend, lower, 1).expect("confirmed E2E");
+        assert_eq!(e2e.l3_profile(), E2eL3Profile::SINGLE_LANE);
         assert_eq!(e2e.info().tls_role, CircuitTlsRole::Server);
         assert_eq!(e2e.info().role, CircuitRole::Initiator);
         e2e.write_all(b"hello").expect("write business bytes");
