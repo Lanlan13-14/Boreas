@@ -516,4 +516,51 @@ fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
     assert!(source_epoch.contains("tx=1 rx=1"), "{source_epoch}");
     let relay_epoch = second.wait_for(&format!("role=relay circuit={}", circuit(&backup)));
     assert!(relay_epoch.contains("ciphertext=["), "{relay_epoch}");
+
+    // Publish an independently signed denial for the still-active backup relay.
+    // The next local authority boundary must stop source admission, not select
+    // another path past the revocation or treat it as ordinary socket failure.
+    use boreas_pki::status_store::IDENTITY_REVOCATION_MAGIC;
+    use boreas_proto::authority_revocation::{
+        AuthorityRevocation, RevocationClass, RevocationScope,
+    };
+    let now = utc_now().unwrap();
+    let tbs = AuthorityRevocation {
+        net_id: NET,
+        class: RevocationClass::Identity,
+        subject_node_id: 513,
+        identity_generation: 1,
+        issuer_key_id: b"identity-authority-v1".to_vec(),
+        issuer_generation: 1,
+        scope: RevocationScope::default(),
+        seq: 1,
+        issued_at: now,
+        next_update: now + 15_000_000,
+    }
+    .encode_tbs()
+    .unwrap();
+    let msg = AuthorityRevocation::signature_input(&tbs).unwrap();
+    let ca = f._temp.0.join("ca");
+    let mut raw = IDENTITY_REVOCATION_MAGIC.to_vec();
+    for name in ["ia.ed25519.key", "ia.mldsa65.key"] {
+        raw.extend(sign(
+            &PKey::private_key_from_der(&read(&ca, name)).unwrap(),
+            &msg,
+        ));
+    }
+    raw.extend(tbs);
+    let stage = dirs[0].join("revocation.tmp");
+    fs::write(&stage, raw).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::rename(stage, dirs[0].join("identity-revocation.signed")).unwrap();
+    source.wait_for("mesh signed graph: Status");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = source.child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(2));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
 }
