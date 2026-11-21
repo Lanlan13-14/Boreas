@@ -150,6 +150,8 @@ use boreas_supervisor::{
 
 /// POSIX signal forwarding + controlled stop (no-ops off Unix).
 mod signals;
+mod stage_cli;
+mod verified_launch;
 
 /// Shared wire-format constants for readiness protocol.
 #[cfg(unix)]
@@ -200,6 +202,10 @@ USAGE:
                                 [--ready-min-workers <N>]
                                 [--stop-grace-ms <MS>]
                                 [--max-trial-attempts <N>] -- <argv...>
+    boreas-supervisor stage --store <ABS_DIR> --manifest <FILE> --artifact <FILE>
+                            --root-key-id <ID> --root-ed25519-der <FILE>
+                            --root-mldsa65-der <FILE> --ed25519-signature <FILE>
+                            --mldsa65-signature <FILE> --min-sequence <N>
     boreas-supervisor recover --store <DIR> [--json]
     boreas-supervisor status --store <DIR> [--json]
     boreas-supervisor reset-trial --store <DIR> --confirm <VERSION>
@@ -303,6 +309,7 @@ struct SupervisePlan {
     argv: Vec<OsString>,
     /// Candidate whose trial launch is in flight (trial launches only).
     trial_candidate: Option<String>,
+    verified: bool,
     /// Unix trial-readiness policy. Windows deliberately refuses trial launch
     /// because its readiness channel is not implemented there.
     #[cfg(unix)]
@@ -368,6 +375,7 @@ fn run_cli(args: &[OsString]) -> CliOutcome {
             }
         }
         "supervise" => cmd_supervise(&args[1..]),
+        "stage" => stage_cli::stage_command(&args[1..]),
         "recover" => cmd_recover(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "reset-trial" => cmd_reset_trial(&args[1..]),
@@ -995,21 +1003,44 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
         Err(e) => return err_out(&format!("cannot supervise store {}: {e}", parsed.store)),
     };
     let mut notes: Vec<String> = Vec::new();
+    let verified = match verified_launch::is_enabled(&parsed.store) {
+        Ok(enabled) => enabled,
+        Err(e) => return err_out(&e),
+    };
+    let recovered = if verified {
+        if let Err(e) = verified_launch::validate_arguments(&parsed.child_argv, &parsed.ready_expected_schema) {
+            return err_out(&e);
+        }
+        match verified_launch::select_recovered(&store) {
+            Ok(launch) => launch,
+            Err(e) => return err_out(&e),
+        }
+    } else {
+        None
+    };
 
     // Durable reservation *before* `begin_activation` can move the active
     // pointer. If this process is killed anywhere after this point — including
     // between `activate()` and the spawn — the attempt is already recorded and
     // the next boot counts it. This is what closes the old
     // "killed after activate, before reserve" window.
-    let reservation = match reserve_pending_trial(&store, parsed.max_trial_attempts) {
-        Ok(reserved) => reserved,
-        Err(e) => return err_out(&format!("cannot reserve a trial attempt: {e}")),
+    let reservation = if recovered.is_some() {
+        None
+    } else {
+        match reserve_pending_trial(&store, parsed.max_trial_attempts) {
+            Ok(reserved) => reserved,
+            Err(e) => return err_out(&format!("cannot reserve a trial attempt: {e}")),
+        }
     };
 
     // Recovery happens before anything is launched (master plan Sec.10.3).
     // `begin_activation` starts from `recover()` and only permits the one
     // trial launch of a `Prepared` candidate afterwards.
-    let launch = match store.begin_activation() {
+    let activation = match recovered {
+        Some(launch) => Ok(launch),
+        None => store.begin_activation(),
+    };
+    let launch = match activation {
         Ok(Activation::Steady { active }) => {
             // A reservation without a trial launch means the journal changed
             // under us (it should not: we hold the lock). Consume it as a
@@ -1094,7 +1125,12 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
         Launch::Trial { candidate } => (Some(candidate.clone()), Some(candidate.clone())),
         Launch::Steady { active } => (None, active.clone()),
     };
-    let argv = match resolve_child_argv(&store, &parsed.child_argv, resolve_expected.as_deref()) {
+    let resolved = if verified {
+        verified_launch::argv(&store, &parsed.child_argv, resolve_expected.as_deref())
+    } else {
+        resolve_child_argv(&store, &parsed.child_argv, resolve_expected.as_deref())
+    };
+    let argv = match resolved {
         Ok(argv) => argv,
         Err(e) => {
             // Fail-closed: a trial whose argv cannot even be resolved must
@@ -1125,6 +1161,7 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             store_root: parsed.store,
             argv,
             trial_candidate,
+            verified,
             #[cfg(unix)]
             ready_timeout: parsed.ready_timeout,
             #[cfg(unix)]
@@ -1265,6 +1302,7 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
                 socket: PathBuf::from(&plan.store_root).join("ready.sock"),
                 ready_timeout: plan.ready_timeout,
                 stop_grace: plan.stop_grace,
+                verified: plan.verified,
                 policy: readiness::ReadinessPolicy {
                     expected_schema: plan.ready_expected_schema.clone(),
                     require_tun: plan.ready_require_tun,
@@ -1285,12 +1323,16 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
             return EXIT_ERROR;
         }
     }
-    run_steady(program, rest)
+    #[cfg(unix)]
+    let stop_grace = plan.stop_grace;
+    #[cfg(not(unix))]
+    let stop_grace = Duration::ZERO;
+    run_steady(program, rest, plan.verified, stop_grace)
 }
 
 /// Steady launch: the store already points at a confirmed version.
-fn run_steady(program: &OsString, args: &[OsString]) -> u8 {
-    match run_child_once(program, args) {
+fn run_steady(program: &OsString, args: &[OsString], verified: bool, stop_grace: Duration) -> u8 {
+    match spawn_child(program, args, None, verified).and_then(|mut child| wait_steady(&mut child, stop_grace)) {
         Ok(status) => exit_code_of(status),
         Err(e) => {
             eprintln!(
@@ -1309,6 +1351,7 @@ struct TrialPlan {
     socket: PathBuf,
     ready_timeout: Duration,
     stop_grace: Duration,
+    verified: bool,
     policy: readiness::ReadinessPolicy,
 }
 
@@ -1330,7 +1373,7 @@ fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], plan: 
             return fail_trial(store);
         }
     };
-    let mut child = match spawn_child_with_env(program, args, &plan.socket) {
+    let mut child = match spawn_child(program, args, Some(&plan.socket), plan.verified) {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
@@ -1522,35 +1565,53 @@ fn rollback_trial(store: &UpgradeStore) -> u8 {
 /// cgroup-wide kill, or Ctrl+C in the same terminal) reaches the child directly.
 /// Stops that target only the supervisor are handled by forwarding (see
 /// `signals`).
-fn spawn_child(program: &OsString, args: &[OsString]) -> io::Result<Child> {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-}
-
-/// Spawn the trial candidate with the readiness socket exported in its
-/// environment (`BOREAS_READY_SOCKET`).
-#[cfg(unix)]
-fn spawn_child_with_env(
+fn spawn_child(
     program: &OsString,
     args: &[OsString],
-    socket: &std::path::Path,
+    socket: Option<&std::path::Path>,
+    verified: bool,
 ) -> io::Result<Child> {
-    Command::new(program)
-        .args(args)
-        .env(readiness::SOCKET_ENV, socket)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
+    let mut command = Command::new(program);
+    let ready_env = boreas_supervisor::ready_client::SOCKET_ENV;
+    command.args(args).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    if let Some(path) = socket {
+        command.env(ready_env, path);
+    } else {
+        command.env_remove(ready_env);
+    }
+    if verified {
+        #[cfg(target_os = "linux")]
+        verified_launch::protect_child(&mut command);
+        #[cfg(not(target_os = "linux"))]
+        return Err(io::Error::other("verified child setup is unavailable"));
+    }
+    command.spawn()
 }
 
-fn run_child_once(program: &OsString, args: &[OsString]) -> io::Result<ExitStatus> {
-    let mut child = spawn_child(program, args)?;
-    child.wait()
+fn wait_steady(child: &mut Child, stop_grace: Duration) -> io::Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let mut stop = None;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if let Some(signal) = signals::take() {
+                let _ = signals::forward(child.id(), signal);
+                stop.get_or_insert_with(|| Instant::now() + stop_grace);
+            }
+            if stop.is_some_and(|deadline| Instant::now() >= deadline) {
+                let _ = child.kill();
+                return child.wait();
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stop_grace;
+        child.wait()
+    }
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]

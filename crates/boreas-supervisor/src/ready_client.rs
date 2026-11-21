@@ -4,6 +4,11 @@
 //! attest artifact identity or prove those facts. In particular, the challenge
 //! is not bound to a signed release hash.
 
+/// Set by the supervisor only for a readiness-gated trial child.
+pub const SOCKET_ENV: &str = "BOREAS_READY_SOCKET";
+/// Durable policy and status schema supported by the Linux daemon.
+pub const DAEMON_STATE_SCHEMA: &str = "boreas-node-state-v1";
+
 use std::fmt;
 use std::io;
 #[cfg(target_os = "linux")]
