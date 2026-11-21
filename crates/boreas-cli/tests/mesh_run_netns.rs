@@ -503,7 +503,7 @@ fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
     fs::write(&stage, raw).unwrap();
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
     fs::rename(stage, dirs[0].join("identity-revocation.signed")).unwrap();
-    source.wait_for("mesh signed graph: Status");
+    source.wait_for("mesh signed graph: IdentityRevoked");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Some(status) = source.child.try_wait().unwrap() {
