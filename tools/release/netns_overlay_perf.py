@@ -34,14 +34,28 @@ SHA-256 check over direct TCP on a distinct port. They are a separate diagnostic
 for the caller's namespace(s), not part of the overlay probe, and they never
 read the throughput gate. `compare` prints both denominators and ratios without
 turning any overlay result green or red.
+
+`multistream-receive`/`multistream-send` are a separate, same-candidate
+application TCP probe. Each round holds the total measured payload constant,
+primes every socket with a 64 KiB write, and starts measured bulk writes only
+once all sockets in that direction have acknowledged the warm-up.
+One receiver process per direction observes one [first payload recv, +1 s)
+window for all its flows; different directions and rounds have separate clocks
+and are never summed. Like the legacy diagnostic, observations count whole
+recv returns (not wire arrivals), and EOF can close a window. The opt-in CLI
+requires a complete window, but completeness does not prove sustained offered
+load or enforce a speedup. Flows are application sockets, not TLS circuits.
 """
 
+from contextlib import ExitStack
 import hashlib
 import json
 import math
 import os
 import re
+import select
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -446,6 +460,247 @@ def baseline_sender(local_ip: str, peer_ip: str) -> None:
     )
     result.update(_baseline_fields("baseline-sender"))
     print(json.dumps(result, sort_keys=True))
+
+
+MULTISTREAM_PORT = 18082
+_MULTISTREAM_MAX_BYTES = 64 * 1024 * 1024
+_MULTISTREAM_READY = b"ready"
+_MULTISTREAM_PRIME = b"boreas-app-stream-v1:"
+_MULTISTREAM_SECOND_NS = 1_000_000_000
+
+
+class _SharedReceiverWindow:
+    """One receiver-local clock and origin across every flow in this round."""
+
+    def __init__(self, flows: int):
+        self.start = None
+        self.complete = False
+        self.bytes = [0] * flows
+        self.first = [None] * flows
+
+    def observe(self, flow: int, size: int, at: int) -> None:
+        if size and self.start is None:
+            self.start = at
+        if self.start is None:
+            return
+        offset = at - self.start
+        if size and self.first[flow] is None:
+            self.first[flow] = offset
+        if offset >= _MULTISTREAM_SECOND_NS:
+            self.complete = True
+        elif size:
+            self.bytes[flow] += size
+
+    @property
+    def status(self) -> str:
+        if self.start is None:
+            return "no-payload"
+        return "complete" if self.complete else "incomplete"
+
+
+def _multistream_remaining(deadline: int) -> float:
+    remaining = deadline - time.monotonic_ns()
+    if remaining <= 0:
+        raise TimeoutError("multistream round deadline expired")
+    return remaining / _MULTISTREAM_SECOND_NS
+
+
+def _multistream_read(connection: socket.socket, size: int, deadline: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        connection.settimeout(_multistream_remaining(deadline))
+        part = connection.recv(size - len(data))
+        if not part:
+            raise ValueError("multistream control message truncated")
+        data.extend(part)
+    return bytes(data)
+
+
+def _multistream_write(connection: socket.socket, data: bytes, deadline: int) -> None:
+    connection.settimeout(_multistream_remaining(deadline))
+    connection.sendall(data)
+
+
+def _multistream_evidence(counts: list[int], hashes: list) -> tuple[dict, bytes]:
+    # Domain-separated commitment to ordered (flow ID, exact byte count,
+    # payload SHA-256) records. Both peers compute it independently; it is not
+    # SHA-256 of arrival order or of a concatenation of the raw TCP payloads.
+    frame = b"".join(
+        struct.pack("!BQ32s", flow, count, digest.digest())
+        for flow, (count, digest) in enumerate(zip(counts, hashes))
+    )
+    total = sum(counts)
+    aggregate = hashlib.sha256(b"boreas-multistream-v1\0" + frame).digest()
+    return {
+        "scope": "same-candidate-overlay-application-tcp",
+        "application_streams": len(counts),
+        "warmup_bytes_per_flow": len(CHUNK),
+        "bytes": total,
+        "aggregate_sha256": aggregate.hex(),
+        "flows": [
+            {"id": flow, "bytes": count, "sha256": digest.hexdigest()}
+            for flow, (count, digest) in enumerate(zip(counts, hashes))
+        ],
+    }, frame + struct.pack("!Q", total) + aggregate
+
+
+def _multistream_payload(flow: int) -> memoryview:
+    # Give each flow distinct content without allocating the whole transfer.
+    return memoryview(CHUNK[flow:] + CHUNK[:flow])
+
+
+def _multistream_transfer(
+    connections: dict[int, socket.socket], per_flow: int, deadline: int, *, receive: bool
+) -> tuple[dict, bytes]:
+    flow_count = len(connections)
+    counts = [0] * flow_count
+    hashes = [hashlib.sha256() for _ in range(flow_count)]
+    payloads = [_multistream_payload(flow) for flow in range(flow_count)]
+    window = _SharedReceiverWindow(flow_count) if receive else None
+    active = {connection: flow for flow, connection in connections.items()}
+    for connection in active:
+        connection.setblocking(False)
+    while active:
+        timeout = _multistream_remaining(deadline)
+        reads, writes, _ = select.select(
+            active if receive else [], [] if receive else active, [], timeout
+        )
+        if not (reads or writes):
+            raise TimeoutError("multistream round deadline expired")
+        # At most one chunk per ready socket in each pass. A single process
+        # timestamps reads in observation order, without per-flow clocks.
+        for connection in reads if receive else writes:
+            _multistream_remaining(deadline)
+            flow = active[connection]
+            try:
+                if receive:
+                    data = connection.recv(min(len(CHUNK), per_flow - counts[flow] + 1))
+                    window.observe(flow, len(data), time.monotonic_ns())
+                    if not data:
+                        if counts[flow] != per_flow:
+                            raise ValueError(
+                                f"multistream flow {flow} ended at {counts[flow]} bytes, "
+                                f"expected {per_flow}"
+                            )
+                        del active[connection]
+                        continue
+                    taken = len(data)
+                else:
+                    offset = counts[flow] % len(CHUNK)
+                    data = payloads[flow][offset:offset + per_flow - counts[flow]]
+                    taken = connection.send(data)
+                    if taken == 0:
+                        raise ValueError(f"multistream flow {flow} made no send progress")
+            except BlockingIOError:
+                continue
+            counts[flow] += taken
+            if counts[flow] > per_flow:
+                raise ValueError(f"multistream flow {flow} exceeded {per_flow} bytes")
+            hashes[flow].update(data[:taken])
+            if not receive and counts[flow] == per_flow:
+                connection.shutdown(socket.SHUT_WR)
+                del active[connection]
+    result, evidence = _multistream_evidence(counts, hashes)
+    if window is not None:
+        result.update(
+            first_second_bytes=sum(window.bytes) if window.start is not None else None,
+            first_second_status=window.status,
+            first_second_origin="first-payload-recv-across-flows",
+            first_second_window_ns=_MULTISTREAM_SECOND_NS,
+        )
+        for flow, row in enumerate(result["flows"]):
+            row["first_second_bytes"] = (
+                window.bytes[flow] if window.start is not None else None
+            )
+            row["first_payload_offset_ns"] = window.first[flow]
+    return result, evidence
+
+
+def _multistream_verify(expected: bytes, reported: bytes) -> None:
+    # The fixed-size read has already required the full frame. The trailer is
+    # an eight-byte aggregate count followed by a 32-byte SHA-256 digest.
+    if expected[:-40] != reported[:-40]:
+        raise ValueError("multistream per-flow byte counts or SHA-256 mismatch")
+    if expected[-40:-32] != reported[-40:-32]:
+        raise ValueError("multistream aggregate byte count mismatch")
+    if expected[-32:] != reported[-32:]:
+        raise ValueError("multistream aggregate SHA-256 mismatch")
+
+
+def _multistream_receive(local: str, flows: int, per_flow: int, deadline: int) -> dict:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((local, MULTISTREAM_PORT))
+        listener.listen(flows)
+        return _multistream_accept(listener, flows, per_flow, deadline)
+
+
+def _multistream_accept(listener: socket.socket, flows: int, per_flow: int, deadline: int) -> dict:
+    with ExitStack() as stack:
+        connections = {}
+        for _ in range(flows):
+            listener.settimeout(_multistream_remaining(deadline))
+            connection, _ = listener.accept()
+            stack.enter_context(connection)
+            prime = _multistream_read(connection, len(_MULTISTREAM_PRIME) + 1, deadline)
+            flow = prime[-1]
+            if prime[:-1] != _MULTISTREAM_PRIME or flow >= flows or flow in connections:
+                raise ValueError("multistream invalid or duplicate flow ID")
+            if _multistream_read(connection, len(CHUNK), deadline) != _multistream_payload(flow):
+                raise ValueError(f"multistream flow {flow} warm-up mismatch")
+            connections[flow] = connection
+        # Finish priming all connections before any sender starts measured data.
+        for connection in connections.values():
+            _multistream_write(connection, _MULTISTREAM_READY, deadline)
+        result, evidence = _multistream_transfer(connections, per_flow, deadline, receive=True)
+        _multistream_write(connections[0], evidence, deadline)
+        return result
+
+
+def _multistream_send(local: str, peer: str, flows: int, per_flow: int, deadline: int) -> dict:
+    with ExitStack() as stack:
+        connections = {}
+        for flow in range(flows):
+            connection = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+            connection.bind((local, 0))
+            connection.settimeout(_multistream_remaining(deadline))
+            connection.connect((peer, MULTISTREAM_PORT))
+            connections[flow] = connection
+        for flow, connection in connections.items():
+            prime = _MULTISTREAM_PRIME + bytes([flow]) + bytes(_multistream_payload(flow))
+            _multistream_write(connection, prime, deadline)
+        for connection in connections.values():
+            if _multistream_read(connection, len(_MULTISTREAM_READY), deadline) != _MULTISTREAM_READY:
+                raise ValueError("multistream invalid ready acknowledgement")
+        result, evidence = _multistream_transfer(connections, per_flow, deadline, receive=False)
+        _multistream_verify(evidence, _multistream_read(connections[0], len(evidence), deadline))
+        return result
+
+
+def _multistream_cli(mode: str, args: list[str]) -> int:
+    receive = mode == "multistream-receive"
+    if len(args) != (2 if receive else 3) or args[0] not in ("1", "4"):
+        peer_arg = "" if receive else " PEER_IPV4"
+        raise SystemExit(f"usage: netns_overlay_perf.py {mode} 1|4 LOCAL_IPV4{peer_arg}")
+    flows = int(args[0])
+    try:
+        for address in args[1:]:
+            socket.inet_pton(socket.AF_INET, address)
+        total = int(os.environ.get("BOREAS_MULTISTREAM_BYTES", str(32 * 1024 * 1024)))
+        if not 4 <= total <= _MULTISTREAM_MAX_BYTES or total % 4:
+            raise ValueError("BOREAS_MULTISTREAM_BYTES must be a multiple of four in 4..67108864")
+        deadline = time.monotonic_ns() + int(TIMEOUT_SECONDS * _MULTISTREAM_SECOND_NS)
+        if receive:
+            result = _multistream_receive(args[1], flows, total // flows, deadline)
+        else:
+            result = _multistream_send(args[1], args[2], flows, total // flows, deadline)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{mode}: {exc}") from None
+    result["role"] = "receiver" if receive else "sender"
+    print(json.dumps(result, sort_keys=True))
+    if receive and result["first_second_status"] != "complete":
+        raise SystemExit("multistream receiver did not observe a complete first-second window")
+    return 0
 
 
 def _run_bounded(argv: list[str], timeout: float) -> tuple[str | None, str | None]:
@@ -910,6 +1165,8 @@ def _summarize_cli(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] in {"multistream-receive", "multistream-send"}:
+        raise SystemExit(_multistream_cli(sys.argv[1], sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "sample":
         raise SystemExit(_sampler_cli(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "summarize":
