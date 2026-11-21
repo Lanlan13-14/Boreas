@@ -297,8 +297,9 @@ if systemctl start boreas.service; then
   echo 'ERROR: supervisor started a below-floor fallback' >&2; exit 1
 fi
 journalctl --no-pager -u boreas.service | grep -F "below the operator's minimum runnable sequence"
-systemctl stop boreas.service
+# Reset while the expected failed unit is still loaded, before stop may unload it.
 systemctl reset-failed boreas.service
+systemctl stop boreas.service
 
 # A newer authentic release can replace the spent trial without lowering the
 # run floor or discarding the old version or durable authentication history.
