@@ -320,8 +320,6 @@ mod linux {
         };
         let (_, tun) = LinuxTunDevice::open_provisioned(name, mtu)
             .map_err(|e| format!("mesh TUN attach: {e}"))?;
-        tun.set_nonblocking(true)
-            .map_err(|_| "mesh TUN nonblocking setup failed")?;
         Ok(Some(tun))
     }
 

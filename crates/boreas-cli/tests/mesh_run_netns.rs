@@ -4,18 +4,10 @@
 
 use boreas_pki::{
     NodeRole,
-    management::MANAGEMENT_SCHEMA_VERSION,
     provisioning::{
-        CaInitParams, NodeIssueParams, RootsBundle, SignedRootAuthorization, init_ca_dir,
-        issue_node_dir, sign_network_policy_dir, sign_status_file,
-    },
-    root_authorization::{MAX_CHAIN_DEPTH, Purpose, RootAuthorizationCandidate, Scope},
-};
-use boreas_proto::{
-    messages::{PathRole, SignedObject, SignerRole, SignerSignatures},
-    objects::{
-        self, CoreLsa, ManagementObject, MldsaParameterSet, Neighbor, ObjectBody, ObjectType,
-        SubjectIdentity,
+        CaInitParams, NodeIssueParams, RootsBundle,
+        core_mesh::{LsaParams, authorize_core, init_core_request, sign_lsa},
+        init_ca_dir, issue_node_dir, sign_network_policy_dir, sign_status_file,
     },
 };
 use boreas_tunnel::mesh_probe::utc_now;
@@ -92,11 +84,9 @@ impl Fixture {
         .unwrap();
         let policy_dir = temp.0.join("policy");
         sign_network_policy_dir(&ca, &policy_dir, 1, now, 600).unwrap();
-        let mut roots = RootsBundle::decode(&read(&ca, "roots.cbor")).unwrap();
+        let mut roots_path = ca.join("roots.cbor");
         let snapshot_path = temp.0.join("status.signed");
         sign_status_file(&ca, &snapshot_path, 1, now, 120).unwrap();
-        let root_ed = PKey::private_key_from_der(&read(&ca, "root.ed25519.key")).unwrap();
-        let root_ml = PKey::private_key_from_der(&read(&ca, "root.mldsa65.key")).unwrap();
         let mut nodes = Vec::new();
         for id in 1u8..=4 {
             let path = temp.0.join(format!("core-{id}"));
@@ -110,81 +100,40 @@ impl Fixture {
                 outer_san_dns: Some(NAME.into()),
             })
             .unwrap();
-            let issuer = format!("test-core-{id}").into_bytes();
-            let ed = PKey::generate_ed25519().unwrap();
-            let ml = PKey::private_key_from_seed(
-                None,
-                openssl::pkey::KeyType::ML_DSA_65,
-                None,
-                &[id; 32],
+            let keys = temp.0.join(format!("operational-{id}"));
+            init_core_request(&keys, NET, id, 1, now, 1).unwrap();
+            let new_roots = temp.0.join(format!("roots-{id}.cbor"));
+            authorize_core(
+                &ca,
+                &roots_path,
+                &keys.join("core.request"),
+                &new_roots,
+                id,
+                now,
             )
             .unwrap();
-            let authorization = RootAuthorizationCandidate {
-                net_id: NET,
-                issuer_key_id: issuer.clone(),
-                issuer_generation: 1,
-                purpose: Purpose::CoreOperational,
-                ed25519_public_key_der: ed.public_key_to_der().unwrap(),
-                mldsa_parameter_set: MldsaParameterSet::Mldsa65,
-                mldsa_public_key_der: ml.public_key_to_der().unwrap(),
-                scope: Scope::CoreOperational { core_id: id },
-                not_before: now,
-                expires: now + 300_000_000,
-                chain_depth: MAX_CHAIN_DEPTH,
-                may_delegate: false,
-            };
-            let raw_candidate = authorization.encode_candidate().unwrap();
-            let mut msg = b"BOREAS-ROOT-AUTHORIZATION-CANDIDATE\0".to_vec();
-            msg.extend_from_slice(&raw_candidate);
-            roots.authorizations.push(SignedRootAuthorization {
-                raw_candidate,
-                ed25519_signature: sign(&root_ed, &msg),
-                mldsa_signature: sign(&root_ml, &msg),
-            });
-            let lsa = ManagementObject {
-                net_id: NET,
-                issuer_key_id: issuer,
-                issuer_generation: 1,
-                subject_identity: SubjectIdentity::Core(id),
-                seq: 1,
-                issued_at: now,
-                expires: now + 120_000_000,
-                extensions: Vec::new(),
-                body: ObjectBody::CoreLsa(CoreLsa {
-                    core_id: id,
-                    core_generation: 1,
-                    seq: 1,
-                    neighbors: (1..=4)
-                        .filter(|other| *other != id)
-                        .map(|other| Neighbor {
-                            peer_core_id: other,
-                            rtt_p50_ms: match (id.min(other), id.max(other)) {
-                                (1, 3) => 20,
-                                (2, 4) => 30,
-                                _ => u16::from(other),
-                            },
-                            loss_ppm: 0,
-                            path_type: PathRole::Cdn as u8,
-                        })
-                        .collect(),
-                }),
-            };
-            let raw_tbs = objects::encode_tbs(&lsa).unwrap();
-            let message =
-                objects::signature_input(&raw_tbs, ObjectType::CoreLsa, MANAGEMENT_SCHEMA_VERSION)
-                    .unwrap();
-            let lsa = SignedObject {
-                object_type: ObjectType::CoreLsa,
-                raw_tbs,
-                signers: vec![SignerSignatures {
-                    role: SignerRole::Primary,
-                    ed25519: sign(&ed, &message).try_into().unwrap(),
-                    mldsa_parameter_set: MldsaParameterSet::Mldsa65,
-                    mldsa: sign(&ml, &message),
-                }],
-            }
-            .encode()
+            roots_path = new_roots;
+            let neighbors: Vec<_> = (1..=4)
+                .filter(|other| *other != id)
+                .map(|other| {
+                    let rtt = match (id.min(other), id.max(other)) {
+                        (1, 3) => 20,
+                        (2, 4) => 30,
+                        _ => u16::from(other),
+                    };
+                    (other, rtt, 0)
+                })
+                .collect();
+            let lsa_path = path.join("fixture-lsa.signed");
+            sign_lsa(&keys, &roots_path, &lsa_path, &LsaParams {
+                now,
+                core_generation: 1,
+                sequence: 1,
+                ttl_seconds: 120,
+                neighbors: &neighbors,
+            })
             .unwrap();
+            let lsa = fs::read(lsa_path).unwrap();
             let identity = read(&path, "local.signed");
             nodes.push(Node {
                 path,
@@ -192,6 +141,7 @@ impl Fixture {
                 lsa,
             });
         }
+        let roots = RootsBundle::decode(&fs::read(roots_path).unwrap()).unwrap();
         Self {
             _temp: temp,
             roots,

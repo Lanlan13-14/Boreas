@@ -86,6 +86,8 @@ fn epoch(
     confirmed: impl FnOnce([u8; 16]),
 ) -> Result<PacketEpoch, TunnelError> {
     let bad = TunnelError::Unsupported("invalid Core TUN profile or packet");
+    tun.set_nonblocking(true)
+        .map_err(|_| TunnelError::Unsupported("cannot enable nonblocking mesh TUN"))?;
     let policy = PointToPoint::from_mesh_circuit(c, tun.mtu()).map_err(|_| bad)?;
     let mut expected = [0; PROFILE.len() + 2];
     expected[..PROFILE.len()].copy_from_slice(PROFILE);

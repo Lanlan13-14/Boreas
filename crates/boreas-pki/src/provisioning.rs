@@ -13,6 +13,9 @@
 //!   `StatusSigner` private keys.
 #![cfg(feature = "openssl-backend")]
 
+#[cfg(target_os = "linux")]
+pub mod core_mesh;
+
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -52,7 +55,8 @@ use crate::{Authority, NodeRole, STATUS_MAX_AGE_US, expected_vip, node_id};
 const ROOTS_BUNDLE_MAGIC: &[u8; 8] = b"BRRB0001";
 const ROOT_AUTH_DOMAIN: &[u8] = b"BOREAS-ROOT-AUTHORIZATION-CANDIDATE\0";
 const MAX_ROOTS_BUNDLE_BYTES: usize = 128 * 1024;
-const MAX_BUNDLE_AUTH_RECORDS: usize = 16;
+// Sixteen operational scopes plus distinct IdentityAuthority and StatusSigner.
+const MAX_BUNDLE_AUTH_RECORDS: usize = 18;
 const MAX_MATERIAL_FILE_BYTES: usize = 64 * 1024;
 const MLDSA65_SIG_LEN: usize = 3309;
 const IA_KEY_ID: &[u8] = b"identity-authority-v1";
