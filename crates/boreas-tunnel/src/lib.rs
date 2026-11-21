@@ -57,6 +57,8 @@ pub mod memledger;
 pub mod mesh_probe;
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 pub mod mesh_relay;
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub mod mesh_route;
 pub mod packet_path;
 pub mod pmtu;
 pub mod probe_budget;
@@ -461,12 +463,9 @@ pub fn arbitrate_routes(input: &[RouteCandidate]) -> Result<Vec<RouteDecision>, 
                     group_names[ix].3.push(c.subject_id);
                 }
             } else {
-                group_names.push((
-                    c.issuer_id.clone(),
-                    g.clone(),
-                    vec![c.prefix],
-                    vec![c.subject_id],
-                ));
+                group_names.push((c.issuer_id.clone(), g.clone(), vec![c.prefix], vec![
+                    c.subject_id,
+                ]));
             }
         }
     }

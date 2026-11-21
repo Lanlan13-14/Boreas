@@ -160,6 +160,8 @@ fn map_io(error: io::Error) -> WsError {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => WsError::Timeout,
         io::ErrorKind::UnexpectedEof => WsError::Closed,
+        #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+        io::ErrorKind::Other if crate::error::tls_transport_eof(&error) => WsError::Closed,
         kind => WsError::Io(kind),
     }
 }

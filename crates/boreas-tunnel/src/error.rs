@@ -140,12 +140,45 @@ impl std::error::Error for TunnelError {}
 
 impl From<io::Error> for TunnelError {
     fn from(error: io::Error) -> Self {
+        // CircuitStream and WsStream carry a typed error through Read/Write.
+        // Do not collapse malformed framing or a reset into a generic EOF.
+        if error.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            if let Some(inner) = error
+                .into_inner()
+                .and_then(|inner| inner.downcast::<Self>().ok())
+            {
+                return *inner;
+            }
+            return Self::Io(io::ErrorKind::InvalidData);
+        }
+        if let Some(ws) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<WsError>())
+        {
+            return Self::Ws(*ws);
+        }
+        #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+        if tls_transport_eof(&error) {
+            return Self::Closed;
+        }
         match error.kind() {
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Self::Timeout,
             io::ErrorKind::UnexpectedEof => Self::Closed,
             kind => Self::Io(kind),
         }
     }
+}
+
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub(crate) fn tls_transport_eof(error: &io::Error) -> bool {
+    // OpenSSL 3 headers: ERR_LIB_SSL and SSL_R_UNEXPECTED_EOF_WHILE_READING.
+    // Only this exact reason is truncation; alerts and bad MAC are not.
+    error.get_ref()
+        .and_then(|inner| inner.downcast_ref::<openssl::ssl::Error>())
+        .and_then(openssl::ssl::Error::ssl_error)
+        .is_some_and(|stack| {
+            matches!(stack.errors(), [e] if e.library_code() == 20 && e.reason_code() == 294)
+        })
 }
 
 impl From<WsError> for TunnelError {

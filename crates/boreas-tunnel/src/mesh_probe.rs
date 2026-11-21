@@ -42,6 +42,8 @@ pub enum Error {
     Clock,
     NoRoute,
     WrongReply,
+    /// TCP dial failed before emitting any TLS bytes (graph profile only).
+    PathUnavailable(TunnelError),
     Transport(TunnelError),
 }
 
@@ -79,11 +81,12 @@ pub fn utc_now() -> Result<u64, Error> {
     u64::try_from(n.as_micros()).map_err(|_| Error::Clock)
 }
 
+#[derive(Clone)]
 pub(crate) struct Core {
     pub(crate) id: u8,
     pub(crate) identity: VerifiedNodeIdentity,
     pub(crate) until: u64,
-    object_id: [u8; 32],
+    pub(crate) object_id: [u8; 32],
 }
 
 impl Core {
@@ -256,6 +259,20 @@ impl<'a> MeshProbe<'a> {
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
         admission: &Admission,
     ) -> Result<Adjacency, Error> {
+        self.dial_classified(candidates, outer, admission, None)
+            .map_err(|error| match error {
+                Error::PathUnavailable(cause) => Error::Transport(cause),
+                other => other,
+            })
+    }
+
+    pub(crate) fn dial_classified(
+        &mut self,
+        candidates: &[Candidate<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+        route_deadline: Option<Instant>,
+    ) -> Result<Adjacency, Error> {
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
         }
@@ -282,7 +299,13 @@ impl<'a> MeshProbe<'a> {
         ordered.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2));
         let mut last_dial = Error::NoRoute;
         for (index, (_, _, id, peer, target)) in ordered.into_iter().enumerate() {
-            let deadline = self.deadline(&peer)?;
+            let mut deadline = self.deadline(&peer)?;
+            if let Some(route_deadline) = route_deadline {
+                deadline = deadline.min(route_deadline);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Status);
+            }
             let handshake = admission.reserve_handshake().map_err(TunnelError::from)?;
             let buffer = admission
                 .reserve_bytes(crate::runtime::CONNECTION_BUFFER_BUDGET)
@@ -299,7 +322,7 @@ impl<'a> MeshProbe<'a> {
             {
                 Ok(tcp) => tcp,
                 Err(error) if path_loss(error.kind()) => {
-                    last_dial = Error::Transport(error.into());
+                    last_dial = Error::PathUnavailable(error.into());
                     continue;
                 }
                 Err(error) => return Err(Error::Transport(error.into())),
@@ -384,6 +407,17 @@ impl<'a> MeshProbe<'a> {
         outer: &OpenSslOuterTlsAcceptor,
         admission: &Admission,
     ) -> Result<Adjacency, Error> {
+        self.accept_until(tcp, signed_peer_identity, outer, admission, None)
+    }
+
+    pub(crate) fn accept_until(
+        &mut self,
+        tcp: TcpStream,
+        signed_peer_identity: &[u8],
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+        route_deadline: Option<Instant>,
+    ) -> Result<Adjacency, Error> {
         let now = effective_utc(self.status)?;
         let peer = Core::from_object(
             &self
@@ -396,7 +430,13 @@ impl<'a> MeshProbe<'a> {
             return Err(Error::Identity);
         }
         neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
-        let deadline = self.deadline(&peer)?;
+        let mut deadline = self.deadline(&peer)?;
+        if let Some(route_deadline) = route_deadline {
+            deadline = deadline.min(route_deadline);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Status);
+        }
         let socket = tcp.try_clone().map_err(TunnelError::from)?;
         let inner = OpenSslAcceptor::from_pem_identity(self.pem, Policy::production_default())
             .map_err(|_| Error::Identity)?;
@@ -464,6 +504,40 @@ impl<'a> MeshProbe<'a> {
                 .map_err(|_| Error::Identity)?,
             &self.policy,
         )
+    }
+
+    pub(crate) fn verified_lsa(
+        &mut self,
+        core: &Core,
+        signed: &[u8],
+    ) -> Result<VerifiedObject, Error> {
+        let now = self.check(core)?;
+        let object = self
+            .trust
+            .verify_and_authorize(signed, now)
+            .map_err(|_| Error::Lsa)?;
+        lsa(&object, core.id, now)?;
+        Ok(object)
+    }
+
+    pub(crate) fn local_lsa(&self) -> &VerifiedObject {
+        &self.local_lsa
+    }
+
+    pub(crate) fn is_exact_local(&self, core: &Core) -> bool {
+        core.object_id == self.local.object_id && core.identity == self.local.identity
+    }
+
+    pub(crate) fn route_lsa_deadline(
+        &mut self,
+        core: &Core,
+        object_id: [u8; 32],
+        expires: u64,
+    ) -> Result<Instant, Error> {
+        if !self.trust.is_current_core_lsa(core.id, object_id) {
+            return Err(Error::Lsa);
+        }
+        self.authority_deadline(core, expires)
     }
 
     // The status store is single-owner while a bounded transaction runs. An
