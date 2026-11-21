@@ -843,7 +843,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Verify opt-in private DNS on real Core and Edge TUNs
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        id: acceptance_private_dns
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -853,7 +854,8 @@ jobs:
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-private-dns.log
       - name: Verify four-process Core routing and failover on real TUN
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        id: acceptance_mesh
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
         timeout-minutes: 5
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -868,6 +870,7 @@ jobs:
             "$test_binary" --ignored --nocapture --test-threads=1 2>&1 | tee rust-tls-mesh-runtime.log
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored' rust-tls-mesh-runtime.log
       - name: Verify 2–4 independent encrypted circuits on real Linux devices
+        id: acceptance_multi_active
         if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff')
         timeout-minutes: 5
         run: |
@@ -880,7 +883,7 @@ jobs:
             grep -Fx 'multi_active_lane_loss=both_cohorts_halted_fail_closed' "rust-tls-multi-active-${lanes}.log"
           done
       - name: Record performance runner and exact binary
-        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
         run: |
           set -euo pipefail
           {
@@ -892,9 +895,9 @@ jobs:
             tc -Version
             sha256sum hop-node-linux/boreas-linux-x86_64-musl-pq768
           } > rust-tls-perf-environment.txt
-      - name: Check three delayed full-duplex samples (candidate only)
+      - name: Check three delayed full-duplex samples
         id: candidate_delayed
-        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
@@ -917,7 +920,7 @@ jobs:
             fi
           done
           exit "$failed"
-      - name: Require gigabit useful goodput in each direction (candidate only)
+      - name: Require gigabit useful goodput in each direction
         id: candidate_gigabit
         if: ${{ !cancelled() && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
         timeout-minutes: 4
@@ -983,8 +986,9 @@ jobs:
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-netns-multistream.log
       - name: Measure explicitly enabled TCPv4 GSO over real TUN and strict E2E
+        id: acceptance_gso
         # This profile never replaces the earlier default-profile gates.
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || (github.ref == 'refs/heads/work/v111-handoff' && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
         timeout-minutes: 5
         env:
           BOREAS_NETNS_TCPV4_GSO: '1'
@@ -1002,6 +1006,30 @@ jobs:
               failed=1
             fi
           done
+          exit "$failed"
+      - name: Require every acceptance step to have actually passed
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        env:
+          DNS_RESULT: ${{ steps.acceptance_private_dns.outcome }}
+          MESH_RESULT: ${{ steps.acceptance_mesh.outcome }}
+          MULTI_ACTIVE_RESULT: ${{ steps.acceptance_multi_active.outcome }}
+          DELAYED_RESULT: ${{ steps.candidate_delayed.outcome }}
+          GIGABIT_RESULT: ${{ steps.candidate_gigabit.outcome }}
+          GSO_RESULT: ${{ steps.acceptance_gso.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          {
+            printf '\n### Mandatory real-device acceptance\n\n'
+            for check in DNS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
+              var="${check}_RESULT"
+              outcome="${!var}"
+              printf -- '- %s: `%s`\n' "$check" "${outcome:-not-run}"
+              if [[ "$outcome" != success ]]; then
+                failed=1
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
           exit "$failed"
       - name: Upload non-secret CI evidence
         if: always()
