@@ -590,8 +590,10 @@ mod linux {
                                 path,
                                 socket,
                                 acceptor,
-                                &admission,
-                                tun.as_ref().ok_or("mesh destination TUN missing")?,
+                                (
+                                    &admission,
+                                    tun.as_ref().ok_or("mesh destination TUN missing")?,
+                                ),
                                 |id| confirmed("destination", path, id),
                             )
                             .map(|e| {

@@ -11,7 +11,7 @@ use std::{
 use boreas_tun::linux::{LinuxTunError, LinuxTunQueue};
 
 use crate::{
-    ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
+    OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
     e2e::E2eCircuit,
     mesh_probe::{Error, MeshProbe},
     mesh_relay::EndpointIo,
@@ -65,10 +65,10 @@ impl VerifiedGraph<'_> {
         path: &[u8],
         incoming: TcpStream,
         outer: &OpenSslOuterTlsAcceptor,
-        admission: &Admission,
-        tun: &LinuxTunQueue,
+        endpoint: (&Admission, &LinuxTunQueue),
         confirmed: impl FnOnce([u8; 16]),
     ) -> Result<PacketEpoch, Error> {
+        let (admission, tun) = endpoint;
         let _buffer = admission
             .reserve_bytes(PACKET_BUFFER_BYTES)
             .map_err(TunnelError::from)?;
