@@ -83,11 +83,18 @@ fn sign(key: &PKey<Private>, msg: &[u8]) -> Vec<u8> {
 impl Fixture {
     fn new() -> Self {
         let now = utc_now().unwrap();
-        let temp = Temp(
-            std::env::temp_dir().join(format!("boreas-live-probe-{}-{now}", std::process::id())),
-        );
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(&temp.0).unwrap();
+        use std::{
+            os::unix::fs::DirBuilderExt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "boreas-live-probe-{}-{now}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let temp = Temp(path);
         let ca = temp.0.join("ca");
         init_ca_dir(&ca, &CaInitParams {
             net_id: NET,
@@ -798,4 +805,46 @@ fn graph_rejects_forgery_and_does_not_use_withdrawn_or_superseded_edges() {
         graph.authorize_path(&mut probe, &[1, 2, 3, 4]),
         Err(Error::Lsa)
     ));
+}
+
+#[test]
+fn verified_graph_does_not_fallback_after_wrong_first_hop_spki() {
+    use boreas_tunnel::mesh_route::RouteLocator;
+
+    let f = &Fixture::new();
+    let (wrong, wrong_target) = listener();
+    let (unused, unused_target) = listener();
+    unused.set_nonblocking(true).unwrap();
+    let mut status = f.status(1);
+    let mut probe = f.probe(1, &mut status);
+    let graph = probe
+        .verify_route_graph(&f.node(1).identity, &graph_inputs(f, 1))
+        .unwrap();
+    thread::scope(|scope| {
+        let responder = scope.spawn(|| f.respond(wrong, 3));
+        let result: Result<(), _> = graph.connect(
+            &mut probe,
+            &[
+                RouteLocator {
+                    path: &[1, 3, 4],
+                    target: &unused_target,
+                },
+                RouteLocator {
+                    path: &[1, 2, 3, 4],
+                    target: &wrong_target,
+                },
+            ],
+            &|| OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca),
+            &route_admission(),
+            |_, _| panic!("unauthorized peer must not reach the application"),
+        );
+        assert_eq!(
+            result,
+            Err(Error::Transport(TunnelError::InnerTls(
+                "peer identity mapping"
+            )))
+        );
+        assert!(responder.join().unwrap().is_err());
+        assert!(matches!(unused.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    });
 }
