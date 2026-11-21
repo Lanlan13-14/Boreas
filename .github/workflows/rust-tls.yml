@@ -854,6 +854,7 @@ jobs:
           done
           exit "$failed"
       - name: Require gigabit useful goodput in each direction (candidate only)
+        id: candidate_gigabit
         if: ${{ !cancelled() && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
         timeout-minutes: 4
         env:
@@ -861,7 +862,8 @@ jobs:
           BOREAS_PERF_BYTES: '268435456'
           BOREAS_PERF_TIMEOUT_SECONDS: '25'
           BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '33'
-          BOREAS_DIAGNOSTIC_TIMING: '1'
+          # Measure the normal runtime. The separate diagnostic records per-packet timing.
+          BOREAS_DIAGNOSTIC_TIMING: '0'
         run: |
           set -euo pipefail
           failed=0
@@ -877,6 +879,25 @@ jobs:
             fi
           done
           exit "$failed"
+      - name: Record one instrumented sample after a gigabit failure (diagnostic only)
+        if: ${{ !cancelled() && steps.candidate_gigabit.outcome == 'failure' }}
+        timeout-minutes: 2
+        env:
+          BOREAS_MIN_THROUGHPUT_MBPS: '1000'
+          BOREAS_PERF_BYTES: '268435456'
+          BOREAS_PERF_TIMEOUT_SECONDS: '25'
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '33'
+          BOREAS_DIAGNOSTIC_TIMING: '1'
+        run: |
+          set -euo pipefail
+          log=rust-tls-netns-gigabit-diagnostic.log
+          if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "$log"; then
+            rc=0
+          else
+            rc=$?
+          fi
+          printf 'sample_scope=diagnostic-only\nsample_exit=%s\n' "$rc" | tee -a "$log"
       - name: Upload non-secret CI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
