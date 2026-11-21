@@ -864,11 +864,13 @@ STAT_PATH=$POWN FAKE_MODE=0777 expect_fail_msg 'group/other-writable prefix is r
   run_base --materials "$MAT" --prefix "$POWN" --bindir "$T/bindir"
 STAT_PATH=; FAKE_MODE=700
 
+expect_fail_msg 'digest-only service requires explicit development opt-in' 'accept-legacy-service' \
+  run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir" --service systemd
 expect_fail_msg '--start without a service is refused' '--start requires' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir" --start
 expect_fail_msg '--start without /etc/boreas fails before any system write' '/etc/boreas' \
   run_base --materials "$MAT" --prefix "$P" --bindir "$T/bindir" \
-  --service systemd --start
+  --service systemd --accept-legacy-service --start
 assert_not_contains "$SYSTEM_LOG" 'systemctl'
 assert_absent /etc/systemd/system/boreas.service
 [ "$(sed -n '1p' "$P/active")" = 'test.1' ] || bail 'a refused --start changed the active pointer'

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Installed with the independently trusted supervisor, never from a candidate.
+set -eu
+umask 077
+PATH=/usr/bin:/bin
+export PATH
+unset OPENSSL_CONF OPENSSL_MODULES OPENSSL_ENGINES
+
+fail() { printf 'boreas-service: %s\n' "$*" >&2; exit 78; }
+uid=$(id -u)
+[ "$uid" -ne 0 ] || fail 'refusing UID 0'
+[ "$uid" = "$(id -u boreas)" ] || fail 'requires the dedicated boreas user'
+state=/var/lib/boreas/state
+release_store=/var/lib/boreas/releases
+min=${BOREAS_MIN_RUN_SEQUENCE:-1}
+case "$min" in ''|0*|*[!0-9]*) fail 'invalid BOREAS_MIN_RUN_SEQUENCE' ;; esac
+case "${BOREAS_ROLE:-}" in
+  core)
+    [ -n "${BOREAS_LISTEN:-}" ] || fail 'BOREAS_LISTEN required (numeric IPv4:port)'
+    set -- serve --listen "$BOREAS_LISTEN"
+    ;;
+  edge)
+    if [ -z "${BOREAS_CONNECT:-}" ] || [ -z "${BOREAS_TLS_NAME:-}" ]; then
+      fail 'BOREAS_CONNECT and BOREAS_TLS_NAME required'
+    fi
+    set -- connect --connect "$BOREAS_CONNECT" --tls-name "$BOREAS_TLS_NAME" \
+      --ws-host "${BOREAS_WS_HOST:-$BOREAS_TLS_NAME}"
+    ;;
+  *) fail 'BOREAS_ROLE must be core or edge' ;;
+esac
+
+exec /usr/local/libexec/boreas/boreas-supervisor supervise \
+  --store "$release_store" --writable-state "$state" --require-verified --min-run-sequence "$min" \
+  --ready-expected-schema boreas-node-state-v1 --ready-require-tun yes -- \
+  '{version}/boreas' daemon "$@" \
+  --config /etc/boreas/node.toml --material-dir /etc/boreas/materials \
+  --status-state-file "$state/status.state" --status-state-owner-uid "$uid" \
+  --network-policy-tbs "$state/policy.tbs" \
+  --network-policy-ed25519-signature "$state/policy.ed25519.sig" \
+  --network-policy-mldsa65-signature "$state/policy.mldsa65.sig" \
+  --network-root-ed25519-der "$state/network-root.ed25519.der" \
+  --network-root-mldsa65-der "$state/network-root.mldsa65.der" \
+  --network-policy-state-file "$state/policy.state" --network-policy-state-owner-uid "$uid" \
+  --tun-name "${BOREAS_TUN_NAME:-btun0}" --mtu "${BOREAS_MTU:-1360}"

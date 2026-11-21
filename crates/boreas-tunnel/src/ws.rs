@@ -1349,7 +1349,9 @@ mod tests {
             let masked = role == WsRole::Client;
             // Grow to the long header, then reuse the buffer for shorter frames,
             // including every tail length of an eight-byte masking word.
-            let lengths = [125usize, 126, 65_535, 65_536, 127].into_iter().chain(0..16);
+            let lengths = [125usize, 126, 65_535, 65_536, 127]
+                .into_iter()
+                .chain(0..16);
             for (index, len) in lengths.enumerate() {
                 let payload: Vec<u8> = (0..len).map(|i| (i ^ (i >> 3)) as u8).collect();
                 let start = stream.io.output.len();

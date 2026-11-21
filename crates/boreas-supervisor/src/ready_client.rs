@@ -1,8 +1,15 @@
 //! Bounded client for the supervisor's trial-readiness challenge.
 //!
 //! This reports caller-supplied runtime facts to the supervisor; it does not
-//! attest artifact identity or prove those facts. In particular, the challenge
-//! is not bound to a signed release hash.
+//! attest artifact identity or independently prove those facts. In verified
+//! mode, the supervisor separately binds the peer PID to the sealed ELF.
+
+/// Set by the supervisor only for a readiness-gated child.
+pub const SOCKET_ENV: &str = "BOREAS_READY_SOCKET";
+/// Verified service opens an existing TUN without administrative capabilities.
+pub const PROVISIONED_TUN_ENV: &str = "BOREAS_PROVISIONED_TUN";
+/// Durable policy and status schema supported by the Linux daemon.
+pub const DAEMON_STATE_SCHEMA: &str = "boreas-node-state-v1";
 
 use std::fmt;
 use std::io;
@@ -56,8 +63,8 @@ impl From<io::Error> for ReadyClientError {
 /// and return only after the bounded response has been written.
 ///
 /// `schema`, `workers`, and `tun` are assertions supplied by the caller, not
-/// artifact-bound or cryptographically attested readiness evidence. The
-/// supervisor remains responsible for policy validation of its response.
+/// cryptographically attested readiness evidence. The supervisor validates
+/// the response and the image the peer is executing.
 #[cfg(target_os = "linux")]
 pub fn report_ready(
     socket_path: &Path,

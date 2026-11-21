@@ -13,6 +13,7 @@ on:
       - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/dependencies/verify-openssl-build.sh'
@@ -30,6 +31,7 @@ on:
       - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/dependencies/verify-openssl-build.sh'
@@ -317,6 +319,22 @@ jobs:
             'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
             > hop-node-linux/README-DEVELOPMENT.txt
           (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
+      - name: Authenticated offline stage, real non-root systemd readiness and rollback
+        if: success()
+        timeout-minutes: 8
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p boreas-supervisor --features openssl-backend
+          musl-gcc -static -Os tools/deploy/ci-release-failure.c -o "$RUNNER_TEMP/release-failure-ci"
+          musl-gcc -static -Os -DWAIT_FOR_SUPERVISOR_KILL tools/deploy/ci-release-failure.c -o "$RUNNER_TEMP/release-wait-ci"
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" OPENSSL_CONF="$OPENSSL_CONF" \
+            bash tools/deploy/test-verified-systemd.sh \
+            "$PWD/hop-node-linux/boreas-linux-x86_64-musl-pq768" \
+            "$PWD/target/release/boreas-supervisor" "$BOREAS_OPENSSL_BIN" \
+            "$RUNNER_TEMP/release-failure-ci" "$RUNNER_TEMP/release-wait-ci" 2>&1 | tee rust-tls-verified-systemd.log
       - name: Same-identity initial TCP backup E2E (closed primary, configured backup)
         if: success()
         timeout-minutes: 15
@@ -914,6 +932,7 @@ jobs:
             rust-tls-pki-tests.log
             rust-tls-tunnel-tests.log
             rust-tls-supervisor-tests.log
+            rust-tls-verified-systemd.log
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log

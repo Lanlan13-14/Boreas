@@ -5,8 +5,8 @@
 //! [`inspect_elf`] checks bytes the caller already holds. [`inspect_elf_file`]
 //! reads one regular file only after `metadata.len()` is within
 //! [`MAX_ELF_BYTES`]. Both accept a normal ELF64 little-endian executable or
-//! PIE (`ET_EXEC` / `ET_DYN`) for `EM_X86_64` or `EM_AARCH64`, and only when
-//! the program-header table has neither `PT_INTERP` nor `PT_DYNAMIC`.
+//! PIE (`ET_EXEC` / `ET_DYN`) for `EM_X86_64` or `EM_AARCH64`, requiring no
+//! `PT_INTERP` and no loader dependencies in a static PIE relocation table.
 //!
 //! # What this module is not
 //!
@@ -16,8 +16,7 @@
 //! a state schema, compare seccomp or capability sets, check free disk, or
 //! decide rollback compatibility. `G-SUPPLY` and `G-UPGRADE` are not passed.
 //!
-//! Absence of `PT_INTERP` and `PT_DYNAMIC` is necessary for the static-release
-//! rule and is not a proof that the image cannot `dlopen` through a raw
+//! Static linkage preflight is not a proof that the image cannot `dlopen` through a raw
 //! syscall. Section names are not parsed; a stripped static binary has none.
 //! The pure function does not touch the filesystem.
 
@@ -76,7 +75,7 @@ pub enum Machine {
 pub enum ElfKind {
     /// `ET_EXEC`.
     Exec,
-    /// `ET_DYN` (PIE). Still rejected when `PT_DYNAMIC` or `PT_INTERP` is present.
+    /// `ET_DYN` (PIE); static relocation tables may be present.
     Dyn,
 }
 
@@ -122,7 +121,7 @@ pub enum PreflightError {
     BadProgramHeaders,
     /// `PT_INTERP` is present. A musl `ld.so` path is still a failure.
     Interpreter,
-    /// `PT_DYNAMIC` is present, including a PIE that still has a dynamic segment.
+    /// Malformed/unsupported dynamic segment or external loader dependency.
     DynamicSegment,
 }
 
@@ -150,7 +149,7 @@ impl fmt::Display for PreflightError {
                  including when the interpreter is musl",
             ),
             Self::DynamicSegment => {
-                f.write_str("ELF has PT_DYNAMIC; a PIE with a dynamic segment is not static enough")
+                f.write_str("ELF contains a malformed or externally linked dynamic segment")
             }
         }
     }
@@ -193,9 +192,8 @@ pub const fn image_too_large(len: u64) -> bool {
 /// # Errors
 ///
 /// Returns [`PreflightError`] when the bytes are not a fully static ELF64 LSB
-/// executable or PIE for x86-64 or AArch64. `PT_INTERP` and `PT_DYNAMIC` are
-/// hard failures. Missing both is not a proof against `dlopen` via a raw
-/// syscall.
+/// executable or PIE for x86-64 or AArch64. An interpreter or a dynamic
+/// dependency is a hard failure.
 pub fn inspect_elf(bytes: &[u8]) -> Result<ElfImage, PreflightError> {
     let len = bytes.len() as u64;
     if bytes.is_empty() {
@@ -344,23 +342,31 @@ fn check_program_headers(bytes: &[u8], header: &Header) -> Result<(), PreflightE
     if end > bytes.len() {
         return Err(PreflightError::Truncated);
     }
-    scan_phdrs(bytes, phoff, phnum)
+    scan_phdrs(bytes, phoff, phnum, header.kind)
 }
 
 /// `PT_INTERP` wins over `PT_DYNAMIC` when both are present.
 ///
 /// Other program-header types (`PT_NOTE`, `PT_GNU_STACK`, `PT_PHDR`, …) are
 /// ignored. That is not a claim that every remaining segment is harmless.
-fn scan_phdrs(bytes: &[u8], phoff: usize, phnum: usize) -> Result<(), PreflightError> {
+fn scan_phdrs(
+    bytes: &[u8],
+    phoff: usize,
+    phnum: usize,
+    kind: ElfKind,
+) -> Result<(), PreflightError> {
     let mut saw_interp = false;
-    let mut saw_dynamic = false;
+    let mut dynamic = None;
+    let mut multiple_dynamic = false;
     let mut saw_load = false;
     let mut off = phoff;
     for _ in 0..phnum {
         let p_type = read_u32(bytes, off)?;
         match p_type {
             PT_INTERP => saw_interp = true,
-            PT_DYNAMIC => saw_dynamic = true,
+            PT_DYNAMIC => {
+                multiple_dynamic |= dynamic.replace(off).is_some();
+            }
             PT_LOAD => saw_load = true,
             _ => {}
         }
@@ -371,8 +377,38 @@ fn scan_phdrs(bytes: &[u8], phoff: usize, phnum: usize) -> Result<(), PreflightE
     if saw_interp {
         return Err(PreflightError::Interpreter);
     }
-    if saw_dynamic {
-        return Err(PreflightError::DynamicSegment);
+    if let Some(off) = dynamic {
+        if multiple_dynamic || kind != ElfKind::Dyn {
+            return Err(PreflightError::DynamicSegment);
+        }
+        let start = usize::try_from(read_u64(bytes, off + 8)?)
+            .map_err(|_| PreflightError::DynamicSegment)?;
+        let len = usize::try_from(read_u64(bytes, off + 32)?)
+            .map_err(|_| PreflightError::DynamicSegment)?;
+        let end = start
+            .checked_add(len)
+            .ok_or(PreflightError::DynamicSegment)?;
+        if len == 0 || len % 16 != 0 || len > 64 * 1024 {
+            return Err(PreflightError::DynamicSegment);
+        }
+        let data = bytes
+            .get(start..end)
+            .ok_or(PreflightError::DynamicSegment)?;
+        let mut terminated = false;
+        for at in (0..data.len()).step_by(16) {
+            match read_u64(data, at)? {
+                0 => terminated = true, // DT_NULL (including padding)
+                _ if terminated => return Err(PreflightError::DynamicSegment),
+                // NEEDED, RPATH, RUNPATH, DEPAUDIT, AUDIT, AUXILIARY, FILTER.
+                1 | 15 | 29 | 0x6ffffefb | 0x6ffffefc | 0x7ffffffd | 0x7fffffff => {
+                    return Err(PreflightError::DynamicSegment);
+                }
+                _ => {}
+            }
+        }
+        if !terminated {
+            return Err(PreflightError::DynamicSegment);
+        }
     }
     if !saw_load {
         return Err(PreflightError::BadProgramHeaders);
@@ -545,6 +581,35 @@ mod tests {
                 },
             ],
         );
+        assert!(matches!(
+            inspect_elf(&buf),
+            Err(PreflightError::DynamicSegment)
+        ));
+    }
+
+    #[test]
+    fn static_pie_relocations_are_allowed_but_loader_dependencies_are_not() {
+        let table_end = u64::from(ELF64_EHDR_SIZE) + 2 * u64::from(ELF64_PHDR_SIZE);
+        let mut buf = elf_image(
+            EM_X86_64,
+            ET_DYN,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_offset: 0,
+                    p_filesz: table_end + 32,
+                },
+                PhdrSpec {
+                    p_type: PT_DYNAMIC,
+                    p_offset: table_end,
+                    p_filesz: 32,
+                },
+            ],
+        );
+        buf.extend_from_slice(&[0; 32]);
+        write_u64(&mut buf, table_end as usize, 7); // DT_RELA
+        assert!(inspect_elf(&buf).is_ok());
+        write_u64(&mut buf, table_end as usize, 1); // DT_NEEDED
         assert!(matches!(
             inspect_elf(&buf),
             Err(PreflightError::DynamicSegment)

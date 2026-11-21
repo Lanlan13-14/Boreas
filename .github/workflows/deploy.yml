@@ -46,7 +46,7 @@ jobs:
       - name: Check every deployment shell entry point
         run: |
           set -euo pipefail
-          scripts=(tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh)
+          scripts=(tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh tools/deploy/boreas-service tools/deploy/install-verified-unit.sh tools/deploy/stage-verified-release.sh)
           for script in "${scripts[@]}"; do
             sh -n "$script"
             dash -n "$script"
@@ -55,7 +55,8 @@ jobs:
           # SC2317 is a false positive on the sourceable procd template, and
           # SC2016 is intentional shell code inside single-quoted test cases.
           # SC1090 cannot resolve the absolute template path at static-check time.
-          shellcheck -s sh -e SC2317,SC2016,SC1090 tools/deploy/install.sh tools/deploy/boreas-run tools/deploy/boreas.openwrt tools/deploy/test-install.sh
+          shellcheck -s sh -e SC2317,SC2016,SC1090 "${scripts[@]}"
+          bash -n tools/deploy/test-verified-systemd.sh
       - name: Run deployment regressions under all supported shell parsers
         run: |
           set -euo pipefail

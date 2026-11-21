@@ -390,8 +390,7 @@ impl EstablishedSession {
             flags: 0,
             body_len: u32::try_from(body.len()).map_err(|_| TunnelError::FrameTooLarge)?,
         };
-        if let Err(error) =
-            boreas_proto::validate_frame_policy_parts(&header, body, &mut self.ctx)
+        if let Err(error) = boreas_proto::validate_frame_policy_parts(&header, body, &mut self.ctx)
         {
             // A state-machine violation ends the session; do not leave a
             // half-valid context that a later frame could exploit.

@@ -643,7 +643,10 @@ pub fn encode_packet_frame(packet: &[u8], mtu: usize) -> Result<Vec<u8>, PacketP
     Ok(frame)
 }
 
-fn packet_frame_prefix(packet: &[u8], mtu: usize) -> Result<[u8; FRAME_PREFIX_LEN], PacketPathError> {
+fn packet_frame_prefix(
+    packet: &[u8],
+    mtu: usize,
+) -> Result<[u8; FRAME_PREFIX_LEN], PacketPathError> {
     if packet.is_empty() {
         return Err(PacketPathError::Denied(PacketDeny::EmptyPacket));
     }

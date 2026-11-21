@@ -22,16 +22,9 @@
 //! Linux additionally to the exact child pid, so another local process cannot
 //! answer on the candidate's behalf.
 //!
-//! Deliberate limits, stated rather than implied:
-//!
-//! * The nonce is not yet bound to the candidate artifact SHA-256 because the
-//!   `verify_release` → `prepare` path is not wired; the schema binding is the
-//!   part that exists today.
-//! * There is no Boreas daemon in this workspace yet, so this module is
-//!   exercised against the `__ready-stub` candidate in tests. It is **not**
-//!   claimed to be integrated in production.
-//! * Windows has no `AF_UNIX` in `std` and no peer-credential API here, so the
-//!   module is Unix-only and the store stays fail-closed there.
+//! Verified Linux launches also compare the responding process's executable
+//! with the sealed, hash-verified image before accepting the report. Generic
+//! tests use this protocol without asserting a release artifact identity.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};

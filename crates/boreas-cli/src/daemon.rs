@@ -539,6 +539,29 @@ mod linux_daemon {
         }
     }
 
+    /// The verified supervisor challenges each boot. TUN readiness is
+    /// a fact about this process's verified queue, not host route convergence.
+    fn report_trial_ready(tun: &TunEndpoint) -> Result<(), String> {
+        use boreas_supervisor::ready_client::{
+            DAEMON_STATE_SCHEMA, SOCKET_ENV, TunStatus, report_ready,
+        };
+
+        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
+            return Ok(());
+        };
+        let status = match tun {
+            TunEndpoint::Real { io, .. } => {
+                io.queue.verify().map_err(|e| {
+                    format!("daemon: supervised TUN queue failed verification: {e}")
+                })?;
+                TunStatus::Ready
+            }
+            TunEndpoint::Virtual { .. } => TunStatus::Absent,
+        };
+        report_ready(Path::new(&socket), DAEMON_STATE_SCHEMA, 1, status)
+            .map_err(|e| format!("daemon: supervised readiness handshake failed: {e}"))
+    }
+
     fn daemon_capabilities() -> RuntimeCapabilities {
         RuntimeCapabilities {
             dns_tcp: false,
@@ -1668,7 +1691,10 @@ mod linux_daemon {
         const MAX_ROOTS_FILE_BYTES: usize = 64 * 1024;
         let mut raw = Vec::new();
         fs::File::open(roots_path)
-            .and_then(|file| file.take(MAX_ROOTS_FILE_BYTES as u64 + 1).read_to_end(&mut raw))
+            .and_then(|file| {
+                file.take(MAX_ROOTS_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut raw)
+            })
             .map_err(|_| "daemon: cannot read status trust root bundle".to_string())?;
         if raw.len() > MAX_ROOTS_FILE_BYTES {
             return Err("daemon: status trust root bundle exceeds size limit".to_string());
@@ -1677,7 +1703,9 @@ mod linux_daemon {
             .and_then(|bundle| bundle.verify_all(net_id, now_us))
             .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
         if fingerprint != expected_root_fingerprint {
-            return Err("daemon: status NetworkRoot fingerprint does not match identity".to_string());
+            return Err(
+                "daemon: status NetworkRoot fingerprint does not match identity".to_string(),
+            );
         }
         let mut trust = ManagementTrust::new(net_id);
         let mut identity_trust = AuthorityRevocationTrust::new(net_id);
@@ -1784,6 +1812,12 @@ mod linux_daemon {
     }
 
     pub fn run_mode(mode: Mode, args: &[String]) -> Result<(), String> {
+        let provisioned =
+            std::env::var_os(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV).is_some();
+        if provisioned {
+            boreas_supervisor::sandbox::install_daemon()
+                .map_err(|e| format!("daemon: service network isolation setup failed: {e}"))?;
+        }
         let mut config_path: Option<PathBuf> = None;
         let mut material_dir: Option<PathBuf> = None;
         let mut listen_spec: Option<String> = None;
@@ -1879,6 +1913,9 @@ mod linux_daemon {
             }
         }
 
+        if provisioned && virtual_tun {
+            return Err("daemon: verified service requires a provisioned real TUN".into());
+        }
         if !(1280..=1400).contains(&mtu) {
             return Err("daemon: --mtu must be in 1280..=1400".to_string());
         }
@@ -2076,17 +2113,20 @@ mod linux_daemon {
                 _host: host,
             }
         } else {
-            let (dev, queue) = LinuxTunDevice::create(TunConfig {
-                name: tun_name,
-                mtu,
-                multi_queue: false,
-                vnet_header: false,
-            })
-            .map_err(|e| {
-                format!(
-                    "daemon Linux TUN creation failed (need CAP_NET_ADMIN / /dev/net/tun): {e:?}"
-                )
-            })?;
+            let (dev, queue) = if provisioned {
+                let name = tun_name
+                    .as_deref()
+                    .ok_or("daemon: provisioned TUN requires an explicit --tun-name")?;
+                LinuxTunDevice::open_provisioned(name, mtu)
+            } else {
+                LinuxTunDevice::create(TunConfig {
+                    name: tun_name,
+                    mtu,
+                    multi_queue: false,
+                    vnet_header: false,
+                })
+            }
+            .map_err(|e| format!("daemon Linux TUN setup failed: {e:?}"))?;
             queue
                 .set_nonblocking(true)
                 .map_err(|e| format!("daemon Linux TUN O_NONBLOCK failed: {e:?}"))?;
@@ -2537,9 +2577,18 @@ mod linux_daemon {
             .map_err(|e| format!("daemon serve: policy window failed before accept: {e}"))?;
         lock_gate(&status_store, status_path)
             .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
+        // A Core is ready to accept a peer; this does not claim a peer circuit.
+        report_trial_ready(tun)?;
 
-        let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
-        let accept_deadline = Instant::now() + wait_limit;
+        // The verified service remains available to accept the first peer;
+        // the 30s legacy smoke-run timeout must not churn a healthy service.
+        let supervised =
+            std::env::var_os(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV).is_some();
+        let accept_deadline = max_seconds
+            .map(Duration::from_secs)
+            .or_else(|| (!supervised).then_some(ACCEPT_WAIT))
+            .map(|wait| Instant::now() + wait);
+        let mut next_status_check = Instant::now() + STATUS_RECHECK_INTERVAL;
         let tcp = loop {
             match listener.accept() {
                 Ok((s, _)) => {
@@ -2551,7 +2600,15 @@ mod linux_daemon {
                     policy_window.check().map_err(|e| {
                         format!("daemon serve: policy window failed while waiting for peer: {e}")
                     })?;
-                    if Instant::now() >= accept_deadline {
+                    if supervised && Instant::now() >= next_status_check {
+                        lock_gate(&status_store, status_path).map_err(|e| {
+                            format!(
+                                "daemon serve: durable status gate failed waiting for peer: {e}"
+                            )
+                        })?;
+                        next_status_check = Instant::now() + STATUS_RECHECK_INTERVAL;
+                    }
+                    if accept_deadline.is_some_and(|until| Instant::now() >= until) {
                         return Err(
                             "daemon serve: timed out waiting for peer connection".to_string()
                         );
@@ -3101,6 +3158,15 @@ mod linux_daemon {
             STATUS_RECHECK_INTERVAL,
             Some(endpoints),
         );
+        if mode_name == "connect" && packets_before == 0 && expected.is_none() {
+            // The initial Edge circuit is authenticated and has a bound packet
+            // path. Future promotions must never answer the one-shot challenge.
+            policy_window.check()?;
+            if let Some(reason) = watchdog.fault() {
+                return Err(reason);
+            }
+            report_trial_ready(tun)?;
+        }
 
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;

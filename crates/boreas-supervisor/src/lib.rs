@@ -66,6 +66,7 @@ pub mod install;
 pub mod manifest;
 pub mod preflight;
 pub mod sandbox;
+pub mod verified_stage;
 
 /// Shared private constants for the supervisor readiness wire protocol.
 #[cfg(target_os = "linux")]

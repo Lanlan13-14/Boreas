@@ -17,6 +17,7 @@ default = []
 openssl-inner-tls = [
     "dep:boreas-crypto",
     "dep:boreas-proto",
+    "dep:boreas-supervisor",
     "dep:boreas-tun",
     "dep:boreas-tunnel",
     "boreas-crypto/openssl-backend",
@@ -36,6 +37,9 @@ boreas-tunnel = { path = "../boreas-tunnel", optional = true }
 # This optional normal dependency also serves real backend test fixtures.
 # Dev-dependencies cannot be optional; the feature is the only activation point.
 openssl = { version = "=0.10.82", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+boreas-supervisor = { path = "../boreas-supervisor", optional = true }
 
 # Unix-only: O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC for the safe config open and
 # geteuid for the owner check. Already present in Cargo.lock via other crates,
