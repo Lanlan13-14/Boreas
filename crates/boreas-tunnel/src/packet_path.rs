@@ -437,6 +437,18 @@ impl PointToPoint {
         Self::try_new_in(base_from_endpoints(local, peer)?, local, peer, mtu)
     }
 
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    pub(crate) fn from_mesh_circuit(
+        circuit: &E2eCircuit<'_>,
+        mtu: usize,
+    ) -> Result<Self, PacketPathError> {
+        let endpoints = AuthorizedEndpoints::from_e2e_circuit(circuit)?;
+        if mtu > usize::from(endpoints.mtu_cap) {
+            return Err(PacketPathError::MtuOutOfRange);
+        }
+        Self::try_new(endpoints.local.vip, endpoints.peer.vip, mtu)
+    }
+
     fn try_new_in(
         base: [u8; 4],
         local: Ipv4Addr,

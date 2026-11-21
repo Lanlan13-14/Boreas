@@ -44,6 +44,8 @@ pub enum Error {
     WrongReply,
     /// TCP dial failed before emitting any TLS bytes (graph profile only).
     PathUnavailable(TunnelError),
+    /// At least one confirmed business circuit lost transport, with no replay.
+    ConfirmedPathLost(TunnelError),
     Transport(TunnelError),
 }
 
@@ -232,6 +234,31 @@ impl<'a> MeshProbe<'a> {
 
     pub fn local(&self) -> PeerIdentity {
         self.local.peer()
+    }
+
+    /// Import operator-published updates between bounded circuits. The owner,
+    /// replay heads and durable snapshot deadline are not recreated on reload.
+    pub fn refresh_runtime_authority(
+        &mut self,
+        snapshot: &[u8],
+        identity_revocation: Option<&[u8]>,
+        local_lsa: &[u8],
+    ) -> Result<(), Error> {
+        let observed = utc_now()?;
+        let mono = Instant::now();
+        self.status.accept_signed_snapshot(snapshot, observed, mono)
+            .map_err(|_| Error::Status)?;
+        if let Some(raw) = identity_revocation {
+            self.status.accept_identity_revocation(raw, utc_now()?)
+                .map_err(|_| Error::Status)?;
+        }
+        let now = effective_utc(self.status)?;
+        let verified = self.trust.verify_and_authorize(local_lsa, now)
+            .map_err(|_| Error::Lsa)?;
+        lsa(&verified, self.local.id, now)?;
+        self.local_lsa = verified;
+        self.check(&self.local.clone())?;
+        Ok(())
     }
 
     /// Select a *direct* CDN-class neighbor. Only TCP failures before any TLS
@@ -565,8 +592,18 @@ impl<'a> MeshProbe<'a> {
             .1
             .min(self.local_lsa.valid_until())
             .min(remote_lsa_expiry);
-        if now >= cutoff || route.iter().any(|node| now >= node.until) {
+        if now >= cutoff {
             return Err(Error::Status);
+        }
+        for node in route {
+            let peer = AuthenticatedPeer::new(
+                node.identity.net_id(), node.identity.node_id(), node.identity.identity_generation(),
+            ).ok_or(Error::Identity)?;
+            if now >= node.until || !matches!(self.status.peer_revocation(&peer),
+                PeerRevocation::Verified(state) if !state.sessions_revoked())
+            {
+                return Err(Error::Status);
+            }
         }
         Ok(())
     }

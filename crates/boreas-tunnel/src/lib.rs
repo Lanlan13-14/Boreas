@@ -54,6 +54,8 @@ pub mod h2credit;
 pub mod hedge;
 pub mod memledger;
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub mod mesh_packet;
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 pub mod mesh_probe;
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 pub mod mesh_relay;
