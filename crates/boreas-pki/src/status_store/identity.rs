@@ -97,7 +97,9 @@ impl Decisions {
     }
 }
 
-fn split(raw: &[u8]) -> Result<(&[u8], &[u8], &[u8]), Error> {
+type SignedParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+fn split(raw: &[u8]) -> Result<SignedParts<'_>, Error> {
     let ed_end = IDENTITY_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN;
     let pq_end = ed_end + MLDSA65_SIGNATURE_LEN;
     if raw.len() <= pq_end
