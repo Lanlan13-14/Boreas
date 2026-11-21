@@ -13,3 +13,9 @@ members = [
 
 # Each crate manifest is self-contained: package fields (edition, rust-version,
 # license) are declared per crate, not inherited block-wide.
+
+[profile.release]
+# Allow inlining across the packet, framing and transport crate boundaries.
+# Keep portable target features and all existing security policy; validate
+# actual throughput and build cost on Actions rather than assuming a gain.
+lto = "thin"
