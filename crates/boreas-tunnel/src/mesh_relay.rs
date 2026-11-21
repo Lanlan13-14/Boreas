@@ -31,8 +31,26 @@ const FORWARD_BUFFER_BUDGET: usize = 2 * boreas_proto::MAX_BODY_LEN as usize;
 
 /// Private, locally authorized route facts (no keys, raw objects or sockets).
 pub struct FixedRoute {
-    members: Vec<Core>,
-    position: usize,
+    pub(crate) members: Vec<Core>,
+    pub(crate) position: usize,
+    /// Per-member replay head and exclusive UTC deadline for graph routes.
+    pub(crate) advertisements: Vec<([u8; 32], u64)>,
+}
+
+impl FixedRoute {
+    fn deadline(&self, probe: &mut MeshProbe<'_>, links: &[&Adjacency]) -> Result<Instant, Error> {
+        let mut deadline = probe.route_deadline(&self.members, links)?;
+        for (member, &(id, expiry)) in self.members.iter().zip(&self.advertisements) {
+            deadline = deadline.min(probe.route_lsa_deadline(member, id, expiry)?);
+        }
+        Ok(deadline)
+    }
+
+    fn expiry(&self, adjacent_expiry: u64) -> u64 {
+        self.advertisements
+            .iter()
+            .fold(adjacent_expiry, |expiry, ad| expiry.min(ad.1))
+    }
 }
 
 impl MeshProbe<'_> {
@@ -63,6 +81,7 @@ impl MeshProbe<'_> {
         Ok(FixedRoute {
             members,
             position: pos,
+            advertisements: Vec::new(),
         })
     }
 }
@@ -114,9 +133,9 @@ pub fn forward_fixed(
     let _credit = admission
         .reserve_bytes(FORWARD_BUFFER_BUDGET)
         .map_err(TunnelError::from)?;
-    let deadline = probe.route_deadline(&route.members, &[&left, &right])?;
+    let deadline = route.deadline(probe, &[&left, &right])?;
     let (left_socket, right_socket) = (&left.socket, &right.socket);
-    let remote_expiry = left.remote_lsa_expiry.min(right.remote_lsa_expiry);
+    let remote_expiry = route.expiry(left.remote_lsa_expiry.min(right.remote_lsa_expiry));
     let mut check = || {
         probe
             .check_route_utc(&route.members, remote_expiry)
@@ -327,10 +346,14 @@ pub fn with_fixed_endpoint<T>(
     if hop.peer.identity != route.members[next].identity {
         return Err(Error::Identity);
     }
-    let deadline = probe.route_deadline(&route.members, &[&hop])?;
-    // Fixed-width fields, ordered route, explicit domain separation. Both
-    // TLS-authenticated endpoints must have the same configured route.
-    let mut binding = b"BOREAS-FIXED-CORE-ROUTE-v1\0".to_vec();
+    let deadline = route.deadline(probe, &[&hop])?;
+    // The graph profile binds exact signed identity and LSA TBS digests in
+    // addition to the existing endpoint TLS SPKI checks and route facts.
+    let mut binding = if route.advertisements.is_empty() {
+        b"BOREAS-FIXED-CORE-ROUTE-v1\0".to_vec()
+    } else {
+        b"BOREAS-VERIFIED-CORE-ROUTE-v1\0".to_vec()
+    };
     binding.extend_from_slice(&probe.policy_digest());
     binding.push(route.hops());
     for member in &route.members {
@@ -338,13 +361,17 @@ pub fn with_fixed_endpoint<T>(
         binding.extend_from_slice(&id.node_id.to_be_bytes());
         binding.extend_from_slice(&id.identity_generation.to_be_bytes());
     }
+    for (member, advertisement) in route.members.iter().zip(&route.advertisements) {
+        binding.extend_from_slice(&member.object_id);
+        binding.extend_from_slice(&advertisement.0);
+    }
     let binding = openssl::sha::sha256(&binding);
     let pem = probe.endpoint_credential();
     let connector = OpenSslConnector::from_pem_identity(pem, Policy::production_default())
         .map_err(|_| Error::Identity)?;
     let acceptor = OpenSslAcceptor::from_pem_identity(pem, Policy::production_default())
         .map_err(|_| Error::Identity)?;
-    let remote_expiry = hop.remote_lsa_expiry;
+    let remote_expiry = route.expiry(hop.remote_lsa_expiry);
     let backend = OpenSslE2eBackend::new(
         Arc::new(connector),
         Arc::new(acceptor),

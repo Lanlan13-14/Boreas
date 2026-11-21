@@ -79,11 +79,12 @@ pub fn utc_now() -> Result<u64, Error> {
     u64::try_from(n.as_micros()).map_err(|_| Error::Clock)
 }
 
+#[derive(Clone)]
 pub(crate) struct Core {
     pub(crate) id: u8,
     pub(crate) identity: VerifiedNodeIdentity,
     pub(crate) until: u64,
-    object_id: [u8; 32],
+    pub(crate) object_id: [u8; 32],
 }
 
 impl Core {
@@ -464,6 +465,36 @@ impl<'a> MeshProbe<'a> {
                 .map_err(|_| Error::Identity)?,
             &self.policy,
         )
+    }
+
+    pub(crate) fn verified_lsa(
+        &mut self,
+        core: &Core,
+        signed: &[u8],
+    ) -> Result<VerifiedObject, Error> {
+        let now = self.check(core)?;
+        let object = self
+            .trust
+            .verify_and_authorize(signed, now)
+            .map_err(|_| Error::Lsa)?;
+        lsa(&object, core.id, now)?;
+        Ok(object)
+    }
+
+    pub(crate) fn local_lsa(&self) -> &VerifiedObject {
+        &self.local_lsa
+    }
+
+    pub(crate) fn route_lsa_deadline(
+        &mut self,
+        core: &Core,
+        object_id: [u8; 32],
+        expires: u64,
+    ) -> Result<Instant, Error> {
+        if !self.trust.is_current_core_lsa(core.id, object_id) {
+            return Err(Error::Lsa);
+        }
+        self.authority_deadline(core, expires)
     }
 
     // The status store is single-owner while a bounded transaction runs. An
