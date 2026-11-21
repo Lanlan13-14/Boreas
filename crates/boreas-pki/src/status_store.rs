@@ -1871,14 +1871,14 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(target_os = "linux")]
-fn suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
 }
 
 #[cfg(target_os = "linux")]
-fn checked_path(path: &Path, owner: u32) -> Result<PathBuf, Error> {
+pub(crate) fn checked_path(path: &Path, owner: u32) -> Result<PathBuf, Error> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(Error::UnsafePath);
     }
@@ -1891,7 +1891,10 @@ fn checked_path(path: &Path, owner: u32) -> Result<PathBuf, Error> {
         }
         cursor.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&cursor)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != owner)
+        {
             return Err(Error::UnsafePath);
         }
         let mode = metadata.permissions().mode();
@@ -1946,7 +1949,7 @@ fn reject_symlink_or_nonfile(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_private(path: &Path, create: bool) -> Result<File, Error> {
+pub(crate) fn open_private(path: &Path, create: bool) -> Result<File, Error> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -1962,7 +1965,7 @@ fn open_private(path: &Path, create: bool) -> Result<File, Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_existing(path: &Path) -> io::Result<File> {
+pub(crate) fn open_existing(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -1976,7 +1979,7 @@ fn open_existing(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_staging(path: &Path) -> Result<File, Error> {
+pub(crate) fn open_staging(path: &Path) -> Result<File, Error> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -1992,7 +1995,7 @@ fn open_staging(path: &Path) -> Result<File, Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_file(path: &Path, file: &File, owner: u32) -> Result<(), Error> {
+pub(crate) fn validate_file(path: &Path, file: &File, owner: u32) -> Result<(), Error> {
     let path_metadata = fs::symlink_metadata(path)?;
     let file_metadata = file.metadata()?;
     let parent_metadata = fs::metadata(path.parent().ok_or(Error::UnsafePath)?)?;

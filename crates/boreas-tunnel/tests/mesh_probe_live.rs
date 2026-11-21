@@ -1392,3 +1392,281 @@ fn directory_converges_over_two_authenticated_hops_and_gates_business() {
         Err(Error::Lsa)
     ));
 }
+
+#[test]
+fn shared_directory_listener_discovers_provisioned_spkis_and_rejects_unlisted_core() {
+    use boreas_tunnel::mesh_route::DirectoryCore;
+
+    let f = &Fixture::new();
+    let mut statuses = [f.status(1), f.status(2), f.status(3), f.status(4)];
+    let [a_status, b_status, c_status, stranger_status] = &mut statuses;
+    let mut a = f.probe(1, a_status);
+    let mut b = f.probe(2, b_status);
+    let mut c = f.probe(3, c_status);
+    let mut stranger = f.probe(4, stranger_status);
+    let [a_raw, b_raw, c_raw] = [1, 2, 3].map(|id| f.node(id).identity.as_slice());
+    let a_members = [b_raw, c_raw];
+    let b_members = [a_raw, c_raw];
+    let c_members = [a_raw, b_raw];
+    let (listen, target) = listener();
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let acceptor = outer_for(&f, 2);
+    let admission = route_admission();
+    for (client, provisioned, expected) in [
+        (&mut stranger, &[b_raw][..], None),
+        (&mut c, &c_members[..], Some(3)),
+        (&mut a, &a_members[..], Some(1)),
+        (&mut c, &c_members[..], Some(3)),
+    ] {
+        let socket = listen.try_clone().unwrap();
+        thread::scope(|scope| {
+            let incoming = scope.spawn(|| {
+                b.accept_directory_member(accept_socket(socket), &b_members, &acceptor, &admission)
+            });
+            let outgoing = client.sync_directory(
+                Candidate {
+                    target: &target,
+                    signed_identity: b_raw,
+                },
+                provisioned,
+                &outer,
+                &route_admission(),
+            );
+            let result = incoming.join().unwrap();
+            match expected {
+                Some(id) => {
+                    assert_eq!(result, Ok(id));
+                    assert_eq!(outgoing, Ok(()));
+                }
+                None => {
+                    assert!(result.is_err());
+                    assert!(outgoing.is_err());
+                }
+            }
+        });
+        let snap = admission.snapshot().unwrap();
+        assert_eq!((snap.handshakes, snap.authenticated, snap.bytes), (0, 0, 0));
+    }
+    // Only B has a listener. A and C learned each other's exact signed LSA
+    // despite never having a control locator or socket for each other.
+    for (probe, local, peers, learned) in [
+        (&mut a, a_raw, a_members, 3u8),
+        (&mut c, c_raw, c_members, 1u8),
+    ] {
+        let inputs = peers.map(|identity| DirectoryCore {
+            identity,
+            seed_lsa: None,
+        });
+        let graph = probe.verify_directory_graph(local, &inputs).unwrap();
+        assert_eq!(
+            graph.signed_lsa(learned),
+            Some(f.node(usize::from(learned)).lsa.as_slice())
+        );
+        graph.authorize_path(probe, &[1, 2, 3]).unwrap();
+    }
+}
+
+#[test]
+fn authenticated_forwarded_core_lsa_fork_preserves_both_envelopes_and_blocks_restart() {
+    use boreas_tunnel::mesh_route::DirectoryCore;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let f = &Fixture::new();
+    let [a, b, c] = [1, 2, 3].map(|id| f.node(id));
+    let path = a.path.join("core-lsa.state");
+    let owner = fs::metadata(&a.path).unwrap().uid();
+    fn reopen<'a>(
+        f: &'a Fixture,
+        status: &'a mut StatusStore,
+        path: &Path,
+        owner: u32,
+    ) -> Result<MeshProbe<'a>, Error> {
+        let a = f.node(1);
+        MeshProbe::new_durable(
+            f.policy,
+            &f.roots,
+            status,
+            &a.pem,
+            &a.identity,
+            &a.lsa,
+            (path, owner),
+        )
+    }
+    fn seeds<'a>(b: &'a Node, c: &'a Node, lsa: Option<&'a [u8]>) -> [DirectoryCore<'a>; 2] {
+        [
+            DirectoryCore {
+                identity: &b.identity,
+                seed_lsa: Some(&b.lsa),
+            },
+            DirectoryCore {
+                identity: &c.identity,
+                seed_lsa: lsa,
+            },
+        ]
+    }
+    let newest = change_lsa(c, |obj| {
+        obj.seq += 1;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = obj.seq;
+    });
+    let fork = change_lsa(c, |obj| {
+        obj.seq += 1;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = obj.seq;
+        lsa.neighbors.clear();
+    });
+    let mut a_status = f.status(1);
+    let healthy = {
+        let mut probe = reopen(f, &mut a_status, &path, owner).unwrap();
+        probe
+            .verify_directory_graph(&a.identity, &seeds(b, c, Some(&newest)))
+            .unwrap();
+        let initial = fs::read(&path).unwrap();
+        for signature in [false, true] {
+            let mut corrupt = SignedObject::decode(&fork).unwrap();
+            if signature {
+                corrupt.signers[0].mldsa[0] ^= 1;
+            } else {
+                corrupt.signers[0].ed25519[0] ^= 1;
+            }
+            let corrupt = corrupt.encode().unwrap();
+            assert!(matches!(
+                probe.verify_directory_graph(&a.identity, &seeds(b, c, Some(&corrupt))),
+                Err(Error::Lsa)
+            ));
+            assert_eq!(fs::read(&path).unwrap(), initial);
+        }
+        initial
+    };
+    drop(a_status);
+    let mut a_status = f.status(1);
+    let mut probe = reopen(f, &mut a_status, &path, owner).unwrap();
+    for seed in [None, Some(c.lsa.as_slice())] {
+        let graph = probe
+            .verify_directory_graph(&a.identity, &seeds(b, c, seed))
+            .unwrap();
+        assert_eq!(graph.signed_lsa(3), Some(newest.as_slice()));
+    }
+    let mut b_status = f.status(2);
+    let mut sender = f.probe(2, &mut b_status);
+    assert!(matches!(
+        sender.verify_directory_graph(&b.identity, &[
+            DirectoryCore {
+                identity: &a.identity,
+                seed_lsa: None
+            },
+            DirectoryCore {
+                identity: &c.identity,
+                seed_lsa: Some(&fork)
+            },
+        ]),
+        Err(Error::DirectoryPending)
+    )); // B accepted C, but A is still pending.
+    let a_members = [b.identity.as_slice(), c.identity.as_slice()];
+    let b_members = [a.identity.as_slice(), c.identity.as_slice()];
+    let (listen, target) = listener();
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    thread::scope(|scope| {
+        let receiver = scope.spawn(|| {
+            probe.accept_directory_member(
+                accept_socket(listen),
+                &a_members,
+                &outer_for(&f, 1),
+                &route_admission(),
+            )
+        });
+        let _ = sender.sync_directory(
+            Candidate {
+                target: &target,
+                signed_identity: &a.identity,
+            },
+            &b_members,
+            &outer,
+            &route_admission(),
+        );
+        assert_eq!(receiver.join().unwrap(), Err(Error::LsaConflict));
+    });
+    drop(probe);
+    drop(a_status);
+    let mut a_status = f.status(1);
+    let image = fs::read(&path).unwrap();
+    for original in [&newest, &fork] {
+        assert!(
+            image
+                .windows(original.len())
+                .any(|candidate| candidate == original.as_slice())
+        );
+    }
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaConflict)
+    ));
+    // A checksum is not a trust input. Even with a recomputed checksum,
+    // corrupting either stored signature must be classified as bad state,
+    // not as authenticated evidence.
+    for side in [&newest, &fork] {
+        let at = image
+            .windows(side.len())
+            .position(|raw| raw == side.as_slice())
+            .unwrap();
+        let mut altered = image.clone();
+        altered[at + 6] ^= 1; // first Ed25519 signature byte, after envelope + primary role
+        let digest_at = altered.len() - 32;
+        let digest = openssl::sha::sha256(&altered[..digest_at]);
+        altered[digest_at..].copy_from_slice(&digest);
+        fs::write(&path, altered).unwrap();
+        assert!(matches!(
+            reopen(f, &mut a_status, &path, owner),
+            Err(Error::LsaState)
+        ));
+    }
+    // Simulate crash after the durable conflict intent, before the evidence
+    // image was installed: a valid older image must not resume admission.
+    fs::write(&path, healthy).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    fs::write(&path, &image).unwrap();
+    let displaced = path.with_extension("backup");
+    fs::rename(&path, &displaced).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    symlink(&displaced, &path).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    fs::remove_file(&path).unwrap();
+    fs::hard_link(&displaced, &path).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    fs::remove_file(&path).unwrap();
+    fs::rename(&displaced, &path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let staging = a.path.join("core-lsa.state.staging");
+    fs::write(&staging, b"interrupted").unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+    fs::remove_file(staging).unwrap();
+    fs::write(&path, &image[..image.len() - 1]).unwrap();
+    assert!(matches!(
+        reopen(f, &mut a_status, &path, owner),
+        Err(Error::LsaState)
+    ));
+}

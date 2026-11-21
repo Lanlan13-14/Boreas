@@ -626,6 +626,20 @@ impl LinkServer {
         deadline: Instant,
         admission: &Admission,
     ) -> Result<AcceptedSession, TunnelError> {
+        self.accept_tls_stream_with_policy(tcp, outer, deadline, admission, |_| Ok(policy))
+    }
+
+    /// Internal selector for the mesh directory listener. The selector sees
+    /// only the identity extracted from the authenticated inner TLS peer cert,
+    /// never a socket address or field from SessionHello.
+    pub(crate) fn accept_tls_stream_with_policy(
+        &self,
+        tcp: TcpStream,
+        outer: &dyn crate::tls::OuterTlsAcceptor,
+        deadline: Instant,
+        admission: &Admission,
+        policy: impl FnOnce(crate::tls::PeerIdentity) -> Result<SessionPolicy, TunnelError>,
+    ) -> Result<AcceptedSession, TunnelError> {
         let handshake = admission.reserve_handshake()?;
         let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
@@ -656,7 +670,8 @@ impl LinkServer {
         configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
         let mut guard = arm_handshake_guard(&tcp, deadline)?;
         let outer: Box<dyn Duplex> = Box::new(tcp);
-        let result = self.accept_outer_complete(outer, handshake, buffer_credit, policy, deadline);
+        let result =
+            self.accept_outer_complete(outer, handshake, buffer_credit, |_| Ok(policy), deadline);
         guard.finish(result, deadline)
     }
 
@@ -665,7 +680,7 @@ impl LinkServer {
         outer: Box<dyn Duplex>,
         handshake: HandshakeCredit,
         buffer_credit: ByteCredit,
-        policy: SessionPolicy,
+        policy: impl FnOnce(crate::tls::PeerIdentity) -> Result<SessionPolicy, TunnelError>,
         deadline: Instant,
     ) -> Result<AcceptedSession, TunnelError> {
         // The guard is the absolute bound; this check keeps an overrun from
@@ -698,12 +713,13 @@ impl LinkServer {
         transport: T,
         handshake: HandshakeCredit,
         buffer_credit: ByteCredit,
-        policy: SessionPolicy,
+        policy: impl FnOnce(crate::tls::PeerIdentity) -> Result<SessionPolicy, TunnelError>,
         deadline: Instant,
     ) -> Result<AcceptedSession, TunnelError> {
         let websocket = ws::server_handshake_until(transport, deadline)?;
         let inner = self.tls.accept(Box::new(websocket))?;
         let (stream, tls) = inner.into_parts();
+        let policy = policy(tls.peer())?;
         let session = session::server_handshake(stream, &tls, policy)?;
         let authenticated = AuthenticatedPeer::from_verified_identity(session.peer());
         let credit = handshake.authenticate(&authenticated)?;

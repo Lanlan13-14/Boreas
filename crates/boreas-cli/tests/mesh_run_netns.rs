@@ -305,7 +305,7 @@ fn install(f: &Fixture) -> [PathBuf; 4] {
             if j != i + 1 {
                 peers.push(j);
                 private(&dir.join(format!("core-{j}.signed")), &f.node(j).identity);
-                private(&dir.join(format!("core-{j}-lsa.signed")), &f.node(j).lsa);
+                // Most remote LSAs must be learned through the directory.
             }
         }
         let role = ["source", "relay", "relay", "destination"][i];
@@ -325,6 +325,15 @@ fn install(f: &Fixture) -> [PathBuf; 4] {
             3 => route(MAIN, Some((3, 18082)), None) + &route(BACKUP, Some((3, 18083)), None),
             _ => unreachable!(),
         };
+        runtime += "[directory_discovery]\ncoordinator = 3\n";
+        if i == 2 {
+            runtime += &format!("listen = \"{}:18183\"\n", SERVICE_IP[2]);
+        } else {
+            runtime += &format!(
+                "next = \"{}:18183\"\ntls_name = \"{NAME}\"\n",
+                SERVICE_IP[2]
+            );
+        }
         private(&dir.join("runtime.toml"), runtime);
         let config = format!(
             r#"version = 2
@@ -441,12 +450,19 @@ fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
     let n = Network::setup();
     let f = Fixture::new();
     let dirs = install(&f);
-    let mut destination = Process::spawn(&f, &n, 3, &dirs[3]);
-    destination.wait_for("mesh ready");
+    // Run discovery on real processes and on one dedicated socket. The hub
+    // cannot finish its graph until it sees Core 1, whose business process
+    // must start last: EOF before route confirmation is deliberately not
+    // retryable. Seed Core 1 only at the hub to break that startup dependency.
+    let bootstrap = dirs[2].join("core-1-lsa.signed");
+    fs::write(&bootstrap, &f.node(1).lsa).unwrap();
+    fs::set_permissions(&bootstrap, fs::Permissions::from_mode(0o644)).unwrap();
     let mut second = Process::spawn(&f, &n, 2, &dirs[2]);
-    second.wait_for("mesh ready");
+    let mut destination = Process::spawn(&f, &n, 3, &dirs[3]);
     let mut first = Process::spawn(&f, &n, 1, &dirs[1]);
-    first.wait_for("mesh ready");
+    for process in [&mut second, &mut destination, &mut first] {
+        process.wait_for("mesh ready");
+    }
     let mut source = Process::spawn(&f, &n, 0, &dirs[0]);
     let primary = source.wait_for("role=source path=[1, 2, 3, 4]");
     assert_eq!(

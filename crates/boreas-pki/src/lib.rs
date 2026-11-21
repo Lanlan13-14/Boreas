@@ -5,6 +5,8 @@
 
 #[cfg(feature = "openssl-backend")]
 pub mod authority_revocation;
+#[cfg(all(feature = "openssl-backend", target_os = "linux"))]
+mod core_lsa_store;
 /// NetworkRoot-authorized, independently dual-signed DNS zone/VIP authority.
 /// Produces opaque verified tokens only; it does not enable the DNS runtime.
 #[cfg(feature = "openssl-backend")]

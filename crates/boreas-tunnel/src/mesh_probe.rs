@@ -61,6 +61,10 @@ pub enum Error {
     Trust,
     Identity,
     Lsa,
+    /// A verified same-version fork was persisted, or restored at startup.
+    LsaConflict,
+    /// The durable CoreLSA authority state is unavailable or inconsistent.
+    LsaState,
     Status,
     IdentityRevoked,
     Clock,
@@ -251,6 +255,7 @@ pub struct MeshProbe<'a> {
     // One verified envelope per remote Core ID (at most 15). Both configured
     // seeds and authenticated hop sessions update this same replay-backed view.
     remote_lsas: BTreeMap<u8, VerifiedObject>,
+    durable: bool,
     status: &'a mut StatusStore,
     pem: &'a PemIdentity,
 }
@@ -263,6 +268,40 @@ impl<'a> MeshProbe<'a> {
         pem: &'a PemIdentity,
         local_identity: &[u8],
         local_lsa: &[u8],
+    ) -> Result<Self, Error> {
+        Self::new_inner(policy, roots, status, pem, local_identity, local_lsa, None)
+    }
+
+    /// Mesh service constructor. Replay floors and exact fork evidence are
+    /// durable for every LSA source, not just directory control links.
+    pub fn new_durable(
+        policy: VerifiedNetworkContext,
+        roots: &RootsBundle,
+        status: &'a mut StatusStore,
+        pem: &'a PemIdentity,
+        local_identity: &[u8],
+        local_lsa: &[u8],
+        state: (&std::path::Path, u32),
+    ) -> Result<Self, Error> {
+        Self::new_inner(
+            policy,
+            roots,
+            status,
+            pem,
+            local_identity,
+            local_lsa,
+            Some(state),
+        )
+    }
+
+    fn new_inner(
+        policy: VerifiedNetworkContext,
+        roots: &RootsBundle,
+        status: &'a mut StatusStore,
+        pem: &'a PemIdentity,
+        local_identity: &[u8],
+        local_lsa: &[u8],
+        state: Option<(&std::path::Path, u32)>,
     ) -> Result<Self, Error> {
         if status.net_id() != policy.net_id() {
             return Err(Error::Status);
@@ -288,16 +327,31 @@ impl<'a> MeshProbe<'a> {
         if extractor(&local)?.extract(&leaf) != Some(local.peer()) {
             return Err(Error::Identity);
         }
-        let local_lsa = trust
+        let mut remote_lsas = match state {
+            Some((path, owner)) => trust
+                .open_core_lsa_ledger(path, owner, policy.root_key_fingerprint(), local.id, now)
+                .map_err(|e| map_lsa_error(e, true))?
+                .into_iter()
+                .collect(),
+            None => BTreeMap::new(),
+        };
+        let original = remote_lsas.remove(&local.id);
+        let verified = trust
             .verify_core_lsa(local_lsa, local.id, now)
-            .map_err(|_| Error::Lsa)?;
+            .map_err(|e| map_lsa_error(e, state.is_some()))?;
+        let local_lsa = if verified.is_duplicate() {
+            original.unwrap_or(verified)
+        } else {
+            verified
+        };
         lsa(&local_lsa, local.id, now)?;
         Ok(Self {
             policy,
             trust,
             local,
             local_lsa,
-            remote_lsas: BTreeMap::new(),
+            remote_lsas,
+            durable: state.is_some(),
             status,
             pem,
         })
@@ -329,9 +383,11 @@ impl<'a> MeshProbe<'a> {
         let verified = self
             .trust
             .verify_core_lsa(local_lsa, self.local.id, now)
-            .map_err(|_| Error::Lsa)?;
+            .map_err(|e| map_lsa_error(e, self.durable))?;
         lsa(&verified, self.local.id, now)?;
-        self.local_lsa = verified;
+        if !verified.is_duplicate() {
+            self.local_lsa = verified;
+        }
         self.check(&self.local.clone())?;
         Ok(())
     }
@@ -594,13 +650,24 @@ impl<'a> MeshProbe<'a> {
             inner,
             extractor(&peer)?,
         )));
-        let mut accepted = server.accept_tls_stream_until(
+        let accepted = server.accept_tls_stream_until(
             tcp,
             outer,
             SessionPolicy::default_pq768(self.local(), peer.peer()),
             deadline,
             admission,
         )?;
+        self.accept_advertisements(accepted, socket, peer, purpose, deadline)
+    }
+
+    fn accept_advertisements(
+        &mut self,
+        mut accepted: crate::AcceptedSession,
+        socket: TcpStream,
+        peer: Core,
+        purpose: HopPurpose,
+        deadline: Instant,
+    ) -> Result<Adjacency, Error> {
         let deadline = deadline.min(self.deadline(&peer)?);
         let received = bounded_link_operation(&socket, deadline, || {
             let session = &mut accepted.session;
@@ -769,7 +836,7 @@ impl<'a> MeshProbe<'a> {
                     return Ok((object, now));
                 }
                 Err(ManagementError::StaleSequence) if use_directory => (),
-                Err(_) => return Err(Error::Lsa),
+                Err(e) => return Err(map_lsa_error(e, self.durable)),
             }
         } else if !use_directory {
             return Err(Error::Lsa);
@@ -984,6 +1051,14 @@ impl<'a> MeshProbe<'a> {
         peer.check(&fresh, now)?;
         lsa(&self.local_lsa, self.local.id, now)?;
         Ok(f(&fresh, now))
+    }
+}
+
+fn map_lsa_error(error: ManagementError, durable: bool) -> Error {
+    match error {
+        ManagementError::Equivocation if durable => Error::LsaConflict,
+        ManagementError::CoreLsaState => Error::LsaState,
+        _ => Error::Lsa,
     }
 }
 

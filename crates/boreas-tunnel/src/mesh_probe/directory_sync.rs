@@ -48,6 +48,56 @@ impl MeshProbe<'_> {
         self.exchange_directory(link, &members, false)
     }
 
+    /// Accept a directory session from any provisioned member on one socket.
+    /// Inner mTLS resolves the exact SPKI from signed membership; only then
+    /// is the normal exact-peer SessionHello policy constructed. No in-band
+    /// hint is trusted to select a member, and the socket cannot serve business.
+    pub fn accept_directory_member(
+        &mut self,
+        socket: TcpStream,
+        members: &[&[u8]],
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+    ) -> Result<u8, Error> {
+        let deadline = self.deadline(&self.local.clone())?;
+        let members = self.directory_members(members)?;
+        let extractor = Arc::new(PkiIdentityExtractor::new(
+            members.values().map(|core| core.identity.clone()).collect(),
+        )?);
+        let inner = OpenSslAcceptor::from_pem_identity(self.pem, Policy::production_default())
+            .map_err(|_| Error::Identity)?;
+        let server = LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner, extractor)));
+        let control_socket = socket.try_clone().map_err(TunnelError::from)?;
+        let mut selected = None;
+        let accepted = server.accept_tls_stream_with_policy(
+            socket,
+            outer,
+            deadline,
+            admission,
+            |authenticated| {
+                let peer = members
+                    .values()
+                    .find(|core| core.peer() == authenticated)
+                    .ok_or(TunnelError::Unsupported("unprovisioned directory peer"))?;
+                self.check(peer)
+                    .map_err(|_| TunnelError::Unsupported("directory peer not current"))?;
+                selected = Some(peer.clone());
+                Ok(SessionPolicy::default_pq768(self.local(), peer.peer()))
+            },
+        )?;
+        let peer = selected.ok_or(Error::Identity)?;
+        let id = peer.id;
+        let link = self.accept_advertisements(
+            accepted,
+            control_socket,
+            peer,
+            HopPurpose::Directory,
+            deadline,
+        )?;
+        self.exchange_directory(link, &members, false)?;
+        Ok(id)
+    }
+
     /// Resolve the signed slot for a locally configured member before using
     /// its file position to bind a dedicated listener or dial target.
     pub fn directory_member_id(&mut self, signed: &[u8]) -> Result<u8, Error> {
@@ -174,7 +224,7 @@ impl MeshProbe<'_> {
                 // The original head stays byte-for-byte unchanged; neither
                 // case sets a new deadline or advances the replay watermark.
                 Ok(_) | Err(ManagementError::StaleSequence) => (),
-                Err(_) => return Err(Error::Lsa),
+                Err(e) => return Err(map_lsa_error(e, self.durable)),
             }
         }
         Err(Error::Lsa)

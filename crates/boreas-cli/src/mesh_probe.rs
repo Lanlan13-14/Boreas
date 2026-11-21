@@ -199,8 +199,16 @@ pub(super) mod linux {
         };
         let local = read(&mat.join("local.signed"), MAX_SIGNED_OBJECT_BYTES)?;
         let lsa = read(&mat.join("local-lsa.signed"), MAX_SIGNED_OBJECT_BYTES)?;
-        let mut probe = MeshProbe::new(policy, &roots, &mut status, &pem, &local, &lsa)
-            .map_err(|e| format!("mesh local authority rejected: {e:?}"))?;
+        let mut probe = MeshProbe::new_durable(
+            policy,
+            &roots,
+            &mut status,
+            &pem,
+            &local,
+            &lsa,
+            (&state.join("core-lsa.state"), owner),
+        )
+        .map_err(|e| format!("mesh local authority rejected: {e:?}"))?;
         let identity = probe.local();
         if identity.role != NodeRole::Core
             || identity.node_id != cfg.identity.node_id

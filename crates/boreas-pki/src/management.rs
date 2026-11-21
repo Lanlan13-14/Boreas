@@ -18,10 +18,9 @@
 //! RootAuthorization PKI. A caller that treats arbitrary issuer records as a chain has
 //! widened the trust boundary incorrectly.
 //!
-//! Durability boundary: the `ManagementTrust` replay table is process-local. It detects
-//! equivocation during one process lifetime and keeps the exact conflicting inputs, but a
-//! directory must persist accepted object IDs/watermarks (and both evidence sides) before
-//! acting or before restart. This is not yet a durable global replay database.
+//! Durability boundary: generic replay is process-local. The dedicated Linux Core
+//! mesh enables a bounded ledger for CoreLSAs only, committing each head or pair
+//! of conflicting envelopes before exposing the result.
 //!
 //! `AttachmentLease` uses two mandatory signers: the Primary signature must verify with
 //! the node Ed25519 + ML-DSA public keys in an already verified `NodeIdentity`, and the
@@ -102,6 +101,7 @@ pub enum Error {
     StaleSequence,
     IssuedAtRegression,
     Equivocation,
+    CoreLsaState,
     UnsupportedTwoPartyObject,
     DuplicateIssuer,
     TrustFull,
@@ -278,8 +278,8 @@ struct TrustedIssuer {
 
 /// Stateful verifier with provisioned issuer records and per-logical-slot replay watermarks.
 ///
-/// The replay state is process-local in this module. A production directory must persist
-/// accepted object IDs/watermarks in its own durable store before acting on them.
+/// Generic replay is process-local. On Linux, mesh callers may opt into the
+/// durable CoreLSA ledger before verifying their first LSA.
 #[derive(Debug)]
 pub struct ManagementTrust {
     net_id: [u8; 16],
@@ -288,9 +288,10 @@ pub struct ManagementTrust {
     /// never taken from an unsigned caller-supplied map.
     node_identities: BTreeMap<u16, NodeIdentity>,
     replay: BTreeMap<ReplayKey, ReplayState>,
-    /// Last conflicting envelope bytes, retained for evidence. Bounded to one object;
-    /// a durable directory must copy it to its own append-only evidence store.
+    /// Last conflicting envelope bytes for the generic replay API.
     conflict_evidence: Option<Vec<u8>>,
+    #[cfg(target_os = "linux")]
+    core_lsa_ledger: Option<crate::core_lsa_store::Ledger>,
 }
 impl ManagementTrust {
     pub fn new(net_id: [u8; 16]) -> Self {
@@ -300,6 +301,8 @@ impl ManagementTrust {
             node_identities: BTreeMap::new(),
             replay: BTreeMap::new(),
             conflict_evidence: None,
+            #[cfg(target_os = "linux")]
+            core_lsa_ledger: None,
         }
     }
     pub fn net_id(&self) -> [u8; 16] {
@@ -331,6 +334,14 @@ impl ManagementTrust {
 
     /// Check a previously verified LSA against the current process-local slot.
     pub fn is_current_core_lsa(&self, core_id: u8, object_id: [u8; 32]) -> bool {
+        #[cfg(target_os = "linux")]
+        if self
+            .core_lsa_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.blocked)
+        {
+            return false;
+        }
         self.replay
             .get(&ReplayKey::CoreLsa(core_id))
             .is_some_and(|head| !head.conflicted && head.object_id == object_id)
@@ -422,6 +433,73 @@ impl ManagementTrust {
         self.verify_with_issuer_time(raw_signed_object, now_us, now_us)
     }
 
+    /// Attach a private, exclusively locked ledger before the first CoreLSA.
+    /// Reverify every stored envelope at its historical signed time, reject a
+    /// future-dated head and refuse service if an authenticated fork is present.
+    /// Returned heads are replay floors, not proof of current authorization.
+    #[cfg(target_os = "linux")]
+    pub fn open_core_lsa_ledger(
+        &mut self,
+        path: &std::path::Path,
+        owner: u32,
+        root: [u8; 32],
+        local: u8,
+        now: u64,
+    ) -> Result<Vec<(u8, VerifiedObject)>, Error> {
+        use crate::core_lsa_store::Ledger;
+
+        if self.core_lsa_ledger.is_some()
+            || self
+                .replay
+                .keys()
+                .any(|key| matches!(key, ReplayKey::CoreLsa(_)))
+        {
+            return Err(Error::CoreLsaState);
+        }
+        let ledger =
+            Ledger::open(path, owner, self.net_id, root, local).map_err(|_| Error::CoreLsaState)?;
+        let authenticate = |raw: &[u8], core| {
+            let signed = SignedObject::decode(raw).map_err(|_| Error::CoreLsaState)?;
+            let issued = objects::decode_tbs(&signed.raw_tbs)
+                .map_err(|_| Error::CoreLsaState)?
+                .issued_at;
+            if issued > now {
+                return Err(Error::CoreLsaState);
+            }
+            self.authenticate_at(raw, issued, issued, Some(core))
+                .map_err(|_| Error::CoreLsaState)
+        };
+        let mut heads = Vec::with_capacity(ledger.heads.len());
+        let mut conflicted = false;
+        for (&core, pair) in &ledger.heads {
+            let head = authenticate(&pair.head, core)?;
+            if let Some(other) = &pair.conflict {
+                let other = authenticate(other, core)?;
+                if lsa_version(&head) != lsa_version(&other) || head.object_id == other.object_id {
+                    return Err(Error::CoreLsaState);
+                }
+                conflicted = true;
+            }
+            heads.push((core, head));
+        }
+        if conflicted {
+            return Err(Error::Equivocation);
+        }
+        if ledger.conflict_pending || self.replay.len() + heads.len() > MAX_REPLAY_SLOTS {
+            return Err(Error::CoreLsaState);
+        }
+        for (core, head) in &heads {
+            self.record_replay(
+                ReplayKey::CoreLsa(*core),
+                lsa_version(head),
+                head.object.issued_at,
+                head.object_id,
+            )?;
+        }
+        self.core_lsa_ledger = Some(ledger);
+        Ok(heads)
+    }
+
     /// Authenticate an LSA for this exact Core before changing any replay slot.
     /// `StaleSequence` is returned only after successful signature/authority checks.
     pub fn verify_core_lsa(
@@ -446,6 +524,42 @@ impl ManagementTrust {
 
     fn verify_at(
         &mut self,
+        raw_signed_object: &[u8],
+        object_now_us: u64,
+        issuer_now_us: u64,
+        expected_lsa_core: Option<u8>,
+    ) -> Result<VerifiedObject, Error> {
+        let mut verified = self.authenticate_at(
+            raw_signed_object,
+            object_now_us,
+            issuer_now_us,
+            expected_lsa_core,
+        )?;
+        #[cfg(target_os = "linux")]
+        if let ObjectBody::CoreLsa(lsa) = &verified.object.body {
+            self.persist_core_lsa(lsa.core_id, &verified)?;
+        }
+        verified.duplicate = match self.record_replay(
+            replay_key(&verified.object)?,
+            lsa_version(&verified),
+            verified.object.issued_at,
+            verified.object_id,
+        ) {
+            Ok(duplicate) => duplicate,
+            Err(Error::Equivocation) => {
+                self.conflict_evidence = Some(raw_signed_object.to_vec());
+                return Err(Error::Equivocation);
+            }
+            Err(error) => return Err(error),
+        };
+        if let ObjectBody::NodeIdentity(node) = &verified.object.body {
+            self.node_identities.insert(node.node_id, node.clone());
+        }
+        Ok(verified)
+    }
+
+    fn authenticate_at(
+        &self,
         raw_signed_object: &[u8],
         object_now_us: u64,
         issuer_now_us: u64,
@@ -477,9 +591,12 @@ impl ManagementTrust {
             .cloned()
             .ok_or(Error::UnknownIssuer)?;
         let valid_until = if let Some((not_before, expires)) = issuer.validity {
-            // For StatusSnapshot, the signed issued_at also anchors historical
-            // verification on reopen; do not accept a pre-delegation snapshot.
-            let not_before_check = if matches!(&object.body, ObjectBody::StatusSnapshot(_)) {
+            // A historical ledger read must verify under the same grant
+            // that authorized the original acceptance.
+            let not_before_check = if matches!(
+                &object.body,
+                ObjectBody::StatusSnapshot(_) | ObjectBody::CoreLsa(_)
+            ) {
                 object.issued_at
             } else {
                 object_now_us
@@ -528,36 +645,67 @@ impl ManagementTrust {
         } else {
             verify_signer_signatures(&issuer, &message, &signed.signers[0], SignerRole::Primary)?;
         }
-        let object_id = sha256(&raw_tbs)?;
-        let generation = match &object.body {
-            ObjectBody::CoreLsa(lsa) => lsa.core_generation,
-            _ => 0,
-        };
-        let duplicate = match self.record_replay(
-            replay_key(&object)?,
-            (generation, object.seq),
-            object.issued_at,
-            object_id,
-        ) {
-            Ok(duplicate) => duplicate,
-            Err(Error::Equivocation) => {
-                self.conflict_evidence = Some(raw_signed_object.to_vec());
-                return Err(Error::Equivocation);
-            }
-            Err(error) => return Err(error),
-        };
-        if let ObjectBody::NodeIdentity(node) = &object.body {
-            self.node_identities.insert(node.node_id, node.clone());
-        }
         Ok(VerifiedObject {
-            object_id,
+            object_id: sha256(&raw_tbs)?,
             object,
             raw_tbs,
             signed_object: signed,
             raw_signed_object: raw_signed_object.to_vec(),
-            duplicate,
+            duplicate: false,
             valid_until,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_core_lsa(&mut self, core: u8, candidate: &VerifiedObject) -> Result<(), Error> {
+        use crate::core_lsa_store::Pair;
+
+        let Some(ledger) = &mut self.core_lsa_ledger else {
+            return Ok(());
+        };
+        if ledger.blocked {
+            return Err(Error::CoreLsaState);
+        }
+        let raw = candidate.raw_signed_object();
+        let key = ReplayKey::CoreLsa(core);
+        match self.replay.get(&key) {
+            Some(current) if current.conflicted => return Err(Error::Equivocation),
+            Some(current) if lsa_version(candidate) < current.version => {
+                return Err(Error::StaleSequence);
+            }
+            Some(current) if lsa_version(candidate) == current.version => {
+                if candidate.object_id() == current.object_id {
+                    return Ok(());
+                }
+                if ledger.mark_conflict().is_err() {
+                    // Still try to persist the full immutable pair. A durable
+                    // image on its own is also enough to reject on reopen.
+                    ledger.blocked = true;
+                }
+                let Some(pair) = ledger.heads.get_mut(&core) else {
+                    ledger.blocked = true;
+                    return Err(Error::CoreLsaState);
+                };
+                pair.conflict = Some(raw.to_vec());
+            }
+            Some(current) if candidate.object().issued_at < current.issued_at => {
+                return Err(Error::IssuedAtRegression);
+            }
+            current => {
+                if current.is_none() && self.replay.len() >= MAX_REPLAY_SLOTS {
+                    return Err(Error::ReplayFull);
+                }
+                ledger.heads.insert(core, Pair {
+                    head: raw.to_vec(),
+                    conflict: None,
+                });
+            }
+        }
+        if ledger.commit().is_err() {
+            ledger.blocked = true;
+            return Err(Error::CoreLsaState);
+        }
+        Ok(())
     }
 
     /// True two-party AttachmentLease authorization: the Primary signer must be the
@@ -657,6 +805,14 @@ impl ManagementTrust {
             }
         }
     }
+}
+
+fn lsa_version(object: &VerifiedObject) -> (u64, u64) {
+    let generation = match &object.object.body {
+        ObjectBody::CoreLsa(lsa) => lsa.core_generation,
+        _ => 0,
+    };
+    (generation, object.object.seq)
 }
 
 /// Verify a persisted proto `SignedObject` against a trust store containing the

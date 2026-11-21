@@ -78,6 +78,7 @@ mod linux {
         routes: Vec<Route>,
         #[serde(default)]
         directory: Vec<DirectoryLink>,
+        directory_discovery: Option<DirectoryDiscovery>,
     }
 
     // Strictly lower slot initiates, higher slot listens; prohibiting reverse
@@ -91,6 +92,19 @@ mod linux {
         tls_name: Option<String>,
     }
 
+    // A provisioned coordinator is a locator/polling hub, never a new issuer.
+    // Its one socket admits members by exact inner TLS SPKI, not by source IP.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DirectoryDiscovery {
+        coordinator: u8,
+        listen: Option<SocketAddr>,
+        next: Option<SocketAddr>,
+        tls_name: Option<String>,
+    }
+
+    const DISCOVERED: usize = usize::MAX; // sentinel; real indices are <16
+
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Route {
@@ -101,6 +115,10 @@ mod linux {
     }
 
     impl Spec {
+        fn directory_enabled(&self) -> bool {
+            self.directory_discovery.is_some() || !self.directory.is_empty()
+        }
+
         fn validate(&self, local: u8) -> Result<(), String> {
             let mut peers = BTreeSet::from([local]);
             if self.peers.len() >= usize::from(MAX_CORES)
@@ -170,6 +188,33 @@ mod linux {
                         .is_some_and(|name| !valid_tls_name(name))
                 {
                     return Err("invalid or duplicate dedicated mesh listener/next target".into());
+                }
+            }
+            if let Some(d) = &self.directory_discovery {
+                let outgoing = local != d.coordinator;
+                if !self.directory.is_empty()
+                    || !peers.contains(&d.coordinator)
+                    || d.listen.is_some() == outgoing
+                    || d.next.is_some() != outgoing
+                    || d.tls_name.is_some() != outgoing
+                    || d.listen.is_some_and(|a| {
+                        a.port() == 0
+                            || listens.iter().any(|b| {
+                                a.port() == b.port()
+                                    && (a.ip() == b.ip()
+                                        || a.ip().is_unspecified()
+                                        || b.ip().is_unspecified())
+                            })
+                    })
+                    || d.next.is_some_and(|a| {
+                        a.port() == 0 || a.ip().is_unspecified() || targets.contains(&a)
+                    })
+                    || d.tls_name.as_deref().is_some_and(|s| !valid_tls_name(s))
+                {
+                    return Err(
+                        "invalid directory discovery configuration or overlapping legacy links"
+                            .into(),
+                    );
                 }
             }
             let mut adjacent = BTreeSet::new();
@@ -347,6 +392,15 @@ mod linux {
         Ok(None)
     }
 
+    fn bind_directory(addr: SocketAddr) -> Result<TcpListener, String> {
+        let listener = TcpListener::bind(addr)
+            .map_err(|e| format!("mesh directory bind {addr}: {}", e.kind()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "mesh directory listener setup failed")?;
+        Ok(listener)
+    }
+
     fn open_tun(spec: &Spec) -> Result<Option<LinuxTunQueue>, String> {
         let (Some(name), Some(mtu)) = (&spec.tun, spec.mtu) else {
             return Ok(None);
@@ -446,9 +500,16 @@ mod linux {
             trust_anchor_pem: read(&dir.join("identity-ca.pem"), MAX_PEM)?,
         };
         let local = read(&dir.join("local.signed"), MAX_SIGNED_OBJECT_BYTES)?;
-        let mut probe =
-            MeshProbe::new(policy, &roots, &mut status, &pem, &local, &materials.lsa()?)
-                .map_err(|e| format!("mesh local authority: {e:?}"))?;
+        let mut probe = MeshProbe::new_durable(
+            policy,
+            &roots,
+            &mut status,
+            &pem,
+            &local,
+            &materials.lsa()?,
+            (&cfg.paths.state_dir.join("core-lsa.state"), owner()),
+        )
+        .map_err(|e| format!("mesh local authority: {e:?}"))?;
         if probe.local().node_id != cfg.identity.node_id
             || probe.local().identity_generation != cfg.identity.identity_generation
         {
@@ -468,18 +529,33 @@ mod linux {
                 .position(|&id| id == d.peer)
                 .ok_or("missing directory peer")?;
             if let Some(addr) = d.listen {
-                let listener = TcpListener::bind(addr)
-                    .map_err(|e| format!("mesh directory bind {addr}: {}", e.kind()))?;
-                listener
-                    .set_nonblocking(true)
-                    .map_err(|_| "mesh directory listener setup failed")?;
-                directory_listeners.push((i, listener));
+                directory_listeners.push((i, bind_directory(addr)?));
             } else {
                 directory_targets.push((
                     i,
                     client_target(
                         d.next.ok_or("missing directory target")?,
                         d.tls_name.as_deref().ok_or("missing directory TLS name")?,
+                    ),
+                ));
+            }
+        }
+        if let Some(d) = &spec.directory_discovery {
+            if let Some(addr) = d.listen {
+                directory_listeners.push((DISCOVERED, bind_directory(addr)?));
+            } else {
+                let i = spec
+                    .peers
+                    .iter()
+                    .position(|&id| id == d.coordinator)
+                    .ok_or("missing signed directory coordinator")?;
+                directory_targets.push((
+                    i,
+                    client_target(
+                        d.next.ok_or("missing coordinator target")?,
+                        d.tls_name
+                            .as_deref()
+                            .ok_or("missing coordinator TLS name")?,
                     ),
                 ));
             }
@@ -567,7 +643,7 @@ mod linux {
                     seed_lsa: entry.lsa.as_deref(),
                 })
                 .collect();
-            if !spec.directory.is_empty() {
+            if spec.directory_enabled() {
                 for (entry, &id) in signed.iter().zip(&spec.peers) {
                     if probe
                         .directory_member_id(entry.identity)
@@ -589,16 +665,20 @@ mod linux {
             let mut synced = false;
             if let Some((i, socket)) = dir_incoming {
                 prefer_directory_dial = true;
-                let result = probe.accept_directory(
-                    socket,
-                    members[i],
-                    &members,
-                    acceptor
-                        .as_ref()
-                        .ok_or("directory listener credential missing")?,
-                    &admission,
-                );
+                let outer = acceptor
+                    .as_ref()
+                    .ok_or("directory listener credential missing")?;
+                let result = if i == DISCOVERED {
+                    probe
+                        .accept_directory_member(socket, &members, outer, &admission)
+                        .map(|_| ())
+                } else {
+                    probe.accept_directory(socket, members[i], &members, outer, &admission)
+                };
                 if let Err(e) = result {
+                    if matches!(e, Error::LsaConflict | Error::LsaState) {
+                        return Err(format!("mesh directory authority stopped: {e:?}"));
+                    }
                     eprintln!("mesh directory listener refused/closed exchange: {e:?}");
                 }
                 synced = true;
@@ -616,6 +696,9 @@ mod linux {
                 );
                 dir_poll[poll] = Instant::now() + DIRECTORY_POLL;
                 if let Err(e) = result {
+                    if matches!(e, Error::LsaConflict | Error::LsaState) {
+                        return Err(format!("mesh directory authority stopped: {e:?}"));
+                    }
                     eprintln!("mesh directory dial refused/closed exchange: {e:?}");
                 }
                 synced = true;
@@ -627,7 +710,7 @@ mod linux {
             };
             let graph = match graph {
                 Ok(graph) => graph,
-                Err(Error::DirectoryPending) if !spec.directory.is_empty() => {
+                Err(Error::DirectoryPending) if spec.directory_enabled() => {
                     thread::sleep(POLL);
                     continue;
                 }
@@ -647,7 +730,7 @@ mod linux {
                     }
                 }
                 if !usable {
-                    if spec.directory.is_empty() {
+                    if !spec.directory_enabled() {
                         return Err("no authorized route at mesh startup".into());
                     }
                     thread::sleep(POLL);
@@ -759,6 +842,9 @@ mod linux {
                         Mode::Source => unreachable!(),
                     };
                     if let Err(e) = result {
+                        if matches!(e, Error::LsaConflict | Error::LsaState) {
+                            return Err(format!("mesh business authority stopped: {e:?}"));
+                        }
                         // One unauthenticated connection must not kill the service.
                         // Replay poisoning and local authority errors are revisited
                         // by the next unconditional refresh before any admission.
