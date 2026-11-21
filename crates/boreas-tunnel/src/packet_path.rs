@@ -68,8 +68,6 @@ use std::{
 
 use boreas_crypto::NodeRole;
 use boreas_tun::{Error as TunError, InspectedPacket, IpVersion, PacketInfo, PacketIo, PacketRead};
-#[cfg(all(test, feature = "openssl-inner-tls"))]
-use boreas_tun::inspect_packet;
 
 use crate::e2e::E2eCircuit;
 use crate::relay::MAX_RELAY_HOPS;
@@ -1251,7 +1249,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use boreas_tun::VirtualTun;
+    use boreas_tun::{VirtualTun, inspect_packet};
 
     const NET: [u8; 16] = [0x2a; 16];
     const GENERATION: u64 = 7;
@@ -1934,10 +1932,10 @@ mod tests {
 
     #[test]
     fn outbound_reuses_scratch_and_drops_pending_batch_on_read_error() {
-        use std::{borrow::Cow, collections::VecDeque};
+        use std::collections::VecDeque;
 
         struct ScratchIo<'a> {
-            reads: RefCell<VecDeque<Result<&'a [u8], TunError>>>,
+            reads: RefCell<VecDeque<&'a [u8]>>,
             address: Cell<Option<*const u8>>,
         }
         impl PacketIo for ScratchIo<'_> {
@@ -1945,20 +1943,20 @@ mod tests {
                 panic!("outbound must use the scratch-capable read");
             }
 
-            fn read_packet_with_scratch<'buf>(
+            fn read_for_forwarding<'buf>(
                 &self,
                 scratch: &'buf mut [u8],
-            ) -> Result<Option<Cow<'buf, [u8]>>, TunError> {
+            ) -> Result<Option<PacketRead<'buf>>, TunError> {
                 assert_eq!(scratch.len(), MAX_MTU + 1);
                 if let Some(previous) = self.address.replace(Some(scratch.as_ptr())) {
                     assert_eq!(scratch.as_ptr(), previous);
                 }
-                let Some(bytes) = self.reads.borrow_mut().pop_front().transpose()? else {
+                let Some(bytes) = self.reads.borrow_mut().pop_front() else {
                     return Ok(None);
                 };
                 let dst = &mut scratch[..bytes.len()];
                 dst.copy_from_slice(bytes);
-                Ok(Some(Cow::Borrowed(dst)))
+                InspectedPacket::new(dst).map(|packet| Some(PacketRead::Inspected(packet)))
             }
 
             fn write_packet(&self, _packet: &[u8]) -> Result<(), TunError> {
@@ -1968,12 +1966,16 @@ mod tests {
 
         let p1 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"longer packet");
         let p2 = ipv4([10, 20, 3, 1], [10, 20, 3, 9], b"short");
+        let spoof = ipv4([10, 20, 3, 7], [10, 20, 3, 9], b"spoof");
+        let mut bad_checksum = p1.clone();
+        bad_checksum[10] ^= 1;
         let host = ScratchIo {
             reads: RefCell::new(VecDeque::from([
-                Ok(p1.as_slice()),
-                Ok(p2.as_slice()),
-                Ok(p1.as_slice()),
-                Err(TunError::InvalidLength),
+                p1.as_slice(),
+                spoof.as_slice(),
+                p2.as_slice(),
+                p1.as_slice(),
+                bad_checksum.as_slice(),
             ])),
             address: Cell::new(None),
         };
@@ -1992,13 +1994,76 @@ mod tests {
         expected.extend(encode_packet_frame(&p2, mtu).unwrap());
         assert_eq!(
             path.step_outbound_batch(16, 16_000),
-            Err(PacketPathError::HostRejected(TunError::InvalidLength))
+            Err(PacketPathError::HostRejected(TunError::InvalidChecksum))
         );
         assert_eq!(path.step_outbound(), Err(PacketPathError::Poisoned));
+        assert_eq!(path.stats().dropped_outbound, 1);
         assert_eq!(path.stats().outbound_packets, 2);
         assert_eq!(path.stats().failures, 1);
         assert!(path.circuit.is_none());
         assert_eq!(written.borrow().as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn inspected_host_read_still_checks_negotiated_mtu() {
+        let policy = PointToPoint::try_new(
+            Ipv4Addr::new(10, 20, 3, 1),
+            Ipv4Addr::new(10, 20, 3, 9),
+            MIN_MTU,
+        )
+        .unwrap();
+        let bytes = ipv4([10, 20, 3, 1], [10, 20, 3, 9], &[0; MIN_MTU - 19]);
+        let packet = PacketRead::Inspected(InspectedPacket::new(&bytes).unwrap());
+        assert_eq!(
+            policy.authorize_host_read(&packet),
+            Err(PacketDeny::MtuExceeded)
+        );
+    }
+
+    #[test]
+    fn inbound_inspected_write_requires_checksum_and_peer_vip() {
+        #[derive(Default)]
+        struct CheckedSink(RefCell<Vec<Vec<u8>>>);
+
+        impl PacketIo for CheckedSink {
+            fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
+                unreachable!()
+            }
+
+            fn write_packet(&self, _packet: &[u8]) -> Result<(), TunError> {
+                panic!("forwarding must pass the inspected bytes to the device");
+            }
+
+            fn write_inspected_packet(&self, packet: InspectedPacket<'_>) -> Result<(), TunError> {
+                self.0.borrow_mut().push(packet.bytes().to_vec());
+                Ok(())
+            }
+        }
+
+        let io = CheckedSink::default();
+        let policy = PointToPoint::try_new(
+            Ipv4Addr::new(10, 20, 3, 1),
+            Ipv4Addr::new(10, 20, 3, 9),
+            DEFAULT_MTU,
+        )
+        .unwrap();
+        let valid = ipv4([10, 20, 3, 9], [10, 20, 3, 1], b"delivery");
+        let spoof = ipv4([10, 20, 3, 7], [10, 20, 3, 1], b"spoof");
+        let mut corrupt = valid.clone();
+        corrupt[10] ^= 1;
+        let mut scratch = Vec::new();
+        for (bytes, expected) in [
+            (&spoof, Err(PacketPathError::Denied(PacketDeny::SourceNotPeer))),
+            (&corrupt, Err(PacketPathError::Denied(PacketDeny::BadChecksum))),
+            (&valid, Ok(Some(valid.len()))),
+        ] {
+            let mut frame = InboundSource::new(encode_packet_frame(bytes, policy.mtu()).unwrap());
+            assert_eq!(
+                inbound_once(&io, &mut frame, &policy, &mut scratch),
+                expected
+            );
+        }
+        assert_eq!(io.0.into_inner(), vec![valid]);
     }
 
     #[test]

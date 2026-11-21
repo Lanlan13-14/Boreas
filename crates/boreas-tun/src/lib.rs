@@ -424,6 +424,7 @@ pub struct InspectedPacket<'a> {
 }
 
 impl<'a> InspectedPacket<'a> {
+    #[inline]
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
         Ok(Self {
             bytes,
@@ -431,10 +432,12 @@ impl<'a> InspectedPacket<'a> {
         })
     }
 
+    #[inline]
     pub fn bytes(self) -> &'a [u8] {
         self.bytes
     }
 
+    #[inline]
     pub fn info(self) -> PacketInfo {
         self.info
     }

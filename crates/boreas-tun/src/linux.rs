@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Error, InspectedPacket, MAX_IP_PACKET, PacketIo, PacketRead};
+use super::{Error, InspectedPacket, MAX_IP_PACKET, PacketIo};
 
 const IFNAMSIZ: usize = 16;
 const IFF_TUN: libc::c_short = 0x0001;
@@ -516,10 +516,30 @@ mod tests {
             queue.try_read_packet_into(&mut scratch[..MTU - 1]),
             Err(LinuxTunError::InvalidConfiguration)
         ));
-        let packet = queue.try_read_packet_into(&mut scratch).unwrap().unwrap();
-        assert_eq!(packet.as_ptr(), address);
-        assert_eq!(packet, big.as_slice());
+        let inspected = queue.try_read_inspected_into(&mut scratch).unwrap().unwrap();
+        assert_eq!(inspected.bytes().as_ptr(), address);
+        assert_eq!(inspected.bytes(), big.as_slice());
+        assert_eq!(inspected.info().version, crate::IpVersion::V6);
+        assert_eq!(inspected.info().packet_len, MTU);
+        queue.write_inspected_packet(inspected).unwrap();
         assert_eq!(scratch[MTU], 0xa5);
+        let mut received = [0; MTU + 1];
+        tx.set_nonblocking(true).unwrap();
+        let n = tx.recv(&mut received).unwrap();
+        assert_eq!(&received[..n], big.as_slice());
+
+        let mut one_over_mtu = [0; MTU + 1];
+        one_over_mtu[..MTU].copy_from_slice(&big);
+        one_over_mtu[4..6].copy_from_slice(&((MTU + 1 - 40) as u16).to_be_bytes());
+        assert!(matches!(
+            queue.write_inspected_packet(InspectedPacket::new(&one_over_mtu).unwrap()),
+            Err(LinuxTunError::Packet(Error::PacketTooLarge { mtu: MTU }))
+        ));
+        assert_eq!(
+            tx.recv(&mut received).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "over-MTU proof must not reach the device"
+        );
 
         let mut small = [0u8; 40];
         small[0] = 0x60;

@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use boreas_tun::{
-    IpVersion,
+    InspectedPacket, IpVersion,
     linux::{LinuxTunDevice, TunConfig},
 };
 use std::{
@@ -98,15 +98,14 @@ fn ipv4_checksum(b: &[u8]) -> u16 {
     !(sum as u16)
 }
 fn is_expected_echo_reply(
-    packet: &[u8],
+    inspected: InspectedPacket<'_>,
     expected_src: Ipv4Addr,
     expected_dst: Ipv4Addr,
     expected_id: u16,
     expected_seq: u16,
 ) -> bool {
-    let Ok(info) = boreas_tun::inspect_packet(packet) else {
-        return false;
-    };
+    let info = inspected.info();
+    let packet = inspected.bytes();
     if info.version != IpVersion::V4
         || info.protocol != 1
         || info.fragment.is_some()
@@ -201,26 +200,29 @@ fn real_l3_write_and_kernel_routed_reply() {
     // this TUN interface; this tests actual queue read/write, IP stack, route and configured MTU.
     let req = echo_packet(Ipv4Addr::new(198, 18, 0, 2), Ipv4Addr::new(198, 18, 0, 1));
     queue
-        .write_packet(&req)
+        .write_inspected_packet(InspectedPacket::new(&req).unwrap())
         .expect("write valid packet into kernel through TUN");
+    queue.set_nonblocking(true).unwrap();
+    let mut scratch = vec![0; queue.mtu() + 1];
     let until = Instant::now() + Duration::from_secs(3);
     let mut reply = None;
     let mut ignored = 0usize;
     while Instant::now() < until {
-        match queue.read_packet_timeout(Duration::from_millis(100)) {
-            Ok(Some(p)) => {
+        match queue.try_read_inspected_into(&mut scratch) {
+            Ok(Some(packet)) => {
+                let p = packet.bytes();
                 // The kernel may emit IPv6 router/neighbor control packets on
                 // the same queue (for example after the interface goes up).
                 // Only the echo reply for this exact probe is success; other
                 // valid packets are logged and skipped, not treated as failure.
                 if is_expected_echo_reply(
-                    &p,
+                    packet,
                     Ipv4Addr::new(198, 18, 0, 1),
                     Ipv4Addr::new(198, 18, 0, 2),
                     1,
                     1,
                 ) {
-                    reply = Some(p);
+                    reply = Some((p.to_vec(), packet.info()));
                     break;
                 }
                 ignored += 1;
@@ -231,15 +233,13 @@ fn real_l3_write_and_kernel_routed_reply() {
                     p.len()
                 );
             }
-            Ok(None) => {}
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
             Err(other) => panic!("TUN read returned unexpected result: {other:?}"),
         }
     }
-    let p = reply.unwrap_or_else(|| {
+    let (p, reply_info) = reply.unwrap_or_else(|| {
         panic!("kernel should route the echo reply out through the TUN (ignored {ignored} other packets)")
     });
-    let reply_info =
-        boreas_tun::inspect_packet(&p).expect("filtered reply must be a valid IP packet");
     assert_eq!(reply_info.version, IpVersion::V4);
     assert_eq!(reply_info.protocol, 1);
     assert_eq!(p[reply_info.header_len], 0, "ICMP echo reply");

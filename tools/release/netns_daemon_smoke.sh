@@ -115,14 +115,13 @@ report_startup_timings() {
   echo 'startup_timing_threshold=none-asserted'
 }
 
-# --- Opt-in daemon handshake stage diagnostics -------------------------------
-# The binary emits fixed-format, non-secret stderr lines
-#   boreas-diagnostic-timing phase=<static-label> elapsed_us=<digits>
-# only when BOREAS_DIAGNOSTIC_TIMING=1 (the controlled diagnostic job sets it).
+# --- Opt-in daemon handshake, I/O and TUN diagnostics -----------------------
+# The binary emits fixed-format, non-secret stderr lines only when
+# BOREAS_DIAGNOSTIC_TIMING=1 (the controlled diagnostic job sets it).
 # On success the harness never prints `core.err`/`edge.err`, so without this
-# filter those stage lines would stay invisible. Only lines with one of the
-# static phase labels and a bounded decimal duration are copied to stdout,
-# prefixed with the static node label. This filtered copy discards every other
+# filter the summaries would stay invisible. Only the fixed schemas below
+# with bounded decimal values are copied to stdout, prefixed with the static
+# node label. This filtered copy discards every other
 # stderr line (errors, paths, key material) and every unknown phase or malformed
 # value; the existing failure path is unchanged and may still print raw daemon
 # logs. This is collection only: it does not gate, retry or extend any wait, and
@@ -130,6 +129,7 @@ report_startup_timings() {
 DIAGNOSTIC_TIMING_PHASES='outer_tls|ws_handshake|inner_tls|session_handshake|confirmation|circuit_open|e2e_tls|circuit_accept|e2e_tls_accept'
 DIAGNOSTIC_TIMING_PATTERN='^boreas-diagnostic-timing phase=('"$DIAGNOSTIC_TIMING_PHASES"') elapsed_us=[0-9]{1,20}$'
 DIAGNOSTIC_IO_PATTERN='^boreas-io-timing max_outbound_us=[0-9]{1,20} max_inbound_us=[0-9]{1,20} outbound_ge_1ms=[0-9]{1,20} inbound_ge_1ms=[0-9]{1,20}$'
+DIAGNOSTIC_TUN_PATTERN='^boreas-tun-forwarding checked_reads=[0-9]{1,20} empty_reads=[0-9]{1,20} read_errors=[0-9]{1,20} reused_writes=[0-9]{1,20} write_errors=[0-9]{1,20}$'
 DIAGNOSTIC_TIMING_REPORTED=0
 
 report_diagnostic_timing() {
@@ -142,7 +142,8 @@ report_diagnostic_timing() {
     log="$WORK/$node.err"
     [[ -f "$log" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" =~ $DIAGNOSTIC_TIMING_PATTERN || "$line" =~ $DIAGNOSTIC_IO_PATTERN ]]; then
+      if [[ "$line" =~ $DIAGNOSTIC_TIMING_PATTERN || "$line" =~ $DIAGNOSTIC_IO_PATTERN ||
+            "$line" =~ $DIAGNOSTIC_TUN_PATTERN ]]; then
         printf '%s %s\n' "$node" "$line"
       fi
     done < "$log"

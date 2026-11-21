@@ -221,6 +221,7 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 mod linux_daemon {
     use std::borrow::Cow;
+    use std::cell::Cell;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -399,6 +400,35 @@ mod linux_daemon {
     /// ready work without a per-packet sleep.
     struct NonBlockingLinuxTun {
         queue: LinuxTunQueue,
+        metrics: Option<TunForwardingMetrics>,
+    }
+
+    #[derive(Default)]
+    struct TunForwardingMetrics {
+        checked_reads: Cell<u64>,
+        empty_reads: Cell<u64>,
+        read_errors: Cell<u64>,
+        reused_writes: Cell<u64>,
+        write_errors: Cell<u64>,
+    }
+
+    impl TunForwardingMetrics {
+        fn increment(counter: &Cell<u64>) {
+            counter.set(counter.get().saturating_add(1));
+        }
+    }
+
+    impl Drop for TunForwardingMetrics {
+        fn drop(&mut self) {
+            eprintln!(
+                "boreas-tun-forwarding checked_reads={} empty_reads={} read_errors={} reused_writes={} write_errors={}",
+                self.checked_reads.get(),
+                self.empty_reads.get(),
+                self.read_errors.get(),
+                self.reused_writes.get(),
+                self.write_errors.get(),
+            );
+        }
     }
 
     impl NonBlockingLinuxTun {
@@ -426,8 +456,16 @@ mod linux_daemon {
             &self,
             scratch: &'buf mut [u8],
         ) -> Result<Option<PacketRead<'buf>>, TunError> {
-            self.queue
-                .try_read_inspected_into(scratch)
+            let result = self.queue.try_read_inspected_into(scratch);
+            if let Some(metrics) = &self.metrics {
+                let counter = match &result {
+                    Ok(Some(_)) => &metrics.checked_reads,
+                    Ok(None) => &metrics.empty_reads,
+                    Err(_) => &metrics.read_errors,
+                };
+                TunForwardingMetrics::increment(counter);
+            }
+            result
                 .map(|packet| packet.map(PacketRead::Inspected))
                 .map_err(tun_read_error)
         }
@@ -437,9 +475,15 @@ mod linux_daemon {
         }
 
         fn write_inspected_packet(&self, packet: InspectedPacket<'_>) -> Result<(), TunError> {
-            self.queue
-                .write_inspected_packet(packet)
-                .map_err(tun_write_error)
+            let result = self.queue.write_inspected_packet(packet);
+            if let Some(metrics) = &self.metrics {
+                TunForwardingMetrics::increment(if result.is_ok() {
+                    &metrics.reused_writes
+                } else {
+                    &metrics.write_errors
+                });
+            }
+            result.map_err(tun_write_error)
         }
     }
 
@@ -1987,7 +2031,10 @@ mod linux_daemon {
             let actual_name = dev.name().to_string();
             TunEndpoint::Real {
                 _device: dev,
-                io: NonBlockingLinuxTun { queue },
+                io: NonBlockingLinuxTun {
+                    queue,
+                    metrics: diagnostic_timing_enabled().then(TunForwardingMetrics::default),
+                },
                 name: actual_name,
             }
         };
@@ -2885,6 +2932,10 @@ mod linux_daemon {
         }
     }
 
+    fn diagnostic_timing_enabled() -> bool {
+        std::env::var_os("BOREAS_DIAGNOSTIC_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"))
+    }
+
     #[derive(Default)]
     struct PathIoTiming {
         max_outbound_us: u128,
@@ -2974,9 +3025,7 @@ mod linux_daemon {
             Arc::clone(&revocations),
         );
 
-        let mut io_timing = (std::env::var_os("BOREAS_DIAGNOSTIC_TIMING").as_deref()
-            == Some(std::ffi::OsStr::new("1")))
-        .then(PathIoTiming::default);
+        let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
