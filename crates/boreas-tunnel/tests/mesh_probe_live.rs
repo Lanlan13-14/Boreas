@@ -80,12 +80,17 @@ fn sign(key: &PKey<Private>, msg: &[u8]) -> Vec<u8> {
 
 impl Fixture {
     fn new() -> Self {
-        let now = utc_now().unwrap();
-        let temp = Temp(
-            std::env::temp_dir().join(format!("boreas-live-probe-{}-{now}", std::process::id())),
-        );
         use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(&temp.0).unwrap();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let now = utc_now().unwrap();
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "boreas-live-probe-{}-{now}-{sequence}",
+            std::process::id(),
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let temp = Temp(path);
         let ca = temp.0.join("ca");
         init_ca_dir(&ca, &CaInitParams {
             net_id: NET,

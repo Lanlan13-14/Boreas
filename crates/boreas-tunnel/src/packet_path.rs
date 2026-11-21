@@ -1597,7 +1597,7 @@ fn edge_udp_dns(packet: &[u8], info: PacketInfo) -> Result<(u16, u16, &[u8]), Pa
     // Optional IPv4 UDP checksum. Nonzero checksums include the pseudo-header.
     if udp[6..8] != [0, 0] {
         let mut sum = u32::from(len) + 17;
-        for word in packet[12..20].chunks_exact(2).chain(udp.chunks(2)) {
+        for word in packet[12..20].chunks(2).chain(udp.chunks(2)) {
             sum += u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]));
         }
         while sum >> 16 != 0 {
