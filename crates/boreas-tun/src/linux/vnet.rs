@@ -20,6 +20,7 @@ pub(super) struct Reader {
     pending: std::ops::Range<usize>,
     stride: usize,
     read_syscalls: u64,
+    aggregate_reads: u64,
     delivered_segments: u64,
 }
 
@@ -33,12 +34,17 @@ impl Reader {
             pending: 0..0,
             stride: 0,
             read_syscalls: 0,
+            aggregate_reads: 0,
             delivered_segments: 0,
         }
     }
 
-    pub(super) fn read_counts(&self) -> (u64, u64) {
-        (self.read_syscalls, self.delivered_segments)
+    pub(super) fn read_counts(&self) -> (u64, u64, u64) {
+        (
+            self.read_syscalls,
+            self.aggregate_reads,
+            self.delivered_segments,
+        )
     }
 
     pub(super) fn has_pending(&self) -> bool {
@@ -110,6 +116,7 @@ impl Reader {
                         .len();
                     self.pending = 0..(stride * (count - 1) + last);
                     self.stride = stride;
+                    self.aggregate_reads = self.aggregate_reads.saturating_add(1);
                 }
                 _ => return Err(Error::VirtioUnsupportedGso.into()),
             }
@@ -249,14 +256,14 @@ mod tests {
             assert_eq!(&p.bytes()[40..], chunk);
             assert_eq!(p.bytes()[33], if i == 2 { 0x19 } else { 0x10 });
             assert_eq!(transport_checksum(p.bytes()), 0);
-            assert_eq!(reader.read_counts(), (1, i as u64 + 1));
+            assert_eq!(reader.read_counts(), (1, 1, i as u64 + 1));
         }
         let udp = reader.read(fd, 80, &mut scratch, true).unwrap().unwrap();
         assert_eq!(&udp.bytes()[28..], &[0xab, 0xcd, 0xef]);
         assert_eq!(transport_checksum(udp.bytes()), 0);
-        assert_eq!(reader.read_counts(), (2, 3));
+        assert_eq!(reader.read_counts(), (2, 1, 3));
         assert!(reader.read(fd, 80, &mut scratch, true).unwrap().is_none());
-        assert_eq!(reader.read_counts(), (3, 3));
+        assert_eq!(reader.read_counts(), (3, 1, 3));
     }
 
     #[test]
@@ -290,6 +297,6 @@ mod tests {
             assert!(!reader.has_pending());
             assert_eq!(scratch, [0xa5; 81]);
         }
-        assert_eq!(reader.read_counts(), (7, 0));
+        assert_eq!(reader.read_counts(), (7, 0, 0));
     }
 }

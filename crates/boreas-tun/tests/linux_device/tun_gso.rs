@@ -507,7 +507,8 @@ fn real_tcpv4_gso_adapter_fifo_and_syscalls() {
         }
         assert_eq!(offset, seen, "production adapter preserves FIFO");
         if after.0 == before.0 {
-            assert_eq!(after.1, before.1 + 1);
+            assert_eq!(after.1, before.1);
+            assert_eq!(after.2, before.2 + 1);
             buffered_reads += 1;
         }
         seen = end;

@@ -447,9 +447,11 @@ mod linux_daemon {
     impl Drop for NonBlockingLinuxTun {
         fn drop(&mut self) {
             if self.metrics.is_some()
-                && let Some((read_syscalls, delivered_segments)) = self.queue.gso_read_counts()
+                && let Some((read_syscalls, aggregate_reads, delivered_segments)) = self.queue.gso_read_counts()
             {
-                eprintln!("boreas-tun-gso read_syscalls={read_syscalls} delivered_segments={delivered_segments}");
+                eprintln!(
+                    "boreas-tun-gso read_syscalls={read_syscalls} aggregate_reads={aggregate_reads} delivered_segments={delivered_segments}"
+                );
             }
         }
     }

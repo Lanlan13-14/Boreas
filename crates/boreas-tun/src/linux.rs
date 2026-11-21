@@ -365,8 +365,8 @@ impl LinuxTunQueue {
         packet.truncate(len);
         Ok(Some(packet))
     }
-    /// VNET diagnostics: actual attempted read syscalls and delivered GSO segments.
-    pub fn gso_read_counts(&self) -> Option<(u64, u64)> {
+    /// VNET diagnostics: attempted read syscalls, accepted aggregates and delivered GSO segments.
+    pub fn gso_read_counts(&self) -> Option<(u64, u64, u64)> {
         self.state
             .lock()
             .ok()?

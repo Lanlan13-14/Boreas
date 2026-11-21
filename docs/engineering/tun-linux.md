@@ -41,7 +41,7 @@ sudo -E env BOREAS_NETNS_TCPV4_GSO=1 BOREAS_DIAGNOSTIC_TIMING=1 \
   bash tools/release/netns_daemon_smoke.sh /absolute/path/to/candidate/boreas
 ```
 
-Keep the existing digest, goodput and deadline assertions, including for an existing netem profile if selected. `boreas-tun-gso` reports attempted fd read syscalls (including EAGAIN) and GSO segments handed to policy; these lifetime counters are not per-transfer throughput evidence or an aggregate rate. No historical-binary run, threshold changes, or release claims are required.
+Keep the existing digest, goodput and deadline assertions, including for an existing netem profile if selected. `boreas-tun-gso` reports attempted fd read syscalls (including EAGAIN), accepted GSO aggregates and segments handed to policy; `delivered_segments - aggregate_reads` is a conservative lower bound on local read syscalls avoided by GSO when positive. Incomplete draining at shutdown can reduce that difference; these lifetime counters are not per-transfer throughput evidence or an aggregate rate. No historical-binary run, threshold changes, or release claims are required.
 
 ## Privileges, cleanup, and evidence
 
