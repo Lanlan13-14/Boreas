@@ -1827,7 +1827,9 @@ mod tests {
         assert!(stdout.contains("stage --store <ABS_DIR> --manifest <FILE> --artifact <FILE>"));
         assert!(stdout.contains("--ed25519-signature <FILE>"));
         assert!(stdout.contains("--mldsa65-signature <FILE>"));
-        assert!(stdout.contains("independently trusted release keys"));
+        assert!(stdout.contains("verify-stage"));
+        let help = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("independently trusted release keys"));
         assert!(stdout.contains("and ML-DSA-65 signatures"));
         assert!(stdout.contains("`--require-verified` fails closed without a verified"));
     }
