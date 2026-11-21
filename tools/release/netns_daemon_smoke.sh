@@ -10,12 +10,27 @@
 #   5. Real kernel ICMP latency and an 8 MiB integrity/throughput probe across
 #      the overlay + `boreas ctl status` packet counters with `0% packet loss`.
 #      These are loopback-veth development measurements, not public-path SLA.
+# Opt-in alternative for step 5's TCP probe (ICMP checks stay enabled):
+#   BOREAS_NETNS_MULTISTREAM=1 BOREAS_NETEM_RTT_MS=200 BOREAS_MAX_PING_MS=450 \
+#   BOREAS_NETEM_RATE_MBIT=100 BOREAS_NETNS_EDGE_LIFETIME_SECONDS=180 \
+#     bash tools/release/netns_daemon_smoke.sh /path/to/the/candidate/boreas
+# Runs warm 1-stream and then warm 4-stream rounds, full duplex in each round.
+# Set BOREAS_MULTISTREAM_BYTES for total measured bytes per direction per round
+# (32 MiB by default); BOREAS_PERF_TIMEOUT_SECONDS bounds each worker/round.
 set -euo pipefail
 
 BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+if [[ "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 ]]; then
+  if [[ "$BOREAS_NETNS_MULTISTREAM" != 1 || ! "${BOREAS_NETEM_RTT_MS:-}" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    echo 'ERROR: BOREAS_NETNS_MULTISTREAM=1 requires positive BOREAS_NETEM_RTT_MS (one-way ms)' >&2
+    exit 1
+  fi
+  # The existing ping floor proves the impairment and its ceiling still applies.
+  echo 'multistream_scope=same-candidate-overlay-application-tcp;not-tls-circuit-count'
+fi
 # This is a test-fixture lifetime, not a TLS or authorization timeout. Keep
 # routine sanity runs short; explicit long samples get a separate bounded
 # wall-clock budget. The Core outlives the Edge for orderly teardown.
@@ -1003,6 +1018,65 @@ if (( PING_FAILED )); then
   report_daemon_state
 fi
 
+run_multistream_round() {
+  local flows="$1" ready=0 failed=0 worker label
+  local -a pids=() labels=(receiver-core receiver-edge sender-edge sender-core)
+  local -a directions=(edge_to_core core_to_edge edge_to_core core_to_edge)
+  echo "multistream_round_application_streams_per_direction=$flows"
+  ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" multistream-receive "$flows" 10.20.1.1 \
+    > "$WORK/multistream-receiver-core.log" 2>&1 &
+  pids+=("$!")
+  ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" multistream-receive "$flows" 10.20.1.2 \
+    > "$WORK/multistream-receiver-edge.log" 2>&1 &
+  pids+=("$!")
+  for _ in $(seq 1 40); do
+    if ip netns exec "$CORE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.1:18082' &&
+       ip netns exec "$EDGE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.2:18082'; then
+      ready=1
+      break
+    fi
+    sleep 0.05
+  done
+  if (( ready )); then
+    ip netns exec "$EDGE_NS" python3 "$PERF_SCRIPT" multistream-send "$flows" 10.20.1.2 10.20.1.1 \
+      > "$WORK/multistream-sender-edge.log" 2>&1 &
+    pids+=("$!")
+    ip netns exec "$CORE_NS" python3 "$PERF_SCRIPT" multistream-send "$flows" 10.20.1.1 10.20.1.2 \
+      > "$WORK/multistream-sender-core.log" 2>&1 &
+    pids+=("$!")
+  else
+    echo 'ERROR: both multistream receivers did not reach TCP LISTEN' >&2
+    return 2  # EXIT cleanup reaps the live workers.
+  fi
+  for worker in "${!pids[@]}"; do
+    label="${labels[$worker]}"
+    if ! wait "${pids[$worker]}"; then
+      echo "ERROR: multistream $label exited nonzero" >&2
+      failed=1
+    fi
+    echo "--- multistream $flows ${directions[$worker]} $label ---"
+    cat "$WORK/multistream-$label.log" || failed=1
+  done
+  return "$failed"
+}
+
+if [[ "${BOREAS_NETNS_MULTISTREAM:-0}" == 1 ]]; then
+  # One daemon pair / one candidate / one netem profile. No throughput floor
+  # from the legacy probe is applied to this opt-in receiver-window evidence.
+  # Attempt both bounded rounds so a failure doesn't hide the other sample.
+  for flows in 1 4; do
+    multistream_rc=0
+    run_multistream_round "$flows" || multistream_rc=$?
+    if (( multistream_rc == 2 )); then
+      report_failure_evidence
+      exit 1
+    elif (( multistream_rc != 0 )); then
+      record_failure "application TCP probe with $flows stream(s) per direction failed"
+    fi
+  done
+  stop_underlay_telemetry_samplers
+  report_underlay_telemetry
+else
 # The sampling window brackets the probe: it opens immediately before the four
 # probe workers start and closes after all four have been reaped. Only the
 # recorded `$!` PIDs (the wrapper chain that ends in `exec` of the daemon) are
@@ -1166,6 +1240,8 @@ if (( PERF_RESULT != 0 )); then
   fi
 fi
 
+fi  # legacy one-flow probe
+
 CTL_FAILED=0
 if CORE_CTL="$("$BIN" ctl status --socket "$CORE_STATE/control.sock" 2>&1)"; then
   echo "Core live ctl: $CORE_CTL"
@@ -1214,4 +1290,8 @@ if (( ${#FAILURES[@]} > 0 )); then
 fi
 report_diagnostic_timing
 run_hook verify
-echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"
+if [[ "${BOREAS_NETNS_MULTISTREAM:-0}" == 1 ]]; then
+  echo 'REAL NETNS PQ768 E2E OVERLAY PING + SAME-CANDIDATE APPLICATION STREAM PROBE SUCCEEDED'
+else
+  echo "REAL NETNS PQ768 E2E OVERLAY PING + THROUGHPUT SUCCEEDED"
+fi

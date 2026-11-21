@@ -16,8 +16,11 @@ import json
 import math
 import os
 import socket
+import struct
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest import mock
 
@@ -694,6 +697,163 @@ class BaselineCompareTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("overlay_gate=unchanged", stdout.getvalue())
         self.assertIn("baseline_compare_acceptance=never", stdout.getvalue())
+
+
+class MultistreamProbeTests(unittest.TestCase):
+    def test_observations_use_one_half_open_window_not_a_window_per_flow(self):
+        window = netns_overlay_perf._SharedReceiverWindow(4)
+        window.observe(0, 4, 10)
+        window.observe(1, 6, 500_000_010)
+        window.observe(2, 8, 1_000_000_009)
+        self.assertEqual(window.status, "incomplete")
+        window.observe(3, 9, 1_000_000_010)
+        window.observe(1, 7, 1_000_000_011)
+        self.assertEqual(window.status, "complete")
+        self.assertEqual(window.bytes, [4, 6, 8, 0])
+        self.assertEqual(sum(window.bytes), 18)
+        self.assertEqual(window.first, [0, 500_000_000, 999_999_999, 1_000_000_000])
+
+    def test_receiver_transfer_counts_late_flow_only_in_full_integrity_result(self):
+        sockets = [mock.Mock(recv=mock.Mock(side_effect=[bytes([flow]), b""])) for flow in range(4)]
+        # Deliberately stagger application reads. The fourth stream's first
+        # read is exactly at the common right edge, not a new window origin.
+        schedule = [[sock] for sock in sockets] + [sockets]
+        ticks = [0, 250_000_000, 999_999_999, 1_000_000_000] + [1_000_000_001] * 4
+        with (
+            mock.patch.object(netns_overlay_perf, "_multistream_remaining", return_value=5),
+            mock.patch.object(netns_overlay_perf.time, "monotonic_ns", side_effect=ticks),
+            mock.patch.object(
+                netns_overlay_perf.select, "select",
+                side_effect=[(ready, [], []) for ready in schedule],
+            ),
+        ):
+            result, _ = netns_overlay_perf._multistream_transfer(
+                dict(enumerate(sockets)), 1, 0, receive=True
+            )
+        self.assertEqual(result["bytes"], 4)
+        self.assertEqual(result["first_second_status"], "complete")
+        self.assertEqual(result["first_second_bytes"], 3)
+        self.assertEqual(result["flows"][3]["first_second_bytes"], 0)
+        self.assertEqual(result["flows"][3]["sha256"], hashlib.sha256(b"\x03").hexdigest())
+
+    def test_only_eof_at_or_after_deadline_completes_a_short_window(self):
+        window = netns_overlay_perf._SharedReceiverWindow(1)
+        window.observe(0, 0, 9)
+        self.assertEqual(window.status, "no-payload")
+        window.observe(0, 1, 10)
+        window.observe(0, 0, 1_000_000_009)
+        self.assertEqual(window.status, "incomplete")
+        self.assertEqual(window.bytes, [1])
+        other = netns_overlay_perf._SharedReceiverWindow(1)
+        other.observe(0, 1, 10)
+        other.observe(0, 0, 1_000_000_010)
+        self.assertEqual(other.status, "complete")
+        self.assertEqual(other.bytes, [1])
+
+    def test_per_flow_count_digest_and_aggregate_errors_are_distinct(self):
+        _, evidence = netns_overlay_perf._multistream_evidence(
+            [3], [hashlib.sha256(b"abc")]
+        )
+        for offset in (8, 9):  # count and digest, respectively
+            reported = bytearray(evidence)
+            reported[offset] ^= 1
+            with self.assertRaisesRegex(ValueError, "per-flow"):
+                netns_overlay_perf._multistream_verify(evidence, bytes(reported))
+        reported = bytearray(evidence)
+        reported[-33] ^= 1
+        with self.assertRaisesRegex(ValueError, "aggregate byte count"):
+            netns_overlay_perf._multistream_verify(evidence, bytes(reported))
+        with self.assertRaisesRegex(ValueError, "aggregate SHA-256"):
+            netns_overlay_perf._multistream_verify(
+                evidence, evidence[:-1] + bytes([evidence[-1] ^ 1])
+            )
+
+    def test_receiver_rejects_early_eof_and_extra_bytes(self):
+        for payload, error in ((b"a", "ended at 1"), (b"abc", "exceeded 2")):
+            with self.subTest(payload=payload):
+                left, right = socket.socketpair()
+                with left, right:
+                    right.sendall(payload)
+                    right.shutdown(socket.SHUT_WR)
+                    deadline = time.monotonic_ns() + 5_000_000_000
+                    with self.assertRaisesRegex(ValueError, error):
+                        netns_overlay_perf._multistream_transfer(
+                            {0: left}, 2, deadline, receive=True
+                        )
+
+    def test_deadline_is_absolute_not_renewed_after_progress(self):
+        with mock.patch.object(
+            netns_overlay_perf.time, "monotonic_ns", side_effect=[10, 500_000_010, 1_000_000_010]
+        ):
+            self.assertEqual(netns_overlay_perf._multistream_remaining(1_000_000_010), 1.0)
+            self.assertEqual(netns_overlay_perf._multistream_remaining(1_000_000_010), 0.5)
+            with self.assertRaises(TimeoutError):
+                netns_overlay_perf._multistream_remaining(1_000_000_010)
+
+    def test_incomplete_window_cli_reports_evidence_but_does_not_pass(self):
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.dict(os.environ, {"BOREAS_MULTISTREAM_BYTES": "4"}),
+            mock.patch.object(
+                netns_overlay_perf, "_multistream_receive",
+                return_value={"first_second_status": "incomplete", "first_second_bytes": 4},
+            ) as receive,
+            self.assertRaisesRegex(SystemExit, "complete first-second window"),
+        ):
+            netns_overlay_perf._multistream_cli("multistream-receive", ["4", "127.0.0.1"])
+        self.assertEqual(receive.call_args.args[:3], ("127.0.0.1", 4, 1))
+        self.assertEqual(json.loads(stdout.getvalue())["first_second_bytes"], 4)
+
+    def test_cli_refuses_unbounded_payloads_or_other_stream_counts(self):
+        with self.assertRaisesRegex(SystemExit, "usage"):
+            netns_overlay_perf._multistream_cli("multistream-receive", ["2", "127.0.0.1"])
+        for invalid in ("0", "7", "67108868"):
+            with self.subTest(total=invalid), mock.patch.dict(
+                os.environ, {"BOREAS_MULTISTREAM_BYTES": invalid}
+            ), self.assertRaisesRegex(SystemExit, "multiple of four"):
+                netns_overlay_perf._multistream_cli("multistream-receive", ["1", "127.0.0.1"])
+
+    def test_real_tcp_rounds_have_equal_totals_and_independent_stream_hashes(self):
+        # No sleep or timing-rate assertion: an ephemeral listener is already
+        # bound and short loopback payloads need not fill a one-second window.
+        total = 4 * (len(netns_overlay_perf.CHUNK) + 7)
+        for flows in (1, 4):
+            with self.subTest(flows=flows), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(flows)
+                port = listener.getsockname()[1]
+                deadline = time.monotonic_ns() + 10_000_000_000
+                per_flow = total // flows
+                with mock.patch.object(netns_overlay_perf, "MULTISTREAM_PORT", port), ThreadPoolExecutor(1) as executor:
+                    receiver = executor.submit(
+                        netns_overlay_perf._multistream_accept, listener, flows, per_flow, deadline
+                    )
+                    sender = netns_overlay_perf._multistream_send(
+                        "127.0.0.1", "127.0.0.1", flows, per_flow, deadline
+                    )
+                    received = receiver.result(timeout=10)
+                self.assertEqual(sender["application_streams"], flows)
+                self.assertEqual(len(received["flows"]), flows)
+                self.assertEqual(sender["bytes"], total)
+                self.assertEqual(received["bytes"], total)
+                frame = b""
+                for flow, (tx, rx) in enumerate(zip(sender["flows"], received["flows"])):
+                    chunk = netns_overlay_perf.CHUNK
+                    rotated = chunk[flow:] + chunk[:flow]
+                    payload = (rotated * (per_flow // len(chunk) + 1))[:per_flow]
+                    digest = hashlib.sha256(payload).digest()
+                    frame += struct.pack("!BQ32s", flow, per_flow, digest)
+                    expected = {"id": flow, "bytes": per_flow, "sha256": digest.hex()}
+                    self.assertEqual(tx, expected)
+                    self.assertEqual({key: rx[key] for key in expected}, expected)
+                expected_hash = hashlib.sha256(b"boreas-multistream-v1\0" + frame).hexdigest()
+                self.assertEqual(sender["aggregate_sha256"], expected_hash)
+                self.assertEqual(received["aggregate_sha256"], expected_hash)
+                self.assertEqual(
+                    received["first_second_bytes"],
+                    sum(flow["first_second_bytes"] for flow in received["flows"]),
+                )
 
 
 class ProtocolConstantsTests(unittest.TestCase):
