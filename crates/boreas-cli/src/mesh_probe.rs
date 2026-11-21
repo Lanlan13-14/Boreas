@@ -17,7 +17,7 @@ pub fn run(args: &[String]) -> (u8, String, String) {
 }
 
 #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
-mod linux {
+pub(super) mod linux {
     use std::{
         fs::OpenOptions,
         io::{self, Read},
@@ -49,7 +49,7 @@ mod linux {
         read_material(path, max, None)
     }
 
-    fn read_material(
+    pub(in crate::node) fn read_material(
         path: &Path,
         max: usize,
         secret_owner: Option<u32>,

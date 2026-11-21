@@ -603,6 +603,9 @@ impl OpenSslOuterTlsConnector {
         builder.set_verify(SslVerifyMode::PEER);
         let roots = X509::stack_from_pem(root_pem)
             .map_err(|_| TunnelError::InnerTls("root certificate"))?;
+        if roots.is_empty() {
+            return Err(TunnelError::InnerTls("root certificate"));
+        }
         for root in roots {
             builder
                 .cert_store_mut()
@@ -637,14 +640,7 @@ impl OpenSslOuterTlsAcceptor {
         certificate_chain: impl AsRef<Path>,
         private_key: impl AsRef<Path>,
     ) -> Result<Self, TunnelError> {
-        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
-            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
-        builder
-            .set_max_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        let mut builder = Self::builder()?;
         builder
             .set_certificate_chain_file(certificate_chain)
             .map_err(|_| TunnelError::InnerTls("outer certificate"))?;
@@ -657,6 +653,40 @@ impl OpenSslOuterTlsAcceptor {
         Ok(Self {
             acceptor: builder.build(),
         })
+    }
+
+    /// Use caller-validated, bounded file contents without reopening paths.
+    pub fn from_pem(certificate_chain: &[u8], private_key: &[u8]) -> Result<Self, TunnelError> {
+        let mut builder = Self::builder()?;
+        let mut chain = X509::stack_from_pem(certificate_chain)
+            .map_err(|_| TunnelError::InnerTls("outer certificate"))?
+            .into_iter();
+        let leaf = chain.next().ok_or(TunnelError::InnerTls("outer certificate"))?;
+        builder.set_certificate(&leaf)
+            .map_err(|_| TunnelError::InnerTls("outer certificate"))?;
+        for certificate in chain {
+            builder.add_extra_chain_cert(certificate)
+                .map_err(|_| TunnelError::InnerTls("outer certificate chain"))?;
+        }
+        let key = openssl::pkey::PKey::private_key_from_pem(private_key)
+            .map_err(|_| TunnelError::InnerTls("outer private key"))?;
+        builder.set_private_key(&key)
+            .map_err(|_| TunnelError::InnerTls("outer private key"))?;
+        builder.check_private_key()
+            .map_err(|_| TunnelError::InnerTls("outer key mismatch"))?;
+        Ok(Self { acceptor: builder.build() })
+    }
+
+    fn builder() -> Result<openssl::ssl::SslAcceptorBuilder, TunnelError> {
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        Ok(builder)
     }
 }
 
