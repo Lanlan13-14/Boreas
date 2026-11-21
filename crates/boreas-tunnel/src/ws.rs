@@ -663,9 +663,7 @@ fn read_frame<T: Read>(
     let mut payload = vec![0u8; payload_len];
     read_exact(io, &mut payload, deadline)?;
     if let Some(mask) = mask {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
+        unmask_payload(&mut payload, mask);
     }
     Ok(RawFrame {
         fin,
@@ -737,6 +735,21 @@ fn copy_masked_payload(src: &[u8], dst: &mut [u8], mask: [u8; 4]) {
     }
     for (index, (src, dst)) in src_tail.iter().zip(dst_tail.iter_mut()).enumerate() {
         *dst = *src ^ mask[index % 4];
+    }
+}
+
+fn unmask_payload(payload: &mut [u8], mask: [u8; 4]) {
+    // An eight-byte word is two full mask cycles on either endian. No
+    // alignment assumptions, unsafe loads, or access outside the payload.
+    let mask_word = u64::from_ne_bytes([
+        mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
+    ]);
+    let (words, tail) = payload.as_chunks_mut::<8>();
+    for word in words {
+        *word = (u64::from_ne_bytes(*word) ^ mask_word).to_ne_bytes();
+    }
+    for (index, byte) in tail.iter_mut().enumerate() {
+        *byte ^= mask[index % mask.len()];
     }
 }
 
@@ -1227,6 +1240,24 @@ mod tests {
             Instant::now() + WsLimits::default().bounded().message_deadline,
         )
         .expect("valid client frame")
+    }
+
+    #[test]
+    fn unmask_matches_wire_bytes_for_unaligned_frames_and_all_tail_lengths() {
+        for length in (0..=42).chain([125, 126, 16_384, 65_535, MAX_WS_FRAME_PAYLOAD]) {
+            let mut actual = vec![0x5a; length + 2];
+            let mask = [0x11, 0x23, 0x45, 0x87];
+            let payload = &mut actual[1..1 + length];
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+            let expected: Vec<_> = payload.iter().zip(mask.into_iter().cycle())
+                .map(|(&byte, key)| byte ^ key).collect();
+            unmask_payload(payload, mask);
+            assert_eq!(payload, expected.as_slice(), "length {length}");
+            assert_eq!(actual[0], 0x5a);
+            assert_eq!(actual[length + 1], 0x5a);
+        }
     }
 
     #[test]
