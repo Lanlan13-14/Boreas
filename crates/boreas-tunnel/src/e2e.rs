@@ -207,7 +207,6 @@ pub struct CircuitStream<'a> {
     // a check. One copy serves the caller instead of one per byte.
     inbound: Vec<u8>,
     inbound_pos: usize,
-    write_buf: Vec<u8>,
     closed: bool,
 }
 
@@ -227,7 +226,6 @@ impl<'a> CircuitStream<'a> {
             recv_offset: 0,
             inbound: Vec::new(),
             inbound_pos: 0,
-            write_buf: Vec::new(),
             closed: false,
         }
     }
@@ -258,16 +256,13 @@ impl<'a> CircuitStream<'a> {
             return Err(CircuitReject::Closed.into());
         }
         let take = data.len().min(MAX_FRAGMENT_PAYLOAD);
-        RelayFragment::encode_slice_into(
+        self.session.send_relay_fragment(
             self.circuit_id,
             self.role.outbound(),
             self.send_offset,
             self.path_hops,
             &data[..take],
-            &mut self.write_buf,
         )?;
-        self.session
-            .send_frame(Kind::RelayCircuit, &self.write_buf)?;
         let advance =
             u64::try_from(take).map_err(|_| TunnelError::Circuit(CircuitReject::BadBody))?;
         self.send_offset = self

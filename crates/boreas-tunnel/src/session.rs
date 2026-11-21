@@ -251,7 +251,7 @@ impl FrameIo {
         Ok(())
     }
 
-    fn send_inner(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
+    fn prepare_frame(&mut self, kind: Kind, body: &[u8]) -> Result<(), TunnelError> {
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
             kind,
@@ -263,11 +263,6 @@ impl FrameIo {
         self.write_buf.reserve(encoded.len() + body.len());
         self.write_buf.extend_from_slice(&encoded);
         self.write_buf.extend_from_slice(body);
-        // One application frame is one TLS write. TLS record boundaries remain
-        // independent of AppHeader framing, but avoiding separate header/body
-        // records halves avoidable encryption and WebSocket overhead.
-        self.stream.write_all(&self.write_buf)?;
-        self.stream.flush()?;
         Ok(())
     }
 
@@ -275,11 +270,27 @@ impl FrameIo {
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
-        let result = self.send_inner(kind, body);
+        if let Err(error) = self.prepare_frame(kind, body) {
+            self.poison();
+            return Err(error);
+        }
+        self.send_buffered()
+    }
+
+    fn send_buffered(&mut self) -> Result<(), TunnelError> {
+        if self.failed {
+            return Err(TunnelError::Poisoned);
+        }
+        // Offer TLS the whole frame, not separate header and body writes.
+        // Short writes are retried; any write or flush error is terminal.
+        let result = self
+            .stream
+            .write_all(&self.write_buf)
+            .and_then(|()| self.stream.flush());
         if result.is_err() {
             self.poison();
         }
-        result
+        result.map_err(TunnelError::from)
     }
 
     fn recv(&mut self) -> Result<Frame, TunnelError> {
@@ -398,6 +409,49 @@ impl EstablishedSession {
             return Err(error.into());
         }
         self.io.send(kind, body)
+    }
+
+    /// Assemble a local circuit fragment directly in the session write buffer,
+    /// keeping it contiguous for TLS without an intermediate payload copy.
+    pub(crate) fn send_relay_fragment(
+        &mut self,
+        circuit_id: [u8; 16],
+        direction: u8,
+        byte_offset: u64,
+        hops_remaining: u8,
+        payload: &[u8],
+    ) -> Result<(), TunnelError> {
+        let fragment_header = messages::RelayFragment::encode_header(
+            circuit_id,
+            direction,
+            byte_offset,
+            hops_remaining,
+            payload.len(),
+        )?;
+        let body_len = fragment_header.len() + payload.len();
+        let header = AppHeader {
+            proto_major: PROTO_MAJOR,
+            kind: Kind::RelayCircuit,
+            flags: 0,
+            body_len: u32::try_from(body_len).map_err(|_| TunnelError::FrameTooLarge)?,
+        };
+        if self.io.failed {
+            return Err(TunnelError::Poisoned);
+        }
+        let encoded = header.encode()?;
+        let wire = &mut self.io.write_buf;
+        wire.clear();
+        wire.reserve(HEADER_LEN + body_len);
+        wire.extend_from_slice(&encoded);
+        wire.extend_from_slice(&fragment_header);
+        wire.extend_from_slice(payload);
+        if let Err(error) =
+            boreas_proto::validate_frame_policy_parts(&header, &wire[HEADER_LEN..], &mut self.ctx)
+        {
+            self.io.poison();
+            return Err(error.into());
+        }
+        self.io.send_buffered()
     }
 
     /// Receive one application frame and apply the frame-level state machine.

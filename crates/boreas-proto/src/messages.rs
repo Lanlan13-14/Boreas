@@ -1689,29 +1689,50 @@ impl RelayFragment {
         payload: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), MessageError> {
+        let header = Self::encode_header(
+            circuit_id,
+            direction,
+            byte_offset,
+            hops_remaining,
+            payload.len(),
+        )?;
+        out.clear();
+        out.reserve(header.len() + payload.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(payload);
+        Ok(())
+    }
+
+    /// Encode the fixed fields for a caller assembling a larger frame. The
+    /// caller must append exactly `payload_len` bytes after this header.
+    pub fn encode_header(
+        circuit_id: [u8; 16],
+        direction: u8,
+        byte_offset: u64,
+        hops_remaining: u8,
+        payload_len: usize,
+    ) -> Result<[u8; RELAY_FRAGMENT_FIXED_LEN], MessageError> {
         if direction > 1 {
             return Err(MessageError::InvalidDirection(direction));
         }
         if !(1..=MAX_CIRCUIT_HOPS).contains(&hops_remaining) {
             return Err(MessageError::InvalidHopCount(hops_remaining));
         }
-        if payload.len() > MAX_RELAY_PAYLOAD {
-            return Err(MessageError::PayloadTooLarge(payload.len()));
+        if payload_len > MAX_RELAY_PAYLOAD {
+            return Err(MessageError::PayloadTooLarge(payload_len));
         }
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| MessageError::PayloadTooLarge(payload.len()))?;
+        let payload_len =
+            u32::try_from(payload_len).map_err(|_| MessageError::PayloadTooLarge(payload_len))?;
         byte_offset
             .checked_add(u64::from(payload_len))
             .ok_or(MessageError::OffsetOverflow)?;
-        out.clear();
-        out.reserve(RELAY_FRAGMENT_FIXED_LEN + payload.len());
-        out.extend_from_slice(&circuit_id);
-        out.push(direction);
-        out.extend_from_slice(&byte_offset.to_be_bytes());
-        out.extend_from_slice(&payload_len.to_be_bytes());
-        out.push(hops_remaining);
-        out.extend_from_slice(payload);
-        Ok(())
+        let mut header = [0; RELAY_FRAGMENT_FIXED_LEN];
+        header[..16].copy_from_slice(&circuit_id);
+        header[16] = direction;
+        header[17..25].copy_from_slice(&byte_offset.to_be_bytes());
+        header[25..29].copy_from_slice(&payload_len.to_be_bytes());
+        header[29] = hops_remaining;
+        Ok(header)
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, MessageError> {
