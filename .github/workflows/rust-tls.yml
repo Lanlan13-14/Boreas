@@ -961,6 +961,26 @@ jobs:
           sudo -E timeout --kill-after=5s 135s bash tools/release/netns_daemon_smoke.sh \
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-netns-multistream.log
+      - name: Measure explicitly enabled TCPv4 GSO over real TUN and strict E2E
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso'
+        timeout-minutes: 5
+        env:
+          BOREAS_NETNS_TCPV4_GSO: '1'
+          BOREAS_MIN_THROUGHPUT_MBPS: '1000'
+          BOREAS_PERF_BYTES: '268435456'
+          BOREAS_PERF_TIMEOUT_SECONDS: '25'
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '33'
+          BOREAS_DIAGNOSTIC_TIMING: '1'
+        run: |
+          set -euo pipefail
+          failed=0
+          for sample in 1 2 3; do
+            if ! sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "rust-tls-gso-${sample}.log"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Upload non-secret CI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -984,6 +1004,7 @@ jobs:
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log
             rust-tls-netns-gigabit-*.log
+            rust-tls-gso-*.log
             rust-tls-netns-multistream.log
             rust-tls-perf-environment.txt
             rust-tls-initial-backup.log
