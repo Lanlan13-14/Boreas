@@ -30,6 +30,17 @@ once by the `Refresh Cargo.lock` workflow before `--locked` jobs resolve any new
 edges. `serde`/`serde_json` were deliberately not added: the manifest reader is
 a small, strict, hand-written JSON subset.
 
+## Automatic update remains blocked
+
+`boreas update-check` and console entry 7 only perform [advisory release discovery](../releases/README.md#13-只读更新检查). The GitHub list or release-branch JSON is not an authorization input, and neither command invokes this supervisor or exposes an install action. In particular, do not substitute Zephyr's single-signature updater, a GitHub `prerelease` flag, a release-asset checksum, or a downloaded executable for an independent trust decision.
+
+The following are required before enabling an automatic action:
+
+1. Provision independently pinned Boreas ReleaseRoot keys, distinct from NetworkRoot, with an approved rotation/revocation policy and trusted UTC. Enable and validate the supervisor's OpenSSL 3.5+ verification on the exact shipped platform build: **Ed25519 AND ML-DSA-65** over the original manifest bytes, with no algorithm downgrade. No packaged updater with that trust configuration is wired here.
+2. Bind the signed release identity, version/channel and applicable promotion evidence to **exactly one** authorized platform artifact, its exact bytes (size and SHA-256) and compatible state policy. Supply a bounded streaming downloader and controlled extraction to an immutable private staging input; close the verification-to-staging gap. The existing byte-slice check and a public listing are not this pipeline.
+3. Persist a tamper-resistant monotonic release sequence and manifest digest across restarts, rollback and state restore; enforce expiration/revocation, lower-sequence and same-sequence/different-bytes refusal before staging. The in-memory `SequenceLedger` and the durable trial-attempt counter are not a durable release authorization watermark.
+4. Wire only that verified candidate into the exclusive supervisor transaction via the packaged service layout. Bind real daemon readiness to the candidate digest, enforce state compatibility and last-permitted-version rollback, and validate crash/power-loss recovery and restart interruption on supported targets. The current test stub, unintegrated Windows store and absent end-to-end deployment binding do not meet this contract.
+
 ## Transaction model
 
 `UpgradeStore::open(root)` opens a trusted, already-existing, non-symlink store
