@@ -89,6 +89,8 @@ USAGE:
                             --root-key-id <ID> --root-ed25519-der <FILE>
                             --root-mldsa65-der <FILE> --ed25519-signature <FILE>
                             --mldsa65-signature <FILE> --min-sequence <N>
+                            [--confirm-manifest-sha256 <HEX>]
+    boreas-supervisor verify-stage <same options as stage>
     boreas-supervisor recover --store <DIR> [--json]
     boreas-supervisor status --store <DIR> [--json]
     boreas-supervisor reset-trial --store <DIR> --confirm <VERSION>
@@ -134,8 +136,10 @@ goes stale.
 `__ready-stub` is a hidden test-support candidate (not an operator command); it
 exists so integration tests exercise the real handshake with a real subprocess.
 
-`stage` requires independently trusted release keys and matching raw Ed25519
-and ML-DSA-65 signatures. `--require-verified` fails closed without a verified
+`stage` and read-only `verify-stage` require independently trusted release
+keys and matching raw Ed25519 and ML-DSA-65 signatures. `verify-stage` reports
+an advisory candidate ID and raw manifest SHA-256 without writing the store.
+`--require-verified` fails closed without a verified
 store and checks live daemon readiness on every boot before notifying systemd.";
 
 fn main() -> ExitCode {
@@ -262,7 +266,8 @@ fn run_cli(args: &[OsString]) -> CliOutcome {
             }
         }
         "supervise" => cmd_supervise(&args[1..]),
-        "stage" => stage_cli::stage_command(&args[1..]),
+        "stage" => stage_cli::stage_command(&args[1..], false),
+        "verify-stage" => stage_cli::stage_command(&args[1..], true),
         "recover" => cmd_recover(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "reset-trial" => cmd_reset_trial(&args[1..]),
@@ -1822,7 +1827,9 @@ mod tests {
         assert!(stdout.contains("stage --store <ABS_DIR> --manifest <FILE> --artifact <FILE>"));
         assert!(stdout.contains("--ed25519-signature <FILE>"));
         assert!(stdout.contains("--mldsa65-signature <FILE>"));
-        assert!(stdout.contains("independently trusted release keys"));
+        assert!(stdout.contains("verify-stage"));
+        let help = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("independently trusted release keys"));
         assert!(stdout.contains("and ML-DSA-65 signatures"));
         assert!(stdout.contains("`--require-verified` fails closed without a verified"));
     }

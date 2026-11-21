@@ -148,12 +148,18 @@ mod linux {
         Ok(Some((version.to_owned(), manifest_hash.to_owned())))
     }
 
-    /// Stage the selected asset of an authenticated and policy-checked manifest.
-    /// A retained prior binary is never copied over or removed. A failed trial
-    /// requires an explicit reset (same release) or a newer signed release.
-    pub fn stage(root: &Path, candidate: &VerifiedCandidate, binary: &[u8]) -> StageResult<String> {
-        validate_store_path(root)?;
+    struct Admission {
+        version: String,
+        manifest_hash: String,
+    }
+
+    fn authenticate(
+        candidate: &VerifiedCandidate,
+        binary: &[u8],
+        expected_manifest: Option<&str>,
+    ) -> StageResult<Admission> {
         let (arch, machine) = native_asset()?;
+        candidate.verify_bytes(binary)?;
         if candidate.arch() != arch || inspect_elf(binary)?.machine != machine {
             return Err(io::Error::other("verified artifact must be a native static ELF").into());
         }
@@ -162,45 +168,74 @@ mod linux {
                 io::Error::other("manifest must support the current daemon state schema").into(),
             );
         }
-        candidate.verify_bytes(binary)?;
         let version = format!(
             "release-{}-{}",
             candidate.sequence(),
             candidate.asset()?.sha256()
         );
         let manifest_hash = sha256(candidate.manifest().raw_bytes());
-        let store = UpgradeStore::open(root)?;
-        let _lock = store.lock_exclusive()?;
-        let watermark = read_watermark(root)?;
+        if expected_manifest.is_some_and(|expected| expected != manifest_hash.as_str()) {
+            return Err(io::Error::other("manifest SHA-256 does not match operator approval").into());
+        }
+        Ok(Admission {
+            version,
+            manifest_hash,
+        })
+    }
+
+    // Read-only snapshot. A live supervisor can change the journal; stage
+    // must repeat these checks after acquiring the writer lock.
+    fn check_admission(
+        store: &UpgradeStore,
+        input: &Admission,
+    ) -> StageResult<(bool, Option<String>)> {
+        let version = &input.version;
+        let seq = sequence(version)?;
+        let watermark = read_watermark(store.root())?;
         let before = store.journal()?;
         let active = store.active_version()?;
+        let trial = store.trial_state()?;
         if let Some((previous, previous_manifest)) = &watermark {
             let (highest, _) = parse_version(previous)?;
-            if candidate.sequence() < highest {
+            if active
+                .as_deref()
+                .map(sequence)
+                .transpose()?
+                .is_some_and(|n| n > highest || (n == highest && active.as_ref() != Some(previous)))
+            {
+                return Err(io::Error::other("active release disagrees with the release watermark").into());
+            }
+            if seq < highest {
                 return Err(io::Error::other("release sequence rollback").into());
             }
-            if candidate.sequence() == highest
-                && (&version != previous || &manifest_hash != previous_manifest)
-            {
+            if seq == highest && (version != previous || &input.manifest_hash != previous_manifest) {
                 return Err(io::Error::other(
                     "signed manifest equivocation at the same release sequence",
                 )
                 .into());
             }
-            if before.as_ref().is_some_and(|j| j.new_version == version) {
-                if before.as_ref().is_some_and(|j| j.phase == Phase::Activated) {
+            if let Some(j) = &before
+                && &j.new_version == version
+            {
+                if version != previous {
                     return Err(UpgradeError::WrongState.into());
                 }
-                if let Some(journal) = &before
-                    && journal.phase == Phase::Confirmed
-                    && active.as_deref() != Some(version.as_str())
-                {
-                    return Err(UpgradeError::WrongState.into());
+                match j.phase {
+                    Phase::Prepared if active == j.old_version => {
+                        if trial.as_ref().is_some_and(|t| &t.version == version) {
+                            return Err(io::Error::other(
+                                "release trial already attempted; stage a newer release or explicitly reset the trial",
+                            )
+                            .into());
+                        }
+                    }
+                    Phase::Confirmed if active.as_deref() == Some(version.as_str()) => {}
+                    _ => return Err(UpgradeError::WrongState.into()),
                 }
-                validate_binary(&store, &version)?;
-                return Ok(version);
+                validate_binary(store, version)?;
+                return Ok((true, active));
             }
-        } else if before.is_some() || active.is_some() || store.trial_state()?.is_some() {
+        } else if before.is_some() || active.is_some() || trial.is_some() {
             return Err(io::Error::other("cannot adopt an existing generic upgrade store").into());
         }
         if let Some(journal) = &before {
@@ -208,7 +243,6 @@ mod linux {
                 Phase::Activated => return Err(UpgradeError::WrongState.into()),
                 Phase::Prepared => {
                     // Only replace a failed (not merely pending) release.
-                    let trial = store.trial_state()?;
                     if active != journal.old_version
                         || !trial.is_some_and(|t| t.version == journal.new_version && !t.in_flight)
                     {
@@ -221,6 +255,47 @@ mod linux {
                 Phase::Confirmed => {}
             }
         }
+        Ok((false, active))
+    }
+
+    /// Authenticate local inputs and check the current store without writing.
+    /// This result cannot authorize a later stage; it may be stale by then.
+    pub fn preflight(
+        root: &Path,
+        candidate: &VerifiedCandidate,
+        binary: &[u8],
+        expected_manifest: Option<&str>,
+    ) -> StageResult<(String, String)> {
+        validate_store_path(root)?;
+        let input = authenticate(candidate, binary, expected_manifest)?;
+        check_admission(&UpgradeStore::inspect(root)?, &input)?;
+        Ok((input.version, input.manifest_hash))
+    }
+
+    /// Stage the authenticated bytes under the exclusive writer lock.
+    pub fn stage(root: &Path, candidate: &VerifiedCandidate, binary: &[u8]) -> StageResult<String> {
+        stage_approved(root, candidate, binary, None)
+    }
+
+    pub fn stage_approved(
+        root: &Path,
+        candidate: &VerifiedCandidate,
+        binary: &[u8],
+        expected_manifest: Option<&str>,
+    ) -> StageResult<String> {
+        validate_store_path(root)?;
+        let input = authenticate(candidate, binary, expected_manifest)?;
+        let store = UpgradeStore::open(root)?;
+        let _lock = store.lock_exclusive()?;
+        let (already_staged, active) = check_admission(&store, &input)?;
+        let Admission {
+            version,
+            manifest_hash,
+        } = input;
+        if already_staged {
+            return Ok(version);
+        }
+
         // Persist the acceptance floor first. A crash after this point can
         // resume only the exact signed manifest, or a newer signed sequence.
         atomic_write(
@@ -298,4 +373,7 @@ mod linux {
 }
 
 #[cfg(all(target_os = "linux", feature = "openssl-backend"))]
-pub use linux::{checked_binary, native_asset, read_input, sequence, stage, validate_binary};
+pub use linux::{
+    checked_binary, native_asset, preflight, read_input, sequence, stage, stage_approved,
+    validate_binary,
+};

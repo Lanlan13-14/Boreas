@@ -189,6 +189,18 @@ pub struct UpgradeStore {
 impl UpgradeStore {
     /// Create/open a store. Root must already exist and be a real directory (not a symlink).
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let store = Self::inspect(root)?;
+        ensure_child_dir(&store.root, &store.versions)?;
+        ensure_child_dir(&store.root, &store.staging)?;
+        restrict_private_dir(&store.versions)?;
+        restrict_private_dir(&store.staging)?;
+        sync_dir(&store.root)?;
+        Ok(store)
+    }
+
+    // For advisory admission checks while the supervisor owns the writer
+    // lock. No creation, permission changes or fsync on this path.
+    fn inspect(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         reject_symlink_components(&root)?;
         let meta = fs::symlink_metadata(&root)?;
@@ -197,17 +209,10 @@ impl UpgradeStore {
                 "root must be a non-symlink directory",
             ));
         }
-        let versions = root.join("versions");
-        let staging = root.join("staging");
-        ensure_child_dir(&root, &versions)?;
-        ensure_child_dir(&root, &staging)?;
-        restrict_private_dir(&versions)?;
-        restrict_private_dir(&staging)?;
-        sync_dir(&root)?;
         Ok(Self {
+            versions: root.join("versions"),
+            staging: root.join("staging"),
             root,
-            versions,
-            staging,
         })
     }
     pub fn root(&self) -> &Path {

@@ -347,6 +347,7 @@ fn run_with_columns(
         Some("menu") => run_menu(&args[1..], lang, stdout_tty, columns),
         Some("console") => run_console(&args[1..], lang, stdout_tty, columns),
         Some("update-check") => update::run(&args[1..], lang),
+        Some("update") => update::offline(&args[1..]),
         Some("--version") if args.len() == 1 => {
             (0, format!("Boreas {}", update::local_build()), String::new())
         }
@@ -1516,7 +1517,8 @@ fn help_text() -> String {
      \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|console [--json] [--socket <p>] [--config <f>] [--service <u>]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|config-save-candidate ...|node serve|node connect|help]\n\
      \x20 boreas-easy   (line-mode console: menu, service status/start/stop, updates)\n\
      \x20 boreas --version          local CLI build identity\n\
-     \x20 boreas update-check [--channel stable|pre]  read-only (default: stable)\n\n\
+     \x20 boreas update-check [--channel stable|pre]  advisory discovery (default: stable)\n\
+     \x20 boreas update --help     operator-only verified offline update (Linux/systemd)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\

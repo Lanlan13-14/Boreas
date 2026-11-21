@@ -16,7 +16,6 @@ trust_installed=/etc/boreas/release-trust
 store=/var/lib/boreas/releases
 state=/var/lib/boreas/state
 sup=/usr/local/libexec/boreas/boreas-supervisor
-release_cmd=/usr/local/libexec/boreas/stage-verified-release
 iface=boreas-ci0
 installed=0
 cleanup() {
@@ -36,8 +35,9 @@ mkdir "$trust"
 # Only this user's staging process can traverse into the input subdirectory;
 # the ephemeral signing private keys and node CA remain root-only.
 chmod 0711 "$work"
-# The dedicated account cannot traverse the Actions workspace. This trusted
-# test binary is solely for querying the live control socket as that account.
+# The dedicated account cannot traverse the Actions workspace. This known CI
+# fixture is a management client here (query and update), never an unverified
+# candidate executed as administrator.
 install -m0755 "$bin" "$work/status-client"
 chgrp boreas "$trust"
 chmod 0750 "$trust"
@@ -119,10 +119,11 @@ PY
 }
 stage() {
   local name=$1
+  shift
   runuser -u boreas -- "$sup" stage --store "$store" --manifest "$trust/$name.json" \
     --artifact "$trust/$name.bin" --root-key-id ci-release \
     --root-ed25519-der "$trust/ed25519.der" --root-mldsa65-der "$trust/mldsa65.der" \
-    --ed25519-signature "$trust/$name.ed25519" --mldsa65-signature "$trust/$name.mldsa65" --min-sequence 1
+    --ed25519-signature "$trust/$name.ed25519" --mldsa65-signature "$trust/$name.mldsa65" --min-sequence 1 "$@"
 }
 reject() {
   local name=$1 diagnostic=$2
@@ -170,21 +171,70 @@ printf '\377' | dd of="$trust/tampered.bin" bs=1 seek=15 conv=notrunc status=non
 reject tampered 'SHA-256|digest|hash'
 [[ ! -e $store/verified-release.state && ! -e $store/active.version ]]
 
-"$release_cmd" "$trust/real.json" "$trust/real.bin" "$trust/real.ed25519" "$trust/real.mldsa65"
+update() {
+  local name=$1
+  shift
+  "$work/status-client" update "$@" "$trust/$name.json" "$trust/$name.bin" \
+    "$trust/$name.ed25519" "$trust/$name.mldsa65"
+}
+verified_hash() {
+  local response
+  response=$(update "$1" verify) || return
+  [[ $response =~ ^verified\ release-[0-9]+-[0-9a-f]{64}\ ([0-9a-f]{64})$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+apply() { update "$1" apply --confirm-manifest-sha256 "$2"; }
+if runuser -u boreas -- "$work/status-client" update verify "$trust/real.json" "$trust/real.bin" \
+  "$trust/real.ed25519" "$trust/real.mldsa65"; then
+  echo 'ERROR: unprivileged offline verification unexpectedly accepted' >&2; exit 1
+fi
+[[ ! -e $store/versions && ! -e $store/staging && ! -e $store/verified-release.state && ! -e $store/active.version ]]
+real_hash=$(verified_hash real)
+if systemctl is-active --quiet boreas.service; then
+  echo 'ERROR: verify unexpectedly started the service' >&2; exit 1
+fi
+[[ ! -e $store/versions && ! -e $store/staging && ! -e $store/verified-release.state && ! -e $store/active.version ]]
+apply real "$real_hash"
 
 unit_ready
 old=$(cat "$store/active.version")
 [[ $old == release-1-* ]]
 runuser -u boreas -- "$sup" status --store "$store" --json | grep -q '"phase":"Confirmed"'
 
+old_pid=$(systemctl show --value -p MainPID boreas.service)
+old_watermark=$(cat "$store/verified-release.state")
+apply real "$real_hash" # Idempotent: already active, no restart.
 emit 2 failing "$fail_bin"
-if "$release_cmd" "$trust/failing.json" "$trust/failing.bin" "$trust/failing.ed25519" "$trust/failing.mldsa65"; then
+failing_hash=$(verified_hash failing)
+# A different valid manifest with the same sequence and artifact. The apply
+# path must require the exact reviewed manifest digest, not just the version ID.
+emit 2 substituted "$fail_bin"
+for name in substituted bad-ed25519 bad-mldsa65 tampered expired; do
+  if apply "$name" "$failing_hash"; then
+    echo "ERROR: $name unexpectedly accepted" >&2; exit 1
+  fi
+  [[ $(systemctl show --value -p MainPID boreas.service) == "$old_pid" ]]
+  [[ $(cat "$store/verified-release.state") == "$old_watermark" ]]
+  [[ $(cat "$store/active.version") == "$old" ]]
+done
+if apply failing "$failing_hash"; then
   echo 'ERROR: failed signed candidate was reported as confirmed' >&2; exit 1
 fi
 unit_ready
 [[ $(cat "$store/active.version") == "$old" ]]
+[[ $(cat "$store/verified-release.state") == "release-2-"*" $failing_hash" ]]
 runuser -u boreas -- "$sup" status --store "$store" --json | grep -q '"phase":"Prepared"'
 journalctl --no-pager -u boreas.service | grep -F 'restarting retained verified release'
+# A verified replay of a spent trial cannot interrupt the retained service.
+retained_pid=$(systemctl show --value -p MainPID boreas.service)
+if apply failing "$failing_hash"; then
+  echo 'ERROR: spent trial was accepted' >&2; exit 1
+fi
+[[ $(systemctl show --value -p MainPID boreas.service) == "$retained_pid" ]]
+if apply real "$real_hash"; then
+  echo 'ERROR: downgrade was accepted' >&2; exit 1
+fi
+[[ $(systemctl show --value -p MainPID boreas.service) == "$retained_pid" ]]
 
 systemctl stop boreas.service
 systemctl reset-failed boreas.service
@@ -192,7 +242,14 @@ reject real 'rollback'
 emit 2 different "$bin"
 reject different 'equivocation'
 emit 3 valid-next "$bin"
-stage valid-next
+next_hash=$(verified_hash valid-next)
+emit 3 replaced-next "$bin"
+watermark_before=$(cat "$store/verified-release.state")
+if stage replaced-next --confirm-manifest-sha256 "$next_hash"; then
+  echo 'ERROR: staging accepted substituted signed manifest' >&2; exit 1
+fi
+[[ $(cat "$store/verified-release.state") == "$watermark_before" ]]
+stage valid-next --confirm-manifest-sha256 "$next_hash"
 # Tampering after staging, even when the filename still claims the old hash.
 next=$(cut -d' ' -f1 "$store/verified-release.state")
 printf '\377' | dd of="$store/versions/$next/boreas" bs=1 seek=0 conv=notrunc status=none
@@ -240,4 +297,16 @@ if systemctl start boreas.service; then
   echo 'ERROR: supervisor started a below-floor fallback' >&2; exit 1
 fi
 journalctl --no-pager -u boreas.service | grep -F "below the operator's minimum runnable sequence"
+# Reset while the expected failed unit is still loaded, before stop may unload it.
+systemctl reset-failed boreas.service
 systemctl stop boreas.service
+
+# A newer authentic release can replace the spent trial without lowering the
+# run floor or discarding the old version or durable authentication history.
+emit 5 recovered "$bin"
+recovered_hash=$(verified_hash recovered)
+apply recovered "$recovered_hash"
+unit_ready
+[[ $(cat "$store/active.version") == release-5-* ]]
+[[ -f $store/versions/$old/boreas ]]
+runuser -u boreas -- "$sup" status --store "$store" --json | grep -q '"phase":"Confirmed"'

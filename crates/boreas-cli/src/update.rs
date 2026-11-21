@@ -1,7 +1,12 @@
 //! Advisory release discovery only. No value here authorizes an artifact.
 
 mod json;
+mod offline;
 mod transport;
+
+pub(crate) fn offline(args: &[String]) -> (u8, String, String) {
+    offline::run(args)
+}
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -351,7 +356,7 @@ pub(crate) fn check(channel: Channel, lang: Lang) -> (bool, Vec<String>) {
 }
 
 pub(crate) fn blocked(lang: Lang) -> &'static str {
-    localized(lang, "Auto-update blocked: release trust/recovery not wired.", "自动更新已禁用：发布信任与恢复尚未接入。", "自動更新已停用：發布信任與復原尚未接入。")
+    localized(lang, "Auto-update blocked: no trusted feed; offline operator action only.", "自动更新已禁用：无可信更新源，仅支持管理员离线操作。", "自動更新已停用：無可信更新來源，僅支援管理員離線操作。")
 }
 
 pub(crate) fn run(args: &[String], lang: Lang) -> (u8, String, String) {
