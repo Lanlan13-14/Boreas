@@ -114,7 +114,9 @@ impl fmt::Display for DispatchError {
             Self::AuthorityNotFresh => f.write_str("private DNS authority is not fresh"),
             Self::AuthorityResponse(reason) => write!(f, "private DNS response failed: {reason:?}"),
             Self::PublicForwardingDisabled => f.write_str("public DNS forwarding is disabled"),
-            Self::PublicEdnsOptionsUnsupported => f.write_str("public EDNS options are unsupported"),
+            Self::PublicEdnsOptionsUnsupported => {
+                f.write_str("public EDNS options are unsupported")
+            }
             Self::Upstream(error) => write!(f, "{error}"),
         }
     }
@@ -183,6 +185,29 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
         query: &[u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, DispatchError> {
+        self.dispatch_inner(peer, query, deadline, None, true)
+    }
+
+    /// Nonblocking packet path: the private branch only, even if the instance
+    /// has an upstream. `udp_ceiling` is the IP MTU less IP/UDP headers, or
+    /// `None` for a complete TCP message. Both transports share one budget.
+    pub(crate) fn dispatch_private_packet(
+        &self,
+        peer: AuthenticatedPeerSource,
+        query: &[u8],
+        udp_ceiling: Option<usize>,
+    ) -> Result<Vec<u8>, DispatchError> {
+        self.dispatch_inner(peer, query, Instant::now() + WINDOW, udp_ceiling, false)
+    }
+
+    fn dispatch_inner(
+        &self,
+        peer: AuthenticatedPeerSource,
+        query: &[u8],
+        deadline: Instant,
+        udp_ceiling: Option<usize>,
+        allow_public: bool,
+    ) -> Result<Vec<u8>, DispatchError> {
         use DispatchError::*;
 
         let node = self.authorizer.authorized_node(peer).ok_or(Unauthorized)?;
@@ -206,10 +231,18 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
             }
             let reply = snapshot
                 .resolver
-                .respond_parsed(query, &question, false)
+                .respond_parsed(
+                    query,
+                    &question,
+                    udp_ceiling.is_some(),
+                    udp_ceiling.unwrap_or(MAX_RESPONSE_BYTES),
+                )
                 .map_err(AuthorityResponse)?;
             (reply, Some(snapshot))
         } else {
+            if !allow_public {
+                return Err(PublicForwardingDisabled);
+            }
             let upstream = self.upstream.as_ref().ok_or(PublicForwardingDisabled)?;
             // Uninterpreted client options are not public QNAMEs. Don't relay
             // their opaque payload (which might include private information).
@@ -236,8 +269,19 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
         Ok(response)
     }
 
+    pub(crate) fn permits_private_packet_peer(&self, peer: AuthenticatedPeerSource) -> bool {
+        self.authority.as_ref().is_some_and(|snapshot| {
+            snapshot.resolver.sources.permits(peer.address())
+                && self.authorizer.authorized_node(peer).is_some()
+                && snapshot.is_fresh(Instant::now())
+        })
+    }
+
     fn admit(&self, node: u16, bytes: usize) -> Result<Permit<'_>, DispatchError> {
-        let mut budget = self.budget.lock().map_err(|_| DispatchError::ResourceLimit)?;
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| DispatchError::ResourceLimit)?;
         if !budget.admit(node, bytes, Instant::now()) {
             return Err(DispatchError::ResourceLimit);
         }
@@ -353,6 +397,47 @@ impl Budget {
 mod tests {
     use super::*;
     use crate::{SourceAuthorization, Zone};
+
+    struct TestClient(AuthenticatedPeerSource);
+
+    impl ClientAuthorizer for TestClient {
+        fn authorized_node(&self, peer: AuthenticatedPeerSource) -> Option<u16> {
+            (peer == self.0).then_some(2)
+        }
+    }
+
+    #[test]
+    fn private_packet_transports_charge_the_same_budget() {
+        let address = "10.20.1.2".parse().unwrap();
+        let peer = AuthenticatedPeerSource::from_authenticated_overlay_peer(address).unwrap();
+        let now = Instant::now();
+        let resolver = AuthoritativeDns::new(
+            Zone::new("corp.test").unwrap(),
+            SourceAuthorization::new([address]),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let snapshot = AuthoritySnapshot::new(resolver, now, now + WINDOW).unwrap();
+        let dispatcher =
+            QueryDispatcher::new("corp.test", Some(snapshot), None, TestClient(peer)).unwrap();
+        // Seed the window one small request below its byte ceiling. The same
+        // full-response reservation applies to UDP and TCP, even on failure.
+        let query = b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x04corp\x04test\0\0\x01\0\x01";
+        let cost = query.len() + MAX_RESPONSE_BYTES + 4;
+        {
+            let mut budget = dispatcher.budget.lock().unwrap();
+            // Keep this window from rolling over regardless of scheduler timing.
+            budget.start = now + Duration::from_secs(60);
+            let start = budget.start;
+            assert!(budget.admit(2, PER_IDENTITY.bytes - cost, start));
+            budget.release(2);
+        }
+        assert!(dispatcher.dispatch_private_packet(peer, query, Some(512)).is_ok());
+        assert!(matches!(
+            dispatcher.dispatch_private_packet(peer, query, None),
+            Err(DispatchError::ResourceLimit)
+        ));
+    }
 
     #[test]
     fn authority_freshness_is_half_open() {

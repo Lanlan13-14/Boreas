@@ -301,38 +301,8 @@ impl<'a, P: PacketIo + ?Sized> DnsUdpRuntime<'a, P> {
         let dns_octet = u8::try_from(DNS_PORT).map_err(|_| Error::InvalidAuthority)?;
         let dns_vip = Ipv4Addr::new(base[0], base[1], 0, dns_octet);
 
-        // The profile has no policy ULA. Refuse IPv6 claims/records rather than
-        // putting an address into the zone that the policy never authorized.
-        if authority.vips().iter().any(|claim| claim.ipv6.is_some()) {
-            return Err(Error::UnsupportedIpv6);
-        }
-
-        // The zone is rebuilt from the verified token, never from caller bytes.
-        // Only A records are accepted; an AAAA record would need a policy ULA.
-        let mut zone = Zone::new(authority.zone()).map_err(|_| Error::InvalidAuthority)?;
-        for record in authority.records() {
-            let address = match record.record_type {
-                1 => {
-                    let octets: [u8; 4] = record
-                        .address
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| Error::InvalidAuthority)?;
-                    IpAddr::V4(Ipv4Addr::from(octets))
-                }
-                28 => return Err(Error::UnsupportedIpv6),
-                _ => return Err(Error::InvalidAuthority),
-            };
-            zone.add_address(&record.owner, address)
-                .map_err(|_| Error::InvalidAuthority)?;
-        }
-
-        // The resolver's own allowlist is the verified local VIP. The packet
-        // source check below is an additional, independent check.
-        let sources = SourceAuthorization::new([IpAddr::V4(local_vip)]);
         let max_response_bytes = (mtu - DATAGRAM_OVERHEAD).min(MAX_RESPONSE_BYTES);
-        let resolver = AuthoritativeDns::new(zone, sources, max_response_bytes)
-            .map_err(|_| Error::InvalidAuthority)?;
+        let resolver = verified_ipv4_resolver(authority, local_vip, max_response_bytes)?;
         Ok(Self {
             io,
             resolver,
@@ -609,13 +579,50 @@ fn tcp_destination_port(packet: &[u8], ip_header_len: usize) -> Option<u16> {
     Some(u16::from_be_bytes([tcp[2], tcp[3]]))
 }
 
+/// Materialize only records covered by the already-verified signed token.
+/// The caller must bind the exact policy and source before using the resolver.
+pub(super) fn verified_ipv4_resolver(
+    authority: &VerifiedDnsAuthority,
+    source: Ipv4Addr,
+    max_response_bytes: usize,
+) -> Result<AuthoritativeDns, Error> {
+    // The profile has no policy ULA. Refuse IPv6 claims/records rather than
+    // putting an address into the zone that the policy never authorized.
+    if authority.vips().iter().any(|claim| claim.ipv6.is_some()) {
+        return Err(Error::UnsupportedIpv6);
+    }
+
+    // The zone is rebuilt from the verified token, never from caller bytes.
+    // Only A records are accepted; an AAAA record would need a policy ULA.
+    let mut zone = Zone::new(authority.zone()).map_err(|_| Error::InvalidAuthority)?;
+    for record in authority.records() {
+        let address = match record.record_type {
+            1 => {
+                let octets: [u8; 4] = record
+                    .address
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::InvalidAuthority)?;
+                IpAddr::V4(Ipv4Addr::from(octets))
+            }
+            28 => return Err(Error::UnsupportedIpv6),
+            _ => return Err(Error::InvalidAuthority),
+        };
+        zone.add_address(&record.owner, address)
+            .map_err(|_| Error::InvalidAuthority)?;
+    }
+
+    let sources = SourceAuthorization::new([IpAddr::V4(source)]);
+    AuthoritativeDns::new(zone, sources, max_response_bytes).map_err(|_| Error::InvalidAuthority)
+}
+
 /// Permanent IPv4 slot for `(node_id, role)` inside a verified prefix.
 ///
 /// This is the same rule `packet_path` applies to its authenticated endpoints,
 /// parameterized by the signed policy's base. It is kept private here so this
 /// slice does not modify the packet-path file; the per-node `(node_id, VIP)`
 /// binding is also re-checked inside `boreas-pki` for every signed claim.
-fn permanent_vip_in(base: [u8; 4], node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
+pub(super) fn permanent_vip_in(base: [u8; 4], node_id: u16, role: NodeRole) -> Option<Ipv4Addr> {
     let home_core = u8::try_from(node_id >> 8).ok()?.checked_add(1)?;
     let vip_octet = u8::try_from(node_id & 0xff).ok()?;
     if home_core > 16 {
@@ -669,7 +676,7 @@ fn ones_complement_sum(data: &[u8]) -> u16 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use boreas_pki::dns_authority::DnsSignerPin;
     use boreas_pki::{NetworkRootPin, verify_network_policy};
@@ -691,7 +698,11 @@ mod tests {
     const NET: [u8; 16] = [7; 16];
     const LOCAL: [u8; 4] = [10, 20, 1, 1];
 
-    fn sign(ed: &PKey<Private>, pq: &PKey<Private>, message: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn sign(
+        ed: &PKey<Private>,
+        pq: &PKey<Private>,
+        message: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
         let mut signer = Signer::new_without_digest(ed).unwrap();
         let ed_signature = signer.sign_oneshot_to_vec(message).unwrap();
         let mut signer = Signer::new_without_digest(pq).unwrap();
@@ -705,9 +716,23 @@ mod tests {
         )
     }
 
+    pub(crate) struct Fixture {
+        pub(crate) authority: VerifiedDnsAuthority,
+        pub(crate) local: PeerIdentity,
+        pub(crate) network: boreas_pki::VerifiedNetworkPolicy,
+        pub(crate) root: NetworkRootPin,
+        pub(crate) root_ed: PKey<Private>,
+        pub(crate) root_pq: PKey<Private>,
+    }
+
+    fn fixture() -> (VerifiedDnsAuthority, PeerIdentity) {
+        let f = fixture_at(1);
+        (f.authority, f.local)
+    }
+
     /// A complete real trust chain: root pin -> signed policy -> root-signed DNS
     /// signer grant -> signer-signed zone authority -> policy-bound local identity.
-    fn fixture() -> (VerifiedDnsAuthority, PeerIdentity) {
+    pub(crate) fn fixture_at(unit: u64) -> Fixture {
         let (root_ed, root_pq) = keys(41);
         let root = NetworkRootPin::provisioned(
             NET,
@@ -722,16 +747,14 @@ mod tests {
             overlay_base: [10, 20, 0, 0],
             version: 1,
             seq: 1,
-            issued_at: 1_000,
-            expires: 2_000,
+            issued_at: 1_000 * unit,
+            expires: 2_000 * unit,
         };
         let raw = candidate.encode_tbs().unwrap();
         let message = NetworkPolicyCandidate::signature_input(&raw).unwrap();
         let (ed, pq) = sign(&root_ed, &root_pq, &message);
-        let policy = verify_network_policy(&raw, &ed, &pq, &root, NET, 1_500)
-            .unwrap()
-            .require_default_runtime()
-            .unwrap();
+        let network = verify_network_policy(&raw, &ed, &pq, &root, NET, 1_500 * unit).unwrap();
+        let policy = network.require_default_runtime().unwrap();
 
         let (signer_ed, signer_pq) = keys(42);
         let grant = DnsSignerGrant {
@@ -739,8 +762,8 @@ mod tests {
             policy_digest: policy.policy_digest(),
             signer_generation: 1,
             sequence: 1,
-            not_before: 1_000,
-            expires: 2_000,
+            not_before: 1_000 * unit,
+            expires: 2_000 * unit,
             ed25519_public_key_der: signer_ed.public_key_to_der().unwrap(),
             mldsa_parameter_set: MLDSA_PARAMETER_SET_65,
             mldsa_public_key_der: signer_pq.public_key_to_der().unwrap(),
@@ -748,16 +771,22 @@ mod tests {
         let grant_raw = grant.encode_tbs().unwrap();
         let message = DnsSignerGrant::signature_input(&grant_raw).unwrap();
         let (grant_ed, grant_pq) = sign(&root_ed, &root_pq, &message);
-        let signer =
-            DnsSignerPin::verify_grant(&grant_raw, &grant_ed, &grant_pq, &root, &policy, 1_500)
-                .unwrap();
+        let signer = DnsSignerPin::verify_grant(
+            &grant_raw,
+            &grant_ed,
+            &grant_pq,
+            &root,
+            &policy,
+            1_500 * unit,
+        )
+        .unwrap();
 
         let authority = DnsAuthority {
             net_id: NET,
             policy_digest: policy.policy_digest(),
             sequence: 2,
-            issued_at: 1_000,
-            expires: 1_900,
+            issued_at: 1_000 * unit,
+            expires: 1_900 * unit,
             zone: b"b.example".to_vec(),
             vips: vec![DnsVipClaim {
                 node_id: 0x0001,
@@ -774,12 +803,19 @@ mod tests {
         let message = DnsAuthority::signature_input(&raw).unwrap();
         let (ed, pq) = sign(&signer_ed, &signer_pq, &message);
         let authority =
-            VerifiedDnsAuthority::verify(&raw, &ed, &pq, &signer, &policy, 1_500).unwrap();
+            VerifiedDnsAuthority::verify(&raw, &ed, &pq, &signer, &policy, 1_500 * unit).unwrap();
         let local = PeerIdentity::policy_bound(NET, 0x0001, 1, NodeRole::Core, policy).unwrap();
-        (authority, local)
+        Fixture {
+            authority,
+            local,
+            network,
+            root,
+            root_ed,
+            root_pq,
+        }
     }
 
-    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+    pub(crate) fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
         for label in name.split('.') {
             query.push(u8::try_from(label.len()).unwrap());
@@ -791,7 +827,7 @@ mod tests {
         query
     }
 
-    fn udp_datagram(
+    pub(crate) fn udp_datagram(
         source: [u8; 4],
         destination: [u8; 4],
         source_port: u16,
@@ -850,7 +886,7 @@ mod tests {
         packet
     }
 
-    fn dns_payload(packet: &[u8]) -> &[u8] {
+    pub(crate) fn dns_payload(packet: &[u8]) -> &[u8] {
         let info = inspect_packet(packet).expect("structurally valid response");
         &packet[info.header_len + UDP_HEADER_LEN..]
     }

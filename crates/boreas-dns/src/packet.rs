@@ -6,7 +6,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::AuthoritativeDns;
+use crate::{AuthoritativeDns, DnsError};
 
 pub const DNS_PORT: u16 = 53;
 pub const MIN_PACKET_MTU: usize = 1280;
@@ -121,7 +121,9 @@ impl AuthenticatedPeerSource {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PacketConfig {
-    genesis: TrustedDnsGenesis,
+    ipv4_network: (Ipv4Addr, u8),
+    dns_v4: Ipv4Addr,
+    ipv6: Option<(Ipv6Addr, Ipv6Addr)>,
     max_packet_bytes: usize,
 }
 
@@ -131,25 +133,45 @@ impl PacketConfig {
             return Err(PacketError::InvalidLength);
         }
         Ok(Self {
-            genesis,
+            ipv4_network: genesis.ipv4_network(),
+            dns_v4: genesis.dns_v4(),
+            ipv6: Some((genesis.ipv6_ula48(), genesis.dns_v6())),
+            max_packet_bytes,
+        })
+    }
+
+    /// IPv4-only packet configuration. The network must come from the owner's
+    /// verified policy; this validates shape, not provenance or freshness.
+    pub fn new_ipv4(network: Ipv4Addr, max_packet_bytes: usize) -> Result<Self, PacketError> {
+        let [a, b, c, d] = network.octets();
+        if !network.is_private() || c != 0 || d != 0 {
+            return Err(PacketError::InvalidAddress);
+        }
+        if !(MIN_PACKET_MTU..=MAX_PACKET_MTU).contains(&max_packet_bytes) {
+            return Err(PacketError::InvalidLength);
+        }
+        Ok(Self {
+            ipv4_network: (network, 16),
+            dns_v4: Ipv4Addr::new(a, b, 0, 53),
+            ipv6: None,
             max_packet_bytes,
         })
     }
 
     pub const fn dns_v4(self) -> Ipv4Addr {
-        self.genesis.dns_v4
+        self.dns_v4
     }
-    pub const fn dns_v6(self) -> Ipv6Addr {
-        self.genesis.dns_v6
+    pub fn dns_v6(self) -> Option<Ipv6Addr> {
+        self.ipv6.map(|(_, dns)| dns)
     }
     pub const fn max_packet_bytes(self) -> usize {
         self.max_packet_bytes
     }
     pub const fn ipv4_network(self) -> (Ipv4Addr, u8) {
-        self.genesis.ipv4_network()
+        self.ipv4_network
     }
-    pub const fn ipv6_ula48(self) -> Ipv6Addr {
-        self.genesis.ipv6_ula48()
+    pub fn ipv6_ula48(self) -> Option<Ipv6Addr> {
+        self.ipv6.map(|(ula, _)| ula)
     }
 }
 
@@ -253,6 +275,17 @@ pub fn respond_packet(
     authenticated_source: AuthenticatedPeerSource,
     packet: &[u8],
 ) -> Result<Option<Vec<u8>>, PacketError> {
+    respond_packet_with(config, authenticated_source, packet, |source, query, _| {
+        dns.respond_udp(source, query)
+    })
+}
+
+pub(crate) fn respond_packet_with(
+    config: PacketConfig,
+    authenticated_source: AuthenticatedPeerSource,
+    packet: &[u8],
+    answer: impl FnOnce(IpAddr, &[u8], usize) -> Result<Option<Vec<u8>>, DnsError>,
+) -> Result<Option<Vec<u8>>, PacketError> {
     if packet.is_empty() {
         return Err(PacketError::Truncated);
     }
@@ -260,17 +293,17 @@ pub fn respond_packet(
         return Err(PacketError::InvalidLength);
     }
     match packet[0] >> 4 {
-        4 => respond_v4(dns, config, authenticated_source, packet),
-        6 => respond_v6(dns, config, authenticated_source, packet),
+        4 => respond_v4(config, authenticated_source, packet, answer),
+        6 => respond_v6(config, authenticated_source, packet, answer),
         _ => Err(PacketError::InvalidVersion),
     }
 }
 
 fn respond_v4(
-    dns: &AuthoritativeDns,
     cfg: PacketConfig,
     peer: AuthenticatedPeerSource,
     p: &[u8],
+    answer: impl FnOnce(IpAddr, &[u8], usize) -> Result<Option<Vec<u8>>, DnsError>,
 ) -> Result<Option<Vec<u8>>, PacketError> {
     if p.len() < IPV4_HEADER_LEN {
         return Err(PacketError::Truncated);
@@ -305,7 +338,7 @@ fn respond_v4(
     if peer.0 != src {
         return Err(PacketError::UnauthorizedSource);
     }
-    if dst4 != cfg.genesis.dns_v4 {
+    if dst4 != cfg.dns_v4() {
         return Err(PacketError::InvalidAddress);
     }
     let udp = &p[ihl..total];
@@ -313,12 +346,10 @@ fn respond_v4(
     if dst_port != DNS_PORT || src_port == 0 {
         return Err(PacketError::InvalidPort);
     }
-    let response = match dns
-        .respond_udp(src, dns_bytes)
+    let Some(response) = answer(src, dns_bytes, cfg.max_packet_bytes - ihl - UDP_HEADER_LEN)
         .map_err(|_| PacketError::InvalidLength)?
-    {
-        Some(v) => v,
-        None => return Ok(None),
+    else {
+        return Ok(None);
     };
     let out = build_v4(dst4, src4, dst_port, src_port, &response)?;
     if out.len() > cfg.max_packet_bytes {
@@ -328,10 +359,10 @@ fn respond_v4(
 }
 
 fn respond_v6(
-    dns: &AuthoritativeDns,
     cfg: PacketConfig,
     peer: AuthenticatedPeerSource,
     p: &[u8],
+    answer: impl FnOnce(IpAddr, &[u8], usize) -> Result<Option<Vec<u8>>, DnsError>,
 ) -> Result<Option<Vec<u8>>, PacketError> {
     if p.len() < IPV6_HEADER_LEN {
         return Err(PacketError::Truncated);
@@ -361,7 +392,7 @@ fn respond_v6(
     if peer.0 != src {
         return Err(PacketError::UnauthorizedSource);
     }
-    if dst != cfg.genesis.dns_v6 {
+    if Some(dst) != cfg.dns_v6() {
         return Err(PacketError::InvalidAddress);
     }
     let udp = &p[IPV6_HEADER_LEN..];
@@ -376,12 +407,14 @@ fn respond_v6(
     if dst_port != DNS_PORT || src_port == 0 {
         return Err(PacketError::InvalidPort);
     }
-    let response = match dns
-        .respond_udp(src, dns_bytes)
-        .map_err(|_| PacketError::InvalidLength)?
-    {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some(response) = answer(
+        src,
+        dns_bytes,
+        cfg.max_packet_bytes - IPV6_HEADER_LEN - UDP_HEADER_LEN,
+    )
+    .map_err(|_| PacketError::InvalidLength)?
+    else {
+        return Ok(None);
     };
     let src6 = match src {
         IpAddr::V6(a) => a,

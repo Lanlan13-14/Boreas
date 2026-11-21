@@ -49,8 +49,9 @@ use smoltcp::{
 };
 
 use crate::{
-    AuthoritativeDns,
-    packet::{AuthenticatedPeerSource, PacketConfig, inspect_ip_packet, respond_packet},
+    AuthoritativeDns, DnsError,
+    dispatch::{ClientAuthorizer, DispatchError, QueryDispatcher},
+    packet::{AuthenticatedPeerSource, PacketConfig, inspect_ip_packet, respond_packet_with},
     tcp::{DNS_TCP_PORT, TcpDnsConfig, TcpDnsError, TcpDnsServer, TcpSourceAuthorizer},
 };
 
@@ -95,11 +96,23 @@ pub trait AuthenticatedSourceMap: Send + Sync {
 
 /// Adapter so the TCP server uses exactly the same typed map as UDP without a
 /// public blanket implementation that could constrain downstream types.
-struct MapAuthorizer<'a, M: AuthenticatedSourceMap>(&'a M);
+struct MapAuthorizer<'a, M, F>(&'a M, F);
 
-impl<M: AuthenticatedSourceMap> TcpSourceAuthorizer for MapAuthorizer<'_, M> {
+impl<M: AuthenticatedSourceMap, F: Fn(AuthenticatedPeerSource) -> bool> MapAuthorizer<'_, M, F> {
+    fn peer(&self, source: IpAddr) -> Option<AuthenticatedPeerSource> {
+        self.0
+            .authenticated_source(source)
+            .filter(|peer| peer.address() == source && self.1(*peer))
+    }
+}
+
+impl<M, F> TcpSourceAuthorizer for MapAuthorizer<'_, M, F>
+where
+    M: AuthenticatedSourceMap,
+    F: Fn(AuthenticatedPeerSource) -> bool + Send + Sync,
+{
     fn is_authorized_authenticated_peer(&self, source: IpAddr) -> bool {
-        self.0.authenticated_source(source).is_some()
+        self.peer(source).is_some()
     }
 }
 
@@ -270,12 +283,12 @@ impl Device for QueueDevice {
 }
 
 /// One bounded, in-process DNS packet endpoint.
-pub struct PacketRuntime {
+pub struct PacketRuntime<D = AuthoritativeDns> {
     iface: Interface,
     device: QueueDevice,
     sockets: SocketSet<'static>,
     tcp: TcpDnsServer,
-    dns: AuthoritativeDns,
+    dns: D,
     packet_config: PacketConfig,
     listen: IpAddress,
     listen_ip: IpAddr,
@@ -297,6 +310,82 @@ impl PacketRuntime {
         listen: IpAddress,
         config: PacketRuntimeConfig,
     ) -> Result<Self, PacketRuntimeError> {
+        Self::with_backend(dns, packet_config, listen, config)
+    }
+
+    /// Drive the legacy packet model with its explicit source map and authority.
+    pub fn poll<M: AuthenticatedSourceMap>(
+        &mut self,
+        now: Instant,
+        sources: &M,
+    ) -> PacketPollStats {
+        self.poll_with(
+            now,
+            sources,
+            |_| true,
+            |dns, peer, query, udp| {
+                if udp.is_some() {
+                    dns.respond_udp(peer.address(), query)
+                } else {
+                    dns.respond_tcp(peer.address(), query)
+                }
+            },
+        )
+    }
+}
+
+impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
+    /// Own a single dispatcher for both packet transports. Polling this
+    /// runtime never uses the dispatcher's blocking/public upstream path.
+    /// This constructor requires an IPv4-only packet configuration.
+    pub fn new_private_dispatcher(
+        dispatcher: QueryDispatcher<A>,
+        packet_config: PacketConfig,
+        config: PacketRuntimeConfig,
+    ) -> Result<Self, PacketRuntimeError> {
+        if packet_config.dns_v6().is_some() {
+            return Err(PacketRuntimeError::InvalidConfiguration);
+        }
+        Self::with_backend(
+            dispatcher,
+            packet_config,
+            IpAddress::Ipv4(packet_config.dns_v4()),
+            config,
+        )
+    }
+
+    /// Drive private UDP and real TCP together. The owner must keep the same
+    /// authenticated binding through queueing, polls, and final delivery;
+    /// destroy the runtime (including TCP buffers) on binding invalidation.
+    pub fn poll_private<M: AuthenticatedSourceMap>(
+        &mut self,
+        elapsed_millis: i64,
+        sources: &M,
+    ) -> PacketPollStats {
+        self.poll_with(
+            Instant::from_millis(elapsed_millis),
+            sources,
+            QueryDispatcher::permits_private_packet_peer,
+            |dispatcher, peer, query, udp| match dispatcher
+                .dispatch_private_packet(peer, query, udp)
+            {
+                Ok(response) => Ok(Some(response)),
+                Err(
+                    DispatchError::InvalidQuery(error) | DispatchError::AuthorityResponse(error),
+                ) => Err(error),
+                Err(_) => Ok(None),
+            },
+        )
+    }
+}
+
+impl<D> PacketRuntime<D> {
+    fn with_backend(
+        dns: D,
+        packet_config: PacketConfig,
+        listen: IpAddress,
+        config: PacketRuntimeConfig,
+    ) -> Result<Self, PacketRuntimeError> {
         let max_packet_bytes = packet_config.max_packet_bytes();
         if max_packet_bytes > MAX_DEVICE_MTU || !config.validate(max_packet_bytes) {
             return Err(PacketRuntimeError::InvalidConfiguration);
@@ -312,7 +401,7 @@ impl PacketRuntime {
             IpAddress::Ipv6(address) => IpAddr::V6(address),
         };
         if listen_ip != IpAddr::V4(packet_config.dns_v4())
-            && listen_ip != IpAddr::V6(packet_config.dns_v6())
+            && Some(listen_ip) != packet_config.dns_v6().map(IpAddr::V6)
         {
             return Err(PacketRuntimeError::InvalidConfiguration);
         }
@@ -385,14 +474,27 @@ impl PacketRuntime {
     /// ACK, FIN, and idle timers progress. `sources` is the trusted typed map;
     /// an unauthorized source is dropped before it reaches smoltcp or the UDP
     /// handler.
-    pub fn poll<M: AuthenticatedSourceMap>(
+    fn poll_with<M, F>(
         &mut self,
         now: Instant,
         sources: &M,
-    ) -> PacketPollStats {
+        permits: F,
+        answer: impl Fn(
+            &D,
+            AuthenticatedPeerSource,
+            &[u8],
+            Option<usize>,
+        ) -> Result<Option<Vec<u8>>, DnsError>,
+    ) -> PacketPollStats
+    where
+        M: AuthenticatedSourceMap,
+        F: Fn(&D, AuthenticatedPeerSource) -> bool + Send + Sync,
+        D: Sync,
+    {
+        let authorizer = MapAuthorizer(sources, |peer| permits(&self.dns, peer));
         let max_packet_bytes = self.packet_config.max_packet_bytes();
         let dns_v4 = IpAddr::V4(self.packet_config.dns_v4());
-        let dns_v6 = IpAddr::V6(self.packet_config.dns_v6());
+        let dns_v6 = self.packet_config.dns_v6().map(IpAddr::V6);
         let mut stats = PacketPollStats::default();
 
         for _ in 0..self.max_packets_per_poll {
@@ -407,16 +509,21 @@ impl PacketRuntime {
                     continue;
                 }
             };
-            let Some(peer) = sources.authenticated_source(meta.source) else {
+            let Some(peer) = authorizer.peer(meta.source) else {
                 stats.dropped_unauthenticated += 1;
                 continue;
             };
-            if meta.destination != dns_v4 && meta.destination != dns_v6 {
+            if meta.destination != dns_v4 && Some(meta.destination) != dns_v6 {
                 stats.dropped_unsupported += 1;
                 continue;
             }
             match meta.protocol {
-                17 => match respond_packet(&self.dns, self.packet_config, peer, &packet) {
+                17 => match respond_packet_with(
+                    self.packet_config,
+                    peer,
+                    &packet,
+                    |_, query, ceiling| answer(&self.dns, peer, query, Some(ceiling)),
+                ) {
                     Ok(Some(response)) => {
                         if self.device.push_outbound(response) {
                             stats.udp_answered += 1;
@@ -443,10 +550,17 @@ impl PacketRuntime {
         }
 
         let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
-        let authorizer = MapAuthorizer(sources);
-        stats.tcp_frames = self
-            .tcp
-            .process(&mut self.sockets, &self.dns, &authorizer, now);
+        stats.tcp_frames =
+            self.tcp
+                .process_with(
+                    &mut self.sockets,
+                    &authorizer,
+                    now,
+                    |source, query| match authorizer.peer(source) {
+                        Some(peer) => answer(&self.dns, peer, query, None),
+                        None => Ok(None),
+                    },
+                );
         let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
         stats.output_queued = self.device.output_len();
         stats
@@ -460,7 +574,7 @@ impl PacketRuntime {
         self.packet_config.dns_v4()
     }
 
-    pub const fn dns_v6(&self) -> std::net::Ipv6Addr {
+    pub fn dns_v6(&self) -> Option<std::net::Ipv6Addr> {
         self.packet_config.dns_v6()
     }
 
@@ -577,12 +691,9 @@ mod tests {
 
         fn receive(&mut self, _timestamp: Instant) -> Option<(TestRx, TestTx)> {
             let packet = self.inbound.lock().ok()?.pop_front()?;
-            Some((
-                TestRx(packet),
-                TestTx {
-                    queue: self.outbound.clone(),
-                },
-            ))
+            Some((TestRx(packet), TestTx {
+                queue: self.outbound.clone(),
+            }))
         }
 
         fn transmit(&mut self, _timestamp: Instant) -> Option<TestTx> {
@@ -687,6 +798,17 @@ mod tests {
         now: i64,
         sources: &M,
     ) -> PacketPollStats {
+        transfer_with(client, runtime, now, |runtime, now| {
+            runtime.poll(Instant::from_millis(now), sources)
+        })
+    }
+
+    fn transfer_with<D>(
+        client: &mut Side,
+        runtime: &mut PacketRuntime<D>,
+        now: i64,
+        poll: impl FnOnce(&mut PacketRuntime<D>, i64) -> PacketPollStats,
+    ) -> PacketPollStats {
         let time = Instant::from_millis(now);
         let _ = client
             .iface
@@ -694,7 +816,7 @@ mod tests {
         while let Some(packet) = client.device.take_outbound() {
             runtime.push_input(&packet).unwrap();
         }
-        let stats = runtime.poll(time, sources);
+        let stats = poll(runtime, now);
         while let Some(packet) = runtime.pop_output() {
             client.device.push_inbound(packet);
         }
@@ -833,6 +955,82 @@ mod tests {
             }
         }
         assert!(closed, "server FIN not observed after half-close");
+    }
+
+    impl ClientAuthorizer for AllowClient {
+        fn authorized_node(&self, peer: AuthenticatedPeerSource) -> Option<u16> {
+            (peer.address() == IpAddr::V4(CLIENT4)).then_some(2)
+        }
+    }
+
+    #[test]
+    fn private_dispatcher_uses_real_tcp_and_never_calls_configured_upstream() {
+        use crate::{MAX_RESPONSE_BYTES, dispatch::AuthoritySnapshot, upstream::TcpUpstream};
+        use std::{
+            net::TcpListener,
+            time::{Duration, Instant as Mono},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let upstream = TcpUpstream::new(
+            listener.local_addr().unwrap(),
+            Duration::from_millis(50),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let now = Mono::now();
+        let snapshot = AuthoritySnapshot::new(dns(), now, now + Duration::from_secs(60)).unwrap();
+        let dispatcher =
+            QueryDispatcher::new("corp.example", Some(snapshot), Some(upstream), AllowClient)
+                .unwrap();
+        let mut runtime = PacketRuntime::new_private_dispatcher(
+            dispatcher,
+            PacketConfig::new_ipv4(Ipv4Addr::new(10, 20, 0, 0), 1500).unwrap(),
+            PacketRuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut client = client_side(IpAddress::Ipv4(CLIENT4), 11);
+        let handle = start_connect(&mut client, 53_000);
+        let poll = |runtime: &mut PacketRuntime<_>, now| runtime.poll_private(now, &AllowClient);
+        for step in 1..=12 {
+            transfer_with(&mut client, &mut runtime, step * 10, poll);
+        }
+        assert!(client.sockets.get::<tcp::Socket>(handle).may_send());
+        client
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&framed(&query(0x5678)))
+            .unwrap();
+        let mut got = Vec::new();
+        for step in 13..=28 {
+            transfer_with(&mut client, &mut runtime, step * 10, poll);
+            receive_tcp(&mut client.sockets, handle, &mut got);
+        }
+        assert!(got.len() >= 10);
+        assert_eq!(&got[2..4], &[0x56, 0x78]);
+        assert_eq!(&got[8..10], &[0, 1]);
+
+        let mut public = query(0x6789);
+        public[18] = b'x'; // corp.example -> xorp.example
+        runtime.push_input(&udp_query_packet(&public)).unwrap();
+        assert_eq!(runtime.poll_private(290, &AllowClient).udp_answered, 0);
+        assert!(runtime.pop_output().is_none());
+        client
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&framed(&public))
+            .unwrap();
+        got.clear();
+        for step in 30..=44 {
+            transfer_with(&mut client, &mut runtime, step * 10, poll);
+            receive_tcp(&mut client.sockets, handle, &mut got);
+        }
+        assert!(got.is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

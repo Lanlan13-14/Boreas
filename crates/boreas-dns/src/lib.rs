@@ -226,7 +226,8 @@ impl AuthoritativeDns {
             return Ok(None);
         }
         let question = parse_query(query)?;
-        self.respond_parsed(query, &question, datagram).map(Some)
+        self.respond_parsed(query, &question, datagram, MAX_RESPONSE_BYTES)
+            .map(Some)
     }
 
     // Only for callers that already checked sources and parsed this query.
@@ -235,6 +236,7 @@ impl AuthoritativeDns {
         query: &[u8],
         question: &Question,
         datagram: bool,
+        ceiling: usize,
     ) -> Result<Vec<u8>, DnsError> {
         let limit = if datagram {
             if let Some(edns_limit) = question.edns_size {
@@ -246,6 +248,7 @@ impl AuthoritativeDns {
         } else {
             self.max_response_bytes.min(MAX_RESPONSE_BYTES)
         };
+        let limit = limit.min(ceiling);
         let mut answer = None;
         let authoritative = is_in_zone(&question.name, &self.zone.origin);
         let refused = self.zone.refused.contains(&question.name);

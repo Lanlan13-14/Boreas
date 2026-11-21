@@ -104,6 +104,11 @@ impl VerifiedDnsServicePolicy {
         self.body.sequence
     }
 
+    /// Half-open validity of the signed service policy in UTC Unix microseconds.
+    pub fn validity(&self) -> (u64, u64) {
+        (self.body.issued_at, self.body.expires)
+    }
+
     /// Checks only the explicit grant for the supplied authenticated subject facts.
     /// Caller must supply its currently selected verified NetworkPolicy and obtain
     /// subject facts from authenticated identity, not from an advertisement or

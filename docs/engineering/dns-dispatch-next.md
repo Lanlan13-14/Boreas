@@ -39,12 +39,29 @@ increment after the bounded TCP upstream (`fc234cd`), informed by the sibling
   exact on-wire shaping or ingress DoS protection. The caller owns bounded
   ingress scheduling, worker isolation and reply handling. Use separate policy
   instances for distinct networks; recreating an instance resets its budget.
-- No packet, user-space TCP, or daemon paths are wired to this service. The
-  shared query parser now rejects nonzero request RCODE bits on all its paths,
-  matching the existing TCP upstream check. The private authority retains its
-  single-address-per-type behavior and no SOA in negative answers. There is no
-  trusted Core/Edge discovery or listener integration, LAN authorization,
-  production DNS capability, or end-to-end leak claim.
+- `PacketRuntime::new_private_dispatcher` owns a private-only dispatcher for
+  IPv4 UDP packets and the existing real smoltcp TCP listener. Both transports
+  charge one budget; UDP also honors its EDNS and link payload ceiling. The
+  blocking public branch is unreachable from either packet transport, even if
+  a lower-level caller configured an upstream. The private authority retains
+  its single-address-per-type behavior and no SOA in negative answers.
+- `boreas_tunnel::dns_packet_service` (OpenSSL feature) is an opt-in owner for
+  one Core-to-Edge E2E binding. It takes endpoint identities and MTU from the
+  established circuit, requires an exact signed network/policy binding and a
+  current `Replica` grant for that Core generation, and materializes the
+  signed IPv4 zone and single Edge source allowlist. It drops its state and
+  queues on observed invalidation, UTC expiry/rollback, or a fixed monotonic
+  expiry derived from the intersection of signed windows. It does not infer
+  trust from a packet address. An embedding owner must supply a current,
+  revocation-aware binding check and trusted UTC, keep ingress isolated to that
+  circuit, and keep authorization current through actual reply delivery. This
+  seam is not a multi-circuit admission controller; recreating it resets rate
+  state. The current IPv4 packet profile accepts only MTUs 1280–1500.
+- Nothing attaches this owner to `PacketPath`, TUN, a daemon, or an Edge
+  resolver. There is no discovery or advertisement, host/LAN listener, IPv6,
+  public forwarding from packets, persisted policy/snapshot selection, or live
+  revocation feed. No wire format or capability changed, and the default is
+  disabled. This is not production DNS or an end-to-end leak claim.
 
 Regression coverage includes loopback TCP wire tests with a sentinel listener
 for private negative/failure/stale/authorization outcomes, lookalike public
