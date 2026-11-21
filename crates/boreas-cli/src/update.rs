@@ -59,7 +59,7 @@ impl Source {
     fn url(self) -> &'static str {
         match self {
             Self::Static => {
-                "https://raw.githubusercontent.com/Lanlan13-14/Boreas/release/release-manifest.json"
+                "https://raw.githubusercontent.com/Lanlan13-14/Boreas/refs/heads/release/release-manifest.json"
             }
             Self::Api => "https://api.github.com/repos/Lanlan13-14/Boreas/releases?per_page=20",
         }

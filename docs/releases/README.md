@@ -33,9 +33,9 @@
 选择 Stable/Pre-release，`c` 或 Enter 才发出请求。通道只保留在当前会话；选择通道、
 进入页面、渲染菜单和非 TTY JSON 均不检查，且没有定时请求。
 
-- 首选固定地址 `https://raw.githubusercontent.com/Lanlan13-14/Boreas/release/release-manifest.json`。
+- 首选固定地址 `https://raw.githubusercontent.com/Lanlan13-14/Boreas/refs/heads/release/release-manifest.json`。
   本功能定义独立的发现清单格式，例如 `{"product":"boreas","schema":1,"stable":null,"prerelease":"v0.1.0-pre.3"}`。
-  两通道字段都必需，值为匹配的 `v<SemVer>` 标签或 `null`；**它不是**生产双签清单。首个检查源有效时（包括 `null`）不请求 API。此提交不创建 `release` 分支、清单或发布工作流。
+  两通道字段都必需，值为匹配的 `v<SemVer>` 标签或 `null`；**它不是**生产双签清单。首个检查源有效时（包括 `null`）不请求 API。`release` 分支仅存放发现清单；更新清单不创建 GitHub Release、不打标签，也不触发发布工作流。
 - 静态源不存在、不可用或内容无效时，请求 `https://api.github.com/repos/Lanlan13-14/Boreas/releases?per_page=20`，只检查首批最多 20 项，不调用 `/releases/latest`，不分页。拒绝 draft，要求 `prerelease` 标记与标签匹配，然后按 SemVer 比较，不按 API 返回顺序或字典序。预览只看预发布标签，稳定只看正式标签；`pre.9 < pre.40 <` 同基线正式版。没有匹配项表示**已检查数据**无匹配，不能证明从未发布、已安装版本最新或发布已获生产批准。
 - 两个 HTTPS GET 共用 5 秒期限（静态源分配最多 1.75 秒），每个响应上限 1 MiB。依赖受信系统 curl 7.77+ 或支持等价选项的发行版兼容版本（Unix 仅 root 所有且非组/其他用户可写的 `/usr/bin/curl` 或 `/bin/curl` 及其路径；Windows 仅系统目录的 `curl.exe`）；缺失或不支持必要选项则提示不可用，不搜索 `PATH`。忽略 curl 配置及继承的代理、凭据、证书覆盖等；禁用自动客户端证书，要求 TLS 1.2+ 和系统信任验证，不跟随重定向。不发送 GitHub token、设备/服务标识或版本；服务仍可见普通网络连接元数据（如源 IP）。离线、TLS 失败或限流会明确报告，绝不显示为“已是最新”。
 - 未显式标注标签的构建显示 Cargo 软件版本和 `dev`（编译时有完整 `BOREAS_BUILD_SHA` / `GITHUB_SHA` 时显示短 SHA），只报告发现的候选，不比较开发提交与发布标签。以后由获准的打包环境按实际标签提供编译期 `BOREAS_BUILD_TAG`；发现结果只能说明远端声称标签较新、SemVer 优先级相同、较旧或无法比较。CLI 退出码：`0` 检查完成（含无匹配），`1` 不可用，`2` 参数错误。
