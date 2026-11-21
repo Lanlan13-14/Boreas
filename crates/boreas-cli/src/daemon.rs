@@ -2500,6 +2500,20 @@ mod linux_daemon {
         }
     }
 
+    enum PathPoll {
+        Read,
+        SendPreflight,
+        SendDeferred,
+    }
+
+    #[derive(Debug, Default)]
+    struct PathReadiness {
+        socket_readable: bool,
+        socket_writable: bool,
+        socket_terminal: bool,
+        tun_readable: bool,
+    }
+
     /// Bounded readiness wait on the outer socket and, when the endpoint is a real
     /// device, the TUN descriptor as one event set.
     ///
@@ -2517,20 +2531,28 @@ mod linux_daemon {
     fn poll_io(
         sock_fd: i32,
         tun_fd: Option<i32>,
+        mode: PathPoll,
         timeout: Duration,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<PathReadiness, String> {
         if sock_fd < 0 || tun_fd.is_some_and(|fd| fd < 0) {
             return Err("daemon: invalid poll fd".to_string());
         }
+        let (socket_events, tun_events) = match mode {
+            PathPoll::Read => (libc::POLLIN, libc::POLLIN),
+            PathPoll::SendPreflight => (libc::POLLIN | libc::POLLOUT, libc::POLLIN),
+            // Keep the TUN fd in the poll set: HUP/ERR/NVAL still surface
+            // with events=0, but an already queued packet won't wake us.
+            PathPoll::SendDeferred => (libc::POLLIN, 0),
+        };
         let mut fds = [
             libc::pollfd {
                 fd: sock_fd,
-                events: libc::POLLIN,
+                events: socket_events,
                 revents: 0,
             },
             libc::pollfd {
                 fd: tun_fd.unwrap_or(-1),
-                events: libc::POLLIN,
+                events: tun_events,
                 revents: 0,
             },
         ];
@@ -2542,7 +2564,7 @@ mod linux_daemon {
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok((false, false));
+                return Ok(PathReadiness::default());
             }
             return Err("daemon: socket/TUN poll failed".to_string());
         }
@@ -2555,36 +2577,59 @@ mod linux_daemon {
                     .to_string(),
             );
         }
-        let ready =
-            |pfd: &libc::pollfd| pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
-        Ok((
-            ready(&fds[0]),
-            count == 2 && fds[1].revents & libc::POLLIN != 0,
-        ))
+        let socket_terminal = fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
+        Ok(PathReadiness {
+            socket_readable: socket_terminal || fds[0].revents & libc::POLLIN != 0,
+            socket_writable: !socket_terminal && fds[0].revents & libc::POLLOUT != 0,
+            socket_terminal,
+            tun_readable: count == 2 && fds[1].revents & libc::POLLIN != 0,
+        })
     }
 
     /// Once this turn has attempted inbound work, defer a new socket read
-    /// when an outbound packet is ready. Already-buffered input is scheduled
-    /// independently and the first inbound attempt never uses this rule.
-    fn poll_additional_inbound(sock_fd: i32, tun_fd: Option<i32>) -> Result<bool, String> {
-        let (socket, tun) = poll_io(sock_fd, tun_fd, Duration::ZERO)?;
-        Ok(socket && !tun)
+    /// when an outbound packet can run. With a deferred send, yield only once
+    /// the socket has room again; a ready TUN alone cannot make progress.
+    fn poll_additional_inbound(
+        sock_fd: i32,
+        tun_fd: Option<i32>,
+        send_deferred: bool,
+    ) -> Result<bool, String> {
+        let mode = if send_deferred {
+            PathPoll::SendPreflight
+        } else {
+            PathPoll::Read
+        };
+        let ready = poll_io(sock_fd, tun_fd, mode, Duration::ZERO)?;
+        if !ready.socket_readable || !ready.tun_readable || ready.socket_terminal {
+            return Ok(ready.socket_readable);
+        }
+        Ok(send_deferred && !tcp_send_has_room(sock_fd, &ready)?)
     }
 
     // Linux uapi linux/sockios.h. Count unsent bytes only, not the congestion
     // window or all bytes in flight. This is a preflight hint, not a hard cap.
     const TCP_UNSENT_LENGTH: libc::c_ulong = 0x894b;
-    const GSO_SEND_HIGH_WATER: libc::c_int = 256 * 1024;
+    const TCP_SEND_HIGH_WATER: libc::c_int = 256 * 1024;
 
-    fn gso_send_has_room(sock_fd: i32) -> Result<bool, String> {
+    fn tcp_send_has_room(sock_fd: i32, ready: &PathReadiness) -> Result<bool, String> {
+        if !ready.socket_writable {
+            return Ok(false);
+        }
         let mut unsent: libc::c_int = 0;
         // SAFETY: this sole socket owner provides a valid fd and the ioctl
         // writes one initialized C integer to the supplied pointer.
         let rc = unsafe { libc::ioctl(sock_fd, TCP_UNSENT_LENGTH as _, &mut unsent) };
-        if rc != 0 || unsent < 0 {
-            return Err("daemon: cannot measure TCP unsent bytes for GSO".into());
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(format!("daemon: cannot measure TCP unsent bytes: {err}"));
         }
-        Ok(unsent < GSO_SEND_HIGH_WATER)
+        if unsent < 0 {
+            return Err("daemon: invalid TCP unsent byte count".into());
+        }
+        Ok(unsent < TCP_SEND_HIGH_WATER)
     }
 
     /// Whether one loop iteration did work.
@@ -3686,7 +3731,12 @@ mod linux_daemon {
 
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;
-        let protect_gso_send = tun.uses_tcpv4_gso();
+        let tun_fd = tun.raw_fd();
+        let gso_may_have_pending = tun.uses_tcpv4_gso();
+        // Leave non-GSO private DNS paths unchanged: their inbound responder
+        // can also write synchronously. Preserve preflight on all GSO paths.
+        let protect_send = gso_may_have_pending || (tun_fd.is_some() && private_dns.is_none());
+        let mut send_deferred_since = None;
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -3757,8 +3807,52 @@ mod linux_daemon {
             // When both sides write into full receive windows, neither can
             // reach the inbound turn. Leave packets in the host queue before
             // framing/encrypting them so the inbound path still makes progress.
-            let send_deferred = out_limit > 0 && protect_gso_send && !gso_send_has_room(sock_fd)?;
-            if out_limit > 0 && !send_deferred {
+            let preflight = if protect_send {
+                Some(poll_io(sock_fd, tun_fd, PathPoll::SendPreflight, Duration::ZERO)?)
+            } else {
+                None
+            };
+            // A GSO aggregate can have segments buffered in userspace even
+            // when the TUN fd no longer reports POLLIN.
+            let host_ready = preflight
+                .as_ref()
+                .is_none_or(|ready| gso_may_have_pending || ready.tun_readable);
+            let send_deferred = if let Some(ready) = &preflight
+                && out_limit > 0
+                && host_ready
+            {
+                !tcp_send_has_room(sock_fd, ready)?
+            } else {
+                false
+            };
+            if send_deferred
+                && preflight
+                    .as_ref()
+                    .is_some_and(|ready| ready.tun_readable && !ready.socket_terminal)
+            {
+                let now = Instant::now();
+                let since = *send_deferred_since.get_or_insert(now);
+                // Do not turn the existing I/O timeout into an unbounded
+                // retry for known queued host traffic, even if inbound is busy.
+                if now.duration_since(since) >= PATH_IO_TIMEOUT {
+                    if let Some(reason) = watchdog.fault() {
+                        path.close();
+                        return Err(reason);
+                    }
+                    // Circuit teardown attempts a best-effort reset. Shut down
+                    // the still-owned socket first so that write cannot block.
+                    // SAFETY: the active path still owns this socket descriptor.
+                    unsafe { libc::shutdown(sock_fd, libc::SHUT_RDWR) };
+                    path.close();
+                    break 'outer PathStop::Failed {
+                        kind: PathFailureKind::Transport,
+                        reason: "outbound circuit error: TCP send preflight timed out".into(),
+                    };
+                }
+            } else {
+                send_deferred_since = None;
+            }
+            if out_limit > 0 && host_ready && !send_deferred {
                 let started = io_timing.as_ref().map(|_| Instant::now());
                 let result = path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES);
                 if let (Some(timing), Some(started)) = (&mut io_timing, started) {
@@ -3814,8 +3908,12 @@ mod linux_daemon {
             let mut buffered = path.has_buffered_input();
             let mut socket_ready = if buffered {
                 false
+            } else if let Some(ready) = &preflight
+                && (!host_ready || send_deferred)
+            {
+                ready.socket_readable
             } else {
-                poll_io(sock_fd, None, Duration::ZERO)?.0
+                poll_io(sock_fd, tun_fd, PathPoll::SendDeferred, Duration::ZERO)?.socket_readable
             };
             for step in 0..MAX_INBOUND_BATCH_PACKETS {
                 if let Some(reason) = watchdog.fault() {
@@ -3847,11 +3945,7 @@ mod linux_daemon {
                         // current burst before starting another socket read.
                         // Keep the first inbound attempt on every turn, so a
                         // busy TUN cannot starve incoming traffic.
-                        if send_deferred {
-                            poll_io(sock_fd, None, Duration::ZERO)?.0
-                        } else {
-                            poll_additional_inbound(sock_fd, tun.raw_fd())?
-                        }
+                        poll_additional_inbound(sock_fd, tun_fd, send_deferred)?
                     };
                     if !buffered && !socket_ready {
                         break;
@@ -3908,7 +4002,12 @@ mod linux_daemon {
             buffered = path.has_buffered_input();
 
             if !made_progress && !buffered {
-                if tun.raw_fd().is_none() && !socket_ready {
+                if send_deferred {
+                    // Falling below the unsent watermark need not cause a
+                    // readiness transition. Retry briefly without spinning on
+                    // already-readable TUN or already-writable TCP descriptors.
+                    poll_io(sock_fd, tun_fd, PathPoll::SendDeferred, Duration::from_millis(1))?;
+                } else if tun_fd.is_none() && !socket_ready {
                     // In-memory endpoint: nothing to wait on, so yield briefly
                     // rather than spin at 100% CPU.
                     thread::sleep(VIRTUAL_IDLE_WAIT);
@@ -3916,14 +4015,7 @@ mod linux_daemon {
                     // One wait on both sources: an outbound packet arriving on
                     // the TUN wakes the loop immediately, and a TUN HUP/ERR is
                     // fail-closed inside `poll_io` instead of idling forever.
-                    let (tun_fd, wait) = if send_deferred {
-                        // The kernel can drain without making a readable event.
-                        // Recheck briefly without spinning on a ready TUN.
-                        (None, Duration::from_millis(1))
-                    } else {
-                        (tun.raw_fd(), IDLE_POLL_TIMEOUT)
-                    };
-                    poll_io(sock_fd, tun_fd, wait)?;
+                    poll_io(sock_fd, tun_fd, PathPoll::Read, IDLE_POLL_TIMEOUT)?;
                 }
             }
         };
@@ -4286,7 +4378,8 @@ mod linux_daemon {
             assert_eq!(unsafe { libc::pipe(tun.as_mut_ptr()) }, 0);
             // Closing the write end makes the TUN read end report POLLHUP.
             unsafe { libc::close(tun[1]) };
-            let result = poll_io(sock[0], Some(tun[0]), Duration::ZERO);
+            let result = poll_io(sock[0], Some(tun[0]), PathPoll::Read, Duration::ZERO);
+            let deferred = poll_io(sock[0], Some(tun[0]), PathPoll::SendDeferred, Duration::ZERO);
             unsafe {
                 libc::close(sock[0]);
                 libc::close(sock[1]);
@@ -4294,16 +4387,66 @@ mod linux_daemon {
             }
             let error = result.expect_err("a dead TUN must fail closed");
             assert!(error.contains("TUN"), "unexpected error: {error}");
+            let error = deferred.expect_err("send deferral must still observe TUN failure");
+            assert!(error.contains("TUN"), "unexpected error: {error}");
         }
 
         #[test]
-        fn gso_send_room_requires_a_live_tcp_socket() {
+        fn send_preflight_reuses_inbound_readiness_and_yields_to_recovered_send() {
+            use std::os::unix::net::UnixStream;
+
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let socket = TcpStream::connect(listener.local_addr().expect("address"))
-                .expect("connect");
-            let (_peer, _) = listener.accept().expect("accept");
-            assert_eq!(gso_send_has_room(socket.as_raw_fd()), Ok(true));
-            assert!(gso_send_has_room(-1).is_err());
+            let socket =
+                TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+            let (mut peer, _) = listener.accept().expect("accept");
+            let (tun, mut host) = UnixStream::pair().expect("TUN stand-in pair");
+            let sock_fd = socket.as_raw_fd();
+            let tun_fd = Some(tun.as_raw_fd());
+            host.write_all(b"t").expect("queue host packet");
+
+            let deferred = poll_io(sock_fd, tun_fd, PathPoll::SendDeferred, Duration::ZERO).unwrap();
+            assert!(!deferred.tun_readable && !deferred.socket_writable);
+            let ready = poll_io(sock_fd, tun_fd, PathPoll::SendPreflight, Duration::ZERO).unwrap();
+            assert!(ready.tun_readable);
+            assert_eq!(tcp_send_has_room(sock_fd, &ready), Ok(true));
+            assert!(tcp_send_has_room(-1, &ready).is_err());
+            assert_eq!(tcp_send_has_room(sock_fd, &deferred), Ok(false));
+
+            peer.write_all(b"s").expect("queue inbound data");
+            // Wait for arrival explicitly rather than assuming the receiver is
+            // ready as soon as the sender's write returns.
+            let inbound = poll_io(sock_fd, tun_fd, PathPoll::SendDeferred, Duration::from_secs(1))
+                .expect("wait for socket input");
+            assert!(inbound.socket_readable);
+            assert!(!poll_additional_inbound(sock_fd, tun_fd, true).unwrap());
+        }
+
+        #[test]
+        fn deferred_send_allows_a_read_while_the_socket_is_not_writable() {
+            use std::os::unix::net::UnixStream;
+
+            let (mut socket, mut peer) = UnixStream::pair().expect("socket pair");
+            let (tun, mut host) = UnixStream::pair().expect("TUN stand-in pair");
+            socket.set_nonblocking(true).unwrap();
+            let sock_fd = socket.as_raw_fd();
+            let tun_fd = Some(tun.as_raw_fd());
+            host.write_all(b"t").unwrap();
+            peer.write_all(b"s").unwrap();
+
+            // Leaving data unread on the peer removes POLLOUT. A Unix pair
+            // makes this deterministic without a TCP receive-window timer.
+            let data = [0; 8192];
+            for _ in 0..1024 {
+                match socket.write(&data) {
+                    Ok(n) if n > 0 => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(poll_additional_inbound(sock_fd, tun_fd, true).unwrap());
+                        return;
+                    }
+                    outcome => panic!("unexpected write result: {outcome:?}"),
+                }
+            }
+            panic!("socket was still writable after queueing up to 8 MiB without reads");
         }
 
         #[test]
@@ -4314,20 +4457,20 @@ mod linux_daemon {
             let (mut tun, mut host) = UnixStream::pair().expect("TUN stand-in pair");
             let socket_fd = tcp.as_raw_fd();
             let tun_fd = Some(tun.as_raw_fd());
-            assert!(!poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            assert!(!poll_additional_inbound(socket_fd, tun_fd, false).unwrap());
             peer.write_all(b"s").unwrap();
-            assert!(poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            assert!(poll_additional_inbound(socket_fd, tun_fd, false).unwrap());
             host.write_all(b"t").unwrap();
-            assert!(!poll_additional_inbound(socket_fd, tun_fd).unwrap());
-            assert!(poll_additional_inbound(socket_fd, None).unwrap());
+            assert!(!poll_additional_inbound(socket_fd, tun_fd, false).unwrap());
+            assert!(poll_additional_inbound(socket_fd, None, false).unwrap());
             let mut byte = [0];
             tun.read_exact(&mut byte).unwrap();
             assert_eq!(&byte, b"t");
-            assert!(poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            assert!(poll_additional_inbound(socket_fd, tun_fd, false).unwrap());
             tcp.read_exact(&mut byte).unwrap();
             assert_eq!(&byte, b"s");
             drop(host);
-            assert!(poll_additional_inbound(socket_fd, tun_fd).is_err());
+            assert!(poll_additional_inbound(socket_fd, tun_fd, false).is_err());
         }
 
         /// Local discards keep the loop hot but never count as delivery.
