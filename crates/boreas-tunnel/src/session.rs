@@ -641,6 +641,194 @@ mod tests {
     use crate::tls::strict_test_negotiated;
     use boreas_crypto::PolicyError;
     use boreas_proto::messages::Suite as TestSuite;
+    use std::io::{self, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordedIo {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    struct RecordingStream {
+        record: Arc<Mutex<RecordedIo>>,
+        write_limit: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl Read for RecordingStream {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for RecordingStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut record = self.record.lock().unwrap();
+            record.writes += 1;
+            let n = self.write_limit.map_or(buf.len(), |limit| {
+                buf.len().min(limit.saturating_sub(record.bytes.len()))
+            });
+            if n == 0 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            record.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.record.lock().unwrap().flushes += 1;
+            if self.fail_flush {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Duplex for RecordingStream {
+        fn has_buffered_input(&self) -> bool {
+            false
+        }
+    }
+
+    fn recording_session(
+        circuit_established: bool,
+        write_limit: Option<usize>,
+        fail_flush: bool,
+    ) -> (EstablishedSession, Arc<Mutex<RecordedIo>>) {
+        let policy = policy();
+        let authorized = AuthorizedSession {
+            peer: policy.expected_peer,
+            connection_instance: [1; 16],
+            mtu_cap: policy.mtu_cap,
+            security_mode: policy.security_mode,
+        };
+        let mut ctx = accepted_context(&policy, &authorized);
+        ctx.circuit_established = circuit_established;
+        let record = Arc::new(Mutex::new(RecordedIo::default()));
+        let io = FrameIo::new(Box::new(RecordingStream {
+            record: Arc::clone(&record),
+            write_limit,
+            fail_flush,
+        }));
+        (
+            EstablishedSession {
+                io,
+                ctx,
+                policy,
+                authorized,
+            },
+            record,
+        )
+    }
+
+    #[test]
+    fn relay_write_keeps_wire_format_and_one_write_per_frame() {
+        let (mut session, record) = recording_session(true, None, false);
+        let max_payload = vec![0xa5; messages::MAX_RELAY_PAYLOAD];
+        let id = [0x2a; 16];
+        let next_offset = max_payload.len() as u64;
+        session
+            .send_relay_fragment(id, 1, 0, 2, &max_payload)
+            .unwrap();
+        session
+            .send_relay_fragment(id, 1, next_offset, 2, b"tail")
+            .unwrap();
+
+        let record = record.lock().unwrap();
+        assert_eq!((record.writes, record.flushes), (2, 2));
+        let mut remaining = record.bytes.as_slice();
+        for (offset, payload) in [(0, max_payload.as_slice()), (next_offset, b"tail")] {
+            let header = AppHeader::parse(remaining[..HEADER_LEN].try_into().unwrap()).unwrap();
+            assert_eq!(header.kind, Kind::RelayCircuit);
+            assert_eq!(header.flags, 0);
+            let frame_len = HEADER_LEN + header.body_len as usize;
+            let body = &remaining[HEADER_LEN..frame_len];
+            let fragment = messages::RelayFragment::decode_ref(body).unwrap();
+            assert_eq!(fragment.circuit_id, id);
+            assert_eq!(fragment.direction, 1);
+            assert_eq!(fragment.byte_offset, offset);
+            assert_eq!(fragment.hops_remaining, 2);
+            assert_eq!(fragment.payload, payload);
+            remaining = &remaining[frame_len..];
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn relay_write_preserves_bounds_and_session_policy() {
+        let id = [0x2a; 16];
+        let (mut session, record) = recording_session(false, None, false);
+        let oversized = vec![0; messages::MAX_RELAY_PAYLOAD + 1];
+        for (direction, offset, hops, payload, error) in [
+            (
+                2,
+                0,
+                1,
+                b"x".as_slice(),
+                messages::MessageError::InvalidDirection(2),
+            ),
+            (
+                0,
+                0,
+                0,
+                b"x".as_slice(),
+                messages::MessageError::InvalidHopCount(0),
+            ),
+            (
+                0,
+                u64::MAX,
+                1,
+                b"x".as_slice(),
+                messages::MessageError::OffsetOverflow,
+            ),
+            (
+                0,
+                0,
+                1,
+                oversized.as_slice(),
+                messages::MessageError::PayloadTooLarge(oversized.len()),
+            ),
+        ] {
+            assert_eq!(
+                session.send_relay_fragment(id, direction, offset, hops, payload),
+                Err(TunnelError::Message(error)),
+            );
+        }
+        assert_eq!(
+            session.send_relay_fragment(id, 0, 0, 1, b"x"),
+            Err(TunnelError::Frame(boreas_proto::Error::IllegalState)),
+        );
+        assert_eq!(
+            session.send_relay_fragment(id, 0, 0, 1, b"x"),
+            Err(TunnelError::Poisoned),
+        );
+        let record = record.lock().unwrap();
+        assert_eq!((record.writes, record.flushes), (0, 0));
+    }
+
+    #[test]
+    fn relay_partial_write_or_flush_failure_poisons_all_writes() {
+        let id = [0x2a; 16];
+        for (limit, fail_flush, calls) in [(Some(3), false, (2, 0)), (None, true, (1, 1))] {
+            let (mut session, record) = recording_session(true, limit, fail_flush);
+            assert_eq!(
+                session.send_relay_fragment(id, 0, 0, 1, b"payload"),
+                Err(TunnelError::Io(io::ErrorKind::BrokenPipe)),
+            );
+            assert_eq!(
+                session.send_relay_fragment(id, 0, 0, 1, b"retry"),
+                Err(TunnelError::Poisoned),
+            );
+            assert_eq!(
+                session.send_control(ControlType::Probe, &[ControlType::Probe as u8]),
+                Err(TunnelError::Poisoned),
+            );
+            let record = record.lock().unwrap();
+            assert_eq!((record.writes, record.flushes), calls);
+        }
+    }
 
     fn identity(node_id: u16, generation: u64, role: NodeRole) -> PeerIdentity {
         PeerIdentity::legacy_default([7; 16], node_id, generation, role)
