@@ -38,7 +38,7 @@ Boreas 的目标是让业务 IP 报文经由 TCP/WSS 承载穿过常见网络，
 - **想先理解限制并手动搭建双机：** 从[双机公网部署教程](docs/deployment/README.md)开始。它涵盖离线 PKI、Core/Edge 配置、TUN 路由、状态检查、systemd 示例与排错；示例中所有 IP、域名、序号与权限都需按环境审阅。
 - **想审阅安装步骤：** 看[受限一键安装指南](docs/deployment/ONE_CLICK.md)。先用 `--dry-run`；它安装已有二进制，不负责编译，也不会替你验证来源信任、生产路由或设备兼容性。
 - **想看控制台：** `boreas-easy` 是行式三语入口，不是 curses/图形 TUI。交互终端下可以逐行操作；非 TTY 环境输出一次 JSON，避免脚本挂起。具体状态与可用操作以运行时探测和权限为准。
-- **想开发或审阅实现：** 查看[实现状态与证据门禁](docs/engineering/implementation-status.md)、[配置字段说明](docs/config/README.md)及仓库内工作流。
+- **想开发或审阅实现：** 查看[实现状态与证据门禁](docs/engineering/implementation-status.md)、[配置字段说明](docs/config/README.md)和 [GitHub Actions 测试导航](docs/engineering/ci-workflows.md)。
 
 ### `boreas-easy` 快速入口
 

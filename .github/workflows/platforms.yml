@@ -46,38 +46,10 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  lock-preflight:
-    name: Locked dependency preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Verify Cargo.lock satisfies every workspace manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! cargo metadata --locked --format-version 1 --no-deps > workspace-metadata.json 2> lock-error.txt; then
-            cat lock-error.txt
-            echo "::error title=Stale Cargo.lock::Cargo.lock does not satisfy the workspace manifests. Dispatch the 'Refresh Cargo.lock' workflow on main, review its validated diff, then rerun this workflow."
-            exit 1
-          fi
-          sha256sum Cargo.lock | tee cargo-lock.sha256
-          echo "Cargo.lock SHA-256: $(cut -d' ' -f1 cargo-lock.sha256)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload locked workspace metadata
-        uses: actions/upload-artifact@v7
-        with:
-          name: lock-preflight-${{ github.run_id }}
-          path: |
-            workspace-metadata.json
-            cargo-lock.sha256
-          if-no-files-found: error
-          retention-days: 7
-
   build-test:
+    # Every target resolves and tests with --locked. Quick checks also resolves
+    # the full workspace graph; a serial --no-deps metadata job adds no gate.
     name: ${{ matrix.label }}
-    needs: lock-preflight
     strategy:
       fail-fast: false
       matrix:
@@ -378,10 +350,8 @@ jobs:
   development-bundle:
     name: Five-target development bundle (unsigned; production blocked)
     needs:
-      - lock-preflight
       - build-test
       - linux-runtime-compat
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
