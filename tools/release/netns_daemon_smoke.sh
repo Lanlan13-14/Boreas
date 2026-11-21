@@ -23,6 +23,15 @@ BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+PRIVATE_DNS="${BOREAS_NETNS_PRIVATE_DNS:-0}"
+if [[ "$PRIVATE_DNS" != 0 && "$PRIVATE_DNS" != 1 ]]; then
+  echo 'ERROR: BOREAS_NETNS_PRIVATE_DNS must be 0 or 1' >&2
+  exit 1
+fi
+if [[ "$PRIVATE_DNS" == 1 && ( "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ) ]]; then
+  echo 'ERROR: DNS netns slice is not a performance/netem scenario' >&2
+  exit 1
+fi
 if [[ "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 ]]; then
   if [[ "$BOREAS_NETNS_MULTISTREAM" != 1 || ! "${BOREAS_NETEM_RTT_MS:-}" =~ ^[1-9][0-9]{0,3}$ ]]; then
     echo 'ERROR: BOREAS_NETNS_MULTISTREAM=1 requires positive BOREAS_NETEM_RTT_MS (one-way ms)' >&2
@@ -733,6 +742,19 @@ for spec in "core:$CORE_STATE" "edge:$EDGE_STATE"; do
   fi
 done
 
+CORE_DNS_ARGS=()
+EDGE_DNS_ARGS=()
+DNS_FIXTURE="$(dirname "$PERF_SCRIPT")/netns_private_dns_fixture.py"
+if [[ "$PRIVATE_DNS" == 1 ]]; then
+  DNS_DIR="$WORK/dns-objects"
+  DNS_PIN="$WORK/dns-current.pin"
+  python3 "$DNS_FIXTURE" "$CA_DIR" "$POLICY_FIXTURE_DIR/tbs.cbor" "$DNS_DIR" "$DNS_PIN" "$TEST_NET_ID"
+  cp -- "$DNS_PIN" "$WORK/dns-edge.pin"
+  chmod 0400 "$DNS_PIN" "$WORK/dns-edge.pin" "$DNS_DIR"/*
+  CORE_DNS_ARGS=(--private-dns-dir "$DNS_DIR" --private-dns-pin "$DNS_PIN")
+  EDGE_DNS_ARGS=(--private-dns-dir "$DNS_DIR" --private-dns-pin "$WORK/dns-edge.pin")
+fi
+
 "$BIN" pki issue-node \
   --ca-dir "$CA_DIR" \
   --out-dir "$CORE_MAT" \
@@ -797,6 +819,12 @@ paths = 4
 probe_paths = 1
 EOF
 chmod 0600 "$WORK/edge.toml"
+if [[ "$PRIVATE_DNS" == 1 ]]; then
+  for label in core edge; do
+    printf '\n[dns]\nzone = "private.boreas.test"\nlisten_vip = "10.20.0.53"\n' >> "$WORK/$label.toml"
+  done
+fi
+
 
 # Create isolated network namespaces and underlay veth link.
 ip netns add "$CORE_NS"
@@ -867,7 +895,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --material-dir "$CORE_MAT" \
   --status-state-file "$CORE_STATE/status.state" \
   --status-state-owner-uid "$STATE_OWNER_UID" \
-  "${CORE_POLICY_ARGS[@]}" \
+  "${CORE_POLICY_ARGS[@]}" "${CORE_DNS_ARGS[@]}" \
   --listen "192.0.2.1:8443" \
   --tun-name "btun0" \
   --mtu "$TUN_MTU" \
@@ -898,7 +926,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --material-dir "$EDGE_MAT" \
   --status-state-file "$EDGE_STATE/status.state" \
   --status-state-owner-uid "$STATE_OWNER_UID" \
-  "${EDGE_POLICY_ARGS[@]}" \
+  "${EDGE_POLICY_ARGS[@]}" "${EDGE_DNS_ARGS[@]}" \
   --connect "192.0.2.1:8443" \
   --tls-name "wss.boreas.test" \
   --ws-host "wss.boreas.test:8443" \
@@ -922,6 +950,9 @@ probe_ctl_state edge_tun_observed edge "$EDGE_STATE/control.sock"
 ip netns exec "$EDGE_NS" ip addr add 10.20.1.2/32 dev btun0
 ip netns exec "$EDGE_NS" ip link set btun0 up
 ip netns exec "$EDGE_NS" ip route add 10.20.1.1/32 dev btun0
+if [[ "$PRIVATE_DNS" == 1 ]]; then
+  ip -n "$EDGE_NS" route add 10.20.0.53/32 dev btun0 src 10.20.1.2
+fi
 
 run_hook ready
 
@@ -955,6 +986,32 @@ if [[ "$CONNECTED" -ne 1 ]]; then
   echo "ERROR: Edge daemon never reached connected state" >&2
   report_failure_evidence
   exit 1
+fi
+
+if [[ "$PRIVATE_DNS" == 1 ]]; then
+  ip netns exec "$EDGE_NS" python3 "$DNS_FIXTURE" probe
+  ip netns exec "$EDGE_NS" ping -c 2 -W 2 -I 10.20.1.2 10.20.1.1
+  # Withdraw the independently mounted pin while the circuit is active.
+  # A successful clean exit is wrong; require a real DNS invalidation reason.
+  mv "$DNS_PIN" "$DNS_PIN.withdrawn"
+  for _ in $(seq 1 60); do
+    if ! kill -0 "$(<"$WORK/core.pid")" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  if kill -0 "$(<"$WORK/core.pid")" 2>/dev/null; then
+    echo 'ERROR: Core did not halt after DNS pin withdrawal' >&2
+    exit 1
+  fi
+  if wait "$(<"$WORK/core.pid")"; then
+    echo 'ERROR: DNS pin withdrawal reported a clean Core exit' >&2
+    exit 1
+  fi
+  if [[ "$(<"$WORK/core.err")" != *'private DNS authorization lost'* ]]; then
+    echo 'ERROR: missing Core DNS invalidation reason' >&2
+    exit 1
+  fi
+  echo 'private_dns_pin_withdrawal=core_halted_fail_closed'
+  exit 0
 fi
 
 # Exercise sparse ICMP traffic and reject the former fixed 25 ms polling delay.

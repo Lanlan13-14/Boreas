@@ -316,6 +316,45 @@ struct Question {
     edns_size: Option<usize>,
 }
 
+/// Matching key for a private DNS request and the question echoed in its reply.
+/// This does not validate or authenticate answer RRs; the transport must bind
+/// the authenticated responder and the application must still match replies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateQuestion {
+    id: u16,
+    name: String,
+    qtype: u16,
+}
+
+impl PrivateQuestion {
+    /// Apply the responder's query parser and exact label-boundary rule.
+    pub fn query(message: &[u8], origin: &str) -> Option<Self> {
+        let Question {
+            id, name, qtype, ..
+        } = parse_query(message).ok()?;
+        is_in_zone(&name, origin).then_some(Self { id, name, qtype })
+    }
+
+    /// Require one IN question in a private-only DNS response.
+    pub fn response(message: &[u8], origin: &str) -> Option<Self> {
+        if message.len() > MAX_RESPONSE_BYTES
+            || u16_at(message, 2).map(|flags| flags & 0xf8c0) != Ok(0x8000)
+            || u16_at(message, 4) != Ok(1)
+        {
+            return None;
+        }
+        let (name, end) = decode_name(message, 12).ok()?;
+        if !is_in_zone(&name, origin) || u16_at(message, end + 2) != Ok(CLASS_IN) {
+            return None;
+        }
+        Some(Self {
+            id: u16_at(message, 0).ok()?,
+            name,
+            qtype: u16_at(message, end).ok()?,
+        })
+    }
+}
+
 fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
     if msg.len() > MAX_QUERY_BYTES {
         return Err(DnsError::MessageTooLarge);

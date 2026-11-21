@@ -48,7 +48,7 @@ pub struct PolicyInputPaths<'a> {
 }
 
 #[cfg(feature = "openssl-inner-tls")]
-fn read_bounded_regular(
+pub(crate) fn read_bounded_regular(
     path: &Path,
     max: usize,
     label: &'static str,
@@ -115,6 +115,35 @@ pub fn verify_and_record_default_policy(
     expected_root_fingerprint: [u8; 32],
     trusted_owner_uid: u32,
 ) -> Result<boreas_pki::VerifiedNetworkContext, PolicyRuntimeError> {
+    let (token, _) = verify_and_record_policy_material(
+        inputs,
+        state_path,
+        configured_state_dir,
+        expected_net_id,
+        expected_root_fingerprint,
+        trusted_owner_uid,
+    )?;
+    token
+        .require_default_runtime()
+        .map_err(|_| PolicyRuntimeError::UnsupportedPrefix)
+}
+
+/// Keep the exact token and root used in the durable acceptance transaction.
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) fn verify_and_record_policy_material(
+    inputs: PolicyInputPaths<'_>,
+    state_path: &Path,
+    configured_state_dir: &Path,
+    expected_net_id: [u8; 16],
+    expected_root_fingerprint: [u8; 32],
+    trusted_owner_uid: u32,
+) -> Result<
+    (
+        boreas_pki::VerifiedNetworkPolicy,
+        boreas_pki::NetworkRootPin,
+    ),
+    PolicyRuntimeError,
+> {
     use boreas_pki::{
         NetworkRootPin, network_policy_store::NetworkPolicyStore, verify_network_policy,
     };
@@ -226,7 +255,7 @@ pub fn verify_and_record_default_policy(
     let now = u64::try_from(now).map_err(|_| PolicyRuntimeError::Clock)?;
     let token = verify_network_policy(&tbs, &ed_sig, &pq_sig, &pin, expected_net_id, now)
         .map_err(|e| PolicyRuntimeError::Verify(e.to_string()))?;
-    let context = token
+    token
         .require_default_runtime()
         .map_err(|_| PolicyRuntimeError::UnsupportedPrefix)?;
     let mut store =
@@ -235,7 +264,7 @@ pub fn verify_and_record_default_policy(
     store
         .commit(&token, &tbs)
         .map_err(|e| PolicyRuntimeError::Store(e.to_string()))?;
-    Ok(context)
+    Ok((token, pin))
 }
 
 #[cfg(all(test, feature = "openssl-inner-tls"))]
