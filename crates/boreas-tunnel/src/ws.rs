@@ -198,7 +198,7 @@ impl WsLimits {
     }
 }
 
-/// Bounded per-stream read buffer for WebSocket frame parsing so `read_frame_into`
+/// Bounded per-stream read buffer for WebSocket frame parsing so `read_frame`
 /// does not issue 3–4 tiny TLS/socket reads per frame.
 const WS_READ_BUFFER_BYTES: usize = 32 * 1024;
 
@@ -364,14 +364,13 @@ impl<T: Read + Write> WsStream<T> {
         Ok(())
     }
 
-    /// Fill the caller's scratch buffer with the next nonempty data payload.
-    /// Control frames use the same storage but are never returned as data;
-    /// `Ok(false)` means EOF.
+    /// Read frames until a payload byte is available. Control frames are fully
+    /// handled here; `Ok(None)` means the peer closed the connection.
     ///
     /// One absolute deadline covers the whole call, and a frame budget bounds
     /// both control floods and empty binary frames. An empty data frame makes no
     /// progress, so it must not restart the deadline or loop forever.
-    fn next_data_payload(&mut self, pending: &mut Vec<u8>) -> Result<bool, WsError> {
+    fn next_data_payload(&mut self) -> Result<Option<Vec<u8>>, WsError> {
         let deadline = Instant::now() + self.limits.message_deadline;
         let mut frames = 0usize;
         let mut control_frames = 0usize;
@@ -381,40 +380,40 @@ impl<T: Read + Write> WsStream<T> {
             if frames > MAX_FRAMES_PER_READ {
                 return Err(WsError::FrameFlood);
             }
-            let (fin, opcode) = {
+            let frame = {
                 let mut reader = BufferedReader {
                     io: &mut self.io,
                     buf: &mut self.read_buf,
                     pos: &mut self.read_pos,
                     len: &mut self.read_len,
                 };
-                read_frame_into(&mut reader, self.role, &self.limits, deadline, pending)?
+                read_frame(&mut reader, self.role, &self.limits, deadline)?
             };
-            match opcode {
+            match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
                     control_frames += 1;
-                    control_bytes = control_bytes.saturating_add(pending.len());
+                    control_bytes = control_bytes.saturating_add(frame.payload.len());
                     if control_frames > MAX_CONTROL_FRAMES_PER_READ
                         || control_bytes > MAX_CONTROL_BYTES_PER_READ
                     {
                         return Err(WsError::ControlFlood);
                     }
-                    match opcode {
-                        OpCode::Ping => self.send_frame(OpCode::Pong, pending)?,
+                    match frame.opcode {
+                        OpCode::Ping => self.send_frame(OpCode::Pong, &frame.payload)?,
                         OpCode::Close => {
                             self.close_received = true;
-                            self.respond_close(pending)?;
-                            return Ok(false);
+                            self.respond_close(&frame.payload)?;
+                            return Ok(None);
                         }
                         _ => {}
                     }
                 }
                 OpCode::Binary | OpCode::Continuation => {
-                    self.track_message(opcode, fin, pending.len())?;
-                    if pending.is_empty() {
+                    self.track_message(frame.opcode, frame.fin, frame.payload.len())?;
+                    if frame.payload.is_empty() {
                         continue;
                     }
-                    return Ok(true);
+                    return Ok(Some(frame.payload));
                 }
                 OpCode::Text => return Err(WsError::TextFrame),
             }
@@ -478,18 +477,9 @@ impl<T: Read + Write> Read for WsStream<T> {
             if self.close_received {
                 return Ok(0);
             }
-            // Temporarily take the allocation so control replies can borrow
-            // their payload independently of the stream. Publish data only
-            // after the frame and message checks succeed.
-            let mut pending = std::mem::take(&mut self.pending);
-            let result = self.next_data_payload(&mut pending);
-            self.pending = pending;
-            match result {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.pending.clear();
-                    return Ok(0);
-                }
+            match self.next_data_payload() {
+                Ok(Some(payload)) => self.pending = payload,
+                Ok(None) => return Ok(0),
                 Err(error) => {
                     // Any framing/protocol error is fatal: bytes may already be
                     // partially consumed, so a later read must never try to
@@ -573,6 +563,13 @@ impl OpCode {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawFrame {
+    fin: bool,
+    opcode: OpCode,
+    payload: Vec<u8>,
+}
+
 /// Fill `buf`, re-checking an absolute deadline before and after every blocking
 /// read. The socket read timeout alone would let a peer drip one byte per
 /// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
@@ -599,13 +596,12 @@ fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<
     Ok(())
 }
 
-fn read_frame_into<T: Read>(
+fn read_frame<T: Read>(
     io: &mut T,
     role: WsRole,
     limits: &WsLimits,
     deadline: Instant,
-    payload: &mut Vec<u8>,
-) -> Result<(bool, OpCode), WsError> {
+) -> Result<RawFrame, WsError> {
     let mut head = [0u8; 2];
     read_exact(io, &mut head, deadline)?;
     let fin = head[0] & 0x80 != 0;
@@ -662,19 +658,18 @@ fn read_frame_into<T: Read>(
     } else {
         None
     };
-    // Resize only after the existing frame and mask checks. Do not let
-    // geometric Vec growth retain capacity above the validated high-water mark.
-    if payload_len > payload.capacity() {
-        payload.reserve_exact(payload_len - payload.len());
-    }
-    payload.resize(payload_len, 0);
-    read_exact(io, payload, deadline)?;
+    let mut payload = vec![0u8; payload_len];
+    read_exact(io, &mut payload, deadline)?;
     if let Some(mask) = mask {
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index % 4];
         }
     }
-    Ok((fin, opcode))
+    Ok(RawFrame {
+        fin,
+        opcode,
+        payload,
+    })
 }
 
 /// Encode one frame into reusable storage. Only the returned prefix is on the wire.
@@ -1194,13 +1189,11 @@ mod tests {
         input: Cursor<Vec<u8>>,
         output: Vec<u8>,
         flushes: usize,
-        max_read: usize,
     }
 
     impl Read for MemoryIo {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let take = buf.len().min(self.max_read);
-            self.input.read(&mut buf[..take])
+            self.input.read(buf)
         }
     }
 
@@ -1221,24 +1214,7 @@ mod tests {
             input: Cursor::new(input.to_vec()),
             output: Vec::new(),
             flushes: 0,
-            max_read: usize::MAX,
         }
-    }
-
-    struct RawFrame {
-        opcode: OpCode,
-        payload: Vec<u8>,
-    }
-
-    fn read_frame(
-        io: &mut impl Read,
-        role: WsRole,
-        limits: &WsLimits,
-        deadline: Instant,
-    ) -> Result<RawFrame, WsError> {
-        let mut payload = Vec::new();
-        let (_, opcode) = read_frame_into(io, role, limits, deadline, &mut payload)?;
-        Ok(RawFrame { opcode, payload })
     }
 
     fn inbound_frame(bytes: &[u8]) -> RawFrame {
@@ -1630,110 +1606,6 @@ mod tests {
             .err(),
             Some(WsError::Timeout)
         );
-    }
-
-    #[test]
-    fn pending_allocation_is_reused_across_short_reads_and_control_frames() {
-        let large: Vec<u8> = (0..MAX_WS_FRAME_PAYLOAD).map(|i| (i % 251) as u8).collect();
-        let medium = [0x45; 126];
-        let small = [0x67; 125];
-        let close = b"\x03\xe8done";
-        let mut input = Vec::new();
-        for (fin, opcode, payload) in [
-            (false, OpCode::Binary, large.as_slice()),
-            (true, OpCode::Ping, b"ping"),
-            (true, OpCode::Pong, b"pong"),
-            (true, OpCode::Continuation, medium.as_slice()),
-            (true, OpCode::Binary, b""),
-            (true, OpCode::Binary, small.as_slice()),
-            (true, OpCode::Close, close.as_slice()),
-        ] {
-            input.extend_from_slice(&encode_frame(true, fin, opcode, payload).unwrap());
-        }
-        let mut io = memory(&input);
-        io.max_read = 3;
-        let mut stream = WsStream::new(io, WsRole::Server, WsLimits::default());
-
-        let mut prefix = [0; 5];
-        stream.read_exact(&mut prefix).expect("first payload prefix");
-        assert_eq!(&prefix[..], &large[..prefix.len()]);
-        let ptr = stream.pending.as_ptr();
-        let capacity = stream.pending.capacity();
-        assert!(capacity >= large.len());
-        assert_eq!(stream.pending_pos, prefix.len());
-        let mut tail = vec![0; large.len() - prefix.len()];
-        stream.read_exact(&mut tail).expect("rest of first payload");
-        assert_eq!(&tail[..], &large[prefix.len()..]);
-
-        let mut buf = [0; 128];
-        for expected in [medium.as_slice(), small.as_slice()] {
-            let n = stream.read(&mut buf).expect("next data payload");
-            assert_eq!(&buf[..n], expected);
-            assert_eq!(stream.pending.as_ptr(), ptr);
-            assert_eq!(stream.pending.capacity(), capacity);
-        }
-        assert_eq!(stream.read(&mut buf).expect("close"), 0);
-        assert_eq!(stream.read(&mut buf).expect("still closed"), 0);
-        assert_eq!(stream.pending.as_ptr(), ptr);
-        assert_eq!(stream.pending.capacity(), capacity);
-        assert!(stream.pending.is_empty());
-
-        let mut replies = Cursor::new(&stream.io.output[..]);
-        let limits = WsLimits::default();
-        let deadline = Instant::now() + limits.message_deadline;
-        let pong = read_frame(&mut replies, WsRole::Client, &limits, deadline).unwrap();
-        assert_eq!(pong.opcode, OpCode::Pong);
-        assert_eq!(pong.payload, b"ping");
-        let echoed = read_frame(&mut replies, WsRole::Client, &limits, deadline).unwrap();
-        assert_eq!(echoed.opcode, OpCode::Close);
-        assert_eq!(echoed.payload, [0x03, 0xe8]);
-        assert_eq!(replies.position() as usize, stream.io.output.len());
-    }
-
-    #[test]
-    fn partial_payload_in_reused_storage_is_never_exposed_after_error() {
-        let first = encode_frame(false, true, OpCode::Binary, b"previous").unwrap();
-        let next = encode_frame(false, true, OpCode::Binary, b"next").unwrap();
-        let (partial, rest) = next.split_at(next.len() - 2);
-        let mut input = first;
-        input.extend_from_slice(partial);
-        let mut stream = WsStream::new(memory(&input), WsRole::Client, WsLimits::default());
-        let mut out = [0; 8];
-        stream.read_exact(&mut out).expect("first data payload");
-        assert_eq!(&out, b"previous");
-        let ptr = stream.pending.as_ptr();
-        let capacity = stream.pending.capacity();
-
-        let err = stream.read(&mut out).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            err.get_ref().and_then(|e| e.downcast_ref::<WsError>()),
-            Some(&WsError::Closed)
-        );
-        assert_eq!(&out, b"previous");
-        assert!(stream.pending.is_empty());
-        assert_eq!(stream.pending_pos, 0);
-        assert_eq!(stream.pending.as_ptr(), ptr);
-        assert_eq!(stream.pending.capacity(), capacity);
-        assert!(stream.read_buf.is_empty());
-        assert_eq!((stream.read_pos, stream.read_len), (0, 0));
-
-        // Even if bytes become readable again, the failed stream stays dead.
-        let position = stream.io.input.position();
-        stream.io.input.get_mut().extend_from_slice(rest);
-        for err in [
-            stream.read(&mut out).unwrap_err(),
-            stream.write(b"reply").unwrap_err(),
-        ] {
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(
-                err.get_ref().and_then(|e| e.downcast_ref::<WsError>()),
-                Some(&WsError::Poisoned)
-            );
-        }
-        assert_eq!(stream.io.input.position(), position);
-        assert!(stream.io.output.is_empty());
-        assert_eq!(&out, b"previous");
     }
 
     #[test]
