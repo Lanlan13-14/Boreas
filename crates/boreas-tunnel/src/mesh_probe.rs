@@ -42,6 +42,8 @@ pub enum Error {
     Clock,
     NoRoute,
     WrongReply,
+    /// TCP dial failed before emitting any TLS bytes (graph profile only).
+    PathUnavailable(TunnelError),
     Transport(TunnelError),
 }
 
@@ -257,6 +259,20 @@ impl<'a> MeshProbe<'a> {
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
         admission: &Admission,
     ) -> Result<Adjacency, Error> {
+        self.dial_classified(candidates, outer, admission, None)
+            .map_err(|error| match error {
+                Error::PathUnavailable(cause) => Error::Transport(cause),
+                other => other,
+            })
+    }
+
+    pub(crate) fn dial_classified(
+        &mut self,
+        candidates: &[Candidate<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+        route_deadline: Option<Instant>,
+    ) -> Result<Adjacency, Error> {
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
         }
@@ -283,7 +299,13 @@ impl<'a> MeshProbe<'a> {
         ordered.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2));
         let mut last_dial = Error::NoRoute;
         for (index, (_, _, id, peer, target)) in ordered.into_iter().enumerate() {
-            let deadline = self.deadline(&peer)?;
+            let mut deadline = self.deadline(&peer)?;
+            if let Some(route_deadline) = route_deadline {
+                deadline = deadline.min(route_deadline);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Status);
+            }
             let handshake = admission.reserve_handshake().map_err(TunnelError::from)?;
             let buffer = admission
                 .reserve_bytes(crate::runtime::CONNECTION_BUFFER_BUDGET)
@@ -300,7 +322,7 @@ impl<'a> MeshProbe<'a> {
             {
                 Ok(tcp) => tcp,
                 Err(error) if path_loss(error.kind()) => {
-                    last_dial = Error::Transport(error.into());
+                    last_dial = Error::PathUnavailable(error.into());
                     continue;
                 }
                 Err(error) => return Err(Error::Transport(error.into())),

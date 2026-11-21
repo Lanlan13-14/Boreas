@@ -35,11 +35,19 @@ pub struct FixedRoute {
     pub(crate) position: usize,
     /// Per-member replay head and exclusive UTC deadline for graph routes.
     pub(crate) advertisements: Vec<([u8; 32], u64)>,
+    pub(crate) attempt_until: Option<Instant>,
 }
 
 impl FixedRoute {
-    fn deadline(&self, probe: &mut MeshProbe<'_>, links: &[&Adjacency]) -> Result<Instant, Error> {
+    pub(crate) fn deadline(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        links: &[&Adjacency],
+    ) -> Result<Instant, Error> {
         let mut deadline = probe.route_deadline(&self.members, links)?;
+        if let Some(until) = self.attempt_until {
+            deadline = deadline.min(until);
+        }
         for (member, &(id, expiry)) in self.members.iter().zip(&self.advertisements) {
             deadline = deadline.min(probe.route_lsa_deadline(member, id, expiry)?);
         }
@@ -82,6 +90,7 @@ impl MeshProbe<'_> {
             members,
             position: pos,
             advertisements: Vec::new(),
+            attempt_until: None,
         })
     }
 }

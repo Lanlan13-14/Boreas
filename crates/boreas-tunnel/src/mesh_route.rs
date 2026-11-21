@@ -3,14 +3,18 @@
 //! assertion. The caller provisions the graph snapshot and dedicated listeners;
 //! this module is not discovery, LSA flooding, or a shared listener dispatcher.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::ErrorKind, net::TcpStream, time::Instant};
 
 use boreas_pki::management::VerifiedObject;
 use boreas_proto::{messages::PathRole, objects::ObjectBody};
 
 use crate::{
-    mesh_probe::{Core, Error, MeshProbe},
-    mesh_relay::FixedRoute,
+    ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
+    e2e::E2eCircuit,
+    mesh_probe::{ATTEMPT_LIMIT, Candidate, Core, Error, MeshProbe},
+    mesh_relay::{FixedRoute, Forwarded, forward_fixed, with_fixed_endpoint},
+    resource::Admission,
+    ws::WsError,
 };
 
 const MAX_CORES: usize = 16;
@@ -51,14 +55,11 @@ impl MeshProbe<'_> {
         if local.identity.peer_identity() != self.local() {
             return Err(Error::Identity);
         }
-        let mut vertices = BTreeMap::from([(
-            local.id,
-            Vertex {
-                core: local,
-                identity: local_identity,
-                lsa: self.local_lsa().clone(),
-            },
-        )]);
+        let mut vertices = BTreeMap::from([(local.id, Vertex {
+            core: local,
+            identity: local_identity,
+            lsa: self.local_lsa().clone(),
+        })]);
         for raw in others {
             let core = self.verified_core(raw.identity)?;
             // Verify before rejecting duplicate IDs so a signed fork poisons
@@ -67,12 +68,19 @@ impl MeshProbe<'_> {
             if vertices.contains_key(&core.id) {
                 return Err(Error::Lsa);
             }
-            vertices.insert(core.id, Vertex { core, identity: raw.identity, lsa });
+            vertices.insert(core.id, Vertex {
+                core,
+                identity: raw.identity,
+                lsa,
+            });
         }
         for v in vertices.values() {
             self.route_lsa_deadline(&v.core, v.lsa.object_id(), v.lsa.valid_until())?;
         }
-        Ok(VerifiedGraph { local: self.local(), vertices })
+        Ok(VerifiedGraph {
+            local: self.local(),
+            vertices,
+        })
     }
 }
 
@@ -106,10 +114,16 @@ impl VerifiedGraph<'_> {
     /// Exact receiver/relay route for a dedicated listener. Provisioning an
     /// ordered list constrains where the listener can go; it does not bypass
     /// two-sided signed adjacency or the endpoint/profile binding.
-    pub fn authorize_path(&self, probe: &mut MeshProbe<'_>, ids: &[u8]) -> Result<FixedRoute, Error> {
+    pub fn authorize_path(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        ids: &[u8],
+    ) -> Result<FixedRoute, Error> {
         self.owner(probe)?;
         if !(3..=MAX_ROUTE_CORES).contains(&ids.len())
-            || ids.windows(2).any(|pair| self.edge(pair[0], pair[1]).is_none())
+            || ids
+                .windows(2)
+                .any(|pair| self.edge(pair[0], pair[1]).is_none())
             || ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id))
         {
             return Err(Error::NoRoute);
@@ -130,7 +144,12 @@ impl VerifiedGraph<'_> {
             .iter()
             .position(|m| m.identity.peer_identity() == self.local)
             .ok_or(Error::Identity)?;
-        Ok(FixedRoute { members, position, advertisements })
+        Ok(FixedRoute {
+            members,
+            position,
+            advertisements,
+            attempt_until: Some(Instant::now() + ATTEMPT_LIMIT),
+        })
     }
 
     fn check_vertex(&self, probe: &mut MeshProbe<'_>, v: &Vertex<'_>) -> Result<(), Error> {
@@ -155,4 +174,193 @@ impl VerifiedGraph<'_> {
         tie[..ids.len()].copy_from_slice(ids);
         Some((loss, rtt, ids.len(), tie))
     }
+}
+
+/// One preprovisioned listener for an exact route. The locator is not trusted
+/// for identity. Routes must use distinct first hops so a failed first-hop
+/// connection cannot fill the budget with routes that use the same link.
+pub struct RouteLocator<'a> {
+    pub path: &'a [u8],
+    pub target: &'a ClientTarget,
+}
+
+const MAX_ROUTE_ATTEMPTS: usize = 3;
+
+impl VerifiedGraph<'_> {
+    /// Open a dedicated E2E circuit across the best eligible signed path.
+    /// On typed path loss only, close it before opening a fresh circuit on
+    /// the next path. No stream/fragment/offset or application data is queued
+    /// or replayed by this API. `exchange` is called once per *confirmed*
+    /// circuit and must make an explicit choice about application replay (e.g.
+    /// run an idempotent query or submit the next independent FIFO item).
+    /// The network budget is three sequential attempts, five seconds each;
+    /// trusted callback computation itself is not interruptible.
+    pub fn connect<T>(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        locators: &[RouteLocator<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+        mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>) -> Result<T, TunnelError>,
+    ) -> Result<T, Error> {
+        self.owner(probe)?;
+        if locators.is_empty() || locators.len() > MAX_ROUTE_ATTEMPTS {
+            return Err(Error::NoRoute);
+        }
+        let mut ranked = Vec::with_capacity(locators.len());
+        let mut first_hops = Vec::with_capacity(locators.len());
+        let source = locators[0].path.first();
+        let destination = locators[0].path.last();
+        for locator in locators {
+            let path = locator.path;
+            if !(3..=MAX_ROUTE_CORES).contains(&path.len())
+                || path.first() != source
+                || path.last() != destination
+                || path[0] >= path[path.len() - 1]
+                || first_hops.contains(&path[1])
+                || path
+                    .iter()
+                    .enumerate()
+                    .any(|(i, id)| path[..i].contains(id))
+            {
+                return Err(Error::NoRoute);
+            }
+            first_hops.push(path[1]);
+            for &id in path {
+                self.check_vertex(probe, self.vertex(id)?)?;
+            }
+            if self.vertex(path[0])?.core.identity.peer_identity() != self.local {
+                return Err(Error::Identity);
+            }
+            // An authentic, current advertisement can withdraw an edge.
+            // Unknown, stale or conflicted inputs above are not withdrawals.
+            if let Some(score) = self.rank(path) {
+                ranked.push((score, locator));
+            }
+        }
+        ranked.sort_unstable_by_key(|entry| entry.0);
+        let mut loss = Error::NoRoute;
+        for (_, locator) in ranked {
+            // Recheck all route facts after the previous circuit was dropped.
+            let route = self.authorize_path(probe, locator.path)?;
+            let next = self.vertex(locator.path[1])?;
+            let deadline = route.deadline(probe, &[])?;
+            let hop = match probe.dial_classified(
+                &[Candidate {
+                    target: locator.target,
+                    signed_identity: next.identity,
+                }],
+                outer,
+                admission,
+                Some(deadline),
+            ) {
+                Err(error @ Error::PathUnavailable(_)) => {
+                    for &id in locator.path {
+                        self.check_vertex(probe, self.vertex(id)?)?;
+                    }
+                    loss = error;
+                    continue;
+                }
+                other => other?,
+            };
+            let mut reported_loss = false;
+            let result = with_fixed_endpoint(probe, &route, hop, |c| {
+                let result = exchange(locator.path, c);
+                reported_loss = result.as_ref().is_err_and(established_loss);
+                result
+            });
+            match result {
+                // In particular do not retry EOF during nested TLS / path
+                // confirmation: a downstream auth failure can look like EOF.
+                // Also never invoke the callback again after it succeeded.
+                Err(Error::Transport(e)) if reported_loss && established_loss(&e) => {
+                    // A time/status cutoff must never be treated as permission
+                    // to route past an expired, revoked or equivocated path.
+                    for &id in locator.path {
+                        self.check_vertex(probe, self.vertex(id)?)?;
+                    }
+                    loss = Error::Transport(e);
+                }
+                other => return other,
+            }
+        }
+        Err(loss)
+    }
+
+    /// Run one dedicated relay listener after its caller accepts TCP. No
+    /// endpoint key exchange or application callback runs on this branch.
+    pub fn relay(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        path: &[u8],
+        incoming: TcpStream,
+        outgoing: &ClientTarget,
+        outer: (
+            &OpenSslOuterTlsAcceptor,
+            &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        ),
+        admission: &Admission,
+    ) -> Result<Forwarded, Error> {
+        let route = self.authorize_path(probe, path)?;
+        let pos = route.position;
+        if pos == 0 || pos + 1 >= path.len() {
+            return Err(Error::NoRoute);
+        }
+        let left = probe.accept(
+            incoming,
+            self.vertex(path[pos - 1])?.identity,
+            outer.0,
+            admission,
+        )?;
+        let deadline = route.deadline(probe, &[&left])?;
+        let right = probe.dial_classified(
+            &[Candidate {
+                target: outgoing,
+                signed_identity: self.vertex(path[pos + 1])?.identity,
+            }],
+            outer.1,
+            admission,
+            Some(deadline),
+        )?;
+        forward_fixed(probe, &route, left, right, admission)
+    }
+
+    /// Run one dedicated destination listener. The opener, first adjacent
+    /// peer, route and endpoint TLS identity are all independently checked.
+    pub fn respond<T>(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        path: &[u8],
+        incoming: TcpStream,
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+        exchange: impl FnOnce(&mut E2eCircuit<'_>) -> Result<T, TunnelError>,
+    ) -> Result<T, Error> {
+        let route = self.authorize_path(probe, path)?;
+        if route.position + 1 != path.len() {
+            return Err(Error::NoRoute);
+        }
+        let left = probe.accept(
+            incoming,
+            self.vertex(path[path.len() - 2])?.identity,
+            outer,
+            admission,
+        )?;
+        with_fixed_endpoint(probe, &route, left, exchange)
+    }
+}
+
+fn established_loss(error: &TunnelError) -> bool {
+    // Ambiguous timeouts/reset alerts/protocol failures are terminal; only
+    // known transport truncation, socket reset or failed writes get replaced.
+    use ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(
+        error,
+        TunnelError::Closed
+            | TunnelError::Ws(WsError::Closed)
+            | TunnelError::Io(BrokenPipe | ConnectionAborted | ConnectionReset)
+            | TunnelError::Ws(WsError::Io(
+                BrokenPipe | ConnectionAborted | ConnectionReset
+            ))
+    )
 }

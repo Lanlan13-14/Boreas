@@ -56,6 +56,8 @@ struct Node {
     pem: PemIdentity,
     identity: Vec<u8>,
     lsa: Vec<u8>,
+    lsa_ed: PKey<Private>,
+    lsa_ml: PKey<Private>,
 }
 
 struct Fixture {
@@ -180,7 +182,11 @@ impl Fixture {
                         .filter(|other| *other != id)
                         .map(|other| Neighbor {
                             peer_core_id: other,
-                            rtt_p50_ms: u16::from(other),
+                            rtt_p50_ms: match (id.min(other), id.max(other)) {
+                                (1, 3) => 20,
+                                (2, 4) => 30,
+                                _ => u16::from(other),
+                            },
                             loss_ppm: 0,
                             path_type: PathRole::Cdn as u8,
                         })
@@ -215,6 +221,8 @@ impl Fixture {
                 pem,
                 identity,
                 lsa,
+                lsa_ed: ed,
+                lsa_ml: ml,
             });
         }
         Self {
@@ -232,11 +240,15 @@ impl Fixture {
     }
 
     fn status(&self, id: usize) -> StatusStore {
+        self.named_status(id, "status.state")
+    }
+
+    fn named_status(&self, id: usize, name: &str) -> StatusStore {
         let path = &self.node(id).path;
         let now = utc_now().unwrap();
         let trust = management_trust(&self.roots, &self.policy, now).unwrap();
         let mut store = StatusStore::open(
-            path.join("status.state"),
+            path.join(name),
             NET,
             fs::metadata(path).unwrap().uid(),
             trust,
@@ -539,4 +551,251 @@ fn signed_fixed_route_transfers_bidirectional_e2e_and_rebuilds_after_path_loss()
     assert_ne!(lost, replacement);
     let through_two = fixed_exchange(&f, &[1, 2, 3, 4], false).unwrap();
     assert_ne!(through_two, replacement);
+}
+
+fn graph_inputs(f: &Fixture, local: usize) -> Vec<boreas_tunnel::mesh_route::SignedCore<'_>> {
+    (1..=4)
+        .filter(|id| *id != local)
+        .map(|id| boreas_tunnel::mesh_route::SignedCore {
+            identity: &f.node(id).identity,
+            lsa: &f.node(id).lsa,
+        })
+        .collect()
+}
+
+fn route_admission() -> Admission {
+    Admission::new(Limits {
+        handshakes_global: 1,
+        authenticated_global: 2,
+        authenticated_per_peer: 1,
+        bytes_global: 1024 * 1024,
+    })
+}
+
+fn outer_for(f: &Fixture, id: usize) -> OpenSslOuterTlsAcceptor {
+    let path = &f.node(id).path;
+    OpenSslOuterTlsAcceptor::from_pem_files(path.join("outer.pem"), path.join("outer.key")).unwrap()
+}
+
+#[test]
+fn verified_graph_automatically_rebuilds_confirmed_circuit_after_link_cut() {
+    use boreas_tunnel::mesh_route::RouteLocator;
+    use std::{
+        io::{Read, Write},
+        net::Shutdown,
+        sync::mpsc,
+    };
+
+    let f = &Fixture::new();
+    const PRIMARY: &[u8] = &[1, 2, 3, 4];
+    const BACKUP: &[u8] = &[1, 3, 4];
+    let (p2, p2_target) = listener();
+    let (p3, p3_target) = listener();
+    let (p4, p4_target) = listener();
+    let (b3, b3_target) = listener();
+    let (b4, b4_target) = listener();
+    let outer = &|| OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let payload: Vec<u8> = (0..70_000u32)
+        .map(|n| (n.wrapping_mul(43) >> 7) as u8)
+        .collect();
+    let payload = &payload;
+    let (ids_tx, ids_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let spawn_relay =
+            |listener, id, path: &'static [u8], target: ClientTarget, state: &'static str| {
+                scope.spawn(move || {
+                    let mut status = f.named_status(id, state);
+                    let mut probe = f.probe(id, &mut status);
+                    let graph =
+                        probe.verify_route_graph(&f.node(id).identity, &graph_inputs(f, id))?;
+                    graph.relay(
+                        &mut probe,
+                        path,
+                        accept_socket(listener),
+                        &target,
+                        (&outer_for(f, id), outer),
+                        &route_admission(),
+                    )
+                })
+            };
+        let primary2 = spawn_relay(p2, 2, PRIMARY, p3_target, "primary.state");
+        let primary3 = spawn_relay(p3, 3, PRIMARY, p4_target, "primary.state");
+        let backup3 = spawn_relay(b3, 3, BACKUP, b4_target, "backup.state");
+        let spawn_destination = |listener,
+                                 path: &'static [u8],
+                                 state: &'static str,
+                                 cut: bool,
+                                 tx: mpsc::Sender<[u8; 16]>| {
+            scope.spawn(move || -> Result<_, Error> {
+                let mut status = f.named_status(4, state);
+                let mut probe = f.probe(4, &mut status);
+                let graph = probe.verify_route_graph(&f.node(4).identity, &graph_inputs(f, 4))?;
+                let accepted = accept_socket(listener);
+                let fault = accepted.try_clone().map_err(TunnelError::from)?;
+                graph.respond(
+                    &mut probe,
+                    path,
+                    accepted,
+                    &outer_for(f, 4),
+                    &route_admission(),
+                    |c| {
+                        let mut observed = vec![0; payload.len()];
+                        c.read_exact(&mut observed)?;
+                        if cut {
+                            assert_eq!(&observed, payload);
+                        } else {
+                            assert!(observed.iter().zip(payload).all(|(a, b)| *a == !*b));
+                        }
+                        tx.send(c.circuit_id()).unwrap();
+                        if cut {
+                            fault.shutdown(Shutdown::Both)?;
+                            return Err(TunnelError::Closed);
+                        }
+                        c.write_all(b"second circuit")?;
+                        Ok(c.circuit_id())
+                    },
+                )
+            })
+        };
+        let primary4 = spawn_destination(p4, PRIMARY, "primary.state", true, ids_tx.clone());
+        let backup4 = spawn_destination(b4, BACKUP, "backup.state", false, ids_tx);
+
+        let mut status = f.status(1);
+        let mut probe = f.probe(1, &mut status);
+        let graph = probe
+            .verify_route_graph(&f.node(1).identity, &graph_inputs(f, 1))
+            .unwrap();
+        let admission = route_admission();
+        let mut seen = Vec::new();
+        let result = graph
+            .connect(
+                &mut probe,
+                &[
+                    RouteLocator {
+                        path: BACKUP,
+                        target: &b3_target,
+                    },
+                    RouteLocator {
+                        path: PRIMARY,
+                        target: &p2_target,
+                    },
+                ],
+                outer,
+                &admission,
+                |path, c| {
+                    seen.push((path.to_vec(), c.circuit_id()));
+                    if path == PRIMARY {
+                        c.write_all(payload)?;
+                    } else {
+                        // Explicitly different, independent operation. The transport
+                        // must not replay the first path's already consumed bytes.
+                        c.write_all(&payload.iter().map(|b| !*b).collect::<Vec<_>>())?;
+                    }
+                    let mut reply = [0; 14];
+                    c.read_exact(&mut reply)?;
+                    assert_eq!(&reply, b"second circuit");
+                    Ok(c.circuit_id())
+                },
+            )
+            .unwrap();
+        assert_eq!(seen.iter().map(|p| p.0.as_slice()).collect::<Vec<_>>(), [
+            PRIMARY, BACKUP
+        ]);
+        assert_ne!(seen[0].1, result);
+        assert_eq!(ids_rx.try_recv().unwrap(), seen[0].1);
+        assert_eq!(ids_rx.try_recv().unwrap(), result);
+        assert!(primary2.join().unwrap().is_err());
+        assert!(primary3.join().unwrap().is_err());
+        assert_eq!(
+            primary4.join().unwrap(),
+            Err(Error::Transport(TunnelError::Closed))
+        );
+        assert_eq!(backup4.join().unwrap().unwrap(), result);
+        let forwarded = backup3.join().unwrap().unwrap();
+        assert_eq!(forwarded.circuit_id, result);
+        assert!(forwarded.ciphertext_bytes[0] > payload.len() as u64);
+        assert!(forwarded.ciphertext_bytes[1] > 14);
+        let snap = admission.snapshot().unwrap();
+        assert_eq!((snap.handshakes, snap.authenticated, snap.bytes), (0, 0, 0));
+    });
+}
+
+fn change_lsa(node: &Node, edit: impl FnOnce(&mut ManagementObject)) -> Vec<u8> {
+    let mut envelope = SignedObject::decode(&node.lsa).unwrap();
+    let mut object = objects::decode_tbs(&envelope.raw_tbs).unwrap();
+    edit(&mut object);
+    envelope.raw_tbs = objects::encode_tbs(&object).unwrap();
+    let msg = objects::signature_input(
+        &envelope.raw_tbs,
+        ObjectType::CoreLsa,
+        MANAGEMENT_SCHEMA_VERSION,
+    )
+    .unwrap();
+    envelope.signers[0].ed25519 = sign(&node.lsa_ed, &msg).try_into().unwrap();
+    envelope.signers[0].mldsa = sign(&node.lsa_ml, &msg);
+    envelope.encode().unwrap()
+}
+
+#[test]
+fn graph_rejects_forgery_and_does_not_use_withdrawn_or_superseded_edges() {
+    let f = Fixture::new();
+    let mut status = f.status(1);
+    let mut probe = f.probe(1, &mut status);
+    let initial = probe
+        .verify_route_graph(&f.node(1).identity, &graph_inputs(&f, 1))
+        .unwrap();
+    initial.authorize_path(&mut probe, &[1, 2, 4]).unwrap();
+    let mut inputs = graph_inputs(&f, 1);
+    let mut forged = SignedObject::decode(&f.node(2).lsa).unwrap();
+    forged.signers[0].ed25519[0] ^= 1;
+    let forged = forged.encode().unwrap();
+    inputs[0].lsa = &forged;
+    assert!(matches!(
+        probe.verify_route_graph(&f.node(1).identity, &inputs),
+        Err(Error::Lsa)
+    ));
+
+    let withdrawn = change_lsa(f.node(2), |obj| {
+        obj.seq = 2;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = 2;
+        lsa.neighbors.retain(|n| n.peer_core_id != 4);
+    });
+    inputs[0].lsa = &withdrawn;
+    let graph = probe
+        .verify_route_graph(&f.node(1).identity, &inputs)
+        .unwrap();
+    assert!(matches!(
+        initial.authorize_path(&mut probe, &[1, 2, 4]),
+        Err(Error::Lsa)
+    ));
+    assert!(matches!(
+        graph.authorize_path(&mut probe, &[1, 2, 4]),
+        Err(Error::NoRoute)
+    ));
+    graph.authorize_path(&mut probe, &[1, 3, 4]).unwrap();
+    assert!(matches!(
+        probe.verify_route_graph(&f.node(1).identity, &graph_inputs(&f, 1)),
+        Err(Error::Lsa)
+    ));
+
+    let fork = change_lsa(f.node(2), |obj| {
+        obj.seq = 2;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = 2;
+        lsa.neighbors[0].rtt_p50_ms += 1;
+    });
+    inputs[0].lsa = &fork;
+    assert!(matches!(
+        probe.verify_route_graph(&f.node(1).identity, &inputs),
+        Err(Error::Lsa)
+    ));
+    assert!(matches!(
+        graph.authorize_path(&mut probe, &[1, 2, 3, 4]),
+        Err(Error::Lsa)
+    ));
 }
