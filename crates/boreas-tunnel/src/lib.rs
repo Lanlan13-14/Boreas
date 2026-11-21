@@ -37,6 +37,7 @@
 pub mod budget;
 pub mod capacity;
 pub mod circuit;
+pub mod circuit_pool;
 pub mod csprng;
 pub mod dataplane;
 pub mod directory;
