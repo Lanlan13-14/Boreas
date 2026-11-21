@@ -3791,7 +3791,12 @@ mod linux_daemon {
             // Keep each blocking write and inbound drain small so the opposite
             // direction and the next policy check can run between bursts.
             const MAX_OUTBOUND_BATCH_PACKETS: usize = 16;
-            const MAX_OUTBOUND_BATCH_BYTES: usize = 16_000;
+            // Leave space in a 16 KiB TLS plaintext record for both nested
+            // TLS record overheads, the relay header and the masked WS header.
+            // PacketPath checks the threshold before appending one last packet.
+            const SINGLE_RECORD_BATCH: usize = 16_288;
+            let batch_read_threshold = SINGLE_RECORD_BATCH
+                - (mtu + boreas_tunnel::packet_path::FRAME_PREFIX_LEN - 1);
             const MAX_INBOUND_BATCH_PACKETS: usize = 32;
             let mut made_progress = false;
             let remaining_budget = max_packets
@@ -3854,7 +3859,7 @@ mod linux_daemon {
             }
             if out_limit > 0 && host_ready && !send_deferred {
                 let started = io_timing.as_ref().map(|_| Instant::now());
-                let result = path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES);
+                let result = path.step_outbound_batch(out_limit, batch_read_threshold);
                 if let (Some(timing), Some(started)) = (&mut io_timing, started) {
                     timing.observe(true, started.elapsed());
                 }
