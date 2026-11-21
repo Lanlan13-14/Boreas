@@ -1,7 +1,12 @@
 //! Linux packet profile for dedicated, confirmed Core routes. Relays use
 //! `VerifiedGraph::relay` and cannot instantiate this endpoint exchange.
 
-use std::{io::{self, Read, Write}, net::TcpStream, os::fd::AsRawFd, time::{Duration, Instant}};
+use std::{
+    io::{self, Read, Write},
+    net::TcpStream,
+    os::fd::AsRawFd,
+    time::{Duration, Instant},
+};
 
 use boreas_tun::linux::{LinuxTunError, LinuxTunQueue};
 
@@ -40,11 +45,17 @@ impl VerifiedGraph<'_> {
         endpoint: (&LinuxTunQueue, Option<u8>),
         mut confirmed: impl FnMut(&[u8], [u8; 16]),
     ) -> Result<PacketEpoch, Error> {
-        let _buffer = admission.reserve_bytes(PACKET_BUFFER_BYTES).map_err(TunnelError::from)?;
+        let _buffer = admission
+            .reserve_bytes(PACKET_BUFFER_BYTES)
+            .map_err(TunnelError::from)?;
         let (tun, preferred) = endpoint;
-        self.connect_io(probe, locators, outer, (admission, preferred), |path, c, io| {
-            epoch(c, io, tun, true, |id| confirmed(path, id))
-        })
+        self.connect_io(
+            probe,
+            locators,
+            outer,
+            (admission, preferred),
+            |path, c, io| epoch(c, io, tun, true, |id| confirmed(path, id)),
+        )
     }
 
     /// Respond to one incoming epoch on one exact, locally authorized path.
@@ -58,7 +69,9 @@ impl VerifiedGraph<'_> {
         tun: &LinuxTunQueue,
         confirmed: impl FnOnce([u8; 16]),
     ) -> Result<PacketEpoch, Error> {
-        let _buffer = admission.reserve_bytes(PACKET_BUFFER_BYTES).map_err(TunnelError::from)?;
+        let _buffer = admission
+            .reserve_bytes(PACKET_BUFFER_BYTES)
+            .map_err(TunnelError::from)?;
         self.respond_io(probe, path, incoming, outer, admission, |c, io| {
             epoch(c, io, tun, false, confirmed)
         })
@@ -78,21 +91,31 @@ fn epoch(
     expected[..PROFILE.len()].copy_from_slice(PROFILE);
     expected[PROFILE.len()..].copy_from_slice(&(tun.mtu() as u16).to_be_bytes());
     let mut received = [0; PROFILE.len() + 2];
+    // This is still admission, not established business I/O: an EOF may
+    // mean the other side rejected the profile and cannot authorize failover.
+    let profile_error = |_| TunnelError::Unsupported("Core TUN profile or MTU mismatch");
     if initiator {
-        c.write_all(&expected)?;
+        c.write_all(&expected).map_err(profile_error)?;
     }
-    c.read_exact(&mut received)?;
+    c.read_exact(&mut received).map_err(profile_error)?;
     if received != expected {
         return Err(TunnelError::Unsupported("Core TUN profile or MTU mismatch"));
     }
     if !initiator {
-        c.write_all(&expected)?;
+        c.write_all(&expected).map_err(profile_error)?;
     }
     (io.check)()?;
-    let mut stats = PacketEpoch { circuit_id: c.circuit_id(), tx: 0, rx: 0 };
+    let mut stats = PacketEpoch {
+        circuit_id: c.circuit_id(),
+        tx: 0,
+        rx: 0,
+    };
     confirmed(stats.circuit_id);
 
-    let rotate = io.deadline.checked_sub(CLOSE_BUDGET).ok_or(TunnelError::Timeout)?;
+    let rotate = io
+        .deadline
+        .checked_sub(CLOSE_BUDGET)
+        .ok_or(TunnelError::Timeout)?;
     let mut incoming = [0; MAX_MTU];
     let mut outgoing = [0; MAX_MTU + 1];
     let mut closing = false;
@@ -102,7 +125,11 @@ fn epoch(
             c.write_all(&[0; 2])?;
             closing = true;
         }
-        let next = if initiator && !closing { rotate } else { io.deadline };
+        let next = if initiator && !closing {
+            rotate
+        } else {
+            io.deadline
+        };
         let (wire_ready, tun_ready) = ready(c, io.socket, (!closing).then_some(tun), next)?;
         if wire_ready {
             let mut prefix = [0; 2];
@@ -123,7 +150,8 @@ fn epoch(
             }
             let packet = &mut incoming[..n];
             c.read_exact(packet)?;
-            policy.authorize_inbound(packet)
+            policy
+                .authorize_inbound(packet)
                 .map_err(|_| TunnelError::Unsupported("mesh inbound VIP or IP rejected"))?;
             (io.check)()?;
             match tun.write_packet(packet) {
@@ -150,15 +178,31 @@ fn epoch(
 }
 
 fn ready(
-    c: &E2eCircuit<'_>, socket: &TcpStream, tun: Option<&LinuxTunQueue>, until: Instant,
+    c: &E2eCircuit<'_>,
+    socket: &TcpStream,
+    tun: Option<&LinuxTunQueue>,
+    until: Instant,
 ) -> Result<(bool, bool), TunnelError> {
     let buffered = c.has_buffered_input();
     let mut fds = [
-        libc::pollfd { fd: socket.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: tun.map_or(-1, LinuxTunQueue::as_raw_fd), events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: tun.map_or(-1, LinuxTunQueue::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
-    let ms = if buffered { 0 } else {
-        until.saturating_duration_since(Instant::now()).min(POLL_INTERVAL).as_millis() as i32
+    let ms = if buffered {
+        0
+    } else {
+        until
+            .saturating_duration_since(Instant::now())
+            .min(POLL_INTERVAL)
+            .as_millis() as i32
     };
     // SAFETY: initialized array; fd ownership remains with the borrowed socket/TUN.
     if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } < 0 {
@@ -171,5 +215,8 @@ fn ready(
     if fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
         return Err(TunnelError::Unsupported("mesh TUN unavailable"));
     }
-    Ok((buffered || fds[0].revents != 0, fds[1].revents & libc::POLLIN != 0))
+    Ok((
+        buffered || fds[0].revents != 0,
+        fds[1].revents & libc::POLLIN != 0,
+    ))
 }

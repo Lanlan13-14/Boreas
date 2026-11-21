@@ -246,14 +246,18 @@ impl<'a> MeshProbe<'a> {
     ) -> Result<(), Error> {
         let observed = utc_now()?;
         let mono = Instant::now();
-        self.status.accept_signed_snapshot(snapshot, observed, mono)
+        self.status
+            .accept_signed_snapshot(snapshot, observed, mono)
             .map_err(|_| Error::Status)?;
         if let Some(raw) = identity_revocation {
-            self.status.accept_identity_revocation(raw, utc_now()?)
+            self.status
+                .accept_identity_revocation(raw, utc_now()?)
                 .map_err(|_| Error::Status)?;
         }
         let now = effective_utc(self.status)?;
-        let verified = self.trust.verify_and_authorize(local_lsa, now)
+        let verified = self
+            .trust
+            .verify_and_authorize(local_lsa, now)
             .map_err(|_| Error::Lsa)?;
         lsa(&verified, self.local.id, now)?;
         self.local_lsa = verified;
@@ -597,9 +601,13 @@ impl<'a> MeshProbe<'a> {
         }
         for node in route {
             let peer = AuthenticatedPeer::new(
-                node.identity.net_id(), node.identity.node_id(), node.identity.identity_generation(),
-            ).ok_or(Error::Identity)?;
-            if now >= node.until || !matches!(self.status.peer_revocation(&peer),
+                node.identity.net_id(),
+                node.identity.node_id(),
+                node.identity.identity_generation(),
+            )
+            .ok_or(Error::Identity)?;
+            if now >= node.until
+                || !matches!(self.status.peer_revocation(&peer),
                 PeerRevocation::Verified(state) if !state.sessions_revoked())
             {
                 return Err(Error::Status);

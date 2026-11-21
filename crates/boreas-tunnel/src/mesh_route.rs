@@ -85,6 +85,11 @@ impl MeshProbe<'_> {
 }
 
 impl VerifiedGraph<'_> {
+    /// Verified slots, independent of untrusted material filenames.
+    pub fn core_ids(&self) -> impl Iterator<Item = u8> + '_ {
+        self.vertices.keys().copied()
+    }
+
     fn vertex(&self, id: u8) -> Result<&Vertex<'_>, Error> {
         self.vertices.get(&id).ok_or(Error::NoRoute)
     }
@@ -202,11 +207,13 @@ impl VerifiedGraph<'_> {
         admission: &Admission,
         mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>) -> Result<T, TunnelError>,
     ) -> Result<T, Error> {
-        self.connect_io(probe, locators, outer, (admission, None), |path, c, _| exchange(path, c))
-            .map_err(|e| match e {
-                Error::ConfirmedPathLost(cause) => Error::Transport(cause),
-                other => other,
-            })
+        self.connect_io(probe, locators, outer, (admission, None), |path, c, _| {
+            exchange(path, c)
+        })
+        .map_err(|e| match e {
+            Error::ConfirmedPathLost(cause) => Error::Transport(cause),
+            other => other,
+        })
     }
 
     pub(crate) fn connect_io<T>(
@@ -253,7 +260,8 @@ impl VerifiedGraph<'_> {
                 ranked.push((score, locator));
             }
         }
-        ranked.sort_unstable_by_key(|(score, locator)| (preferred != Some(locator.path[1]), *score));
+        ranked
+            .sort_unstable_by_key(|(score, locator)| (preferred != Some(locator.path[1]), *score));
         let mut loss = Error::NoRoute;
         for (_, locator) in ranked {
             // Recheck all route facts after the previous circuit was dropped.

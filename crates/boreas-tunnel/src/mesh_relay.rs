@@ -430,12 +430,15 @@ pub(crate) fn with_fixed_endpoint_io<T>(
             if Instant::now() >= deadline {
                 return Err(TunnelError::Timeout);
             }
-            probe.check_route_utc(&route.members, remote_expiry)
+            probe
+                .check_route_utc(&route.members, remote_expiry)
                 .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
         };
         check()?;
         let result = exchange(&mut circuit, EndpointIo {
-            socket: &hop.socket, deadline, check: &mut check,
+            socket: &hop.socket,
+            deadline,
+            check: &mut check,
         })?;
         check()?;
         if initiator {
