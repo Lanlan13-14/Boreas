@@ -2,8 +2,9 @@
 //!
 //! Linux's `virtio_net_hdr_from_skb` can emit a linear-head-length hint, not
 //! the exact header size. This API deliberately requires an exact match and
-//! derives the split point from the packet, never from that hint. This module
-//! does not configure TUN, authorize offload, or negotiate a wire feature.
+//! derives the split point from the packet, never from that hint. The Linux
+//! device adapter can accept a larger in-frame linear head on its owned fd.
+//! This module does not configure TUN or negotiate a wire feature.
 
 use std::{fmt, slice::Chunks};
 
@@ -73,6 +74,24 @@ pub fn segment_tcpv4<'out>(
     mtu: usize,
     scratch: &'out mut [u8],
 ) -> Result<Chunks<'out, u8>, GsoError> {
+    segment(frame, mtu, scratch, false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn segment_linux_tcpv4<'out>(
+    frame: &[u8],
+    mtu: usize,
+    scratch: &'out mut [u8],
+) -> Result<Chunks<'out, u8>, GsoError> {
+    segment(frame, mtu, scratch, true)
+}
+
+fn segment<'out>(
+    frame: &[u8],
+    mtu: usize,
+    scratch: &'out mut [u8],
+    linux_head_hint: bool,
+) -> Result<Chunks<'out, u8>, GsoError> {
     let (meta, packet) = frame
         .split_at_checked(VIRTIO_HDR_LEN)
         .ok_or(GsoError::TruncatedVirtio)?;
@@ -114,7 +133,8 @@ pub fn segment_tcpv4<'out>(
         return Err(GsoError::InvalidTcp);
     }
     let hdr_len = IPV4_LEN + tcp_len;
-    if usize::from(read_le16(meta, 2)) != hdr_len {
+    let hint = usize::from(read_le16(meta, 2));
+    if hint < hdr_len || hint > packet.len() || (!linux_head_hint && hint != hdr_len) {
         return Err(GsoError::InvalidMetadata);
     }
     let (header, payload) = packet.split_at(hdr_len);

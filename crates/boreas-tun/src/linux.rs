@@ -12,9 +12,14 @@ use std::{
 };
 
 use super::{Error, InspectedPacket, MAX_IP_PACKET, PacketIo};
+use crate::{gso::GsoError, virtio::VIRTIO_HDR_LEN};
+
+mod gso_limits;
+mod vnet;
 
 const IFNAMSIZ: usize = 16;
 const IFF_TUN: libc::c_short = 0x0001;
+const IFF_VNET_HDR: libc::c_short = 0x4000;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
 const IFF_PERSIST: libc::c_short = 0x0800;
@@ -23,8 +28,13 @@ const IFF_TUN_EXCL: libc::c_short = 0x8000u16 as libc::c_short;
 // site: glibc defines Ioctl as c_ulong, musl as c_int, so a fixed-width
 // c_ulong constant does not compile on musl targets.
 const TUNSETIFF: u32 = 0x400454ca;
+const TUNGETFEATURES: u32 = 0x800454cf;
 const TUNGETIFF: u32 = 0x800454d2;
 const TUNSETOFFLOAD: u32 = 0x400454d0;
+const TUNGETVNETHDRSZ: u32 = 0x800454d7;
+const TUNSETVNETLE: u32 = 0x400454dc;
+const TUNGETVNETLE: u32 = 0x800454dd;
+const TUN_F_CSUM_TSO4: libc::c_uint = 0x01 | 0x02;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -83,6 +93,7 @@ pub enum LinuxTunError {
     DeviceNameMismatch,
     QueueConfiguration,
     Packet(Error),
+    Gso(GsoError),
     PartialWrite,
 }
 impl std::fmt::Display for LinuxTunError {
@@ -108,7 +119,8 @@ pub struct TunConfig {
     pub name: Option<String>,
     pub mtu: usize,
     pub multi_queue: bool,
-    /// Unsupported until the complete VNET header/offload path exists; true is rejected.
+    /// Explicitly enable Linux local TCPv4 GSO and its 10-byte VNET framing.
+    /// Requires a single-queue device created by Boreas; defaults to false.
     pub vnet_header: bool,
 }
 impl Default for TunConfig {
@@ -130,10 +142,11 @@ pub struct LinuxTunDevice {
     management: Mutex<OwnedFd>,
 }
 impl LinuxTunDevice {
-    /// Create a real TUN device with `TUNSETIFF`, verify it with `TUNGETIFF`, set MTU and disable
-    /// device offloads. Closing all queue and manager descriptors releases this non-persistent fd.
+    /// Create a real TUN device with `TUNSETIFF`, verify it with `TUNGETIFF`, set MTU and configure
+    /// either no offloads (default) or the bounded TCPv4-only profile. Closing all queue and manager descriptors releases this non-persistent fd.
     pub fn create(config: TunConfig) -> Result<(Arc<Self>, LinuxTunQueue), LinuxTunError> {
-        if !(68..=MAX_IP_PACKET).contains(&config.mtu) || config.vnet_header {
+        if !(68..=MAX_IP_PACKET).contains(&config.mtu) || (config.vnet_header && config.multi_queue)
+        {
             return Err(LinuxTunError::InvalidConfiguration);
         }
         let requested = match config.name {
@@ -151,15 +164,28 @@ impl LinuxTunDevice {
                 IFF_MULTI_QUEUE
             } else {
                 0
-            };
+            }
+            | if config.vnet_header { IFF_VNET_HDR } else { 0 };
         let fd = open_tun()?;
+        if config.vnet_header {
+            let mut features = 0u32;
+            ioctl_word(fd.as_raw_fd(), TUNGETFEATURES, &mut features)?;
+            if features & u32::from(flags.cast_unsigned()) != u32::from(flags.cast_unsigned()) {
+                return Err(LinuxTunError::WrongFlags);
+            }
+        }
         let mut req = IfReq::new(&requested, flags | IFF_TUN_EXCL)?;
         ioctl_ifreq(fd.as_raw_fd(), TUNSETIFF, &mut req)?;
         let actual = req.actual_name()?;
         let actual_flags = verify_fd(fd.as_raw_fd(), &actual, flags)?;
         set_mtu_sysfs(&actual, config.mtu)?;
-        // Linux TUNSETOFFLOAD takes the scalar bitmask in the ioctl argument, not a pointer.
-        ioctl_scalar(fd.as_raw_fd(), TUNSETOFFLOAD, 0)?;
+        if config.vnet_header {
+            verify_vnet_abi(fd.as_raw_fd(), true)?;
+            gso_limits::configure(&actual)?;
+            ioctl_scalar(fd.as_raw_fd(), TUNSETOFFLOAD, TUN_F_CSUM_TSO4)?;
+        } else {
+            ioctl_scalar(fd.as_raw_fd(), TUNSETOFFLOAD, 0)?;
+        }
         let manager = Arc::new(Self {
             name: actual,
             flags: actual_flags,
@@ -173,7 +199,10 @@ impl LinuxTunDevice {
             .try_clone()?;
         let queue = LinuxTunQueue {
             device: manager.clone(),
-            fd: Mutex::new(queue_fd),
+            state: Mutex::new(QueueState {
+                fd: queue_fd,
+                vnet: config.vnet_header.then(|| vnet::Reader::new(config.mtu)),
+            }),
         };
         Ok((manager, queue))
     }
@@ -234,7 +263,10 @@ impl LinuxTunDevice {
         });
         let queue = LinuxTunQueue {
             device: Arc::clone(&device),
-            fd: Mutex::new(queue_fd),
+            state: Mutex::new(QueueState {
+                fd: queue_fd,
+                vnet: None,
+            }),
         };
         Ok((device, queue))
     }
@@ -245,9 +277,9 @@ impl LinuxTunDevice {
     pub fn mtu(&self) -> usize {
         self.mtu
     }
-    /// Only disabled offloads are currently permitted, managed through the unique queue-zero owner.
+    /// Offload mode is frozen at creation. Only a raw device can reaffirm disabled offloads.
     pub fn set_offloads(&self, flags: libc::c_uint) -> Result<(), LinuxTunError> {
-        if flags != 0 {
+        if flags != 0 || self.flags & IFF_VNET_HDR != 0 {
             return Err(LinuxTunError::InvalidConfiguration);
         }
         let fd = self
@@ -268,17 +300,23 @@ impl LinuxTunDevice {
         verify_fd(fd.as_raw_fd(), &self.name, self.flags)?;
         Ok(LinuxTunQueue {
             device: self.clone(),
-            fd: Mutex::new(fd),
+            state: Mutex::new(QueueState { fd, vnet: None }),
         })
     }
 }
 
-/// One verified owned Linux TUN queue. Each read/write transfers one L3 packet.
+/// One verified owned Linux TUN queue. Each API read/write transfers one L3 packet.
+/// On TCPv4 GSO queues pending segments are drained in order before reading the fd again.
 /// `PacketIo::read_packet` blocks until a packet or fd error; event-loop users should prefer
 /// `read_packet_timeout` to integrate bounded polling.
 pub struct LinuxTunQueue {
     device: Arc<LinuxTunDevice>,
-    fd: Mutex<OwnedFd>,
+    state: Mutex<QueueState>,
+}
+
+struct QueueState {
+    fd: OwnedFd,
+    vnet: Option<vnet::Reader>,
 }
 impl LinuxTunQueue {
     pub fn device_name(&self) -> &str {
@@ -290,45 +328,62 @@ impl LinuxTunQueue {
     /// Borrow the stable queue descriptor for an external event set. The queue
     /// remains owned here; callers must not close or mutate the returned fd.
     pub fn as_raw_fd(&self) -> RawFd {
-        let fd = self
-            .fd
+        let state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        fd.as_raw_fd()
+        state.fd.as_raw_fd()
     }
     pub fn verify(&self) -> Result<(), LinuxTunError> {
-        let fd = self
-            .fd
+        let state = self
+            .state
             .lock()
             .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        verify_fd(fd.as_raw_fd(), &self.device.name, self.device.flags).map(|_| ())
+        let fd = state.fd.as_raw_fd();
+        verify_fd(fd, &self.device.name, self.device.flags)?;
+        if state.vnet.is_some() {
+            verify_vnet_abi(fd, false)?;
+        }
+        Ok(())
     }
     pub fn read_packet(&self) -> Result<Option<Vec<u8>>, LinuxTunError> {
-        let fd = self
-            .fd
-            .lock()
-            .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        read_packet_fd(fd.as_raw_fd(), self.device.mtu)
+        self.read_owned(None, false)
     }
     pub fn read_packet_timeout(&self, timeout: Duration) -> Result<Option<Vec<u8>>, LinuxTunError> {
-        let fd = self
-            .fd
-            .lock()
-            .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        if !poll_readable(fd.as_raw_fd(), timeout)? {
+        self.read_owned(Some(timeout), false)
+    }
+    fn read_owned(
+        &self,
+        timeout: Option<Duration>,
+        allow_empty: bool,
+    ) -> Result<Option<Vec<u8>>, LinuxTunError> {
+        let mut packet = vec![0; self.mtu() + 1];
+        let Some(inspected) = self.read_into(&mut packet, timeout, allow_empty)? else {
             return Ok(None);
-        }
-        read_packet_fd(fd.as_raw_fd(), self.device.mtu)
+        };
+        let len = inspected.bytes().len();
+        packet.truncate(len);
+        Ok(Some(packet))
+    }
+    /// VNET diagnostics: attempted read syscalls, accepted aggregates and delivered GSO segments.
+    pub fn gso_read_counts(&self) -> Option<(u64, u64, u64)> {
+        self.state
+            .lock()
+            .ok()?
+            .vnet
+            .as_ref()
+            .map(vnet::Reader::read_counts)
     }
     /// Configure `O_NONBLOCK` on this queue descriptor.
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), LinuxTunError> {
-        let fd = self
-            .fd
+        let state = self
+            .state
             .lock()
             .map_err(|_| LinuxTunError::QueueConfiguration)?;
+        let fd = state.fd.as_raw_fd();
         // SAFETY: `fd` is an owned TUN queue descriptor; `F_GETFL`/`F_SETFL`
         // only update the descriptor's `O_NONBLOCK` status flag.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -338,22 +393,16 @@ impl LinuxTunQueue {
             flags & !libc::O_NONBLOCK
         };
         if next != flags {
-            let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, next) };
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, next) };
             if rc < 0 {
                 return Err(io::Error::last_os_error().into());
             }
         }
         Ok(())
     }
-    /// Non-blocking single-syscall read when `O_NONBLOCK` is enabled on the queue.
+    /// Non-blocking read (at most one syscall) with `O_NONBLOCK` enabled.
     pub fn try_read_packet(&self) -> Result<Option<Vec<u8>>, LinuxTunError> {
-        let mut packet = vec![0; self.mtu() + 1];
-        let len = match self.try_read_packet_into(&mut packet)? {
-            Some(bytes) => bytes.len(),
-            None => return Ok(None),
-        };
-        packet.truncate(len);
-        Ok(Some(packet))
+        self.read_owned(None, true)
     }
     /// Non-blocking read into caller-owned storage when `O_NONBLOCK` is enabled.
     /// Storage shorter than MTU + 1 is rejected before reading. The extra
@@ -372,17 +421,38 @@ impl LinuxTunQueue {
         &self,
         scratch: &'buf mut [u8],
     ) -> Result<Option<InspectedPacket<'buf>>, LinuxTunError> {
+        self.read_into(scratch, None, true)
+    }
+
+    fn read_into<'buf>(
+        &self,
+        scratch: &'buf mut [u8],
+        timeout: Option<Duration>,
+        allow_empty: bool,
+    ) -> Result<Option<InspectedPacket<'buf>>, LinuxTunError> {
         let buf = scratch
             .get_mut(..self.mtu() + 1)
             .ok_or(LinuxTunError::InvalidConfiguration)?;
-        let fd = self
-            .fd
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        let n = match read_fd(fd.as_raw_fd(), buf) {
+        let fd = state.fd.as_raw_fd();
+        if let Some(reader) = &mut state.vnet {
+            if !reader.has_pending() && !read_ready(fd, timeout)? {
+                return Ok(None);
+            }
+            return reader.read(fd, self.mtu(), buf, allow_empty);
+        }
+        if !read_ready(fd, timeout)? {
+            return Ok(None);
+        }
+        let n = match read_fd(fd, buf) {
             Ok(0) => return Ok(None),
             Ok(n) => n,
-            Err(LinuxTunError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+            Err(LinuxTunError::Io(err))
+                if allow_empty && err.kind() == io::ErrorKind::WouldBlock =>
+            {
                 return Ok(None);
             }
             Err(err) => return Err(err),
@@ -402,12 +472,17 @@ impl LinuxTunQueue {
     }
 
     fn write_checked_bytes(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
-        let fd = self
-            .fd
+        let state = self
+            .state
             .lock()
             .map_err(|_| LinuxTunError::QueueConfiguration)?;
-        let n = write_fd(fd.as_raw_fd(), packet)?;
-        if n != packet.len() {
+        let fd = state.fd.as_raw_fd();
+        let (n, expected) = if state.vnet.is_some() {
+            (write_vnet_fd(fd, packet)?, packet.len() + VIRTIO_HDR_LEN)
+        } else {
+            (write_fd(fd, packet)?, packet.len())
+        };
+        if n != expected {
             return Err(LinuxTunError::PartialWrite);
         }
         Ok(())
@@ -415,10 +490,7 @@ impl LinuxTunQueue {
 }
 impl PacketIo for LinuxTunQueue {
     fn read_packet(&self) -> Result<Option<Vec<u8>>, Error> {
-        LinuxTunQueue::read_packet(self).map_err(|e| match e {
-            LinuxTunError::Packet(p) => p,
-            _ => Error::QueueClosed,
-        })
+        LinuxTunQueue::read_packet(self).map_err(queue_error)
     }
     fn write_packet(&self, p: &[u8]) -> Result<(), Error> {
         LinuxTunQueue::write_packet(self, p).map_err(queue_error)
@@ -432,19 +504,9 @@ impl PacketIo for LinuxTunQueue {
 fn queue_error(error: LinuxTunError) -> Error {
     match error {
         LinuxTunError::Packet(p) => p,
+        LinuxTunError::Gso(_) => Error::VirtioInvalid,
         _ => Error::QueueClosed,
     }
-}
-
-fn read_packet_fd(fd: RawFd, mtu: usize) -> Result<Option<Vec<u8>>, LinuxTunError> {
-    let mut b = vec![0; mtu + 1];
-    let n = read_fd(fd, &mut b)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    b.truncate(n);
-    inspect_at_mtu(&b, mtu)?;
-    Ok(Some(b))
 }
 
 fn check_mtu(packet: &[u8], mtu: usize) -> Result<(), LinuxTunError> {
@@ -507,11 +569,41 @@ fn verify_fd(
     if got & 0x0003 != IFF_TUN {
         return Err(LinuxTunError::WrongDevice);
     }
-    let required = IFF_TUN | IFF_NO_PI | (flags & (IFF_MULTI_QUEUE | IFF_PERSIST));
+    let required = IFF_TUN | IFF_NO_PI | (flags & (IFF_MULTI_QUEUE | IFF_PERSIST | IFF_VNET_HDR));
     if got != required {
         return Err(LinuxTunError::WrongFlags);
     }
     Ok(got)
+}
+fn ioctl_word(fd: RawFd, request: u32, word: &mut u32) -> Result<(), LinuxTunError> {
+    // SAFETY: these UAPI pointer ioctls read or write exactly one aligned 32-bit word.
+    let r = unsafe { libc::ioctl(fd, request as libc::Ioctl, std::ptr::from_mut(word)) };
+    if r < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+fn verify_vnet_abi(fd: RawFd, set_le: bool) -> Result<(), LinuxTunError> {
+    let mut size = 0;
+    ioctl_word(fd, TUNGETVNETHDRSZ, &mut size)?;
+    if size as usize != VIRTIO_HDR_LEN {
+        return Err(LinuxTunError::WrongFlags);
+    }
+    if set_le {
+        ioctl_word(fd, TUNSETVNETLE, &mut 1)?;
+    }
+    let mut le = 0;
+    ioctl_word(fd, TUNGETVNETLE, &mut le)?;
+    if le != 1 {
+        return Err(LinuxTunError::WrongFlags);
+    }
+    Ok(())
+}
+fn read_ready(fd: RawFd, timeout: Option<Duration>) -> Result<bool, LinuxTunError> {
+    match timeout {
+        Some(timeout) => poll_readable(fd, timeout),
+        None => Ok(true),
+    }
 }
 fn poll_readable(fd: RawFd, timeout: Duration) -> Result<bool, LinuxTunError> {
     let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
@@ -544,6 +636,27 @@ fn write_fd(fd: RawFd, b: &[u8]) -> Result<usize, LinuxTunError> {
     Ok(n as usize)
 }
 
+fn write_vnet_fd(fd: RawFd, packet: &[u8]) -> Result<usize, LinuxTunError> {
+    let header = [0u8; VIRTIO_HDR_LEN];
+    let iov = [
+        libc::iovec {
+            iov_base: header.as_ptr().cast_mut().cast(),
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        },
+    ];
+    // SAFETY: two initialized iovecs point to immutable readable storage for
+    // this one writev. Linux TUN consumes them as a single record.
+    let n = unsafe { libc::writev(fd, iov.as_ptr(), 2) };
+    if n < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(n as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,7 +675,10 @@ mod tests {
                 mtu: MTU,
                 management: Mutex::new(rx.try_clone().unwrap().into()),
             }),
-            fd: Mutex::new(rx.into()),
+            state: Mutex::new(QueueState {
+                fd: rx.into(),
+                vnet: None,
+            }),
         };
         queue.set_nonblocking(true).unwrap();
         let mut scratch = [0xa5; MTU + 1];
@@ -579,7 +695,10 @@ mod tests {
             queue.try_read_packet_into(&mut scratch[..MTU - 1]),
             Err(LinuxTunError::InvalidConfiguration)
         ));
-        let inspected = queue.try_read_inspected_into(&mut scratch).unwrap().unwrap();
+        let inspected = queue
+            .try_read_inspected_into(&mut scratch)
+            .unwrap()
+            .unwrap();
         assert_eq!(inspected.bytes().as_ptr(), address);
         assert_eq!(inspected.bytes(), big.as_slice());
         assert_eq!(inspected.info().version, crate::IpVersion::V6);

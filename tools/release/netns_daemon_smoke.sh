@@ -23,6 +23,12 @@ BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
+TUN_GSO_ARGS=()
+case "${BOREAS_NETNS_TCPV4_GSO:-0}" in
+  0) ;;
+  1) TUN_GSO_ARGS=(--tun-tcpv4-gso) ;;
+  *) echo 'ERROR: BOREAS_NETNS_TCPV4_GSO must be 0 or 1' >&2; exit 1 ;;
+esac
 PRIVATE_DNS="${BOREAS_NETNS_PRIVATE_DNS:-0}"
 if [[ "$PRIVATE_DNS" != 0 && "$PRIVATE_DNS" != 1 ]]; then
   echo 'ERROR: BOREAS_NETNS_PRIVATE_DNS must be 0 or 1' >&2
@@ -155,6 +161,7 @@ DIAGNOSTIC_TIMING_PATTERN='^boreas-diagnostic-timing phase=('"$DIAGNOSTIC_TIMING
 DIAGNOSTIC_IO_PATTERN='^boreas-io-timing max_outbound_us=[0-9]{1,20} max_inbound_us=[0-9]{1,20} outbound_ge_1ms=[0-9]{1,20} inbound_ge_1ms=[0-9]{1,20}$'
 DIAGNOSTIC_TUN_PATTERN='^boreas-tun-forwarding checked_reads=[0-9]{1,20} empty_reads=[0-9]{1,20} read_errors=[0-9]{1,20} reused_writes=[0-9]{1,20} write_errors=[0-9]{1,20}$'
 DIAGNOSTIC_STALL_PATTERN='^boreas-inbound-stalls source=(buffered|socket) steps_ge_1ms=[0-9]{1,20} outer_read_us=[0-9]{1,20} outer_write_or_flush_us=[0-9]{1,20} outside_outer_us=[0-9]{1,20} tun_ready_after=[0-9]{1,20} tun_unknown_after=[0-9]{1,20}$'
+DIAGNOSTIC_GSO_PATTERN='^boreas-tun-gso read_syscalls=[0-9]{1,20} aggregate_reads=[0-9]{1,20} delivered_segments=[0-9]{1,20}$'
 DIAGNOSTIC_TIMING_REPORTED=0
 
 report_diagnostic_timing() {
@@ -168,7 +175,8 @@ report_diagnostic_timing() {
     [[ -f "$log" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
       if [[ "$line" =~ $DIAGNOSTIC_TIMING_PATTERN || "$line" =~ $DIAGNOSTIC_IO_PATTERN ||
-            "$line" =~ $DIAGNOSTIC_TUN_PATTERN || "$line" =~ $DIAGNOSTIC_STALL_PATTERN ]]; then
+            "$line" =~ $DIAGNOSTIC_TUN_PATTERN || "$line" =~ $DIAGNOSTIC_STALL_PATTERN ||
+            "$line" =~ $DIAGNOSTIC_GSO_PATTERN ]]; then
         printf '%s %s\n' "$node" "$line"
       fi
     done < "$log"
@@ -898,7 +906,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --status-state-owner-uid "$STATE_OWNER_UID" \
   "${CORE_POLICY_ARGS[@]}" "${CORE_DNS_ARGS[@]}" \
   --listen "192.0.2.1:8443" \
-  --tun-name "btun0" \
+  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" \
   --mtu "$TUN_MTU" \
   --max-seconds "$CORE_LIFETIME_SECONDS" \
   > "$WORK/core.out" 2> "$WORK/core.err" &
@@ -931,7 +939,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --connect "192.0.2.1:8443" \
   --tls-name "wss.boreas.test" \
   --ws-host "wss.boreas.test:8443" \
-  --tun-name "btun0" \
+  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" \
   --mtu "$TUN_MTU" \
   --max-seconds "$EDGE_LIFETIME_SECONDS" \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &

@@ -1,10 +1,13 @@
-//! Test-only Linux ABI wiring. Never enables offloads on a Boreas production fd.
+//! Raw Linux ABI reference and production-adapter integration, in isolated netns.
 //! Reference mechanisms: sing-tun at 4486c14ba472 checks VNET separately from
 //! offload support and distinguishes the Linux hdr_len hint from header geometry.
 //! This test instead drives a real TCP socket and observes kernel-generated data.
 
 use super::{ip, ipv4_checksum, rerun_in_netns, root, unique_name};
-use boreas_tun::gso::{MAX_OUTPUT_BYTES, MAX_SUPERPACKET, segment_tcpv4};
+use boreas_tun::{
+    gso::{MAX_OUTPUT_BYTES, MAX_SUPERPACKET, segment_tcpv4},
+    linux::{LinuxTunDevice, LinuxTunQueue, TunConfig},
+};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -158,11 +161,11 @@ fn tcp_sum(packet: &[u8], seed_only: bool) -> u16 {
 
 // Only the in-namespace fixture peer's ordinary SYN and ACK enter the TUN.
 // All data packets, including the superpacket, originate from the TCP socket.
-fn peer_handshake(tun: &mut File, dst: u16, src: u16, syn: bool, ack: u32) {
+fn handshake_packet(dst: u16, src: u16, syn: bool, ack: u32) -> Vec<u8> {
     let tcp_len = if syn { 24 } else { 20 };
     let len = 20 + tcp_len;
-    let mut frame = vec![0; VNET + len]; // GSO_NONE; complete checksum, no PI
-    let packet = &mut frame[VNET..];
+    let mut bytes = vec![0; len];
+    let packet = bytes.as_mut_slice();
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
     packet[8] = 64;
@@ -185,6 +188,12 @@ fn peer_handshake(tun: &mut File, dst: u16, src: u16, syn: bool, ack: u32) {
     packet[36..38].copy_from_slice(&tcp_check.to_be_bytes());
     let ip_check = ipv4_checksum(&packet[..20]);
     packet[10..12].copy_from_slice(&ip_check.to_be_bytes());
+    bytes
+}
+
+fn peer_handshake(tun: &mut File, dst: u16, src: u16, syn: bool, ack: u32) {
+    let mut frame = vec![0; VNET]; // GSO_NONE; complete checksum, no PI
+    frame.extend(handshake_packet(dst, src, syn, ack));
     assert_eq!(
         tun.write(&frame).expect("inject valid test peer handshake"),
         frame.len()
@@ -199,17 +208,20 @@ fn capture(tun: &mut File, ports: (u16, u16), deadline: Instant) -> Vec<u8> {
         let p = frame
             .get(VNET..n)
             .expect("kernel frame must contain the virtio header");
-        if p.len() >= 40
-            && p[0] == 0x45
-            && p[9] == 6
-            && p[12..16] == LOCAL.octets()
-            && p[16..20] == PEER.octets()
-            && (be16(p, 20), be16(p, 22)) == ports
-        {
+        if matching_tcp(p, ports) {
             frame.truncate(n);
             return frame;
         }
     }
+}
+
+fn matching_tcp(p: &[u8], ports: (u16, u16)) -> bool {
+    p.len() >= 40
+        && p[0] == 0x45
+        && p[9] == 6
+        && p[12..16] == LOCAL.octets()
+        && p[16..20] == PEER.octets()
+        && (be16(p, 20), be16(p, 22)) == ports
 }
 
 fn check_ipv4(packet: &[u8]) {
@@ -394,5 +406,121 @@ fn real_tcpv4_gso_kernel_segmentation() {
     );
     println!(
         "\nBOREAS_DEVICE_EVIDENCE platform=linux driver=tun vnet=ok tcpv4_gso=kernel segmented=ok offload_disabled=ok cleanup=ok"
+    );
+}
+
+// Try the production adapter before polling: kernel readiness does not expose
+// segments that have already been extracted from the fd into adapter scratch.
+fn capture_adapter<'buf>(
+    tun: &LinuxTunQueue,
+    scratch: &'buf mut [u8],
+    ports: (u16, u16),
+    deadline: Instant,
+) -> &'buf [u8] {
+    loop {
+        assert!(Instant::now() < deadline, "adapter TCPv4 deadline expired");
+        match tun
+            .try_read_inspected_into(scratch)
+            .expect("production TUN read")
+        {
+            Some(p) if matching_tcp(p.bytes(), ports) => {
+                let len = p.bytes().len();
+                return &scratch[..len];
+            }
+            Some(_) => {}
+            None => readable(tun.as_raw_fd(), deadline),
+        }
+    }
+}
+
+#[test]
+fn real_tcpv4_gso_adapter_fifo_and_syscalls() {
+    if std::env::var_os("BOREAS_IN_NETNS").is_none() {
+        rerun_in_netns(concat!(
+            "tun_gso::",
+            stringify!(real_tcpv4_gso_adapter_fifo_and_syscalls)
+        ));
+        return;
+    }
+    assert!(root());
+    let parent = PathBuf::from(std::env::var_os("BOREAS_PARENT_NETNS").unwrap());
+    assert_ne!(fs::read_link("/proc/self/ns/net").unwrap(), parent);
+    let name = unique_name();
+    let (dev, tun) = LinuxTunDevice::create(TunConfig {
+        name: Some(name.clone()),
+        mtu: MTU,
+        vnet_header: true,
+        ..TunConfig::default()
+    })
+    .expect("verified TCPv4 GSO TUN setup");
+    tun.verify().expect("verify VNET fd");
+    tun.set_nonblocking(true).unwrap();
+    ip(&["link", "set", "dev", &name, "up"]);
+    ip(&["-4", "addr", "add", "192.0.2.1/30", "dev", &name]);
+
+    let listener = TcpListener::bind(SocketAddrV4::new(LOCAL, 0)).unwrap();
+    let ports = (listener.local_addr().unwrap().port(), 40903);
+    let mut scratch = [0; MTU + 1];
+    let deadline = Instant::now() + TIMEOUT;
+    tun.write_packet(&handshake_packet(ports.0, ports.1, true, 0))
+        .unwrap();
+    let syn_ack = capture_adapter(&tun, &mut scratch, ports, deadline);
+    check_ipv4(syn_ack);
+    assert_eq!(syn_ack[33], SYN | ACK);
+    assert_eq!(
+        tcp_sum(syn_ack, false),
+        0,
+        "ordinary SYN-ACK must have a completed TCP checksum"
+    );
+    let first = be32(syn_ack, 24).wrapping_add(1);
+    tun.write_packet(&handshake_packet(ports.0, ports.1, false, first))
+        .unwrap();
+    readable(listener.as_raw_fd(), deadline);
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+
+    let payload: Vec<_> = (0..2 * MSS + 137)
+        .map(|i| ((i * 19 + i / 101) % 251) as u8)
+        .collect();
+    stream.write_all(&payload).unwrap();
+    let mut seen = 0;
+    let mut buffered_reads = 0;
+    while seen < payload.len() {
+        let before = tun.gso_read_counts().unwrap();
+        let p = capture_adapter(&tun, &mut scratch, ports, deadline);
+        let after = tun.gso_read_counts().unwrap();
+        let seq = be32(p, 24);
+        if p[33] == SYN | ACK && seq.wrapping_add(1) == first {
+            continue;
+        }
+        let offset = usize::try_from(seq.wrapping_sub(first)).unwrap();
+        let data = &p[40..];
+        assert!(!data.is_empty());
+        let end = offset + data.len();
+        assert_eq!(data, &payload[offset..end]);
+        assert_eq!(p[33] & !PSH, ACK);
+        check_segment(p, seq, p[33], data, ports);
+        assert_eq!(tcp_sum(p, false), 0, "completed segment TCP checksum");
+        if end <= seen {
+            continue; // A retransmission cannot count as new data.
+        }
+        assert_eq!(offset, seen, "production adapter preserves FIFO");
+        if after.0 == before.0 {
+            assert_eq!(after.1, before.1);
+            assert_eq!(after.2, before.2 + 1);
+            buffered_reads += 1;
+        }
+        seen = end;
+    }
+    assert!(
+        buffered_reads > 0,
+        "new data must be delivered without an additional TUN read syscall"
+    );
+    drop(tun);
+    drop(dev);
+    assert!(!PathBuf::from(format!("/sys/class/net/{name}")).exists());
+    println!(
+        "BOREAS_DEVICE_EVIDENCE platform=linux driver=tun gso_adapter=fifo syscall_saving=ok checksum=ok cleanup=ok buffered_reads={buffered_reads}"
     );
 }
