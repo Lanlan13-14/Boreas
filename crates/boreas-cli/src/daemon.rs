@@ -2447,6 +2447,14 @@ mod linux_daemon {
         ))
     }
 
+    /// Once this turn has attempted inbound work, defer a new socket read
+    /// when an outbound packet is ready. Already-buffered input is scheduled
+    /// independently and the first inbound attempt never uses this rule.
+    fn poll_additional_inbound(sock_fd: i32, tun_fd: Option<i32>) -> Result<bool, String> {
+        let (socket, tun) = poll_io(sock_fd, tun_fd, Duration::ZERO)?;
+        Ok(socket && !tun)
+    }
+
     /// Whether one loop iteration did work.
     ///
     /// A packet the host emitted for another address is consumed and dropped by
@@ -3636,7 +3644,12 @@ mod linux_daemon {
                     socket_ready = if buffered {
                         false
                     } else {
-                        poll_io(sock_fd, None, Duration::ZERO)?.0
+                        // A readable TCP fd can hold just part of a TLS record.
+                        // If the TUN is also ready, let the next turn send its
+                        // current burst before starting another socket read.
+                        // Keep the first inbound attempt on every turn, so a
+                        // busy TUN cannot starve incoming traffic.
+                        poll_additional_inbound(sock_fd, tun.raw_fd())?
                     };
                     if !buffered && !socket_ready {
                         break;
@@ -4070,6 +4083,30 @@ mod linux_daemon {
             }
             let error = result.expect_err("a dead TUN must fail closed");
             assert!(error.contains("TUN"), "unexpected error: {error}");
+        }
+
+        #[test]
+        fn additional_inbound_yields_only_while_tun_is_ready() {
+            use std::os::unix::net::UnixStream;
+
+            let (mut tcp, mut peer) = UnixStream::pair().expect("socket pair");
+            let (mut tun, mut host) = UnixStream::pair().expect("TUN stand-in pair");
+            let socket_fd = tcp.as_raw_fd();
+            let tun_fd = Some(tun.as_raw_fd());
+            assert!(!poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            peer.write_all(b"s").unwrap();
+            assert!(poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            host.write_all(b"t").unwrap();
+            assert!(!poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            assert!(poll_additional_inbound(socket_fd, None).unwrap());
+            let mut byte = [0];
+            tun.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"t");
+            assert!(poll_additional_inbound(socket_fd, tun_fd).unwrap());
+            tcp.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"s");
+            drop(host);
+            assert!(poll_additional_inbound(socket_fd, tun_fd).is_err());
         }
 
         /// Local discards keep the loop hot but never count as delivery.
