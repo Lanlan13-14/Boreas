@@ -1529,6 +1529,8 @@ fn help_text() -> String {
             "This openssl-inner-tls binary can run one hop via `node serve`/`node connect`. That is not a production daemon.",
         );
     }
+    text.push_str("\n\n  Linux/OpenSSL, one-shot verified Core adjacency (control only):\n  ");
+    text.push_str(node::MESH_PROBE_SYNTAX);
     text
 }
 
