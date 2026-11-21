@@ -4,6 +4,7 @@
 pub mod authority_revocation;
 pub mod batch;
 pub mod dns_authority;
+pub mod dns_service_policy;
 pub mod h1h2;
 pub mod messages;
 pub mod network_policy;

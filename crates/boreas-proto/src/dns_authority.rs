@@ -478,7 +478,7 @@ impl DnsAuthority {
     }
 }
 
-fn signature_input(raw_tbs: &[u8], object_type: u8) -> Result<Vec<u8>, Error> {
+pub(crate) fn signature_input(raw_tbs: &[u8], object_type: u8) -> Result<Vec<u8>, Error> {
     if raw_tbs.len() > MAX_TBS_LEN {
         return Err(Error::TooLarge);
     }
@@ -550,23 +550,23 @@ fn head(out: &mut Vec<u8>, major: u8, n: u64) {
         out.extend_from_slice(&n.to_be_bytes());
     }
 }
-fn uint(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn uint(out: &mut Vec<u8>, n: u64) {
     head(out, 0, n);
 }
-fn map(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn map(out: &mut Vec<u8>, n: u64) {
     head(out, 5, n);
 }
-fn array(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn array(out: &mut Vec<u8>, n: u64) {
     head(out, 4, n);
 }
-fn bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn bytes(out: &mut Vec<u8>, b: &[u8]) {
     head(out, 2, b.len() as u64);
     out.extend_from_slice(b);
 }
 
-struct Reader<'a> {
-    b: &'a [u8],
-    i: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) i: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -620,11 +620,11 @@ impl<'a> Reader<'a> {
         }
         self.arg(h & 31)
     }
-    fn uint(&mut self) -> Result<u64, Error> {
+    pub(crate) fn uint(&mut self) -> Result<u64, Error> {
         self.item(0)
     }
     /// Read a container header and require the declared count to be `expected`.
-    fn container(&mut self, major: u8, expected: u64) -> Result<u64, Error> {
+    pub(crate) fn container(&mut self, major: u8, expected: u64) -> Result<u64, Error> {
         let count = self.item(major)?;
         if count != expected {
             return Err(Error::Invalid(
@@ -633,7 +633,7 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
-    fn key(&mut self, expected: u64) -> Result<(), Error> {
+    pub(crate) fn key(&mut self, expected: u64) -> Result<(), Error> {
         if self.uint()? == expected {
             Ok(())
         } else {
@@ -643,7 +643,7 @@ impl<'a> Reader<'a> {
     /// Read an array header and bound its declared element count *before*
     /// `Vec::with_capacity`. The header is consumed exactly once; an earlier
     /// draft read it twice in one expression, which also failed to borrow.
-    fn array_len(&mut self, max: usize) -> Result<usize, Error> {
+    pub(crate) fn array_len(&mut self, max: usize) -> Result<usize, Error> {
         let count = usize::try_from(self.item(4)?).map_err(|_| Error::TooLarge)?;
         if count > max {
             return Err(Error::Invalid("array count"));
@@ -658,7 +658,7 @@ impl<'a> Reader<'a> {
         }
         self.take(n)
     }
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+    pub(crate) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         let b = self.blob(N)?;
         let mut out = [0; N];
         out.copy_from_slice(b);
