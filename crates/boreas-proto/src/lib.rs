@@ -164,7 +164,9 @@ impl FrameDecoder {
             }
             // Parse at the header boundary, before charging or accepting any body
             // bytes. This preserves header-error priority even for a large feed.
-            let raw = self.buf[..HEADER_LEN].try_into().expect("header length checked");
+            let raw = self.buf[..HEADER_LEN]
+                .try_into()
+                .expect("header length checked");
             let header = match AppHeader::parse(raw) {
                 Ok(header) => header,
                 Err(error) => return self.fail(error),
@@ -177,7 +179,10 @@ impl FrameDecoder {
             if wire_len == self.buf.len() + take && self.buf.len() == HEADER_LEN {
                 // The complete body is already contiguous in the input.
                 self.buf.clear();
-                out.push(Frame { header, body: input[..take].to_vec() });
+                out.push(Frame {
+                    header,
+                    body: input[..take].to_vec(),
+                });
             } else {
                 self.buf.extend_from_slice(&input[..take]);
                 if self.buf.len() < wire_len {

@@ -540,18 +540,22 @@ mod tests {
     fn pt_interp_is_rejected_even_for_a_musl_loader_path() {
         let path = b"/lib/ld-musl-aarch64.so.1\0";
         let interp_off = u64::from(ELF64_EHDR_SIZE) + 2 * u64::from(ELF64_PHDR_SIZE);
-        let mut buf = elf_image(EM_AARCH64, ET_DYN, &[
-            PhdrSpec {
-                p_type: PT_LOAD,
-                p_offset: 0,
-                p_filesz: 64,
-            },
-            PhdrSpec {
-                p_type: PT_INTERP,
-                p_offset: interp_off,
-                p_filesz: u64::try_from(path.len()).expect("path"),
-            },
-        ]);
+        let mut buf = elf_image(
+            EM_AARCH64,
+            ET_DYN,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_offset: 0,
+                    p_filesz: 64,
+                },
+                PhdrSpec {
+                    p_type: PT_INTERP,
+                    p_offset: interp_off,
+                    p_filesz: u64::try_from(path.len()).expect("path"),
+                },
+            ],
+        );
         buf.extend_from_slice(path);
         assert!(matches!(
             inspect_elf(&buf),
@@ -561,18 +565,22 @@ mod tests {
 
     #[test]
     fn pt_dynamic_without_interp_is_rejected() {
-        let buf = elf_image(EM_X86_64, ET_DYN, &[
-            PhdrSpec {
-                p_type: PT_LOAD,
-                p_offset: 0,
-                p_filesz: 64,
-            },
-            PhdrSpec {
-                p_type: PT_DYNAMIC,
-                p_offset: 0,
-                p_filesz: 0,
-            },
-        ]);
+        let buf = elf_image(
+            EM_X86_64,
+            ET_DYN,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_offset: 0,
+                    p_filesz: 64,
+                },
+                PhdrSpec {
+                    p_type: PT_DYNAMIC,
+                    p_offset: 0,
+                    p_filesz: 0,
+                },
+            ],
+        );
         assert!(matches!(
             inspect_elf(&buf),
             Err(PreflightError::DynamicSegment)
@@ -582,18 +590,22 @@ mod tests {
     #[test]
     fn static_pie_relocations_are_allowed_but_loader_dependencies_are_not() {
         let table_end = u64::from(ELF64_EHDR_SIZE) + 2 * u64::from(ELF64_PHDR_SIZE);
-        let mut buf = elf_image(EM_X86_64, ET_DYN, &[
-            PhdrSpec {
-                p_type: PT_LOAD,
-                p_offset: 0,
-                p_filesz: table_end + 32,
-            },
-            PhdrSpec {
-                p_type: PT_DYNAMIC,
-                p_offset: table_end,
-                p_filesz: 32,
-            },
-        ]);
+        let mut buf = elf_image(
+            EM_X86_64,
+            ET_DYN,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_offset: 0,
+                    p_filesz: table_end + 32,
+                },
+                PhdrSpec {
+                    p_type: PT_DYNAMIC,
+                    p_offset: table_end,
+                    p_filesz: 32,
+                },
+            ],
+        );
         buf.extend_from_slice(&[0; 32]);
         write_u64(&mut buf, table_end as usize, 7); // DT_RELA
         assert!(inspect_elf(&buf).is_ok());
@@ -606,18 +618,22 @@ mod tests {
 
     #[test]
     fn interp_is_reported_when_dynamic_precedes_it() {
-        let buf = elf_image(EM_X86_64, ET_DYN, &[
-            PhdrSpec {
-                p_type: PT_DYNAMIC,
-                p_offset: 0,
-                p_filesz: 0,
-            },
-            PhdrSpec {
-                p_type: PT_INTERP,
-                p_offset: 0,
-                p_filesz: 0,
-            },
-        ]);
+        let buf = elf_image(
+            EM_X86_64,
+            ET_DYN,
+            &[
+                PhdrSpec {
+                    p_type: PT_DYNAMIC,
+                    p_offset: 0,
+                    p_filesz: 0,
+                },
+                PhdrSpec {
+                    p_type: PT_INTERP,
+                    p_offset: 0,
+                    p_filesz: 0,
+                },
+            ],
+        );
         assert!(matches!(
             inspect_elf(&buf),
             Err(PreflightError::Interpreter)
@@ -758,11 +774,15 @@ mod tests {
 
     #[test]
     fn image_without_pt_load_is_rejected() {
-        let buf = elf_image(EM_X86_64, ET_EXEC, &[PhdrSpec {
-            p_type: 0,
-            p_offset: 0,
-            p_filesz: 0,
-        }]);
+        let buf = elf_image(
+            EM_X86_64,
+            ET_EXEC,
+            &[PhdrSpec {
+                p_type: 0,
+                p_offset: 0,
+                p_filesz: 0,
+            }],
+        );
         assert!(matches!(
             inspect_elf(&buf),
             Err(PreflightError::BadProgramHeaders)

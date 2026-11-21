@@ -20,7 +20,9 @@ case "${BOREAS_ROLE:-}" in
     set -- serve --listen "$BOREAS_LISTEN"
     ;;
   edge)
-    [ -n "${BOREAS_CONNECT:-}" ] && [ -n "${BOREAS_TLS_NAME:-}" ] || fail 'BOREAS_CONNECT and BOREAS_TLS_NAME required'
+    if [ -z "${BOREAS_CONNECT:-}" ] || [ -z "${BOREAS_TLS_NAME:-}" ]; then
+      fail 'BOREAS_CONNECT and BOREAS_TLS_NAME required'
+    fi
     set -- connect --connect "$BOREAS_CONNECT" --tls-name "$BOREAS_TLS_NAME" \
       --ws-host "${BOREAS_WS_HOST:-$BOREAS_TLS_NAME}"
     ;;

@@ -19,10 +19,14 @@ case "$(systemctl show --property=ExecStart --value boreas.service)" in
   *) fail 'refusing to operate on a different service' ;;
 esac
 [ -x "$sup" ] || fail 'trusted supervisor missing'
-[ -d "$trust" ] && [ ! -L "$trust" ] && [ "$(stat -c '%u %a' "$trust")" = '0 700' ] || fail 'invalid release trust directory'
+if [ ! -d "$trust" ] || [ -L "$trust" ] || [ "$(stat -c '%u %a' "$trust")" != '0 700' ]; then
+  fail 'invalid release trust directory'
+fi
 for name in key-id min-sequence ed25519.der mldsa65.der; do
   file=$trust/$name
-  [ -f "$file" ] && [ ! -L "$file" ] && [ "$(stat -c '%u %a' "$file")" = '0 600' ] || fail "invalid release trust input: $name"
+  if [ ! -f "$file" ] || [ -L "$file" ] || [ "$(stat -c '%u %a' "$file")" != '0 600' ]; then
+    fail "invalid release trust input: $name"
+  fi
 done
 IFS= read -r key_id <"$trust/key-id" || fail 'missing release key ID'
 IFS= read -r min_sequence <"$trust/min-sequence" || fail 'missing admission floor'

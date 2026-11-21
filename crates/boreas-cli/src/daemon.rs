@@ -2698,11 +2698,14 @@ mod linux_daemon {
                         },
                         Ordering::SeqCst,
                     );
-                    link = Some((index, HopLink {
-                        session,
-                        fd,
-                        _permit: permit,
-                    }));
+                    link = Some((
+                        index,
+                        HopLink {
+                            session,
+                            fd,
+                            _permit: permit,
+                        },
+                    ));
                     break;
                 }
                 Err(EndpointAttemptError::TryBackup(_error)) => continue,
@@ -3292,10 +3295,10 @@ mod linux_daemon {
 
         #[test]
         fn endpoint_selection_used_by_connect_loop_and_names_honor_overrides() {
-            assert_eq!(connect_endpoints("primary:443", Some("backup:443")), vec![
-                "primary:443",
-                "backup:443"
-            ]);
+            assert_eq!(
+                connect_endpoints("primary:443", Some("backup:443")),
+                vec!["primary:443", "backup:443"]
+            );
             assert_eq!(connect_endpoints("cli:9443", None), vec!["cli:9443"]);
             assert_eq!(
                 endpoint_tls_name("backup.example:8443").unwrap(),

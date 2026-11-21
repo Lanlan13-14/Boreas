@@ -10,19 +10,31 @@ fail() { printf 'install-verified-unit: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail 'administrator required to install the unit (the service never runs as root)'
 [ "$#" -eq 1 ] || fail 'usage: install-verified-unit.sh <independently-trusted-installed-supervisor>'
 case "$1" in /*) ;; *) fail 'trusted supervisor path must be absolute' ;; esac
-[ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ] || fail 'trusted supervisor must be a regular executable'
+if [ ! -f "$1" ] || [ -L "$1" ] || [ ! -x "$1" ]; then
+  fail 'trusted supervisor must be a regular executable'
+fi
 [ "$(stat -c '%u' -- "$1")" = 0 ] || fail 'trusted supervisor must be owned by root'
 if [ $((0$(stat -c '%a' -- "$1") & 022)) -ne 0 ]; then fail 'trusted supervisor is writable by group/other'; fi
 src=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 unit=/etc/systemd/system/boreas.service
 libexec=/usr/local/libexec/boreas
-[ ! -e "$unit" ] && [ ! -L "$unit" ] || fail 'boreas.service already exists; use explicit migration, not overwrite'
+if [ -e "$unit" ] || [ -L "$unit" ]; then
+  fail 'boreas.service already exists; use explicit migration, not overwrite'
+fi
 unit_state=$(systemctl show --property=LoadState --value boreas.service) || fail 'systemd required'
 [ "$unit_state" = not-found ] || fail 'an existing service definition must be migrated explicitly'
-[ ! -e /etc/init.d/boreas ] && [ ! -L /etc/init.d/boreas ] || fail 'existing procd/service deployment must be migrated explicitly'
-[ ! -e "$libexec" ] && [ ! -L "$libexec" ] || fail 'trusted libexec directory already exists'
-[ ! -e /var/lib/boreas ] && [ ! -L /var/lib/boreas ] || fail 'state already exists; do not reinitialize or change its owner'
-[ ! -e /etc/boreas ] && [ ! -L /etc/boreas ] || fail 'existing configuration must be migrated explicitly'
+if [ -e /etc/init.d/boreas ] || [ -L /etc/init.d/boreas ]; then
+  fail 'existing procd/service deployment must be migrated explicitly'
+fi
+if [ -e "$libexec" ] || [ -L "$libexec" ]; then
+  fail 'trusted libexec directory already exists'
+fi
+if [ -e /var/lib/boreas ] || [ -L /var/lib/boreas ]; then
+  fail 'state already exists; do not reinitialize or change its owner'
+fi
+if [ -e /etc/boreas ] || [ -L /etc/boreas ]; then
+  fail 'existing configuration must be migrated explicitly'
+fi
 if getent passwd boreas >/dev/null || getent group boreas >/dev/null; then
   fail 'boreas user/group already exists; dedicated account ownership needs explicit migration'
 fi

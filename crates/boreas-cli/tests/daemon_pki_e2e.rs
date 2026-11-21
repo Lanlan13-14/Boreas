@@ -1024,7 +1024,10 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     // watermark. Keep all identity, status and signed policy bytes unchanged.
     let ed_pin_path = edge_state.join("root-ed25519.der");
     let valid_ed_pin = fs::read(&ed_pin_path).unwrap();
-    let unrelated_public_key = PKey::generate_ed25519().unwrap().public_key_to_der().unwrap();
+    let unrelated_public_key = PKey::generate_ed25519()
+        .unwrap()
+        .public_key_to_der()
+        .unwrap();
     fs::write(&ed_pin_path, unrelated_public_key).unwrap();
     let mismatched_pin = Command::new(bin())
         .args([
@@ -1045,8 +1048,16 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
     fs::write(ed_pin_path, valid_ed_pin).unwrap();
     assert!(!mismatched_pin.status.success());
     let details = String::from_utf8_lossy(&mismatched_pin.stderr);
-    assert!(details.contains("does not match the daemon identity/status NetworkRoot fingerprint"), "{details}");
-    for name in ["policy.state", "policy.state.lock", "status.state", "control.sock"] {
+    assert!(
+        details.contains("does not match the daemon identity/status NetworkRoot fingerprint"),
+        "{details}"
+    );
+    for name in [
+        "policy.state",
+        "policy.state.lock",
+        "status.state",
+        "control.sock",
+    ] {
         assert!(!edge_state.join(name).exists(), "unexpected {name}");
     }
 

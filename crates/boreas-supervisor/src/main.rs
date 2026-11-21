@@ -1294,11 +1294,16 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
                         eprintln!(
                             "boreas-supervisor: restarting retained verified release {active}"
                         );
-                        return run_trial(&_store, &image.program(), rest, &TrialPlan {
-                            image: Some(&image),
-                            transactional: false,
-                            ..trial
-                        });
+                        return run_trial(
+                            &_store,
+                            &image.program(),
+                            rest,
+                            &TrialPlan {
+                                image: Some(&image),
+                                transactional: false,
+                                ..trial
+                            },
+                        );
                     }
                     Err(e) => eprintln!("boreas-supervisor: retained release refused: {e}"),
                 }
@@ -1809,11 +1814,17 @@ mod tests {
 
     #[test]
     fn help_prints_usage_and_exits_zero() {
-        let (code, stdout, _) = done_parts(run_cli(&[os("--help")]));
+        let (code, stdout, stderr) = done_parts(run_cli(&[os("--help")]));
         assert_eq!(code, 0);
+        assert!(stderr.is_empty());
         assert!(stdout.contains("supervise --store <DIR>"));
         assert!(stdout.contains("-- <argv...>"));
-        assert!(stdout.contains("never downloads, installs, or authenticates"));
+        assert!(stdout.contains("stage --store <ABS_DIR> --manifest <FILE> --artifact <FILE>"));
+        assert!(stdout.contains("--ed25519-signature <FILE>"));
+        assert!(stdout.contains("--mldsa65-signature <FILE>"));
+        assert!(stdout.contains("independently trusted release keys"));
+        assert!(stdout.contains("and ML-DSA-65 signatures"));
+        assert!(stdout.contains("`--require-verified` fails closed without a verified"));
     }
 
     #[test]

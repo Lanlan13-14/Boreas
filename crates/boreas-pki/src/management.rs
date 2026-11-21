@@ -331,7 +331,10 @@ impl ManagementTrust {
         if authorization.net_id() != self.net_id {
             return Err(Error::WrongNetwork);
         }
-        self.insert_issuer(authorization.issuer_record(), Some(authorization.validity()))
+        self.insert_issuer(
+            authorization.issuer_record(),
+            Some(authorization.validity()),
+        )
     }
 
     fn insert_issuer(

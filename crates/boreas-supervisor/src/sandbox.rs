@@ -515,14 +515,10 @@ fn daemon_profile_admits_streams_without_admitting_datagrams_or_passed_fds() {
             (libc::SOCK_RAW, RET_EPERM),
         ] {
             assert_eq!(
-                test(sys.socket, [
-                    family as u64,
-                    (ty | libc::SOCK_CLOEXEC) as u64,
-                    0,
-                    0,
-                    0,
-                    0
-                ]),
+                test(
+                    sys.socket,
+                    [family as u64, (ty | libc::SOCK_CLOEXEC) as u64, 0, 0, 0, 0]
+                ),
                 action
             );
         }
@@ -859,9 +855,12 @@ mod tests {
         for target in [TargetArch::X86_64, TargetArch::Aarch64] {
             let prog = program(target);
             assert_eq!(
-                action(&prog, X86_32_SOCKETCALL, target.audit_arch(), [
-                    1, 0, 0, 0, 0, 0
-                ]),
+                action(
+                    &prog,
+                    X86_32_SOCKETCALL,
+                    target.audit_arch(),
+                    [1, 0, 0, 0, 0, 0]
+                ),
                 SECCOMP_RET_KILL_PROCESS
             );
         }
@@ -880,9 +879,12 @@ mod tests {
 
         let x86_64 = program(TargetArch::X86_64);
         assert_eq!(
-            action(&x86_64, X86_32_SOCKETCALL, AUDIT_ARCH_I386, [
-                1, 0, 0, 0, 0, 0
-            ]),
+            action(
+                &x86_64,
+                X86_32_SOCKETCALL,
+                AUDIT_ARCH_I386,
+                [1, 0, 0, 0, 0, 0]
+            ),
             SECCOMP_RET_KILL_PROCESS
         );
         assert_eq!(
@@ -897,9 +899,12 @@ mod tests {
 
         let aarch64 = program(TargetArch::Aarch64);
         assert_eq!(
-            action(&aarch64, X86_32_SOCKETCALL, AUDIT_ARCH_ARM, [
-                1, 0, 0, 0, 0, 0
-            ]),
+            action(
+                &aarch64,
+                X86_32_SOCKETCALL,
+                AUDIT_ARCH_ARM,
+                [1, 0, 0, 0, 0, 0]
+            ),
             SECCOMP_RET_KILL_PROCESS
         );
     }

@@ -377,7 +377,9 @@ mod tests {
         assert!(!state.exists());
         assert!(!state_dir.join("policy.state.lock").exists());
         assert_eq!(
-            invoke(&paths, &state, &state_dir, net, fingerprint, uid).unwrap().seq(),
+            invoke(&paths, &state, &state_dir, net, fingerprint, uid)
+                .unwrap()
+                .seq(),
             2
         );
         let anchor = {
