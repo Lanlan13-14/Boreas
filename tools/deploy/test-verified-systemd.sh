@@ -36,6 +36,9 @@ mkdir "$trust"
 # Only this user's staging process can traverse into the input subdirectory;
 # the ephemeral signing private keys and node CA remain root-only.
 chmod 0711 "$work"
+# The dedicated account cannot traverse the Actions workspace. This trusted
+# test binary is solely for querying the live control socket as that account.
+install -m0755 "$bin" "$work/status-client"
 chgrp boreas "$trust"
 chmod 0750 "$trust"
 for alg in ed25519 mldsa65; do
@@ -137,7 +140,9 @@ unit_ready() {
   [[ $(systemctl show --value -p ActiveState boreas.service) == active ]]
   # The Core is ready to accept, not falsely connected. A real non-root daemon
   # minted the reply, not the supervisor or the ability to observe a TUN link.
-  runuser -u boreas -- "$bin" ctl status --socket "$state/control.sock" | grep -q '"daemon_connected":false'
+  local status
+  status=$(runuser -u boreas -- "$work/status-client" ctl status --socket "$state/control.sock")
+  [[ $status == *'"daemon_connected":false'* ]] || { echo "ERROR: unexpected Core status: $status" >&2; return 1; }
   local pid child
   pid=$(systemctl show --value -p MainPID boreas.service)
   child=$(pgrep -P "$pid")
