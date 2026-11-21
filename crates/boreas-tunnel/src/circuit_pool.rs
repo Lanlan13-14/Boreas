@@ -364,10 +364,9 @@ mod tests {
     fn ip_checksum(bytes: &mut [u8]) {
         bytes[10..12].fill(0);
         let header_len = usize::from(bytes[0] & 15) * 4;
-        let mut sum: u32 = bytes[..header_len]
-            .chunks_exact(2)
-            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
-            .sum();
+        let (words, tail) = bytes[..header_len].as_chunks::<2>();
+        assert!(tail.is_empty());
+        let mut sum: u32 = words.iter().map(|&word| u32::from(u16::from_be_bytes(word))).sum();
         while sum > 0xffff {
             sum = (sum & 0xffff) + (sum >> 16);
         }
