@@ -477,23 +477,27 @@ mod linux_daemon {
         }
     }
 
-    /// Only trial children get the private supervisor socket. TUN readiness is
+    /// The verified supervisor challenges each boot. TUN readiness is
     /// a fact about this process's verified queue, not host route convergence.
     fn report_trial_ready(tun: &TunEndpoint) -> Result<(), String> {
-        use boreas_supervisor::ready_client::{DAEMON_STATE_SCHEMA, SOCKET_ENV, TunStatus, report_ready};
+        use boreas_supervisor::ready_client::{
+            DAEMON_STATE_SCHEMA, SOCKET_ENV, TunStatus, report_ready,
+        };
 
         let Some(socket) = std::env::var_os(SOCKET_ENV) else {
             return Ok(());
         };
         let status = match tun {
             TunEndpoint::Real { io, .. } => {
-                io.queue.verify().map_err(|e| format!("daemon: trial TUN queue failed verification: {e}"))?;
+                io.queue.verify().map_err(|e| {
+                    format!("daemon: supervised TUN queue failed verification: {e}")
+                })?;
                 TunStatus::Ready
             }
             TunEndpoint::Virtual { .. } => TunStatus::Absent,
         };
         report_ready(Path::new(&socket), DAEMON_STATE_SCHEMA, 1, status)
-            .map_err(|e| format!("daemon: trial readiness handshake failed: {e}"))
+            .map_err(|e| format!("daemon: supervised readiness handshake failed: {e}"))
     }
 
     fn daemon_capabilities() -> RuntimeCapabilities {
@@ -1625,7 +1629,10 @@ mod linux_daemon {
         const MAX_ROOTS_FILE_BYTES: usize = 64 * 1024;
         let mut raw = Vec::new();
         fs::File::open(roots_path)
-            .and_then(|file| file.take(MAX_ROOTS_FILE_BYTES as u64 + 1).read_to_end(&mut raw))
+            .and_then(|file| {
+                file.take(MAX_ROOTS_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut raw)
+            })
             .map_err(|_| "daemon: cannot read status trust root bundle".to_string())?;
         if raw.len() > MAX_ROOTS_FILE_BYTES {
             return Err("daemon: status trust root bundle exceeds size limit".to_string());
@@ -1634,7 +1641,9 @@ mod linux_daemon {
             .and_then(|bundle| bundle.verify_all(net_id, now_us))
             .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
         if fingerprint != expected_root_fingerprint {
-            return Err("daemon: status NetworkRoot fingerprint does not match identity".to_string());
+            return Err(
+                "daemon: status NetworkRoot fingerprint does not match identity".to_string(),
+            );
         }
         let mut trust = ManagementTrust::new(net_id);
         let mut has_status = false;
@@ -1680,6 +1689,12 @@ mod linux_daemon {
     }
 
     pub fn run_mode(mode: Mode, args: &[String]) -> Result<(), String> {
+        let provisioned =
+            std::env::var_os(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV).is_some();
+        if provisioned {
+            boreas_supervisor::sandbox::install_daemon()
+                .map_err(|e| format!("daemon: service network isolation setup failed: {e}"))?;
+        }
         let mut config_path: Option<PathBuf> = None;
         let mut material_dir: Option<PathBuf> = None;
         let mut listen_spec: Option<String> = None;
@@ -1775,6 +1790,9 @@ mod linux_daemon {
             }
         }
 
+        if provisioned && virtual_tun {
+            return Err("daemon: verified service requires a provisioned real TUN".into());
+        }
         if !(1280..=1400).contains(&mtu) {
             return Err("daemon: --mtu must be in 1280..=1400".to_string());
         }
@@ -1972,17 +1990,20 @@ mod linux_daemon {
                 _host: host,
             }
         } else {
-            let (dev, queue) = LinuxTunDevice::create(TunConfig {
-                name: tun_name,
-                mtu,
-                multi_queue: false,
-                vnet_header: false,
-            })
-            .map_err(|e| {
-                format!(
-                    "daemon Linux TUN creation failed (need CAP_NET_ADMIN / /dev/net/tun): {e:?}"
-                )
-            })?;
+            let (dev, queue) = if provisioned {
+                let name = tun_name
+                    .as_deref()
+                    .ok_or("daemon: provisioned TUN requires an explicit --tun-name")?;
+                LinuxTunDevice::open_provisioned(name, mtu)
+            } else {
+                LinuxTunDevice::create(TunConfig {
+                    name: tun_name,
+                    mtu,
+                    multi_queue: false,
+                    vnet_header: false,
+                })
+            }
+            .map_err(|e| format!("daemon Linux TUN setup failed: {e:?}"))?;
             queue
                 .set_nonblocking(true)
                 .map_err(|e| format!("daemon Linux TUN O_NONBLOCK failed: {e:?}"))?;
@@ -2430,8 +2451,15 @@ mod linux_daemon {
         // A Core is ready to accept a peer; this does not claim a peer circuit.
         report_trial_ready(tun)?;
 
-        let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
-        let accept_deadline = Instant::now() + wait_limit;
+        // The verified service remains available to accept the first peer;
+        // the 30s legacy smoke-run timeout must not churn a healthy service.
+        let supervised =
+            std::env::var_os(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV).is_some();
+        let accept_deadline = max_seconds
+            .map(Duration::from_secs)
+            .or_else(|| (!supervised).then_some(ACCEPT_WAIT))
+            .map(|wait| Instant::now() + wait);
+        let mut next_status_check = Instant::now() + STATUS_RECHECK_INTERVAL;
         let tcp = loop {
             match listener.accept() {
                 Ok((s, _)) => {
@@ -2443,7 +2471,15 @@ mod linux_daemon {
                     policy_window.check().map_err(|e| {
                         format!("daemon serve: policy window failed while waiting for peer: {e}")
                     })?;
-                    if Instant::now() >= accept_deadline {
+                    if supervised && Instant::now() >= next_status_check {
+                        lock_gate(&status_store, status_path).map_err(|e| {
+                            format!(
+                                "daemon serve: durable status gate failed waiting for peer: {e}"
+                            )
+                        })?;
+                        next_status_check = Instant::now() + STATUS_RECHECK_INTERVAL;
+                    }
+                    if accept_deadline.is_some_and(|until| Instant::now() >= until) {
                         return Err(
                             "daemon serve: timed out waiting for peer connection".to_string()
                         );
@@ -2662,14 +2698,11 @@ mod linux_daemon {
                         },
                         Ordering::SeqCst,
                     );
-                    link = Some((
-                        index,
-                        HopLink {
-                            session,
-                            fd,
-                            _permit: permit,
-                        },
-                    ));
+                    link = Some((index, HopLink {
+                        session,
+                        fd,
+                        _permit: permit,
+                    }));
                     break;
                 }
                 Err(EndpointAttemptError::TryBackup(_error)) => continue,
@@ -3259,10 +3292,10 @@ mod linux_daemon {
 
         #[test]
         fn endpoint_selection_used_by_connect_loop_and_names_honor_overrides() {
-            assert_eq!(
-                connect_endpoints("primary:443", Some("backup:443")),
-                vec!["primary:443", "backup:443"]
-            );
+            assert_eq!(connect_endpoints("primary:443", Some("backup:443")), vec![
+                "primary:443",
+                "backup:443"
+            ]);
             assert_eq!(connect_endpoints("cli:9443", None), vec!["cli:9443"]);
             assert_eq!(
                 endpoint_tls_name("backup.example:8443").unwrap(),

@@ -1,135 +1,15 @@
 //! `boreas-supervisor` — the external upgrade-supervision process
 //! (master plan §1.1, §10.3, §10.5).
 //!
-//! This binary is the real supervision boundary, not a release system. It never
-//! downloads, installs, or authenticates anything: `prepare`/`activate` are
-//! intentionally absent so no operator can stage an unverified artifact through
-//! this entry point. Manifest verification (Ed25519 + ML-DSA dual signature,
-//! TUF-style roles, SBOM, anti-rollback — master plan §10.1–§10.2, `G-SUPPLY`)
-//! lives in `manifest.rs` as strict structure/policy only; the signature
-//! provider is not implemented, so `manifest::verify_release` fails closed and
-//! `prepare` stays unreachable in production.
+//! `stage` is an offline, dual-signature admission path. It never downloads
+//! anything. `supervise --require-verified` requires that path and executes a
+//! sealed copy of the authenticated static ELF. The private socket binds the
+//! readiness report to both the actual child PID and that sealed image.
 //!
-//! # Boot protocol
-//!
-//! Two launch modes compose into the §10.3 loop ("the external supervisor
-//! rolls back the active pointer from an unconfirmed journal, then
-//! restarts"; "re-running a broken path under systemd is not rollback"):
-//!
-//! 1. `recover` — call before launching any version. An unconfirmed
-//!    (`Prepared`/`Activated`) journal rolls the active pointer back to the
-//!    retained old version (or clears it on first install); a consistent
-//!    `Confirmed` journal keeps the new version. Recovery is honest about
-//!    being a store state transition only — it launches nothing.
-//! 2. `supervise -- <argv...>` — the launch path. It performs recovery
-//!    first ([`UpgradeStore::begin_activation`] starts in `recover()`), but
-//!    never aborts mid-protocol:
-//!    * no journal / consistent `Confirmed` → run `<argv...>` as the steady
-//!      program and propagate its exit status (128+signal when killed);
-//!    * `Prepared` → activate the candidate for one trial launch, run
-//!      `<argv...>`, and confirm only after an **authorized readiness answer**
-//!      (see below); an early exit with any status, a readiness timeout, a
-//!      rejected peer, a spawn/wait failure or a failed `confirm()`
-//!      ⇒ `recover()` rollback, with the old version directory retained;
-//!    * `Activated` (a previous trial never confirmed, e.g. this supervisor
-//!      or the candidate was `SIGKILL`ed before the outcome was recorded)
-//!      → the `recover()` inside `begin_activation` has already restored
-//!      the old pointer; run `<argv...>` as the *old* program and
-//!      propagate its status. The candidate is not auto-retried by this
-//!      invocation, and the dead trial is recorded as a failed attempt.
-//!    * inconsistent `Confirmed` → refuse (non-zero, nothing launched).
-//!
-//!    The caller resolves `<argv...>` against the store: `supervise`
-//!    replaces a leading `{version}` in `argv[0]` with the absolute
-//!    active-version directory (fail-closed when no version is active), so
-//!    the program actually started is always the one the pointer names —
-//!    the candidate on a trial, the old program after a rollback — without
-//!    the supervisor synthesising a binary name of its own.
-//!
-//! In production the pair is driven as `recover` once at service start,
-//! then one `supervise` per OS-service restart; the first restart after an
-//! upgrade runs the candidate once, and a crash before readiness leaves
-//! the journal `Activated`, so the next `supervise` boots the rolled-back
-//! version instead of retrying the candidate. A candidate that keeps failing
-//! early is bounded by the durable trial budget
-//! (`--max-trial-attempts`, default 3) rather than retried forever; after the
-//! budget is spent the supervisor refuses to activate it and the operator must
-//! inspect the store and run `reset-trial`.
-//!
-//! # Readiness: authorized handshake, not liveness
-//!
-//! A trial is confirmed only when the candidate proves it is *ready*, not when
-//! it merely stayed alive. Before spawning, the supervisor binds a private
-//! `AF_UNIX` socket (`<store>/ready.sock`, mode `0600`) and exports its path as
-//! `BOREAS_READY_SOCKET`. The candidate must connect, satisfy peer-credential
-//! checks (same uid always; on Linux the exact spawned pid) and answer a fresh
-//! per-run random challenge with:
-//!
-//! * its state schema identifier,
-//! * the number of ready workers,
-//! * whether its TUN device is ready or absent.
-//!
-//! `--ready-timeout-ms` (default 30 000) bounds the answer, `--ready-min-workers`
-//! (default 1) and `--ready-require-tun` (default `yes`) define acceptance.
-//! Anything else — no connection, wrong peer, wrong echo, unacceptable state —
-//! fails the trial and rolls back. A deadlocked-but-alive process can no longer
-//! be confirmed.
-//!
-//! Deliberate limit: the challenge is **not yet bound to the candidate artifact
-//! SHA-256**, because `verify_release` → `prepare` is not wired; that binding
-//! belongs with the installer. There is also no Boreas daemon in this workspace
-//! yet, so the protocol is exercised against the `__ready-stub` candidate in
-//! integration tests. It is **not** claimed to be integrated in production.
-//!
-//! Every mutating subcommand (`supervise`, `recover`, `reset-trial`) holds the
-//! store's exclusive OS file lock for its whole run, so two supervisors cannot
-//! race the journal or the active pointer. The lock is released by the kernel
-//! when the process dies, so a crash cannot leave a stale lock behind.
-//!
-//! Failed trials are durable. The attempt is written to `trial.state` *before*
-//! the launch, so a supervisor that is killed mid-trial still consumes budget
-//! on the next boot; `--max-trial-attempts` (default 3) bounds the restart loop
-//! across process lifetimes. Only the operator-only `reset-trial` clears it.
-//! The ledger can only ever *restrict* launches, so tampering with it causes a
-//! denial of upgrades, never an unauthorised one.
-//!
-//! # Signals: forwarding and controlled stop
-//!
-//! `supervise` installs handlers for `SIGTERM`, `SIGINT` and `SIGHUP`. The
-//! handler only stores the signal number in an atomic (async-signal-safe); the
-//! wait loop forwards it to the child and gives it `--stop-grace-ms` (default
-//! 10 000) before escalating to `SIGKILL`. A stop that arrives *before*
-//! readiness fails the trial and rolls back, because an interrupted candidate
-//! never proved itself.
-//!
-//! The group/console contract still applies underneath: a cgroup-wide stop
-//! reaches the child directly, and if this supervisor is killed the durable
-//! `Activated` journal plus the `in-flight` reservation make the next
-//! `supervise` roll back and count the attempt (§10.3).
-//!
-//! What is *not* provided: per-signal exit mapping beyond `128+n`, a graceful
-//! stop of an already-confirmed daemon beyond the forwarded signal, and any
-//! Windows signal semantics (Windows has no POSIX disposition; its store path
-//! stays fail-closed).
-//!
-//! # Still missing (explicit, not silently claimed)
-//!
-//! * **No artifact-SHA binding in the challenge**, and no real daemon to answer
-//!   it: the protocol is real, the integration is not.
-//! * **No release verification wiring.** Nothing here downloads, authenticates
-//!   or stages a release; `prepare`/`activate` are deliberately absent from the
-//!   CLI so no unverified artifact can be executed through it.
-//! * **Durability** inherits the library audit: Linux directory `fsync`, macOS
-//!   `F_FULLFSYNC` + directory `fsync`, Windows fail-closed, and the power-cut /
-//!   fault-injection matrix behind `G-UPGRADE` remains unproven. Nothing in this
-//!   slice claims `G-UPGRADE` or `G-SUPPLY` completion.
-//!
-//! Exit codes: `0` success/confirm/child exit 0; `1` any supervisor-side
-//! error (usage, store open/lock/recovery failure, spawn failure, rejected
-//! readiness, rollback after a failed trial — the exact cause is on stderr);
-//! `<n>` for steady launches, confirmed launches that later exit, and
-//! rolled-back launches it is the child's own exit code, and `128+n` when the
-//! child was killed by signal `n` (shell convention).
+//! A failed verified trial consumes its durable reservation and restores the
+//! old active pointer. A subsequent supervisor starts the retained image and
+//! checks its readiness too (no automatic retry of the failed candidate).
+//! Generic `supervise` remains available for non-release use and tests.
 
 use std::env;
 use std::ffi::OsString;
@@ -148,6 +28,8 @@ use boreas_supervisor::{
     Activation, Journal, Phase, Recovery, Result, StoreLock, TrialState, UpgradeStore,
 };
 
+#[cfg(target_os = "linux")]
+mod release_fs;
 /// POSIX signal forwarding + controlled stop (no-ops off Unix).
 mod signals;
 mod stage_cli;
@@ -201,7 +83,8 @@ USAGE:
                                 [--ready-require-tun <yes|no>]
                                 [--ready-min-workers <N>]
                                 [--stop-grace-ms <MS>]
-                                [--max-trial-attempts <N>] -- <argv...>
+                                [--max-trial-attempts <N>]
+                                [--require-verified --min-run-sequence <N> --writable-state <DIR>] -- <argv...>
     boreas-supervisor stage --store <ABS_DIR> --manifest <FILE> --artifact <FILE>
                             --root-key-id <ID> --root-ed25519-der <FILE>
                             --root-mldsa65-der <FILE> --ed25519-signature <FILE>
@@ -251,9 +134,9 @@ goes stale.
 `__ready-stub` is a hidden test-support candidate (not an operator command); it
 exists so integration tests exercise the real handshake with a real subprocess.
 
-This binary never downloads, installs, or authenticates a release.
-prepare/activate are deliberately not exposed: staging artifacts requires
-the independent manifest-verification layer (master plan Sec.10.1-10.2).";
+`stage` requires independently trusted release keys and matching raw Ed25519
+and ML-DSA-65 signatures. `--require-verified` fails closed without a verified
+store and checks live daemon readiness on every boot before notifying systemd.";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -309,7 +192,13 @@ struct SupervisePlan {
     argv: Vec<OsString>,
     /// Candidate whose trial launch is in flight (trial launches only).
     trial_candidate: Option<String>,
-    verified: bool,
+    image: Option<verified_launch::Image>,
+    #[cfg(target_os = "linux")]
+    filesystem: Option<release_fs::ReleaseFs>,
+    #[cfg(unix)]
+    verified_args: Option<Vec<OsString>>,
+    #[cfg(unix)]
+    min_run_sequence: u64,
     /// Unix trial-readiness policy. Windows deliberately refuses trial launch
     /// because its readiness channel is not implemented there.
     #[cfg(unix)]
@@ -443,6 +332,9 @@ struct SuperviseArgs {
     ready_min_workers: u32,
     ready_expected_schema: String,
     max_trial_attempts: u32,
+    require_verified: bool,
+    writable_state: Option<String>,
+    min_run_sequence: u64,
     child_argv: Vec<OsString>,
 }
 
@@ -454,12 +346,35 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
     let mut ready_min_workers: Option<u32> = None;
     let mut ready_expected_schema: Option<String> = None;
     let mut max_trial_attempts: Option<u32> = None;
+    let mut require_verified = false;
+    let mut writable_state = None;
+    let mut min_run_sequence = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i]
             .to_str()
             .ok_or_else(|| "supervise: argument is not valid UTF-8".to_string())?;
         match arg {
+            "--require-verified" if !require_verified => require_verified = true,
+            "--writable-state" if writable_state.is_none() => {
+                i += 1;
+                writable_state = Some(
+                    args.get(i)
+                        .and_then(|v| v.to_str())
+                        .ok_or("supervise: --writable-state requires a directory")?
+                        .to_owned(),
+                );
+            }
+            "--min-run-sequence" if min_run_sequence.is_none() => {
+                i += 1;
+                min_run_sequence = Some(
+                    args.get(i)
+                        .and_then(|v| v.to_str())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .ok_or("supervise: --min-run-sequence requires a positive integer")?,
+                );
+            }
             "--store" => {
                 if store.is_some() {
                     return Err("supervise: duplicate --store".to_string());
@@ -626,6 +541,9 @@ fn parse_supervise_args(args: &[OsString]) -> std::result::Result<SuperviseArgs,
                             .to_string()
                     })?,
                     max_trial_attempts: max_trial_attempts.unwrap_or(DEFAULT_MAX_TRIAL_ATTEMPTS),
+                    require_verified,
+                    writable_state,
+                    min_run_sequence: min_run_sequence.unwrap_or(1),
                     child_argv,
                 });
             }
@@ -986,11 +904,22 @@ fn cmd_ready_stub(_args: &[OsString]) -> CliOutcome {
 // Subcommand: supervise (lock -> recover -> spawn -> readiness -> confirm)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
+fn verified_stage_path(store: &str) -> io::Result<()> {
+    boreas_supervisor::verified_stage::validate_store_path(std::path::Path::new(store))
+}
+
 fn cmd_supervise(args: &[OsString]) -> CliOutcome {
     let parsed = match parse_supervise_args(args) {
         Ok(p) => p,
         Err(e) => return usage_err(&e),
     };
+    #[cfg(target_os = "linux")]
+    if parsed.require_verified
+        && let Err(e) = verified_stage_path(&parsed.store)
+    {
+        return err_out(&format!("invalid verified store: {e}"));
+    }
     let store = match open_store(&parsed.store) {
         Ok(s) => s,
         Err(o) => return o,
@@ -1004,11 +933,37 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
     };
     let mut notes: Vec<String> = Vec::new();
     let verified = match verified_launch::is_enabled(&parsed.store) {
+        Ok(false) if parsed.require_verified => return err_out("verified release store required"),
         Ok(enabled) => enabled,
         Err(e) => return err_out(&e),
     };
+    #[cfg(target_os = "linux")]
+    let filesystem = if verified {
+        // The daemon shares the service UID but must not be able to inspect
+        // or open the supervisor's descriptors through procfs or ptrace.
+        // SAFETY: PR_SET_DUMPABLE uses only a scalar; it must succeed.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return err_out(&format!(
+                "cannot harden verified supervisor: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let Some(state) = parsed.writable_state.as_deref() else {
+            return err_out("verified launch requires --writable-state <ABS_DIR>");
+        };
+        match release_fs::ReleaseFs::new(store.root(), std::path::Path::new(state)) {
+            Ok(fs) => Some(fs),
+            Err(e) => return err_out(&format!("invalid verified writable state: {e}")),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = &parsed.writable_state;
     let recovered = if verified {
-        if let Err(e) = verified_launch::validate_arguments(&parsed.child_argv, &parsed.ready_expected_schema) {
+        if let Err(e) =
+            verified_launch::validate_arguments(&parsed.child_argv, &parsed.ready_expected_schema)
+        {
             return err_out(&e);
         }
         match verified_launch::select_recovered(&store) {
@@ -1121,31 +1076,55 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
     // `{version}` must resolve against the version the pointer names NOW
     // (the trial candidate, or the rolled-back/steady one) — never against
     // a version the caller merely hopes is active.
-    let (trial_candidate, resolve_expected) = match &launch {
+    let (mut trial_candidate, resolve_expected) = match &launch {
         Launch::Trial { candidate } => (Some(candidate.clone()), Some(candidate.clone())),
         Launch::Steady { active } => (None, active.clone()),
     };
-    let resolved = if verified {
-        verified_launch::argv(&store, &parsed.child_argv, resolve_expected.as_deref())
-    } else {
-        resolve_child_argv(&store, &parsed.child_argv, resolve_expected.as_deref())
-    };
-    let argv = match resolved {
-        Ok(argv) => argv,
-        Err(e) => {
-            // Fail-closed: a trial whose argv cannot even be resolved must
-            // not linger in `Activated`. Restore the retained version now
-            // instead of relying on a future boot to notice.
-            if trial_candidate.is_some() {
-                let _ = store.mark_trial_failed();
-                if store.recover().is_err() {
-                    return err_out(&format!(
-                        "{e}; rollback of the activated candidate ALSO failed — \
-                         store may still point at the unconfirmed candidate"
-                    ));
+    let (argv, image) = if verified {
+        let mut argv = parsed.child_argv.clone();
+        let image = match verified_launch::image(
+            &store,
+            resolve_expected.as_deref(),
+            parsed.min_run_sequence,
+        ) {
+            Ok(image) => image,
+            Err(e) if trial_candidate.is_some() => {
+                notes.push(format!(
+                    "verified trial image rejected before execution: {e}"
+                ));
+                if let Err(ledger) = store.mark_trial_failed() {
+                    notes.push(format!("cannot record failed attempt: {ledger}"));
+                }
+                let active = match store.recover() {
+                    Ok(Recovery::RolledBack { active }) => active,
+                    result => return err_out(&format!("rollback after {e} failed: {result:?}")),
+                };
+                trial_candidate = None;
+                match verified_launch::image(&store, active.as_deref(), parsed.min_run_sequence) {
+                    Ok(image) => image,
+                    Err(fallback) => {
+                        return err_out(&format!("{e}; retained release unavailable: {fallback}"));
+                    }
                 }
             }
-            return err_out(&e);
+            Err(e) => return err_out(&e),
+        };
+        argv[0] = image.program();
+        (argv, Some(image))
+    } else {
+        match resolve_child_argv(&store, &parsed.child_argv, resolve_expected.as_deref()) {
+            Ok(argv) => (argv, None),
+            Err(e) => {
+                if trial_candidate.is_some() {
+                    let _ = store.mark_trial_failed();
+                    if store.recover().is_err() {
+                        return err_out(&format!(
+                            "{e}; rollback of activated candidate also failed"
+                        ));
+                    }
+                }
+                return err_out(&e);
+            }
         }
     };
     #[cfg(not(unix))]
@@ -1161,7 +1140,13 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             store_root: parsed.store,
             argv,
             trial_candidate,
-            verified,
+            image,
+            #[cfg(target_os = "linux")]
+            filesystem,
+            #[cfg(unix)]
+            verified_args: verified.then_some(parsed.child_argv),
+            #[cfg(unix)]
+            min_run_sequence: parsed.min_run_sequence,
             #[cfg(unix)]
             ready_timeout: parsed.ready_timeout,
             #[cfg(unix)]
@@ -1262,24 +1247,8 @@ fn resolve_child_argv(
     Ok(argv)
 }
 
-/// Run the planned child and close the journal transaction according to its
-/// real outcome. Returns this process's exit code.
-///
-/// Two quite different contracts apply:
-///
-/// * **steady launch** — the pointer is not ours to change; spawn, wait and
-///   propagate the child's status.
-/// * **trial launch** — the upgrade is committed only once the candidate has
-///   proved it stays alive for the configured soak. Exiting 0 earlier is *not*
-///   *not* readiness: it is recorded as a failed attempt and rolled back. Once the soak
-///   deadline passes, `confirm()` is written while the child is still running,
-///   so a later crash is an ordinary runtime stop instead of a silent upgrade
-///   failure.
-///
-/// Never panics, and every failure path keeps the store consistent: trial
-/// candidates are rolled back and their attempt is already durable, never left
-/// silently `Activated` — and even if a rollback itself fails, the `Activated`
-/// journal makes the *next* supervisor invocation roll back before launching.
+/// Hold the writer lock through child termination. A verified steady launch
+/// also has to report live readiness, but never changes the upgrade journal.
 fn execute_supervise(plan: SupervisePlan) -> u8 {
     // Hold the exclusive store lock for the entire child lifetime: it is
     // dropped only when this function returns.
@@ -1295,21 +1264,51 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
         eprintln!("boreas-supervisor: error: empty child argv");
         return EXIT_ERROR;
     };
-    if plan.trial_candidate.is_some() {
+    if plan.trial_candidate.is_some() || plan.image.is_some() {
         #[cfg(unix)]
         {
             let trial = TrialPlan {
                 socket: PathBuf::from(&plan.store_root).join("ready.sock"),
                 ready_timeout: plan.ready_timeout,
                 stop_grace: plan.stop_grace,
-                verified: plan.verified,
+                image: plan.image.as_ref(),
+                #[cfg(target_os = "linux")]
+                filesystem: plan.filesystem.as_ref(),
+                transactional: plan.trial_candidate.is_some(),
                 policy: readiness::ReadinessPolicy {
                     expected_schema: plan.ready_expected_schema.clone(),
                     require_tun: plan.ready_require_tun,
                     min_workers: plan.ready_min_workers,
                 },
             };
-            return run_trial(&_store, program, rest, &trial);
+            let code = run_trial(&_store, program, rest, &trial);
+            // A controlled stop must not spawn another process. For any other
+            // failure, restart the retained program in this service invocation
+            // only after recovery committed the old pointer.
+            if code != EXIT_ERROR || !trial.transactional || plan.image.is_none() {
+                return code;
+            }
+            if let (Ok(Some(j)), Ok(active)) = (_store.journal(), _store.active_version())
+                && j.phase == Phase::Prepared
+                && active == j.old_version
+                && let Some(active) = active
+                && let Some(argv) = plan.verified_args
+            {
+                match verified_launch::image(&_store, Some(&active), plan.min_run_sequence) {
+                    Ok(image) => {
+                        eprintln!(
+                            "boreas-supervisor: restarting retained verified release {active}"
+                        );
+                        return run_trial(&_store, &image.program(), &argv[1..], &TrialPlan {
+                            image: Some(&image),
+                            transactional: false,
+                            ..trial
+                        });
+                    }
+                    Err(e) => eprintln!("boreas-supervisor: retained release refused: {e}"),
+                }
+            }
+            return code;
         }
         #[cfg(not(unix))]
         {
@@ -1327,12 +1326,13 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
     let stop_grace = plan.stop_grace;
     #[cfg(not(unix))]
     let stop_grace = Duration::ZERO;
-    run_steady(program, rest, plan.verified, stop_grace)
+    run_steady(program, rest, stop_grace)
 }
 
 /// Steady launch: the store already points at a confirmed version.
-fn run_steady(program: &OsString, args: &[OsString], verified: bool, stop_grace: Duration) -> u8 {
-    match spawn_child(program, args, None, verified).and_then(|mut child| wait_steady(&mut child, stop_grace)) {
+fn run_steady(program: &OsString, args: &[OsString], stop_grace: Duration) -> u8 {
+    match spawn_child(program, args, None).and_then(|mut child| wait_steady(&mut child, stop_grace))
+    {
         Ok(status) => exit_code_of(status),
         Err(e) => {
             eprintln!(
@@ -1347,11 +1347,14 @@ fn run_steady(program: &OsString, args: &[OsString], verified: bool, stop_grace:
 /// Everything one trial launch needs: the private socket, the readiness
 /// deadline/policy and the stop grace.
 #[cfg(unix)]
-struct TrialPlan {
+struct TrialPlan<'a> {
     socket: PathBuf,
     ready_timeout: Duration,
     stop_grace: Duration,
-    verified: bool,
+    image: Option<&'a verified_launch::Image>,
+    #[cfg(target_os = "linux")]
+    filesystem: Option<&'a release_fs::ReleaseFs>,
+    transactional: bool,
     policy: readiness::ReadinessPolicy,
 }
 
@@ -1362,7 +1365,27 @@ struct TrialPlan {
 /// answers this run's fresh challenge with an acceptable schema/worker/TUN
 /// state. Being alive is not enough: the old liveness soak is gone.
 #[cfg(unix)]
-fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], plan: &TrialPlan) -> u8 {
+fn run_trial(
+    store: &UpgradeStore,
+    program: &OsString,
+    args: &[OsString],
+    plan: &TrialPlan<'_>,
+) -> u8 {
+    if let Some(signal) = signals::take() {
+        fail_trial(store, plan.transactional);
+        return signals::exit_code(signal);
+    }
+    if plan.image.is_some()
+        && let Err(e) = self_check(program, plan)
+    {
+        eprintln!("boreas-supervisor: verified artifact self-check failed (not readiness): {e}");
+        let code = fail_trial(store, plan.transactional);
+        return signals::take().map(signals::exit_code).unwrap_or(code);
+    }
+    if let Some(signal) = signals::take() {
+        fail_trial(store, plan.transactional);
+        return signals::exit_code(signal);
+    }
     let listener = match readiness::bind(&plan.socket) {
         Ok(listener) => listener,
         Err(e) => {
@@ -1370,10 +1393,10 @@ fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], plan: 
                 "boreas-supervisor: error: cannot bind readiness socket {}: {e}",
                 plan.socket.display()
             );
-            return fail_trial(store);
+            return fail_trial(store, plan.transactional);
         }
     };
-    let mut child = match spawn_child(program, args, Some(&plan.socket), plan.verified) {
+    let mut child = match spawn_child(program, args, Some(plan)) {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
@@ -1381,7 +1404,7 @@ fn run_trial(store: &UpgradeStore, program: &OsString, args: &[OsString], plan: 
                 program.to_string_lossy()
             );
             readiness::cleanup(&plan.socket);
-            return fail_trial(store);
+            return fail_trial(store, plan.transactional);
         }
     };
     let outcome = trial_loop(store, &mut child, &listener, plan);
@@ -1394,7 +1417,7 @@ fn trial_loop(
     store: &UpgradeStore,
     child: &mut Child,
     listener: &std::os::unix::net::UnixListener,
-    plan: &TrialPlan,
+    plan: &TrialPlan<'_>,
 ) -> u8 {
     let deadline = Instant::now() + plan.ready_timeout;
     let mut confirmed = false;
@@ -1415,7 +1438,8 @@ fn trial_loop(
                 eprintln!("boreas-supervisor: stop signal {signal} before readiness; rolling back");
                 let _ = child.kill();
                 let _ = child.wait();
-                return fail_trial(store);
+                fail_trial(store, plan.transactional);
+                return signals::exit_code(signal);
             }
         }
         // 2. Child exit.
@@ -1429,14 +1453,14 @@ fn trial_loop(
                     "boreas-supervisor: trial child exited before readiness ({}); rolling back",
                     describe_status(status)
                 );
-                return fail_trial(store);
+                return fail_trial(store, plan.transactional);
             }
             Ok(None) => {}
             Err(e) => {
                 eprintln!("boreas-supervisor: error: cannot wait for the trial child: {e}");
                 let _ = child.kill();
                 let _ = child.wait();
-                return fail_trial(store);
+                return fail_trial(store, plan.transactional);
             }
         }
         // 3. Stop grace expired: escalate.
@@ -1452,7 +1476,7 @@ fn trial_loop(
             return if confirmed {
                 signals::exit_code(signal)
             } else {
-                fail_trial(store)
+                fail_trial(store, plan.transactional)
             };
         }
         // 4. Readiness handshake.
@@ -1466,7 +1490,7 @@ fn trial_loop(
                 );
                 let _ = child.kill();
                 let _ = child.wait();
-                return fail_trial(store);
+                return fail_trial(store, plan.transactional);
             }
             match readiness::probe_once(
                 listener,
@@ -1476,23 +1500,47 @@ fn trial_loop(
                 deadline,
             ) {
                 Ok(Some(report)) => {
+                    if let Some(image) = plan.image
+                        && let Err(e) = image.matches_process(child.id())
+                    {
+                        eprintln!("boreas-supervisor: artifact binding failed: {e}");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return fail_trial(store, plan.transactional);
+                    }
                     eprintln!(
                         "boreas-supervisor: readiness accepted (schema={}, workers={}, tun={:?})",
                         report.schema, report.workers, report.tun
                     );
-                    match store.confirm() {
+                    let confirmation = if plan.transactional {
+                        store.confirm()
+                    } else {
+                        Ok(())
+                    };
+                    match confirmation {
                         Ok(()) => {
                             confirmed = true;
-                            if let Err(e) = store.clear_trial() {
+                            if plan.transactional
+                                && let Err(e) = store.clear_trial()
+                            {
                                 eprintln!(
                                     "boreas-supervisor: warning: upgrade confirmed, but the \
                                      trial ledger could not be cleared: {e}"
                                 );
                             }
-                            eprintln!(
-                                "boreas-supervisor: upgrade confirmed after readiness; \
-                                 previous version directory retained"
-                            );
+                            if plan.transactional {
+                                eprintln!(
+                                    "boreas-supervisor: upgrade confirmed after readiness; previous version directory retained"
+                                );
+                            }
+                            if plan.image.is_some()
+                                && let Err(e) = verified_launch::notify_ready()
+                            {
+                                eprintln!("boreas-supervisor: cannot notify systemd: {e}");
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return EXIT_ERROR;
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -1501,7 +1549,7 @@ fn trial_loop(
                             );
                             let _ = child.kill();
                             let _ = child.wait();
-                            return fail_trial(store);
+                            return fail_trial(store, plan.transactional);
                         }
                     }
                 }
@@ -1513,7 +1561,7 @@ fn trial_loop(
                     );
                     let _ = child.kill();
                     let _ = child.wait();
-                    return fail_trial(store);
+                    return fail_trial(store, plan.transactional);
                 }
             }
         }
@@ -1524,7 +1572,10 @@ fn trial_loop(
 /// Record the consumed attempt durably (the reservation was written before the
 /// launch) and restore the retained version.
 #[cfg(unix)]
-fn fail_trial(store: &UpgradeStore) -> u8 {
+fn fail_trial(store: &UpgradeStore, transactional: bool) -> u8 {
+    if !transactional {
+        return EXIT_ERROR;
+    }
     if let Err(e) = store.mark_trial_failed() {
         eprintln!("boreas-supervisor: error: cannot record the failed trial attempt: {e}");
     }
@@ -1558,6 +1609,38 @@ fn rollback_trial(store: &UpgradeStore) -> u8 {
     EXIT_ERROR
 }
 
+#[cfg(unix)]
+fn self_check(program: &OsString, plan: &TrialPlan<'_>) -> io::Result<()> {
+    let mut command = Command::new(program);
+    command
+        .arg("self-check")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    configure_verified_child(&mut command, plan, false)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = plan;
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Do not consume stop signals here; the caller owns stop vs rollback.
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(io::Error::other(describe_status(status))),
+            Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(result
+                    .err()
+                    .unwrap_or_else(|| io::Error::other("self-check timed out")));
+            }
+        }
+    }
+}
+
 /// Spawn one child with inherited stdio.
 ///
 /// No new process group/console is created, deliberately: the child stays in
@@ -1568,24 +1651,44 @@ fn rollback_trial(store: &UpgradeStore) -> u8 {
 fn spawn_child(
     program: &OsString,
     args: &[OsString],
-    socket: Option<&std::path::Path>,
-    verified: bool,
+    #[cfg(unix)] plan: Option<&TrialPlan<'_>>,
+    #[cfg(not(unix))] _plan: Option<()>,
 ) -> io::Result<Child> {
     let mut command = Command::new(program);
     let ready_env = boreas_supervisor::ready_client::SOCKET_ENV;
-    command.args(args).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    if let Some(path) = socket {
-        command.env(ready_env, path);
-    } else {
-        command.env_remove(ready_env);
-    }
-    if verified {
-        #[cfg(target_os = "linux")]
-        verified_launch::protect_child(&mut command);
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::other("verified child setup is unavailable"));
+    command
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+        .env_remove(ready_env)
+        .env_remove(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV);
+    #[cfg(unix)]
+    if let Some(plan) = plan {
+        if plan.image.is_some() {
+            command.env_clear();
+            command.env(boreas_supervisor::ready_client::PROVISIONED_TUN_ENV, "1");
+            #[cfg(target_os = "linux")]
+            configure_verified_child(&mut command, plan, true)?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::other("verified child setup is unavailable"));
+        }
+        command.env(ready_env, &plan.socket);
     }
     command.spawn()
+}
+
+#[cfg(target_os = "linux")]
+fn configure_verified_child(
+    command: &mut Command,
+    plan: &TrialPlan<'_>,
+    daemon: bool,
+) -> io::Result<()> {
+    verified_launch::protect_child(command)?;
+    plan.filesystem
+        .ok_or_else(|| io::Error::other("missing verified filesystem policy"))?
+        .configure(command, daemon)
 }
 
 fn wait_steady(child: &mut Child, stop_grace: Duration) -> io::Result<ExitStatus> {

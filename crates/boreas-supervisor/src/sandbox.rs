@@ -442,6 +442,118 @@ pub fn program(target: TargetArch) -> Vec<SockFilter> {
     insns
 }
 
+/// Network boundary for the full Linux daemon, distinct from the existing
+/// closed worker allowlist. The daemon needs TCP accept/dial, files, threads
+/// and TUN ioctls. Only stream sockets in the three known families may be
+/// created, and the Linux ancillary descriptor receive interfaces are denied.
+/// This is a native-ABI 0-UDP / no-arbitrary-received-fd profile, not a complete
+/// syscall allowlist or a restriction on Unix pathname arguments.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn daemon_program(target: TargetArch) -> Vec<SockFilter> {
+    let sys = target.syscalls();
+    let mut out = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+        jump_eq(target.audit_arch(), 1, 0),
+        ret(SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+    ];
+    if target == TargetArch::X86_64 {
+        out.extend([
+            stmt(BPF_ALU | BPF_AND | BPF_K, X32_SYSCALL_BIT),
+            jump_eq(0, 1, 0),
+            ret(SECCOMP_RET_KILL_PROCESS),
+            stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+        ]);
+    }
+    // `socketcall` is unavailable on these native ABIs; all compat ABIs
+    // are rejected above (native syscall 102 is not socketcall).
+    for nr in [
+        sys.io_uring_setup,
+        sys.io_uring_enter,
+        sys.io_uring_register,
+    ] {
+        out.extend([jump_eq(nr, 0, 1), ret(SECCOMP_RET_KILL_PROCESS)]);
+    }
+    for nr in [libc::SYS_recvmsg as u32, libc::SYS_recvmmsg as u32] {
+        out.extend([jump_eq(nr, 0, 1), ret(RET_EPERM)]);
+    }
+    out.extend([
+        jump_eq(sys.socket, 1, 0),
+        ret(SECCOMP_RET_ALLOW),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0),
+        jump_eq(AF_UNIX, 3, 0),
+        jump_eq(libc::AF_INET as u32, 2, 0),
+        jump_eq(libc::AF_INET6 as u32, 1, 0),
+        ret(RET_EPERM),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1),
+        stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK),
+        jump_eq(SOCK_STREAM, 1, 0),
+        ret(RET_EPERM),
+        ret(SECCOMP_RET_ALLOW),
+    ]);
+    out
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn daemon_profile_admits_streams_without_admitting_datagrams_or_passed_fds() {
+    let target = native_target().unwrap();
+    let sys = target.syscalls();
+    let program = daemon_program(target);
+    let test = |nr, args| eval(&program, &seccomp_data(nr, target.audit_arch(), args)).unwrap();
+    for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+        for (ty, action) in [
+            (libc::SOCK_STREAM, SECCOMP_RET_ALLOW),
+            (libc::SOCK_DGRAM, RET_EPERM),
+            (libc::SOCK_RAW, RET_EPERM),
+        ] {
+            assert_eq!(
+                test(sys.socket, [
+                    family as u64,
+                    (ty | libc::SOCK_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]),
+                action
+            );
+        }
+    }
+    assert_eq!(
+        test(sys.socket, [libc::AF_NETLINK as u64, 1, 0, 0, 0, 0]),
+        RET_EPERM
+    );
+    assert_eq!(test(libc::SYS_recvmsg as u32, [0; 6]), RET_EPERM);
+    assert_eq!(test(libc::SYS_recvmmsg as u32, [0; 6]), RET_EPERM);
+    assert_eq!(test(sys.io_uring_setup, [0; 6]), SECCOMP_RET_KILL_PROCESS);
+    assert_eq!(
+        eval(&program, &seccomp_data(sys.socket, 0, [0; 6])).unwrap(),
+        SECCOMP_RET_KILL_PROCESS
+    );
+}
+
+/// Install the daemon profile before creating sockets or threads. The systemd
+/// unit also removes all capabilities and constrains the OS service account.
+#[cfg(target_os = "linux")]
+pub fn install_daemon() -> Result<(), SandboxError> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        install_program(daemon_program(
+            native_target().ok_or(SandboxError::UnsupportedArch)?,
+        ))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Err(SandboxError::UnsupportedArch)
+}
+
 /// Linux install passes `libc::sock_filter`, whose `#[repr(C)]` layout is the
 /// kernel's. [`SockFilter`] is the safe builder's copy and is not what the
 /// syscall receives.
@@ -500,7 +612,11 @@ pub fn install_current() -> Result<(), SandboxError> {
     let Some(target) = native_target() else {
         return Err(SandboxError::UnsupportedArch);
     };
-    let built = program(target);
+    install_program(program(target))
+}
+
+#[cfg(target_os = "linux")]
+fn install_program(built: Vec<SockFilter>) -> Result<(), SandboxError> {
     if built.is_empty() || built.len() > BPF_MAXINSNS {
         return Err(SandboxError::UnsupportedArch);
     }
@@ -743,12 +859,9 @@ mod tests {
         for target in [TargetArch::X86_64, TargetArch::Aarch64] {
             let prog = program(target);
             assert_eq!(
-                action(
-                    &prog,
-                    X86_32_SOCKETCALL,
-                    target.audit_arch(),
-                    [1, 0, 0, 0, 0, 0]
-                ),
+                action(&prog, X86_32_SOCKETCALL, target.audit_arch(), [
+                    1, 0, 0, 0, 0, 0
+                ]),
                 SECCOMP_RET_KILL_PROCESS
             );
         }
@@ -767,12 +880,9 @@ mod tests {
 
         let x86_64 = program(TargetArch::X86_64);
         assert_eq!(
-            action(
-                &x86_64,
-                X86_32_SOCKETCALL,
-                AUDIT_ARCH_I386,
-                [1, 0, 0, 0, 0, 0]
-            ),
+            action(&x86_64, X86_32_SOCKETCALL, AUDIT_ARCH_I386, [
+                1, 0, 0, 0, 0, 0
+            ]),
             SECCOMP_RET_KILL_PROCESS
         );
         assert_eq!(
@@ -787,12 +897,9 @@ mod tests {
 
         let aarch64 = program(TargetArch::Aarch64);
         assert_eq!(
-            action(
-                &aarch64,
-                X86_32_SOCKETCALL,
-                AUDIT_ARCH_ARM,
-                [1, 0, 0, 0, 0, 0]
-            ),
+            action(&aarch64, X86_32_SOCKETCALL, AUDIT_ARCH_ARM, [
+                1, 0, 0, 0, 0, 0
+            ]),
             SECCOMP_RET_KILL_PROCESS
         );
     }

@@ -17,6 +17,7 @@ const IFNAMSIZ: usize = 16;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
+const IFF_PERSIST: libc::c_short = 0x0800;
 const IFF_TUN_EXCL: libc::c_short = 0x8000u16 as libc::c_short;
 // ioctl request codes are stored as u32 and cast to libc::Ioctl at the call
 // site: glibc defines Ioctl as c_ulong, musl as c_int, so a fixed-width
@@ -176,6 +177,68 @@ impl LinuxTunDevice {
         };
         Ok((manager, queue))
     }
+    /// Attach one queue to an administrator-provisioned persistent TUN. This
+    /// path never changes interface MTU, addresses, persistence or routes.
+    /// The verified service runs without CAP_NET_ADMIN: TUNSETIFF therefore
+    /// cannot create an interface and the kernel enforces the owner binding.
+    pub fn open_provisioned(
+        name: &str,
+        mtu: usize,
+    ) -> Result<(Arc<Self>, LinuxTunQueue), LinuxTunError> {
+        if !(68..=MAX_IP_PACKET).contains(&mtu)
+            || name.is_empty()
+            || name.len() >= IFNAMSIZ
+            || matches!(name, "." | "..")
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(LinuxTunError::InvalidConfiguration);
+        }
+        // SAFETY: geteuid reads only this process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            return Err(LinuxTunError::InvalidConfiguration);
+        }
+        let ifname = CString::new(name).map_err(|_| LinuxTunError::InvalidName)?;
+        let flags = IFF_TUN | IFF_NO_PI | IFF_PERSIST;
+        let configured_mtu = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))?;
+        let owner = std::fs::read_to_string(format!("/sys/class/net/{name}/owner"))?;
+        let link_flags = std::fs::read_to_string(format!("/sys/class/net/{name}/flags"))?;
+        let tun_flags = std::fs::read_to_string(format!("/sys/class/net/{name}/tun_flags"))?;
+        let parse_hex = |s: &str| {
+            s.trim()
+                .strip_prefix("0x")
+                .and_then(|v| u32::from_str_radix(v, 16).ok())
+        };
+        if configured_mtu.trim().parse::<usize>().ok() != Some(mtu)
+            || owner.trim().parse::<u32>().ok() != Some(uid)
+            // TUNGETIFF can OR IFF_NOFILTER into the IFF_NO_PI bit. Check
+            // the underlying device flags separately before attaching.
+            || parse_hex(&tun_flags) != Some(flags as u32)
+            || !parse_hex(&link_flags).is_some_and(|v| v & libc::IFF_UP as u32 != 0)
+        {
+            return Err(LinuxTunError::InvalidConfiguration);
+        }
+        let fd = open_tun()?;
+        let mut req = IfReq::new(&ifname, IFF_TUN | IFF_NO_PI)?;
+        ioctl_ifreq(fd.as_raw_fd(), TUNSETIFF, &mut req)?;
+        verify_fd(fd.as_raw_fd(), name, flags)?;
+        ioctl_scalar(fd.as_raw_fd(), TUNSETOFFLOAD, 0)?;
+        let queue_fd = fd.try_clone()?;
+        let device = Arc::new(Self {
+            name: name.to_owned(),
+            flags,
+            mtu,
+            management: Mutex::new(fd),
+        });
+        let queue = LinuxTunQueue {
+            device: Arc::clone(&device),
+            fd: Mutex::new(queue_fd),
+        };
+        Ok((device, queue))
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -419,7 +482,7 @@ fn verify_fd(
     if got & 0x0003 != IFF_TUN {
         return Err(LinuxTunError::WrongDevice);
     }
-    let required = IFF_TUN | IFF_NO_PI | (flags & IFF_MULTI_QUEUE);
+    let required = IFF_TUN | IFF_NO_PI | (flags & (IFF_MULTI_QUEUE | IFF_PERSIST));
     if got != required {
         return Err(LinuxTunError::WrongFlags);
     }
