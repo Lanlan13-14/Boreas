@@ -56,12 +56,8 @@ jobs:
   format:
     name: Apply stable rustfmt
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -77,16 +73,6 @@ jobs:
           name: rustfmt-patch
           path: format.patch
           if-no-files-found: warn
-      - name: Commit formatting on main
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
-        run: |
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -- 'crates/**/*.rs'
-            git commit -m "Apply rustfmt"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
 
   rust:
     name: Rust checks (${{ matrix.os }})
