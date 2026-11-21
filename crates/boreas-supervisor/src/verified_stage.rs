@@ -176,16 +176,25 @@ mod linux {
         let active = store.active_version()?;
         if let Some((previous, previous_manifest)) = &watermark {
             let (highest, _) = parse_version(previous)?;
-            if candidate.sequence() < highest
-                || (candidate.sequence() == highest
-                    && (&version != previous || &manifest_hash != previous_manifest))
+            if candidate.sequence() < highest {
+                return Err(io::Error::other("release sequence rollback").into());
+            }
+            if candidate.sequence() == highest
+                && (&version != previous || &manifest_hash != previous_manifest)
             {
-                return Err(
-                    io::Error::other("release rollback or signed manifest equivocation").into(),
-                );
+                return Err(io::Error::other(
+                    "signed manifest equivocation at the same release sequence",
+                )
+                .into());
             }
             if before.as_ref().is_some_and(|j| j.new_version == version) {
                 if before.as_ref().is_some_and(|j| j.phase == Phase::Activated) {
+                    return Err(UpgradeError::WrongState.into());
+                }
+                if let Some(journal) = &before
+                    && journal.phase == Phase::Confirmed
+                    && active.as_deref() != Some(version.as_str())
+                {
                     return Err(UpgradeError::WrongState.into());
                 }
                 validate_binary(&store, &version)?;
@@ -263,16 +272,22 @@ mod linux {
         let (seq, digest) = parse_version(version)?;
         let (highest, _) = read_watermark(store.root())?
             .ok_or_else(|| io::Error::other("missing verified release watermark"))?;
-        if seq > parse_version(&highest)?.0 {
-            return Err(
-                io::Error::other("version exceeds the authenticated release watermark").into(),
-            );
+        let highest_sequence = parse_version(&highest)?.0;
+        if seq > highest_sequence || (seq == highest_sequence && version != highest) {
+            return Err(io::Error::other(
+                "version disagrees with the authenticated release watermark",
+            )
+            .into());
         }
         store.ensure_version_exists(version)?;
         let path = store.version_dir(version)?.join("boreas");
         let binary = read_input(&path, MAX_ELF_BYTES)?;
         if sha256(&binary) != digest {
             return Err(io::Error::other("stored binary SHA-256 mismatch").into());
+        }
+        let (_, machine) = native_asset()?;
+        if inspect_elf(&binary)?.machine != machine {
+            return Err(io::Error::other("stored image is not a native static ELF").into());
         }
         Ok((path, binary))
     }

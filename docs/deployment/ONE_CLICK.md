@@ -1,5 +1,8 @@
 # Boreas 单机安装辅助脚本（当前能力边界）
 
+> **本页只用于旧开发安装。** 摘要并非签名，以下 root wrapper 也不提供真实就绪或自动恢复。`--service systemd|procd` 现在需要显式 `--accept-legacy-service`。需要双签、非特权、可恢复的 Linux/systemd 路径，请参阅 [离线签名服务](VERIFIED-SERVICE.md)。
+
+
 本页说明 `tools/deploy/install.sh` 的受限安装流程。它**不是 OpenWrt/Boreas 产品支持声明**：仅适用于有 POSIX `/bin/sh`、Linux TUN、root、iproute2、`readelf` 和 SHA-256 工具的目标。BusyBox/OpenWrt 镜像通常缺少 `readelf`、`stat -c`、`find -mindepth`、`cmp`、`sort`、`awk`，因此**安装器本身应在 Linux 主机上执行**；缺失工具会明确失败，不自动 opkg 安装、不改系统。`--dry-run` 只读地审阅输入，不执行候选程序、不下载、不写安装目录/系统、不启动服务。
 
 **先阅读**：[双机部署和当前限制](README.md)。当前 daemon/TUN/路由、多 Core 等能力仍受实现状态与开放生产门禁约束；模板不提供生产安全性，也不应放高敏业务。
@@ -88,9 +91,9 @@ CLI 已支持通过 `pki sign-policy` 离线签发 `NetworkPolicy`。安装器�
 
 ## 4. systemd 与 OpenWrt procd 模板
 
-`--service systemd` 渲染 `tools/deploy/boreas.service` 到 `/etc/systemd/system/boreas.service`（`0644`），并把 wrapper 装到 `<prefix>/boreas-run`。`Type=simple` 是刻意选择：daemon 没有 `sd_notify`，不能伪装 readiness。升级时用 `systemctl enable` + **`restart`**（不是 `enable --now`），否则已运行的旧进程不会被替换。单元默认加固：`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`ProtectKernel*`、`RestrictNamespaces`、`RestrictSUIDSGID`、`CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE`、`SystemCallFilter=@system-service`；`PrivateDevices` 保持默认（需要 `/dev/net/tun`）。安装器创建 `<prefix>/state`（`0700`），配置固定使用该状态目录；单元仅放行 `ReadWritePaths=@@PREFIX@@/state`（安装时替换前缀），release 保持只读，不要整体关闭 `ProtectSystem`。`RestartPreventExitStatus=78` + `StartLimitBurst` 防止配置错误变成热重启。
+`--service systemd --accept-legacy-service` 渲染 `tools/deploy/boreas.service` 到 `/etc/systemd/system/boreas.service`（`0644`），并把 wrapper 装到 `<prefix>/boreas-run`。`Type=simple` 是刻意选择：daemon 没有 `sd_notify`，不能伪装 readiness。升级时用 `systemctl enable` + **`restart`**（不是 `enable --now`），否则已运行的旧进程不会被替换。单元默认加固：`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`ProtectKernel*`、`RestrictNamespaces`、`RestrictSUIDSGID`、`CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE`、`SystemCallFilter=@system-service`；`PrivateDevices` 保持默认（需要 `/dev/net/tun`）。安装器创建 `<prefix>/state`（`0700`），配置固定使用该状态目录；单元仅放行 `ReadWritePaths=@@PREFIX@@/state`（安装时替换前缀），release 保持只读，不要整体关闭 `ProtectSystem`。`RestartPreventExitStatus=78` + `StartLimitBurst` 防止配置错误变成热重启。
 
-`--service procd` 渲染 `tools/deploy/boreas.openwrt` 到 `/etc/init.d/boreas`（`0755`）。该脚本**从不 source** `/etc/boreas/boreas.env`：它逐行校验 key（白名单）、值字符集（拒绝引号、空格、`$`、反引号、`;`、`|`、`&`、括号、CR 等），再把通过校验的 `KEY=VALUE` 交给 procd，因此弱权限的 env 文件无法向 root init 脚本注入 shell 代码（回归测试包含 `$(...)` 与 `;reboot` 用例并断言无副作用）。procd 没有 `RestartPreventExitStatus` 等价物，所以 `exit 78` 也会消耗重启配额，模板设为 10 分钟内最多 5 次后停止。
+`--service procd --accept-legacy-service` 渲染 `tools/deploy/boreas.openwrt` 到 `/etc/init.d/boreas`（`0755`）。该脚本**从不 source** `/etc/boreas/boreas.env`：它逐行校验 key（白名单）、值字符集（拒绝引号、空格、`$`、反引号、`;`、`|`、`&`、括号、CR 等），再把通过校验的 `KEY=VALUE` 交给 procd，因此弱权限的 env 文件无法向 root init 脚本注入 shell 代码（回归测试包含 `$(...)` 与 `;reboot` 用例并断言无副作用）。procd 没有 `RestartPreventExitStatus` 等价物，所以 `exit 78` 也会消耗重启配额，模板设为 10 分钟内最多 5 次后停止。
 
 创建 `/etc/boreas` 与 `/etc/boreas/boreas.env`：
 

@@ -174,7 +174,9 @@ pub fn notify_ready() -> std::io::Result<()> {
             Some(b'/') => SocketAddr::from_pathname(Path::new(&raw))?,
             _ => return Err(std::io::Error::other("invalid NOTIFY_SOCKET")),
         };
-        UnixDatagram::unbound()?.send_to_addr(b"READY=1", &addr)?;
+        let notify = UnixDatagram::unbound()?;
+        notify.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+        notify.send_to_addr(b"READY=1", &addr)?;
     }
     Ok(())
 }

@@ -18,6 +18,7 @@ LOCAL_BIN=
 URL=
 SHA256=
 WEAK_HTTPS=0
+LEGACY_SERVICE=0
 MATERIALS=
 POLICY_DIR=
 NETWORK_ID=
@@ -53,7 +54,9 @@ Options:
   --network-root-ed25519-der F separately provisioned Ed25519 NetworkRoot pin
   --network-root-mldsa65-der F separately provisioned ML-DSA-65 NetworkRoot pin
   --accept-weak-https          acknowledge that a --url digest is not independent
-  --service none|systemd|procd install service template (default none)
+  --service none|systemd|procd select LEGACY development template (default none)
+  --accept-legacy-service      required for unsigned/root development templates;
+                               strict systemd: use install-verified-unit.sh
   --start                      explicitly enable and (re)start selected service
   --dry-run                    inspect local inputs and print the plan; no writes
                                and no candidate execution
@@ -121,6 +124,7 @@ while [ "$#" -gt 0 ]; do
     --prefix) [ "$#" -ge 2 ] || fail '--prefix needs a path'; PREFIX=$2; shift 2 ;;
     --bindir) [ "$#" -ge 2 ] || fail '--bindir needs a path'; BINDIR=$2; shift 2 ;;
     --accept-weak-https) WEAK_HTTPS=1; shift ;;
+    --accept-legacy-service) LEGACY_SERVICE=1; shift ;;
     --service) [ "$#" -ge 2 ] || fail '--service needs none, systemd or procd'; SERVICE=$2; shift 2 ;;
     --start) START=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -153,6 +157,7 @@ case "$RELEASE_ID" in *[!A-Za-z0-9._+-]*) fail '--release contains unsafe charac
 
 case "$SERVICE" in none|systemd|procd) ;; *) fail '--service must be none, systemd or procd' ;; esac
 [ "$START" -eq 0 ] || [ "$SERVICE" != none ] || fail '--start requires --service systemd or procd'
+[ "$SERVICE" = none ] || [ "$LEGACY_SERVICE" -eq 1 ] || fail 'digest-only root service is for development; use install-verified-unit.sh or explicitly pass --accept-legacy-service'
 if [ -n "$LOCAL_BIN" ] && [ -n "$URL" ]; then fail 'choose --binary or --url, not both'; fi
 if [ -z "$LOCAL_BIN" ] && [ -z "$URL" ]; then fail 'exactly one of --binary or --url is required'; fi
 if [ -n "$URL" ]; then
@@ -814,7 +819,7 @@ COMMITTED=0
 
 start_note='not requested'
 if [ "$START" -eq 1 ]; then start_note=requested; fi
-printf '%s\n' "Installed verified release $RELEASE_ID under $PREFIX."
+printf '%s\n' "Installed digest-checked development release $RELEASE_ID under $PREFIX."
 printf '%s\n' "Previous releases were retained; the active pointer is $PREFIX/active. Service start: $start_note."
 if [ -n "$URL" ]; then
   printf '%s\n' 'WARNING: this install used an HTTPS URL; the digest was only an integrity check, not provenance.' >&2

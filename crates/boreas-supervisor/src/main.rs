@@ -196,8 +196,6 @@ struct SupervisePlan {
     #[cfg(target_os = "linux")]
     filesystem: Option<release_fs::ReleaseFs>,
     #[cfg(unix)]
-    verified_args: Option<Vec<OsString>>,
-    #[cfg(unix)]
     min_run_sequence: u64,
     /// Unix trial-readiness policy. Windows deliberately refuses trial launch
     /// because its readiness channel is not implemented there.
@@ -1144,8 +1142,6 @@ fn cmd_supervise(args: &[OsString]) -> CliOutcome {
             #[cfg(target_os = "linux")]
             filesystem,
             #[cfg(unix)]
-            verified_args: verified.then_some(parsed.child_argv),
-            #[cfg(unix)]
             min_run_sequence: parsed.min_run_sequence,
             #[cfg(unix)]
             ready_timeout: parsed.ready_timeout,
@@ -1292,14 +1288,13 @@ fn execute_supervise(plan: SupervisePlan) -> u8 {
                 && j.phase == Phase::Prepared
                 && active == j.old_version
                 && let Some(active) = active
-                && let Some(argv) = plan.verified_args
             {
                 match verified_launch::image(&_store, Some(&active), plan.min_run_sequence) {
                     Ok(image) => {
                         eprintln!(
                             "boreas-supervisor: restarting retained verified release {active}"
                         );
-                        return run_trial(&_store, &image.program(), &argv[1..], &TrialPlan {
+                        return run_trial(&_store, &image.program(), rest, &TrialPlan {
                             image: Some(&image),
                             transactional: false,
                             ..trial

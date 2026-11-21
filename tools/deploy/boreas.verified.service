@@ -1,0 +1,46 @@
+[Unit]
+Description=Boreas authenticated release supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=boreas
+Group=boreas
+UMask=0077
+EnvironmentFile=/etc/boreas/service.env
+ExecStart=/usr/local/libexec/boreas/boreas-service
+# The current single-peer daemon also exits 0 after a clean circuit close.
+# systemctl stop is not auto-restarted; persistent TUN remains provisioned.
+Restart=always
+RestartPreventExitStatus=78
+RestartSec=3s
+TimeoutStartSec=85s
+TimeoutStopSec=20s
+KillMode=mixed
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/boreas/releases /var/lib/boreas/state
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service memfd_create close_range seccomp landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
