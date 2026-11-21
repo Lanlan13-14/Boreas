@@ -1558,6 +1558,8 @@ fn help_text() -> String {
     }
     text.push_str("\n\n  Linux/OpenSSL, one-shot verified Core adjacency (control only):\n  ");
     text.push_str(node::MESH_PROBE_SYNTAX);
+    text.push_str("\n\n  Linux/OpenSSL, dedicated signed Core source/relay/destination:\n  ");
+    text.push_str(node::MESH_RUNTIME_SYNTAX);
     text
 }
 

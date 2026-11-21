@@ -37,11 +37,12 @@ impl VerifiedGraph<'_> {
         locators: &[RouteLocator<'_>],
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
         admission: &Admission,
-        tun: &LinuxTunQueue,
+        endpoint: (&LinuxTunQueue, Option<u8>),
         mut confirmed: impl FnMut(&[u8], [u8; 16]),
     ) -> Result<PacketEpoch, Error> {
         let _buffer = admission.reserve_bytes(PACKET_BUFFER_BYTES).map_err(TunnelError::from)?;
-        self.connect_io(probe, locators, outer, admission, |path, c, io| {
+        let (tun, preferred) = endpoint;
+        self.connect_io(probe, locators, outer, (admission, preferred), |path, c, io| {
             epoch(c, io, tun, true, |id| confirmed(path, id))
         })
     }

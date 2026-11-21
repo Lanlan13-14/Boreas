@@ -202,7 +202,7 @@ impl VerifiedGraph<'_> {
         admission: &Admission,
         mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>) -> Result<T, TunnelError>,
     ) -> Result<T, Error> {
-        self.connect_io(probe, locators, outer, admission, |path, c, _| exchange(path, c))
+        self.connect_io(probe, locators, outer, (admission, None), |path, c, _| exchange(path, c))
             .map_err(|e| match e {
                 Error::ConfirmedPathLost(cause) => Error::Transport(cause),
                 other => other,
@@ -214,9 +214,10 @@ impl VerifiedGraph<'_> {
         probe: &mut MeshProbe<'_>,
         locators: &[RouteLocator<'_>],
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
-        admission: &Admission,
+        budget: (&Admission, Option<u8>),
         mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>, EndpointIo<'_>) -> Result<T, TunnelError>,
     ) -> Result<T, Error> {
+        let (admission, preferred) = budget;
         self.owner(probe)?;
         if locators.is_empty() || locators.len() > MAX_ROUTE_ATTEMPTS {
             return Err(Error::NoRoute);
@@ -252,7 +253,7 @@ impl VerifiedGraph<'_> {
                 ranked.push((score, locator));
             }
         }
-        ranked.sort_unstable_by_key(|entry| entry.0);
+        ranked.sort_unstable_by_key(|(score, locator)| (preferred != Some(locator.path[1]), *score));
         let mut loss = Error::NoRoute;
         for (_, locator) in ranked {
             // Recheck all route facts after the previous circuit was dropped.
