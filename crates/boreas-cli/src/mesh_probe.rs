@@ -179,7 +179,11 @@ mod linux {
         }
         let selected = if dial {
             let mut peers = Vec::new();
-            for group in rest.chunks_exact(3) {
+            let (groups, remainder) = rest.as_chunks::<3>();
+            if !remainder.is_empty() {
+                return Err("expected complete Core candidate triples".into());
+            }
+            for group in groups {
                 let address = group[1]
                     .parse()
                     .map_err(|_| "invalid numeric Core endpoint")?;
