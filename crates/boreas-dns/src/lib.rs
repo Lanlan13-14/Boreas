@@ -27,13 +27,14 @@
 //! [`DnsError::InvalidQuestion`] (FORMERR); no REFUSED message is built.
 //! [`Zone::refuse_name`] is an exact-match REFUSED list and wins over addresses.
 //!
-//! Separately, [`upstream`] offers a blocking plaintext DNS-over-TCP client to
-//! one explicitly configured endpoint. It is not wired to the packet path or
-//! daemon and does not enable forwarding by default.
+//! Separately, [`dispatch`] composes the authority with an optional blocking
+//! plaintext DNS-over-TCP [`upstream`]. Neither the dispatcher nor forwarding
+//! is wired to the packet path or daemon.
 
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod dispatch;
 pub mod packet;
 pub mod packet_runtime;
 pub mod tcp;
@@ -53,6 +54,7 @@ const MAX_NAME_LABELS: usize = 127;
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const TYPE_OPT: u16 = 41;
+const OPT_HEADER_BYTES: usize = 11;
 const CLASS_IN: u16 = 1;
 
 /// Reason a bounded DNS message could not be interpreted.
@@ -223,10 +225,17 @@ impl AuthoritativeDns {
         if !self.sources.permits(source) {
             return Ok(None);
         }
-        if query.len() > MAX_QUERY_BYTES {
-            return Err(DnsError::MessageTooLarge);
-        }
         let question = parse_query(query)?;
+        self.respond_parsed(query, &question, datagram).map(Some)
+    }
+
+    // Only for callers that already checked sources and parsed this query.
+    fn respond_parsed(
+        &self,
+        query: &[u8],
+        question: &Question,
+        datagram: bool,
+    ) -> Result<Vec<u8>, DnsError> {
         let limit = if datagram {
             if let Some(edns_limit) = question.edns_size {
                 self.max_response_bytes
@@ -256,15 +265,15 @@ impl AuthoritativeDns {
         } else {
             rcode = 3; // NXDOMAIN
         }
-        Ok(Some(build_response(
+        build_response(
             query,
-            &question,
+            question,
             rcode,
             answer,
             limit,
             question.edns_size.is_some(),
             authoritative && !refused,
-        )?))
+        )
     }
 
     /// UDP TC indication only. Copies the query id, echoes RD (never sets RA),
@@ -275,9 +284,6 @@ impl AuthoritativeDns {
     pub fn udp_truncate(&self, query: &[u8], max: usize) -> Result<Vec<u8>, DnsError> {
         if !(12..=MAX_RESPONSE_BYTES).contains(&max) {
             return Err(DnsError::InvalidConfiguration);
-        }
-        if query.len() > MAX_QUERY_BYTES {
-            return Err(DnsError::MessageTooLarge);
         }
         let question = parse_query(query)?;
         if question.end > max {
@@ -308,6 +314,9 @@ struct Question {
 }
 
 fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
+    if msg.len() > MAX_QUERY_BYTES {
+        return Err(DnsError::MessageTooLarge);
+    }
     if msg.len() < 12 {
         return Err(DnsError::Truncated);
     }
@@ -319,7 +328,7 @@ fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
     let ar = u16_at(msg, 10)?;
     // Accept only RD and CD request bits. Requests must not carry response-only
     // flags, a nonzero opcode, or any reserved/Z bits.
-    if flags & 0xfee0 != 0 || qd != MAX_QUESTIONS as u16 || an != 0 || ns != 0 || ar > 1 {
+    if flags & !0x0110 != 0 || qd != MAX_QUESTIONS as u16 || an != 0 || ns != 0 || ar > 1 {
         return Err(DnsError::InvalidHeader);
     }
     let (name, after_name) = decode_name(msg, 12)?;
@@ -330,7 +339,7 @@ fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
     }
     let end = after_name + 4;
     let edns_size = if ar == 1 {
-        if end + 11 > msg.len() {
+        if end + OPT_HEADER_BYTES > msg.len() {
             return Err(DnsError::Truncated);
         }
         if msg[end] != 0 || u16_at(msg, end + 1)? != TYPE_OPT {
@@ -339,7 +348,7 @@ fn parse_query(msg: &[u8]) -> Result<Question, DnsError> {
         let payload = usize::from(u16_at(msg, end + 3)?);
         let ttl = u32_at(msg, end + 5)?;
         let rdlen = usize::from(u16_at(msg, end + 9)?);
-        let rstart = end + 11;
+        let rstart = end + OPT_HEADER_BYTES;
         let rend = rstart.checked_add(rdlen).ok_or(DnsError::InvalidEdns)?;
         // Extended RCODE and EDNS version must be zero. Only the DO bit is
         // meaningful in the low flags word; reserved bits fail closed.

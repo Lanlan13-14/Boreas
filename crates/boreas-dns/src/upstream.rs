@@ -13,8 +13,8 @@
 //! advertisement. This primitive only bounds one exchange, not aggregate load.
 
 use crate::{
-    CLASS_IN, DnsError, MAX_QUERY_BYTES, MAX_RESPONSE_BYTES, Question, TYPE_OPT, decode_name,
-    parse_query, u16_at, valid_edns_options,
+    CLASS_IN, DnsError, MAX_RESPONSE_BYTES, Question, TYPE_OPT, decode_name, parse_query, u16_at,
+    valid_edns_options,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -124,13 +124,19 @@ impl TcpUpstream {
     ) -> Result<Vec<u8>, UpstreamError> {
         let deadline = deadline.min(Instant::now() + self.timeout);
         remaining(deadline)?;
-        if query.len() > MAX_QUERY_BYTES {
-            return Err(UpstreamError::InvalidQuery(DnsError::MessageTooLarge));
-        }
         let question = parse_query(query).map_err(UpstreamError::InvalidQuery)?;
-        if question.flags & 0x000f != 0 {
-            return Err(UpstreamError::InvalidQuery(DnsError::InvalidHeader));
-        }
+        self.exchange_parsed_until(query, &question, deadline)
+    }
+
+    // Only for callers passing the result of parsing these exact bytes.
+    pub(super) fn exchange_parsed_until(
+        &self,
+        query: &[u8],
+        question: &Question,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, UpstreamError> {
+        let deadline = deadline.min(Instant::now() + self.timeout);
+        remaining(deadline)?;
         if matches!(question.qtype, 0 | TYPE_OPT | 249..=254) {
             return Err(UpstreamError::UnsupportedQueryType);
         }
@@ -163,7 +169,7 @@ impl TcpUpstream {
         }
         let mut response = vec![0; len];
         read_exact_until(&mut tcp, &mut response, deadline)?;
-        let validation = validate_response(&response, &question);
+        let validation = validate_response(&response, question);
         remaining(deadline)?;
         validation?;
         Ok(response)
@@ -327,6 +333,7 @@ fn skip_owner(msg: &[u8], start: usize) -> Result<usize, DnsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_QUERY_BYTES;
     use std::net::{Shutdown, TcpListener};
     use std::thread::{self, JoinHandle};
 
