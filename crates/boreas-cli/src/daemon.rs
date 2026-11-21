@@ -226,7 +226,7 @@ mod linux_daemon {
     use std::cell::Cell;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
@@ -263,7 +263,7 @@ mod linux_daemon {
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
         OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
-        e2e::{E2eCircuit, accept_e2e, open_e2e},
+        e2e::{E2eCircuit, accept_e2e_until, open_e2e_until},
         failover,
         packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
         resource::{Admission, Limits},
@@ -281,6 +281,8 @@ mod linux_daemon {
 
     const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(10);
     const VIRTUAL_IDLE_WAIT: Duration = Duration::from_millis(1);
+    // The hop and direct E2E exchanges each get this budget. The transport
+    // joins the hop watchdog before the daemon starts the E2E exchange.
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
     const ACCEPT_WAIT: Duration = Duration::from_secs(30);
     const STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -871,24 +873,6 @@ mod linux_daemon {
         fd: i32,
         _permit: ConnectionPermit,
     }
-
-    // Handshake deadlines belong to exactly one layer: the transport crate.
-    //
-    // `LinkClient::connect_preconnected` and `LinkServer::accept_tls_stream`
-    // derive one absolute `Instant` from the budget passed here, install it on the
-    // socket for outer TLS and then carry it through `DeadlineIo` for every later
-    // handshake operation. The daemon therefore passes `HANDSHAKE_TIMEOUT` and
-    // must never install a second, competing deadline on the same socket: two
-    // mechanisms would race, and whichever fired second could mask a correctly
-    // authenticated handshake or leave a timeout behind.
-    //
-    // The daemon owns exactly two other socket-policy decisions, both at explicit
-    // boundaries:
-    // - `bound_path_io` installs the steady-state business I/O bound *after* the
-    //   handshake and before the first packet, deliberately replacing the
-    //   handshake-shaped socket timeout the crate left behind.
-    // - The status watchdog's `shutdown()` on a fault, which is an interruption,
-    //   not a deadline.
 
     /// Transport-level health of one socket, without consuming any bytes.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2509,6 +2493,15 @@ mod linux_daemon {
         Some(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 
+    /// Capture a TCP handle while the authenticated hop still owns `fd`. The
+    /// E2E deadline guard will only ever shut down its own duplicate of it.
+    fn duplicate_e2e_socket(fd: i32) -> std::io::Result<TcpStream> {
+        debug_assert!(fd >= 0);
+        duplicate_shutdown_fd(fd)
+            .map(TcpStream::from)
+            .ok_or_else(std::io::Error::last_os_error)
+    }
+
     /// §3.4 `StatusSnapshot` freshness watchdog plus signed-policy expiry guard.
     ///
     /// The 500 ms re-check checks the fixed signed-policy window and reads and
@@ -2768,8 +2761,7 @@ mod linux_daemon {
         });
         let link_server =
             LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
-        // `HANDSHAKE_TIMEOUT` is the crate's one absolute budget for this
-        // exchange; the daemon installs no second deadline on the same socket.
+        // The transport's hop deadline is disarmed before the E2E phase.
         let mut accepted = link_server
             .accept_tls_stream(
                 tcp,
@@ -2790,8 +2782,18 @@ mod linux_daemon {
             format!("daemon serve: durable status gate failed after hop handshake: {e}")
         })?;
 
-        let e2e = accept_e2e(&mut accepted.session, &e2e_backend, remote_peer)
-            .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?;
+        let e2e = {
+            let socket = duplicate_e2e_socket(sock_fd)
+                .map_err(|e| format!("daemon serve: cannot arm E2E circuit deadline: {e}"))?;
+            accept_e2e_until(
+                &mut accepted.session,
+                &e2e_backend,
+                remote_peer,
+                &socket,
+                Instant::now() + HANDSHAKE_TIMEOUT,
+            )
+            .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?
+        };
 
         // Last business-admission boundary: a status or policy that expired
         // during E2E handshake must stop before any packet is forwarded.
@@ -2943,8 +2945,7 @@ mod linux_daemon {
                         format!("daemon connect: durable status gate failed after TCP connect: {e}")
                     })?;
                     let fd = tcp.as_raw_fd();
-                    // One deadline, owned by the transport crate (see the note
-                    // above `SocketHealth`): the daemon only supplies the budget.
+                    // The transport crate owns the hop handshake deadline.
                     let session = link_client
                         .connect_preconnected(tcp, &target, session_policy.clone())
                         .map_err(|e| {
@@ -3028,8 +3029,8 @@ mod linux_daemon {
 
         loop {
             epoch = epoch.saturating_add(1);
-            // Re-apply the bound per epoch: a promoted session is a different
-            // socket, and it must never run unbounded either.
+            // Re-apply the steady-state I/O bound on the promoted socket.
+            // This per-operation timeout is not the E2E handshake deadline.
             bound_path_io(link.fd)?;
 
             let attempt = {
@@ -3045,8 +3046,20 @@ mod linux_daemon {
                 })?;
                 // The circuit borrows this session for the whole epoch, so the
                 // standby is a distinct object that this loop only polls.
-                let e2e = open_e2e(&mut link.session, &e2e_backend, remote_peer, 1)
-                    .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
+                let e2e = {
+                    let socket = duplicate_e2e_socket(link.fd).map_err(|e| {
+                        format!("daemon connect: cannot arm E2E circuit deadline: {e}")
+                    })?;
+                    open_e2e_until(
+                        &mut link.session,
+                        &e2e_backend,
+                        remote_peer,
+                        1,
+                        &socket,
+                        Instant::now() + HANDSHAKE_TIMEOUT,
+                    )
+                    .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?
+                };
                 // Last business-admission boundary before the packet loop starts.
                 lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                     format!("daemon connect: durable status/identity gate failed before business: {e}")

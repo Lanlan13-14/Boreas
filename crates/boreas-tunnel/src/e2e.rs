@@ -995,6 +995,41 @@ pub fn accept_e2e<'a>(
     )
 }
 
+/// Open and authenticate an E2E circuit under one absolute deadline, covering
+/// circuit setup, TLS and encrypted confirmation. `tcp` must be an owned
+/// handle to the same TCP socket as `session`. On any error, discard the hop
+/// session; the exchange may have left a partial frame on the wire.
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub fn open_e2e_until<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    path_hops: u8,
+    tcp: &std::net::TcpStream,
+    deadline: Instant,
+) -> Result<E2eCircuit<'a>, TunnelError> {
+    crate::runtime::bounded_link_operation(tcp, deadline, || {
+        open_e2e(session, backend, expected_peer, path_hops)
+    })
+}
+
+/// Accept and authenticate an E2E circuit under one absolute deadline, covering
+/// circuit setup, TLS and encrypted confirmation. `tcp` must be an owned
+/// handle to the same TCP socket as `session`. On any error, discard the hop
+/// session; the exchange may have left a partial frame on the wire.
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub fn accept_e2e_until<'a>(
+    session: &'a mut EstablishedSession,
+    backend: &dyn E2eTlsBackend,
+    expected_peer: PeerIdentity,
+    tcp: &std::net::TcpStream,
+    deadline: Instant,
+) -> Result<E2eCircuit<'a>, TunnelError> {
+    crate::runtime::bounded_link_operation(tcp, deadline, || {
+        accept_e2e(session, backend, expected_peer)
+    })
+}
+
 // --- relay forwarding --------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1567,6 +1602,148 @@ mod tests {
         e2e.write_all(b"hello").expect("write business bytes");
         drop(e2e);
         server.join().expect("server thread");
+    }
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    mod direct_deadline {
+        use super::*;
+        use crate::runtime::AcceptedSession;
+        use std::net::TcpStream;
+
+        const EDGE: u16 = 0x0101;
+        const CORE: u16 = 0x0201;
+
+        fn connected_hops(
+            edge: PeerIdentity,
+            core: PeerIdentity,
+        ) -> (TcpStream, EstablishedSession, TcpStream, AcceptedSession) {
+            let (listener, address) = listener();
+            let server = thread::spawn(move || {
+                let (tcp, _) = listener.accept().expect("accept TCP");
+                let socket = tcp.try_clone().expect("server socket handle");
+                let server = LinkServer::new(Box::new(TestOnlyPlaintextTls { peer: edge }));
+                let hop = server
+                    .accept_tls_stream(
+                        tcp,
+                        &TestOnlyPlaintextOuter,
+                        policy(core, edge),
+                        TIMEOUT,
+                        &admission(),
+                    )
+                    .expect("authorized server hop");
+                (socket, hop)
+            });
+            let client = LinkClient::new(
+                Box::new(TestOnlyPlaintextOuter),
+                Box::new(TestOnlyPlaintextTls { peer: core }),
+            );
+            let target = target(address);
+            let tcp = client.connect_tcp(&target, TIMEOUT).expect("connect TCP");
+            let socket = tcp.try_clone().expect("client socket handle");
+            let hop = client
+                .connect_preconnected(tcp, &target, policy(edge, core))
+                .expect("authorized client hop");
+            let (server_socket, server_hop) = server.join().expect("server hop thread");
+            for tcp in [&socket, &server_socket] {
+                // Only a test escape hatch. It cannot close the socket, unlike
+                // the deadline watchdog. Keep it much longer than the deadline.
+                tcp.set_read_timeout(Some(TIMEOUT))
+                    .expect("set read timeout");
+                tcp.set_write_timeout(Some(TIMEOUT))
+                    .expect("set write timeout");
+            }
+            (socket, hop, server_socket, server_hop)
+        }
+
+        #[test]
+        fn deadline_interrupts_open_and_accept_with_peer_still_connected() {
+            let edge = identity(EDGE, 1, NodeRole::Edge);
+            let core = identity(CORE, 1, NodeRole::Core);
+            for initiator in [true, false] {
+                let (mut client_socket, mut client, mut server_socket, mut server) =
+                    connected_hops(edge, core);
+                // Keep both hop sessions and both socket handles alive. Neither
+                // peer sends the frame the guarded endpoint is waiting for.
+                let deadline = Instant::now() + Duration::from_millis(100);
+                let result = if initiator {
+                    open_e2e_until(
+                        &mut client,
+                        &TestE2eBackend { peer: core },
+                        core,
+                        1,
+                        &client_socket,
+                        deadline,
+                    )
+                } else {
+                    accept_e2e_until(
+                        &mut server.session,
+                        &TestE2eBackend { peer: edge },
+                        edge,
+                        &server_socket,
+                        deadline,
+                    )
+                };
+                assert!(matches!(result, Err(TunnelError::Timeout)));
+                // Observe actual shutdown on the peer, not merely the timeout
+                // error (the fallback SO_RCVTIMEO can also produce that error).
+                let peer_socket = if initiator {
+                    &mut server_socket
+                } else {
+                    &mut client_socket
+                };
+                let mut pending = Vec::new();
+                peer_socket
+                    .read_to_end(&mut pending)
+                    .expect("watchdog must deliver EOF");
+            }
+        }
+
+        #[test]
+        fn successful_e2e_leaves_business_stream_live_past_both_deadlines() {
+            let edge = identity(EDGE, 1, NodeRole::Edge);
+            let core = identity(CORE, 1, NodeRole::Core);
+            let (client_socket, mut client, server_socket, mut server) = connected_hops(edge, core);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let responder = thread::spawn(move || {
+                let mut e2e = accept_e2e_until(
+                    &mut server.session,
+                    &TestE2eBackend { peer: edge },
+                    edge,
+                    &server_socket,
+                    deadline,
+                )
+                .expect("confirmed responder");
+                let mut byte = [0];
+                e2e.read_exact(&mut byte)
+                    .expect("read after guard deadline");
+                assert_eq!(byte, [7]);
+                e2e.write_all(&[9]).expect("reply after guard deadline");
+            });
+            let mut e2e = open_e2e_until(
+                &mut client,
+                &TestE2eBackend { peer: core },
+                core,
+                1,
+                &client_socket,
+                deadline,
+            )
+            .expect("confirmed initiator");
+            thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            e2e.write_all(&[7]).expect("write after guard deadline");
+            let mut byte = [0];
+            e2e.read_exact(&mut byte)
+                .expect("read reply after guard deadline");
+            assert_eq!(byte, [9]);
+            responder.join().expect("responder");
+            assert_eq!(
+                client_socket.read_timeout().expect("read timeout"),
+                Some(TIMEOUT)
+            );
+            assert_eq!(
+                client_socket.write_timeout().expect("write timeout"),
+                Some(TIMEOUT)
+            );
+        }
     }
 
     #[test]

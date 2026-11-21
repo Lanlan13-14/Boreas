@@ -289,8 +289,11 @@ fn arm_handshake_guard(tcp: &TcpStream, deadline: Instant) -> io::Result<Handsha
     }
 }
 
-/// Bound a one-shot transaction on an owned link. A timeout shuts down the
-/// socket; callers must discard the session and must not retry a partial frame.
+/// Run a one-shot transaction on the link carried by `tcp`, with one absolute
+/// deadline. An already-expired deadline skips the operation. Expiry during the
+/// operation shuts down the socket; discard the session on error rather than
+/// retrying a partial frame. The guard is joined before this returns and does
+/// not change the socket's I/O timeouts.
 #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 pub(crate) fn bounded_link_operation<T>(
     tcp: &TcpStream,
@@ -300,7 +303,18 @@ pub(crate) fn bounded_link_operation<T>(
     remaining_handshake_budget(deadline)?;
     let mut guard = HandshakeGuard::arm(tcp, deadline)?;
     let result = operation();
-    guard.finish(result, deadline)
+    let completed_late = result.is_ok() && Instant::now() >= deadline;
+    guard.disarm();
+    if guard.fired() {
+        return Err(TunnelError::Timeout);
+    }
+    if completed_late {
+        // Disarm may beat an unscheduled watchdog. Shut down before discarding
+        // a late success: a returned circuit's Drop can itself do socket I/O.
+        let _ = tcp.shutdown(std::net::Shutdown::Both);
+        return Err(TunnelError::Timeout);
+    }
+    result
 }
 
 fn handshake_guard_watch(socket: TcpStream, deadline: Instant, state: std::sync::Arc<GuardState>) {
