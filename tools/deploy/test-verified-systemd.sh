@@ -160,7 +160,8 @@ for bad in ed25519 mldsa65; do
   reject "bad-$bad" 'signature|verification'
 done
 emit 9 tampered "$bin"
-printf '\377' | dd of="$trust/tampered.bin" bs=1 seek=0 conv=notrunc status=none
+# Change only an ELF identification padding byte, not the magic or program headers.
+printf '\377' | dd of="$trust/tampered.bin" bs=1 seek=15 conv=notrunc status=none
 reject tampered 'SHA-256|digest|hash'
 [[ ! -e $store/verified-release.state && ! -e $store/active.version ]]
 
