@@ -1,6 +1,6 @@
-//! Strictly bounded, non-recursive authoritative DNS wire handling.
+//! Bounded authoritative DNS wire handling and explicit TCP upstream transport.
 //!
-//! The crate has three packet-facing layers and no operating-system socket:
+//! The authoritative packet path has three layers and uses no OS sockets:
 //!
 //! * [`packet`] parses complete IPv4/IPv6 UDP packets and builds replies for the
 //!   existing authoritative resolver;
@@ -26,6 +26,10 @@
 //! recursion: RA stays clear. QCLASS other than IN is
 //! [`DnsError::InvalidQuestion`] (FORMERR); no REFUSED message is built.
 //! [`Zone::refuse_name`] is an exact-match REFUSED list and wins over addresses.
+//!
+//! Separately, [`upstream`] offers a blocking plaintext DNS-over-TCP client to
+//! one explicitly configured endpoint. It is not wired to the packet path or
+//! daemon and does not enable forwarding by default.
 
 #![forbid(unsafe_code)]
 
@@ -33,6 +37,7 @@ pub mod bootstrap;
 pub mod packet;
 pub mod packet_runtime;
 pub mod tcp;
+pub mod upstream;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
