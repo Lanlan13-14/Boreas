@@ -50,6 +50,7 @@ impl Reader {
         fd: RawFd,
         mtu: usize,
         scratch: &'buf mut [u8],
+        allow_empty: bool,
     ) -> Result<Option<InspectedPacket<'buf>>, LinuxTunError> {
         if scratch.len() <= mtu {
             return Err(LinuxTunError::InvalidConfiguration);
@@ -59,7 +60,9 @@ impl Reader {
             let n = match read_fd(fd, &mut self.frame) {
                 Ok(0) => return Ok(None),
                 Ok(n) => n,
-                Err(LinuxTunError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err(LinuxTunError::Io(err))
+                    if allow_empty && err.kind() == io::ErrorKind::WouldBlock =>
+                {
                     return Ok(None);
                 }
                 Err(err) => return Err(err),
@@ -178,4 +181,115 @@ fn complete_partial(
     };
     packet[start + offset..start + offset + 2].copy_from_slice(&value.to_be_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::fd::AsRawFd, os::unix::net::UnixDatagram};
+
+    fn frame(gso: bool, protocol: u8, payload: &[u8]) -> Vec<u8> {
+        let transport_len = (if protocol == TCP { 20 } else { 8 }) + payload.len();
+        let len = 20 + transport_len;
+        let mut frame = vec![0; VIRTIO_HDR_LEN + len];
+        let (meta, ip) = frame.split_at_mut(VIRTIO_HDR_LEN);
+        meta[0] = NEEDS_CSUM;
+        meta[6] = 20;
+        meta[8] = if protocol == TCP { 16 } else { 6 };
+        if gso {
+            meta[1] = GSO_TCPV4;
+            meta[2] = 43; // skb head includes three payload bytes
+            meta[4] = 40;
+        }
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        ip[6] = 0x40;
+        ip[8] = 64;
+        ip[9] = protocol;
+        ip[12..20].copy_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2]);
+        let check = checksum(&ip[..20]);
+        ip[10..12].copy_from_slice(&check.to_be_bytes());
+        let mut pseudo = [0; 12];
+        pseudo[..8].copy_from_slice(&ip[12..20]);
+        pseudo[9] = protocol;
+        pseudo[10..12].copy_from_slice(&(transport_len as u16).to_be_bytes());
+        let transport = &mut ip[20..];
+        transport[..4].copy_from_slice(&[0, 81, 0, 82]);
+        if protocol == TCP {
+            transport[12..14].copy_from_slice(&[0x50, 0x19]); // ACK, PSH, FIN
+        } else {
+            transport[4..6].copy_from_slice(&(transport_len as u16).to_be_bytes());
+        }
+        let offset = usize::from(meta[8]);
+        transport[offset..offset + 2].copy_from_slice(&(!checksum(&pseudo)).to_be_bytes());
+        transport[transport_len - payload.len()..].copy_from_slice(payload);
+        frame
+    }
+
+    fn transport_checksum(ip: &[u8]) -> u16 {
+        let mut oracle = ip[12..20].to_vec();
+        oracle.extend([0, ip[9]]);
+        oracle.extend(((ip.len() - 20) as u16).to_be_bytes());
+        oracle.extend(&ip[20..]);
+        checksum(&oracle)
+    }
+
+    #[test]
+    fn pending_segments_are_fifo_and_do_not_read_the_following_frame() {
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let fd = rx.as_raw_fd();
+        let mut reader = Reader::new(80);
+        let mut scratch = [0; 81];
+        let payload: Vec<_> = (0..83u8).collect();
+        tx.send(&frame(true, TCP, &payload)).unwrap();
+        tx.send(&frame(false, UDP, &[0xab, 0xcd, 0xef])).unwrap();
+        for (i, chunk) in payload.chunks(40).enumerate() {
+            let p = reader.read(fd, 80, &mut scratch, true).unwrap().unwrap();
+            assert_eq!(&p.bytes()[40..], chunk);
+            assert_eq!(p.bytes()[33], if i == 2 { 0x19 } else { 0x10 });
+            assert_eq!(transport_checksum(p.bytes()), 0);
+            assert_eq!(reader.read_counts(), (1, i as u64 + 1));
+        }
+        let udp = reader.read(fd, 80, &mut scratch, true).unwrap().unwrap();
+        assert_eq!(&udp.bytes()[28..], &[0xab, 0xcd, 0xef]);
+        assert_eq!(transport_checksum(udp.bytes()), 0);
+        assert_eq!(reader.read_counts(), (2, 3));
+        assert!(reader.read(fd, 80, &mut scratch, true).unwrap().is_none());
+        assert_eq!(reader.read_counts(), (3, 3));
+    }
+
+    #[test]
+    fn unknown_gso_wrong_seed_and_oversize_do_not_produce_packets() {
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let fd = rx.as_raw_fd();
+        let mut reader = Reader::new(80);
+        let mut scratch = [0xa5; 81];
+        let mut unknown = frame(true, TCP, &[0; 83]);
+        unknown[1] |= 0x80;
+        let mut wrong_seed = frame(false, TCP, &[1]);
+        wrong_seed[VIRTIO_HDR_LEN + 36] ^= 1;
+        let mut distant_too_short_hint = frame(true, TCP, &[0; 83]);
+        distant_too_short_hint[2] = 39;
+        let mut too_large_hint = frame(true, TCP, &[0; 83]);
+        too_large_hint[2] = 124;
+        let mut bad_offset = frame(false, UDP, &[0]);
+        bad_offset[8] = 5;
+        for rejected in [
+            unknown,
+            wrong_seed,
+            distant_too_short_hint,
+            too_large_hint,
+            bad_offset,
+            frame(false, TCP, &[0; 41]),
+            vec![0; VIRTIO_HDR_LEN + MAX_SUPERPACKET + 2],
+        ] {
+            tx.send(&rejected).unwrap();
+            assert!(reader.read(fd, 80, &mut scratch, true).is_err());
+            assert!(!reader.has_pending());
+            assert_eq!(scratch, [0xa5; 81]);
+        }
+        assert_eq!(reader.read_counts(), (7, 0));
+    }
 }
