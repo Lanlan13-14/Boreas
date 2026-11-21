@@ -2944,6 +2944,9 @@ uplinks = ["wss://hub-us-c.example.net"]
             );
 
             let (mut stream, _) = listener.accept().expect("accept");
+            // BSD can inherit nonblocking mode from the listener. The
+            // fixture needs a bounded blocking read of the complete request.
+            stream.set_nonblocking(false).expect("blocking fixture stream");
             stream
                 .set_read_timeout(Some(FIXTURE_TIMEOUT))
                 .expect("fixture read timeout");
@@ -3046,6 +3049,9 @@ uplinks = ["wss://hub-us-c.example.net"]
             );
 
             let (mut stream, _) = listener.accept().expect("accept");
+            // BSD can inherit nonblocking mode from the listener. The
+            // fixture needs a bounded blocking read of the complete request.
+            stream.set_nonblocking(false).expect("blocking fixture stream");
             stream
                 .set_read_timeout(Some(FIXTURE_TIMEOUT))
                 .expect("fixture read timeout");
