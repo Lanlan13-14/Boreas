@@ -3221,20 +3221,14 @@ mod linux_daemon {
             let until = fresh
                 .valid_until()
                 .ok_or("daemon: DNS status UTC cutoff unavailable")?;
-            counters
-                .status_sequence
-                .store(fresh.sequence(), Ordering::Relaxed);
-            Some((
-                dns.bind(
-                    until,
-                    fresh
-                        .deadline()
-                        .min(policy_window.deadline())
-                        .min(deadline.unwrap_or_else(|| policy_window.deadline())),
-                    guard.last_trusted_utc(),
-                ),
-                fresh.sequence(),
-            ))
+            let sequence = fresh.sequence();
+            let dns_deadline = fresh
+                .deadline()
+                .min(policy_window.deadline())
+                .min(deadline.unwrap_or_else(|| policy_window.deadline()));
+            let last_trusted_utc = guard.last_trusted_utc();
+            counters.status_sequence.store(sequence, Ordering::Relaxed);
+            Some((dns.bind(until, dns_deadline, last_trusted_utc), sequence))
         } else {
             None
         };
