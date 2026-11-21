@@ -474,7 +474,8 @@ mod tests {
         let mut big = [0u8; MTU];
         big[0] = 0x60;
         big[4..6].copy_from_slice(&((MTU - 40) as u16).to_be_bytes());
-        big[6] = 59;
+        // Use an ICMPv6 payload type; No Next Header (59) requires no bytes.
+        big[6] = 58;
         tx.send(&big).unwrap();
         assert!(matches!(
             queue.try_read_packet_into(&mut scratch[..MTU - 1]),
