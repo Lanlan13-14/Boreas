@@ -9,6 +9,8 @@ pub mod authority_revocation;
 /// Produces opaque verified tokens only; it does not enable the DNS runtime.
 #[cfg(feature = "openssl-backend")]
 pub mod dns_authority;
+#[cfg(feature = "openssl-backend")]
+pub mod dns_service_policy;
 pub mod enforcement;
 pub mod enrollment;
 /// Real Ed25519 + ML-DSA management-object verification and IdentityAuthority signing.

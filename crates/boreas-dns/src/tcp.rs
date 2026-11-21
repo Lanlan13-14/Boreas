@@ -187,6 +187,18 @@ impl TcpDnsServer {
         authorizer: &A,
         now: smoltcp::time::Instant,
     ) -> usize {
+        self.process_with(sockets, authorizer, now, |source, query| {
+            dns.respond_tcp(source, query)
+        })
+    }
+
+    pub(crate) fn process_with<A: TcpSourceAuthorizer>(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        authorizer: &A,
+        now: smoltcp::time::Instant,
+        answer: impl Fn(IpAddr, &[u8]) -> Result<Option<Vec<u8>>, crate::DnsError>,
+    ) -> usize {
         let mut completed = 0usize;
         for conn in &mut self.connections {
             let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
@@ -245,7 +257,7 @@ impl TcpDnsServer {
             // Process frames already buffered from an earlier poll before
             // reading more stream data; this is necessary when a response
             // temporarily filled the application TX staging buffer.
-            if !extract_frames(conn, source, dns, &self.config, &mut completed) {
+            if !extract_frames(conn, source, &answer, &self.config, &mut completed) {
                 socket.abort();
                 reset_connection(conn, now);
                 continue;
@@ -267,7 +279,7 @@ impl TcpDnsServer {
                     }
                     Err(_) => break,
                 }
-                if !extract_frames(conn, source, dns, &self.config, &mut completed) {
+                if !extract_frames(conn, source, &answer, &self.config, &mut completed) {
                     socket.abort();
                     reset_connection(conn, now);
                     break;
@@ -330,7 +342,7 @@ fn flush_transmit(
 fn extract_frames(
     conn: &mut Connection,
     source: IpAddr,
-    dns: &AuthoritativeDns,
+    answer: &impl Fn(IpAddr, &[u8]) -> Result<Option<Vec<u8>>, crate::DnsError>,
     config: &TcpDnsConfig,
     completed: &mut usize,
 ) -> bool {
@@ -350,7 +362,7 @@ fn extract_frames(
         }
         let query = conn.receive[2..2 + frame_len].to_vec();
         conn.receive.drain(..2 + frame_len);
-        match dns.respond_tcp(source, &query) {
+        match answer(source, &query) {
             Ok(Some(response)) => {
                 if response.len() > u16::MAX as usize
                     || response.len() + 2 > config.tx_bytes_per_connection

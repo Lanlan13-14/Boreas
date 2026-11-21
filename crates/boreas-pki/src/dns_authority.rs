@@ -477,7 +477,7 @@ fn decode_authority(raw_tbs: &[u8]) -> Result<DnsAuthority, Error> {
     DnsAuthority::decode_tbs(raw_tbs).map_err(|_| Error::InvalidCandidate)
 }
 
-fn verify_both(
+pub(crate) fn verify_both(
     ed_key: &PKey<openssl::pkey::Public>,
     pq_key: &PKey<openssl::pkey::Public>,
     message: &[u8],
