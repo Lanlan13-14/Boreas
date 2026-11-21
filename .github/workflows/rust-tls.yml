@@ -816,7 +816,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Record performance runner and exact binary
-        if: success() && github.ref == 'refs/heads/fix/v111-release-blockers'
+        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
         run: |
           set -euo pipefail
           {
@@ -830,7 +830,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples (candidate only)
         id: candidate_delayed
-        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/fix/v111-release-blockers'
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
