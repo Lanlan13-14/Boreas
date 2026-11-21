@@ -184,6 +184,8 @@ def _parse_tcp_info(record: dict, line: str) -> None:
                 record["bytes_acked"] = _to_int(value)
             elif key == "bytes_received":
                 record["bytes_received"] = _to_int(value)
+            elif key in ("bytes_retrans", "notsent"):
+                record[key] = _to_int(value)
             elif key == "unacked":
                 record["unacked"] = _to_int(value)
             elif key == "minrtt":
@@ -922,6 +924,8 @@ def summarize(label: str, path: str) -> list[str]:
             retrans = _total_delta(
                 first_sockets, last_sockets, persistent, "retrans_total"
             )
+            retrans_bytes = _total_delta(first_sockets, last_sockets, persistent, "bytes_retrans")
+            notsent_values: list[int] = []
             cwnd_values: list[int] = []
             rto_values: list[float] = []
             delivery_values: list[float] = []
@@ -931,6 +935,8 @@ def summarize(label: str, path: str) -> list[str]:
                     record = sockets.get(key)
                     if not isinstance(record, dict):
                         continue
+                    if isinstance(record.get("notsent"), int):
+                        notsent_values.append(record["notsent"])
                     if isinstance(record.get("cwnd"), int):
                         cwnd_values.append(record["cwnd"])
                     if isinstance(record.get("rto_ms"), (int, float)):
@@ -952,6 +958,8 @@ def summarize(label: str, path: str) -> list[str]:
                 prefix + "_cwnd_max=" + _plain(max(cwnd_values) if cwnd_values else None),
                 prefix + "_rto_max_ms=" + _format(max(rto_values) if rto_values else None),
                 prefix + "_retrans_total_delta=" + _plain(retrans),
+                prefix + "_bytes_retrans_delta=" + _plain(retrans_bytes),
+                prefix + "_notsent_peak_bytes=" + _plain(max(notsent_values, default=None)),
                 prefix
                 + "_delivery_rate_max_mbps="
                 + _format(max(delivery_values) / 1e6 if delivery_values else None),

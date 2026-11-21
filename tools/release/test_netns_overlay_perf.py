@@ -875,6 +875,7 @@ class UnderlayTcpInfoParserTests(unittest.TestCase):
                 "ESTAB 0 0 192.0.2.1:8443 192.0.2.2:41234",
                 "\t cubic wscale:7,7 rto:204 rtt:0.5/0.1 ato:40 mss:1360 cwnd:10 "
                 "bytes_acked:12345 bytes_received:678 retrans:0/1 unacked:3 "
+                "bytes_retrans:1448 notsent:1200 "
                 "ssthresh:1846 app_limited delivery_rate 25473600bps",
                 "ESTAB 0 0 192.0.2.1:8443 192.0.2.2:41235",
                 "\t cubic rto:201 rtt:1.5/0.3 cwnd:27 bytes_acked:1 "
@@ -894,6 +895,9 @@ class UnderlayTcpInfoParserTests(unittest.TestCase):
         self.assertEqual(first["ssthresh"], 1846)
         self.assertEqual(first["retrans_current"], 0)
         self.assertEqual(first["retrans_total"], 1)
+        self.assertEqual(first["bytes_retrans"], 1448)
+        self.assertEqual(first["notsent"], 1200)
+        self.assertNotIn("bytes_retrans", records[1])
         self.assertEqual(first["bytes_acked"], 12345)
         self.assertEqual(first["bytes_received"], 678)
         self.assertEqual(first["unacked"], 3)
