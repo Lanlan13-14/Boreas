@@ -834,7 +834,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Verify opt-in private DNS on real Core and Edge TUNs
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/fix/v111-integration')
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime'))
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -844,7 +844,7 @@ jobs:
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-private-dns.log
       - name: Verify four-process Core routing and failover on real TUN
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || github.ref == 'refs/heads/fix/v111-integration')
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime'))
         timeout-minutes: 5
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -859,7 +859,7 @@ jobs:
             "$test_binary" --ignored --nocapture --test-threads=1 2>&1 | tee rust-tls-mesh-runtime.log
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored' rust-tls-mesh-runtime.log
       - name: Record performance runner and exact binary
-        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
+        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime'))
         run: |
           set -euo pipefail
           {
@@ -873,7 +873,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples (candidate only)
         id: candidate_delayed
-        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime'))
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
@@ -944,7 +944,7 @@ jobs:
       - name: Measure high-RTT first-second payload on one and four application streams
         # The same candidate and circuit are used for both rounds; this does
         # not establish multi-circuit operation or replace the goodput gates.
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/fix/v111-integration' && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
         timeout-minutes: 5
         env:
           BOREAS_NETNS_MULTISTREAM: '1'
