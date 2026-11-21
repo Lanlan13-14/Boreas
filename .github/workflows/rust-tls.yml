@@ -833,6 +833,16 @@ jobs:
           path: hop-node-linux
           if-no-files-found: error
           retention-days: 14
+      - name: Verify opt-in private DNS on real Core and Edge TUNs
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/fix/v111-integration')
+        timeout-minutes: 3
+        env:
+          BOREAS_NETNS_PRIVATE_DNS: '1'
+        run: |
+          set -euo pipefail
+          sudo -E timeout --kill-after=5s 120s bash tools/release/netns_daemon_smoke.sh \
+            hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            2>&1 | tee rust-tls-private-dns.log
       - name: Record performance runner and exact binary
         if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
         run: |
@@ -933,6 +943,7 @@ jobs:
             rust-tls-tunnel-tests.log
             rust-tls-supervisor-tests.log
             rust-tls-verified-systemd.log
+            rust-tls-private-dns.log
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log
