@@ -375,7 +375,7 @@ pub fn validate_frame_policy_parts(
                         && ctx.peer_role == PeerRole::Core
                         && ctx.mode == SecurityMode::E2eRequired
                         && !ctx.circuit_opening
-                        && !ctx.circuit_established => (),
+                        && !ctx.circuit_established => {}
                 ControlType::CircuitOpen
                     if ctx.accepted
                         && ctx.mode == SecurityMode::E2eRequired
