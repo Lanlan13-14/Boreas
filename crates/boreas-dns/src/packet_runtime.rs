@@ -322,7 +322,7 @@ impl PacketRuntime {
         self.poll_with(
             now,
             sources,
-            |_| true,
+            |_, _| true,
             |dns, peer, query, udp| {
                 if udp.is_some() {
                     dns.respond_udp(peer.address(), query)
