@@ -1,4 +1,4 @@
-//! Bounded direct Core adjacency selection and LSA exchange on strict pq768
+//! Bounded direct Core adjacency, LSA and identity revocation exchange on strict pq768
 //! hop sessions. No graph route, application frames, or E2E secrets enter here.
 
 use std::{
@@ -12,14 +12,18 @@ use boreas_crypto::{
     backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
 };
 use boreas_pki::{
-    VerifiedNetworkContext,
+    Authority, VerifiedNetworkContext,
+    authority_revocation::AuthorityRevocationTrust,
     management::{ManagementTrust, VerifiedObject},
     provisioning::RootsBundle,
     status_store::{AuthenticatedPeer, FreshStatus, PeerRevocation, StatusStore},
 };
 use boreas_proto::{
     ControlType, Kind,
-    messages::{PathRole, Probe, ProbeKind},
+    authority_revocation::MAX_IDENTITY_REVOCATIONS,
+    messages::{
+        PathRole, Probe, ProbeKind, decode_identity_revocation, encode_identity_revocation,
+    },
     objects::{CoreLsa, ObjectBody},
 };
 
@@ -39,6 +43,7 @@ pub enum Error {
     Identity,
     Lsa,
     Status,
+    IdentityRevoked,
     Clock,
     NoRoute,
     WrongReply,
@@ -60,18 +65,37 @@ pub fn management_trust(
     policy: &VerifiedNetworkContext,
     now: u64,
 ) -> Result<ManagementTrust, Error> {
+    mesh_trust(roots, policy, now).map(|(management, _)| management)
+}
+
+/// Both verifiers are derived from the same root-bound grants. A Core is
+/// a transport peer, never an issuer of another identity's denial.
+pub fn mesh_trust(
+    roots: &RootsBundle,
+    policy: &VerifiedNetworkContext,
+    now: u64,
+) -> Result<(ManagementTrust, AuthorityRevocationTrust), Error> {
     let net = policy.net_id();
     let (fingerprint, grants) = roots.verify_all(net, now).map_err(|_| Error::Trust)?;
     if fingerprint != policy.root_key_fingerprint() {
         return Err(Error::Trust);
     }
     let mut trust = ManagementTrust::new(net);
+    let mut identity = AuthorityRevocationTrust::new(net);
     for grant in grants {
         trust
             .add_verified_issuer(&grant)
             .map_err(|_| Error::Trust)?;
+        if grant.issuer_record().authority == Authority::IdentityAuthority {
+            identity
+                .add_verified_issuer(grant)
+                .map_err(|_| Error::Trust)?;
+        }
     }
-    Ok(trust)
+    if identity.issuer_count() == 0 {
+        return Err(Error::Trust);
+    }
+    Ok((trust, identity))
 }
 
 pub fn utc_now() -> Result<u64, Error> {
@@ -113,15 +137,32 @@ impl Core {
         if now < self.identity.not_before() || now >= self.until {
             return Err(Error::Identity);
         }
-        let peer = AuthenticatedPeer::new(
+        let peer = self.authenticated_slot()?;
+        match fresh.identity_revoked(&peer) {
+            Ok(false) => (),
+            Ok(true) => return Err(Error::IdentityRevoked),
+            Err(_) => return Err(Error::Status),
+        }
+        match fresh.peer_revocation(&peer) {
+            PeerRevocation::Verified(state) if !state.sessions_revoked() => Ok(()),
+            _ => Err(Error::Status),
+        }
+    }
+
+    fn authenticated_slot(&self) -> Result<AuthenticatedPeer, Error> {
+        AuthenticatedPeer::new(
             self.identity.net_id(),
             self.identity.node_id(),
             self.identity.identity_generation(),
         )
-        .ok_or(Error::Identity)?;
-        match fresh.peer_revocation(&peer) {
-            PeerRevocation::Verified(state) if !state.sessions_revoked() => Ok(()),
-            _ => Err(Error::Status),
+        .ok_or(Error::Identity)
+    }
+
+    fn check_identity_denial(&self, status: &StatusStore) -> Result<(), Error> {
+        match status.identity_revoked(&self.authenticated_slot()?) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(Error::IdentityRevoked),
+            Err(_) => Err(Error::Status),
         }
     }
 
@@ -198,8 +239,10 @@ impl<'a> MeshProbe<'a> {
             return Err(Error::Status);
         }
         let now = utc_now()?.max(status.last_trusted_utc());
-        let mut trust = management_trust(roots, &policy, now)?;
-        if !status.has_same_authorities(&trust) {
+        let (mut trust, identity_trust) = mesh_trust(roots, &policy, now)?;
+        if !status.has_same_authorities(&trust)
+            || !status.has_same_identity_authorities(policy.root_key_fingerprint(), &identity_trust)
+        {
             return Err(Error::Status);
         }
         let local = Core::from_object(
@@ -366,6 +409,14 @@ impl<'a> MeshProbe<'a> {
                 .map_err(|_| Error::Lsa)?;
             neighbor(lsa(&remote, id, now)?, self.local.id)?;
             let remote_lsa_expiry = remote.valid_until();
+            self.exchange_identity_revocations(
+                &mut session,
+                &socket,
+                &peer,
+                remote_lsa_expiry,
+                deadline,
+                true,
+            )?;
             let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
             return Ok(Adjacency {
                 session,
@@ -477,6 +528,14 @@ impl<'a> MeshProbe<'a> {
             send_lsa(&mut accepted.session, &self.local_lsa)
         })?;
         let remote_lsa_expiry = remote.valid_until();
+        self.exchange_identity_revocations(
+            &mut accepted.session,
+            &socket,
+            &peer,
+            remote_lsa_expiry,
+            deadline,
+            false,
+        )?;
         let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
         let selected = Selected {
             core_id: peer.id,
@@ -493,6 +552,86 @@ impl<'a> MeshProbe<'a> {
             selected,
             _credits: (accepted.credit, accepted.buffer_credit),
         })
+    }
+
+    // One batch in each direction after the signed LSA exchange. Use the
+    // existing absolute budget; no timeout-as-idle or downgrade to old Revoke.
+    fn exchange_identity_revocations(
+        &mut self,
+        session: &mut EstablishedSession,
+        socket: &TcpStream,
+        peer: &Core,
+        remote_lsa_expiry: u64,
+        deadline: Instant,
+        initiator: bool,
+    ) -> Result<(), Error> {
+        let deadline = deadline.min(self.authority_deadline(peer, remote_lsa_expiry)?);
+        // Bound the whole transaction and preserve the actual local error for
+        // the caller. A responder may echo newly committed evidence; exact
+        // previously accepted carriers never extend status or decision TTL.
+        let mut local_error = None;
+        let result = bounded_link_operation(socket, deadline, || {
+            let outcome = (|| -> Result<(), Error> {
+                if initiator {
+                    self.send_revocations(session)?;
+                }
+                for index in 0..=MAX_IDENTITY_REVOCATIONS {
+                    let body = recv_control(session, ControlType::IdentityRevocation)?;
+                    let raw = decode_identity_revocation(&body).map_err(TunnelError::from)?;
+                    let Some(raw) = raw else { break };
+                    if index == MAX_IDENTITY_REVOCATIONS {
+                        return Err(TunnelError::Unsupported(
+                            "identity revocation batch exceeds bound",
+                        )
+                        .into());
+                    }
+                    self.check_route_utc(std::slice::from_ref(peer), remote_lsa_expiry)?;
+                    match self.status.accept_identity_revocation(raw, utc_now()?) {
+                        // The store returns Stale only after verifying both
+                        // signatures, exact scope and current validity. It
+                        // already holds a newer denial of the same generation.
+                        Ok(()) | Err(boreas_pki::status_store::Error::RevocationStale) => (),
+                        Err(_) => return Err(Error::Status),
+                    }
+                    // Stop promptly if the object names either endpoint, or if
+                    // the independent status/LSA/policy deadline expired.
+                    self.check_route_utc(std::slice::from_ref(peer), remote_lsa_expiry)?;
+                }
+                self.check_route_utc(std::slice::from_ref(peer), remote_lsa_expiry)?;
+                if !initiator {
+                    self.send_revocations(session)?;
+                }
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => Ok(()),
+                Err(Error::Transport(e)) => Err(e),
+                Err(e) => {
+                    local_error = Some(e);
+                    Err(TunnelError::Unsupported(
+                        "identity revocation exchange rejected",
+                    ))
+                }
+            }
+        });
+        if let Some(error) = local_error {
+            return Err(error);
+        }
+        result.map_err(Error::from)
+    }
+
+    fn send_revocations(&mut self, session: &mut EstablishedSession) -> Result<(), Error> {
+        let evidence = self
+            .status
+            .relayable_identity_revocations(utc_now()?)
+            .map_err(|_| Error::Status)?;
+        for raw in evidence {
+            let body = encode_identity_revocation(Some(raw)).map_err(TunnelError::from)?;
+            session.send_control(ControlType::IdentityRevocation, &body)?;
+        }
+        let end = encode_identity_revocation(None).map_err(TunnelError::from)?;
+        session.send_control(ControlType::IdentityRevocation, &end)?;
+        Ok(())
     }
 
     pub(crate) fn verified_core(&mut self, signed: &[u8]) -> Result<Core, Error> {
@@ -559,13 +698,22 @@ impl<'a> MeshProbe<'a> {
             Err(_) => return Err(Error::Status),
         }
         let now = observed.max(floor);
-        let cutoff = self
-            .policy
-            .validity()
-            .1
+        let (start, policy_expiry) = self.policy.validity();
+        let cutoff = policy_expiry
             .min(self.local_lsa.valid_until())
             .min(remote_lsa_expiry);
-        if now >= cutoff || route.iter().any(|node| now >= node.until) {
+        self.local.check_identity_denial(self.status)?;
+        for node in route {
+            node.check_identity_denial(self.status)?;
+        }
+        if now < start
+            || now >= cutoff
+            || now < self.local.identity.not_before()
+            || now >= self.local.until
+            || route
+                .iter()
+                .any(|node| now < node.identity.not_before() || now >= node.until)
+        {
             return Err(Error::Status);
         }
         Ok(())

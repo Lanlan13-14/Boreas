@@ -51,6 +51,14 @@
 
 /// Hard cap applied before parsing any object.
 pub const MAX_TBS_LEN: usize = 16 * 1024;
+/// Exact signed carrier shared by local publication and Core–Core delivery.
+pub const IDENTITY_REVOCATION_MAGIC: &[u8; 8] = b"BRIR\0\0\0\x01";
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+pub const MLDSA65_SIGNATURE_LEN: usize = 3309;
+pub const SIGNED_CARRIER_HEADER_LEN: usize =
+    IDENTITY_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
+pub const MAX_IDENTITY_REVOCATION_BYTES: usize = SIGNED_CARRIER_HEADER_LEN + MAX_TBS_LEN;
+pub const MAX_IDENTITY_REVOCATIONS: usize = 16;
 /// Schema version carried in field 0.
 pub const SCHEMA_VERSION: u64 = 1;
 /// Object type inside the independent signature domain. This is deliberately not

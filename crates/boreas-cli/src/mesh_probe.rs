@@ -19,7 +19,7 @@ pub fn run(args: &[String]) -> (u8, String, String) {
 #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
 mod linux {
     use std::{
-        fs::OpenOptions,
+        fs::{File, OpenOptions},
         io::{self, Read},
         net::{TcpListener, TcpStream},
         os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -32,11 +32,11 @@ mod linux {
     use boreas_pki::{
         management::MAX_SIGNED_OBJECT_BYTES,
         provisioning::{RootsBundle, parse_net_id_hex},
-        status_store::StatusStore,
+        status_store::{MAX_IDENTITY_REVOCATION_BYTES, StatusStore},
     };
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
-        mesh_probe::{Candidate, MeshProbe, management_trust, utc_now},
+        mesh_probe::{Candidate, MeshProbe, mesh_trust, utc_now},
         resource::{Admission, Limits},
     };
 
@@ -59,6 +59,14 @@ mod linux {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
             .map_err(|_| "mesh material cannot be opened".to_string())?;
+        read_opened_material(file, max, secret_owner)
+    }
+
+    fn read_opened_material(
+        file: File,
+        max: usize,
+        secret_owner: Option<u32>,
+    ) -> Result<Vec<u8>, String> {
         let meta = file
             .metadata()
             .map_err(|_| "mesh material cannot be stat'ed".to_string())?;
@@ -152,15 +160,37 @@ mod linux {
         if cfg.network.overlay_prefix.base() != policy.overlay_base() {
             return Err("configured overlay does not match signed policy".into());
         }
-        let trust = management_trust(&roots, &policy, now)
-            .map_err(|e| format!("mesh trust rejected: {e:?}"))?;
-        let mut status = StatusStore::open(state.join("status.state"), net, owner, trust)
-            .map_err(|e| format!("mesh durable status rejected: {e:?}"))?;
+        let (trust, identity_trust) =
+            mesh_trust(&roots, &policy, now).map_err(|e| format!("mesh trust rejected: {e:?}"))?;
+        let mut status = StatusStore::open_with_identity_revocations(
+            state.join("status.state"),
+            net,
+            owner,
+            trust,
+            root_fingerprint,
+            identity_trust,
+        )
+        .map_err(|e| format!("mesh durable status rejected: {e:?}"))?;
         let snapshot = read(&mat.join("status.signed"), MAX_SIGNED_OBJECT_BYTES)?;
         let now = utc_now().map_err(|e| format!("mesh clock rejected: {e:?}"))?;
         status
             .accept_signed_snapshot(&snapshot, now, Instant::now())
             .map_err(|e| format!("mesh signed status rejected: {e:?}"))?;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(mat.join("identity-revocation.signed"))
+        {
+            Ok(file) => {
+                let raw = read_opened_material(file, MAX_IDENTITY_REVOCATION_BYTES, None)?;
+                let now = utc_now().map_err(|e| format!("mesh clock rejected: {e:?}"))?;
+                status
+                    .accept_identity_revocation(&raw, now)
+                    .map_err(|e| format!("mesh identity revocation rejected: {e:?}"))?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("mesh identity revocation mailbox: {}", e.kind())),
+        }
         let pem = PemIdentity {
             certificate_pem: read(&mat.join("identity.pem"), 64 * 1024)?,
             private_key_pem: read_material(&cfg.identity.private_key, 16 * 1024, Some(owner))?,

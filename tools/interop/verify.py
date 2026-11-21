@@ -56,10 +56,11 @@ SUBTYPE_NAMES = {
     1: "SessionHello", 2: "SessionAccept", 3: "Enrollment", 4: "DirectoryPage",
     5: "Lease", 6: "Lsa", 7: "Grant", 8: "Revoke", 9: "Probe", 10: "Drain",
     16: "CircuitOpen", 17: "CircuitAccept", 18: "CircuitReset", 19: "CircuitClose",
+    20: "IdentityRevocation",
 }
 SUBTYPE_CAPS = {
     1: 4096, 2: 4096, 16: 4096, 17: 4096, 3: 16384, 4: 16384, 5: 16384,
-    8: 16384, 6: 8192, 7: 8192, 9: 256, 10: 256, 18: 256, 19: 256,
+    8: 16384, 6: 8192, 7: 8192, 9: 256, 10: 256, 18: 256, 19: 256, 20: 19767,
 }
 OBJECT_TYPE_NAMES = {
     1: "NodeIdentity", 2: "AttachmentLease", 3: "CoreLsa", 4: "RouteGrant",
@@ -538,6 +539,12 @@ def parse_control(data: bytes) -> dict:
         return parse_circuit_close(data, "CircuitReset")
     if subtype == 19:
         return parse_circuit_close(data, "CircuitClose")
+    if subtype == 20:
+        if data == b"\x14\x00":
+            return {"message": "IdentityRevocation", "evidence_hex": None}
+        if len(data) > 3383 and data.startswith(b"\x14\x01BRIR\x00\x00\x00\x01"):
+            return {"message": "IdentityRevocation", "evidence_hex": data[2:].hex()}
+        raise Reject("wrong_length")
     parsed = parse_signed_object(data[1:])
     allowed = SUBTYPE_OBJECT_TYPES.get(subtype)
     if allowed is not None and parsed["object_type"] not in allowed:

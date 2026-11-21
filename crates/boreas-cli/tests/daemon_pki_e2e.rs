@@ -467,6 +467,63 @@ fn spawn_connect(
         .unwrap()
 }
 
+#[test]
+fn revoking_the_local_generation_closes_active_and_standby_without_promotion() {
+    let pair = Pair::provision("identity-revoke-standby");
+    let active_state = pair.new_state("active");
+    let standby_state = pair.new_state("standby");
+    let edge_state = pair.new_state("edge");
+    pair.long_lived_status(&pair.core_mat);
+    pair.long_lived_status(&pair.edge_mat);
+    let active_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let active = active_reservation.local_addr().unwrap().to_string();
+    let standby = format!("127.0.0.1:{}", free_port());
+    drop(active_reservation);
+    let active_cfg = pair.root.0.join("active.toml");
+    let standby_cfg = pair.root.0.join("standby.toml");
+    let edge_cfg = pair.root.0.join("edge.toml");
+    write_config(&active_cfg, "core", 1, 1, &pair.core_mat, &active_state, "wss.boreas.test:443");
+    write_config(&standby_cfg, "core", 1, 1, &pair.core_mat, &standby_state, "wss.boreas.test:443");
+    write_config_with_uplinks(&edge_cfg, "edge", 1, 2, 2, &pair.edge_mat, &edge_state, &active, Some(&standby));
+    let core = spawn_serve(&active_cfg, &pair.core_mat, &active_state, &active, "25");
+    let spare = spawn_serve(&standby_cfg, &pair.core_mat, &standby_state, &standby, "25");
+    for state in [&active_state, &standby_state] {
+        assert!(wait_for_status(&state.join("control.sock"), "\"status_fresh\":true", Duration::from_secs(10)));
+    }
+    thread::sleep(Duration::from_millis(200));
+    let mut edge = spawn_connect(&edge_cfg, &pair.edge_mat, &edge_state, "wss.boreas.test", "20");
+    let socket = edge_state.join("control.sock");
+    assert!(wait_for_status(&socket, "\"standby_ready\":true", Duration::from_secs(10)));
+    let live = ctl_status(&socket).unwrap();
+    assert_eq!(u64_field(&live, "path_epoch"), Some(1));
+    assert_eq!(u64_field(&live, "failover_events"), Some(0));
+    assert!(live.contains("\"active_path\":\"primary\""));
+
+    let denial = identity_revocation_fixture(&pair.ca_dir, 1, 1);
+    publish_identity_revocation(&pair.edge_mat, &denial);
+    fn expect_exited(child: &mut std::process::Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() { return; }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("revocation did not release the live link promptly");
+    }
+    expect_exited(&mut edge);
+    let out = edge.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("identity node 2 generation 1 revoked"));
+    // Both Core processes exit even though their own material never received
+    // the denial; their respective authenticated transports were closed.
+    for mut peer in [core, spare] {
+        expect_exited(&mut peer);
+        let out = peer.wait_with_output().unwrap();
+        assert!(!out.status.success() || String::from_utf8_lossy(&out.stdout).contains("peer_closed_cleanly"));
+    }
+}
+
 /// Real two-node, same-Core mid-run path failover.
 ///
 /// Both listeners speak for the *same* Core identity (`10.20.1.1`), which is the
