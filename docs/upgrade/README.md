@@ -3,8 +3,10 @@
 `boreas-supervisor` is an independent Rust 2024, version `0.1.0`, GPL-3.0-only
 crate: a crash-recoverable upgrade journal plus the external supervisor
 executable (master plan §1.1/§10.3), and a strict release-metadata layer
-(§10.2). It adds no daemon, installer command, downloader, or service unit, and
-it does **not** claim `G-UPGRADE` or `G-SUPPLY`.
+(§10.2). The Linux systemd tools wire it to the daemon for the offline operator
+path below. It adds no downloader and does **not** claim `G-UPGRADE` or
+`G-SUPPLY`. The component descriptions below also cover the generic store and
+stub paths; those are not the verified systemd deployment recipe.
 
 ## Status at a glance
 
@@ -13,13 +15,13 @@ it does **not** claim `G-UPGRADE` or `G-SUPPLY`.
 | Journal / active pointer / recovery | present in source; CI/test evidence for the exact commit must be checked before deployment claims |
 | Windows transaction backend | **not integrated**; store fails closed |
 | Exclusive store lock | source uses `File::try_lock`; exact-commit validation required |
-| Trial readiness (Unix AF_UNIX + peer credentials + challenge/schema policy) | source present; stub-only tests, no daemon integration |
+| Trial readiness (Unix AF_UNIX + peer credentials + challenge/schema policy) | generic stub tests; the verified Linux systemd fixture uses the real daemon and sealed-image binding |
 | Signal forwarding + controlled stop | Unix source present; Windows fail-closed |
 | Durable trial budget across restarts | source present (`trial.state`); exact-commit validation required |
 | Strict manifest parsing + policy | source present; exact-commit validation required |
 | Ed25519 + ML-DSA-65 verification | source present behind `openssl-backend` (OpenSSL 3.5+); default build fails closed; exact-commit crypto CI still must be verified |
 | Artifact size + SHA-256 check | bounded in-memory bytes on `VerifiedAsset` behind that feature; no streaming downloader |
-| Durable anti-rollback / TUF roles / SBOM | **not implemented** |
+| Durable anti-rollback / TUF roles / SBOM | verified Linux local watermark present; snapshot-resistant state, TUF roles and SBOM not implemented here |
 
 Dependencies: `libc = "=0.2.191"` for **Unix** (the macOS `F_FULLFSYNC` flush plus
 the Linux/macOS readiness and signal backends; already locked by `boreas-tun`),
@@ -34,12 +36,14 @@ a small, strict, hand-written JSON subset.
 
 `boreas update-check` and console entry 7 only perform [advisory release discovery](../releases/README.md#13-只读更新检查). The GitHub list or release-branch JSON is not an authorization input, and neither command invokes this supervisor or exposes an install action. In particular, do not substitute Zephyr's single-signature updater, a GitHub `prerelease` flag, a release-asset checksum, or a downloaded executable for an independent trust decision.
 
-The following are required before enabling an automatic action:
+The [Linux/systemd offline operator procedure](../deployment/VERIFIED-SERVICE.md) is separate. `boreas update verify` checks independently pinned ReleaseRoot **Ed25519 AND ML-DSA-65**, freshness, native static ELF byte identity, schema, and local admission state without stopping service or writing the store. `boreas update apply` requires administrator credentials, the reviewed raw manifest's full SHA-256, and four local files. It preflights again before stopping service, then stages freshly reverified bytes through the installed helper and supervisor. The supervisor's sealed-image readiness and retained-version rollback, admission watermark, and separately configured minimum runnable sequence remain authoritative. This is a bounded service restart, not a seamless handover or a post-confirmation health monitor.
 
-1. Provision independently pinned Boreas ReleaseRoot keys, distinct from NetworkRoot, with an approved rotation/revocation policy and trusted UTC. Enable and validate the supervisor's OpenSSL 3.5+ verification on the exact shipped platform build: **Ed25519 AND ML-DSA-65** over the original manifest bytes, with no algorithm downgrade. No packaged updater with that trust configuration is wired here.
-2. Bind the signed release identity, version/channel and applicable promotion evidence to **exactly one** authorized platform artifact, its exact bytes (size and SHA-256) and compatible state policy. Supply a bounded streaming downloader and controlled extraction to an immutable private staging input; close the verification-to-staging gap. The existing byte-slice check and a public listing are not this pipeline.
-3. Persist a tamper-resistant monotonic release sequence and manifest digest across restarts, rollback and state restore; enforce expiration/revocation, lower-sequence and same-sequence/different-bytes refusal before staging. The in-memory `SequenceLedger` and the durable trial-attempt counter are not a durable release authorization watermark.
-4. Wire only that verified candidate into the exclusive supervisor transaction via the packaged service layout. Bind real daemon readiness to the candidate digest, enforce state compatibility and last-permitted-version rollback, and validate crash/power-loss recovery and restart interruption on supported targets. The current test stub, unintegrated Windows store and absent end-to-end deployment binding do not meet this contract.
+Before an automatic action can be considered:
+
+1. Establish an approved, authenticated production feed and lifecycle for independent ReleaseRoot pins (bootstrap, rotation, revocation and trusted UTC). There is no network trust/configuration path or unattended credential provisioning here.
+2. Cryptographically bind release version/channel and promotion evidence to exactly one deployable asset per platform. Reconcile the promotion tool's archive/envelope and platform vocabulary with the deployment path's raw signed manifest, detached signatures, native Rust target and bare static ELF; no automatic conversion or claim of promotion verification. Define a bounded downloader and controlled extraction whose authenticated bytes reach immutable staging. An advisory tag, same-origin digest or HTTPS is insufficient.
+3. Protect monotonic admission state against snapshots/restores and administrative or same-UID tampering; the current durable watermark assumes trusted local storage/ancestry and is not a hardware monotonic counter. Define revocation and safe state migration/rollback for supported platforms, and an explicit automation/service-manager authorization policy.
+4. Verify the exact shipped binaries, trust provisioning and supported platform matrix in CI and deployment evidence, including recovery under power loss, disk failures and interruption, and complete promotion review. The Linux offline fixture does not confer production approval; Windows/macOS/OpenWrt have no offline execution bridge.
 
 ## Transaction model
 
