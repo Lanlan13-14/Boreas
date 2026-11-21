@@ -472,6 +472,9 @@ if [ -n "$URL" ]; then
   else fail 'required command not found: curl or wget'; fi
   printf '%s\n' 'install: WARNING: the --url digest is only an integrity check against whatever that origin served; it is not provenance. Verify the digest through a separate channel.' >&2
 fi
+if [ "$SERVICE" != none ] && { [ -e /usr/local/libexec/boreas/boreas-service ] || [ -L /usr/local/libexec/boreas/boreas-service ]; }; then
+  fail 'refusing to replace the authenticated service with a legacy development template'
+fi
 case "$SERVICE" in
   systemd) need systemctl ;;
   procd) [ -r /etc/rc.common ] || fail 'required OpenWrt procd file not found: /etc/rc.common' ;;
