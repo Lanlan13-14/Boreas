@@ -47,6 +47,9 @@ pub fn daemon_usage() -> &'static str {
     "Usage:
   boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
   boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
+  Direct multi-active IPv4/TCP (either role, real TUN only): add --e2e-active-lanes <2|3|4>
+  with the same value and MTU on both ends. Connect requires explicit --connect; no standby,
+  private DNS, GSO, virtual TUN or --max-packets in this profile.
   Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
   and set [dns].zone to the signed private suffix; see docs/engineering/dns-daemon-deployment.md."
 }
@@ -277,6 +280,7 @@ mod linux_daemon {
 
     use private_dns::{Interrupt as DnsInterrupt, PinnedDns};
 
+    mod multi_active;
     mod private_dns;
 
     const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(10);
@@ -385,6 +389,8 @@ mod linux_daemon {
         path_epoch: AtomicU64,
         /// Which endpoint currently carries business traffic.
         active_path: AtomicU8,
+        multi_active_count: AtomicU8,
+        multi_active_lanes: [multi_active::LaneCounters; boreas_tunnel::circuit::HARD_PAIR_CAP],
     }
 
     struct ControlSocketGuard {
@@ -721,7 +727,7 @@ mod linux_daemon {
                         let mut reader = BufReader::new((&mut stream).take(256));
                         if reader.read_line(&mut line).is_ok() && line.trim() == "STATUS" {
                             let resp = format!(
-                                "{{\"command\":\"ctl.status\",\"version\":\"{}\",\"node\":\"{}\",\"daemon_connected\":{},\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},\"security_mode\":\"{}\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{},\"status_sequence\":{},\"status_fresh\":{},\"standby_ready\":{},\"standby_rejected\":{},\"standby_state\":\"{}\",\"standby_attempts\":{},\"standby_polls\":{},\"standby_failures\":{},\"failover_events\":{},\"path_epoch\":{},\"active_path\":\"{}\"}}\n",
+                                "{{\"command\":\"ctl.status\",\"version\":\"{}\",\"node\":\"{}\",\"daemon_connected\":{},\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},\"security_mode\":\"{}\",\"tx_packets\":{},\"tx_bytes\":{},\"rx_packets\":{},\"rx_bytes\":{},\"status_sequence\":{},\"status_fresh\":{},\"standby_ready\":{},\"standby_rejected\":{},\"standby_state\":\"{}\",\"standby_attempts\":{},\"standby_polls\":{},\"standby_failures\":{},\"failover_events\":{},\"path_epoch\":{},\"active_path\":\"{}\",\"multi_active_lanes\":{}}}\n",
                                 env!("CARGO_PKG_VERSION"),
                                 counters.node_label,
                                 counters.connected.load(Ordering::Relaxed),
@@ -744,6 +750,7 @@ mod linux_daemon {
                                 counters.failover_events.load(Ordering::Relaxed),
                                 counters.path_epoch.load(Ordering::Relaxed),
                                 active_path_label(counters.active_path.load(Ordering::Relaxed)),
+                                multi_active::status_lanes(&counters),
                             );
                             let _ = stream.write_all(resp.as_bytes());
                             let _ = stream.flush();
@@ -814,6 +821,7 @@ mod linux_daemon {
     fn lock_gate(store: &Mutex<StatusStore>, status_path: &Path) -> Result<(u64, Instant), String> {
         let mut guard = lock_mutex(store);
         status_gate(&mut guard, status_path, now_utc_us()?, Instant::now())
+            .map(|(seq, deadline, _)| (seq, deadline))
     }
 
     // --- bounded upstream connection management ----------------------------
@@ -1774,7 +1782,7 @@ mod linux_daemon {
         status_path: &Path,
         trusted_utc_us: u64,
         mono_now: Instant,
-    ) -> Result<(u64, Instant), String> {
+    ) -> Result<(u64, Instant, u64), String> {
         let raw = read_status_snapshot_raw(status_path)
             .map_err(|e| format!("status file read failed: {e}"))?;
         store
@@ -1786,7 +1794,8 @@ mod linux_daemon {
         fresh
             .check(trusted_utc_us, mono_now)
             .map_err(|e| format!("status check failed: {e:?}"))?;
-        Ok((fresh.sequence(), fresh.deadline()))
+        let valid_until = fresh.valid_until().ok_or("status UTC cutoff unavailable")?;
+        Ok((fresh.sequence(), fresh.deadline(), valid_until))
     }
 
     fn auth_slot(net: [u8; 16], node: u16, generation: u64) -> Result<AuthenticatedPeer, String> {
@@ -1887,6 +1896,7 @@ mod linux_daemon {
         let mut max_seconds: Option<u64> = None;
         let mut virtual_tun = false;
         let mut tun_tcpv4_gso = false;
+        let mut multi_active_profile = None;
         let mut status_state_file: Option<PathBuf> = None;
         let mut status_state_owner_uid: Option<u32> = None;
         let mut policy_tbs: Option<PathBuf> = None;
@@ -1955,6 +1965,18 @@ mod linux_daemon {
                         "--ws-host" => ws_host = Some(val.clone()),
                         "--ws-path" => ws_path = val.clone(),
                         "--tun-name" => tun_name = Some(val.clone()),
+                        "--e2e-active-lanes" if multi_active_profile.is_none() => {
+                            multi_active_profile = val
+                                .parse::<u8>()
+                                .ok()
+                                .and_then(boreas_tunnel::e2e::E2eL3Profile::multi_active);
+                            if multi_active_profile.is_none() {
+                                return Err("daemon: --e2e-active-lanes must be 2, 3 or 4".into());
+                            }
+                        }
+                        "--e2e-active-lanes" => {
+                            return Err("daemon: duplicate --e2e-active-lanes".into());
+                        }
                         "--mtu" => {
                             mtu = val
                                 .parse::<usize>()
@@ -1979,6 +2001,19 @@ mod linux_daemon {
             }
         }
 
+        if multi_active_profile.is_some() {
+            if virtual_tun
+                || tun_tcpv4_gso
+                || dns_dir.is_some()
+                || dns_pin.is_some()
+                || max_packets.is_some()
+            {
+                return Err("daemon: --e2e-active-lanes requires real Linux TUN and excludes GSO, private DNS and --max-packets".into());
+            }
+            if mode == Mode::Connect && connect_spec.is_none() {
+                return Err("daemon: --e2e-active-lanes requires explicit --connect; standby is not supported".into());
+            }
+        }
         if tun_tcpv4_gso && (provisioned || virtual_tun) {
             return Err("daemon: --tun-tcpv4-gso requires a newly created real Linux TUN".into());
         }
@@ -2293,6 +2328,8 @@ mod linux_daemon {
             failover_events: AtomicU64::new(0),
             path_epoch: AtomicU64::new(0),
             active_path: AtomicU8::new(PATH_PRIMARY),
+            multi_active_count: AtomicU8::new(0),
+            multi_active_lanes: std::array::from_fn(|_| multi_active::LaneCounters::default()),
         });
         let _ctl_guard = start_control_socket(&config.paths.state_dir, Arc::clone(&counters))?;
 
@@ -2323,7 +2360,7 @@ mod linux_daemon {
         )
         .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))?;
         let status_path = mat_dir.join("status.signed");
-        let (gate_seq, _gate_deadline) = status_gate(
+        let (gate_seq, _, _) = status_gate(
             &mut status_store,
             &status_path,
             now_utc_us()?,
@@ -2351,6 +2388,63 @@ mod linux_daemon {
             allow_hop_only: false,
             allowed_peer_roles: vec![remote_peer.role],
         };
+
+        if let Some(profile) = multi_active_profile {
+            let endpoint = match mode {
+                Mode::Serve => {
+                    let spec = listen_spec.ok_or("daemon serve: `--listen` is required")?;
+                    let outer = OpenSslOuterTlsAcceptor::from_pem_files(
+                        mat_dir.join("outer.pem"),
+                        mat_dir.join("outer.key"),
+                    )
+                    .map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?;
+                    let listener = TcpListener::bind(resolve_addr(&spec)?)
+                        .map_err(|e| format!("daemon serve: cannot bind TCP listener: {e}"))?;
+                    listener
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("daemon serve: listener nonblocking failed: {e}"))?;
+                    let server =
+                        LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
+                    multi_active::Endpoint::Core(listener, server, outer)
+                }
+                Mode::Connect => {
+                    let spec =
+                        connect_spec.ok_or("daemon multi-active: `--connect` is required")?;
+                    // Bound the dial itself without invoking a resolver that
+                    // can block outside the cohort's startup deadline.
+                    let address = spec
+                        .parse::<SocketAddr>()
+                        .map_err(|_| "daemon multi-active: --connect requires a literal IP:port")?;
+                    let server_name = match tls_name.as_deref() {
+                        Some(name) => name.to_string(),
+                        None => endpoint_tls_name(&spec)?.to_string(),
+                    };
+                    let target = ClientTarget {
+                        address,
+                        ws_host: ws_host.unwrap_or(spec),
+                        tls_server_name: server_name,
+                        path: ws_path,
+                    };
+                    let client = LinkClient::new(
+                        Box::new(direct_outer_connector(&mat_dir)?),
+                        Box::new(OpenSslInnerConnector::new(inner_conn, extractor)),
+                    );
+                    multi_active::Endpoint::Edge(client, target)
+                }
+            };
+            return multi_active::run(endpoint, multi_active::Run {
+                profile,
+                policy: session_policy,
+                backend: e2e_backend,
+                tun: &tun_endpoint,
+                mtu,
+                status_path: &status_path,
+                policy_window,
+                store: status_store,
+                max_seconds,
+                counters: &counters,
+            });
+        }
 
         match mode {
             Mode::Serve => run_serve_loop(
@@ -2569,15 +2663,42 @@ mod linux_daemon {
             interval: Duration,
             endpoints: Option<[AuthenticatedPeer; 2]>,
         ) -> Self {
+            // Capture ownership before starting the checker; never retain a raw fd.
+            let shutdown_fd = duplicate_shutdown_fd(sock_fd);
+            Self::start_with_interrupt(
+                store,
+                status_path,
+                policy_window,
+                move || {
+                    if let Some(fd) = shutdown_fd {
+                        // SAFETY: owned duplicate of the socket, not a recycled raw fd.
+                        unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
+                    }
+                },
+                |_, _| {},
+                counters,
+                interval,
+                endpoints,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn start_with_interrupt(
+            store: Arc<Mutex<StatusStore>>,
+            status_path: PathBuf,
+            policy_window: PolicyWindow,
+            interrupt: impl FnOnce() + Send + 'static,
+            on_fresh: impl Fn(Instant, u64) + Send + 'static,
+            counters: Arc<LiveCounters>,
+            interval: Duration,
+            endpoints: Option<[AuthenticatedPeer; 2]>,
+        ) -> Self {
             let stop = Arc::new((Mutex::new(()), Condvar::new()));
             let stopped = Arc::new(AtomicBool::new(false));
             let fault = Arc::new(OnceLock::new());
             let stop_bg = Arc::clone(&stop);
             let stopped_bg = Arc::clone(&stopped);
             let fault_bg = Arc::clone(&fault);
-            // Capture an owned duplicate now, while the caller's session is
-            // still alive. The worker uses only this duplicate, never `sock_fd`.
-            let shutdown_fd = duplicate_shutdown_fd(sock_fd);
             let handle = thread::spawn(move || {
                 // First check is immediate: business may already have started
                 // when this watchdog is constructed; a 500 ms grace period
@@ -2623,7 +2744,7 @@ mod linux_daemon {
                                 now_us,
                                 Instant::now(),
                             ) {
-                                Ok((seq, status_deadline)) => {
+                                Ok((seq, status_deadline, valid_until)) => {
                                     let prev = counters.status_sequence.load(Ordering::Relaxed);
                                     if seq < prev {
                                         Some(format!(
@@ -2637,9 +2758,13 @@ mod linux_daemon {
                                         deadline = (Instant::now() + interval)
                                             .min(status_deadline)
                                             .min(policy_window.deadline());
-                                        endpoints.and_then(|slots| {
+                                        let failure = endpoints.and_then(|slots| {
                                             check_identity_revocations(&mut store_guard, &status_path, slots).err()
-                                        })
+                                        });
+                                        if failure.is_none() {
+                                            on_fresh(status_deadline, valid_until);
+                                        }
+                                        failure
                                     }
                                 }
                                 Err(error) => Some(format!(
@@ -2659,13 +2784,7 @@ mod linux_daemon {
                     counters.status_fresh.store(false, Ordering::SeqCst);
                     // One worker publishes once; readers need no mutex in the hot path.
                     let _ = fault_bg.set(message);
-                    if let Some(fd) = shutdown_fd.as_ref() {
-                        // SAFETY: `fd` is an owned duplicate of the connected
-                        // outer socket. It keeps the socket alive even if the
-                        // packet path has already dropped the original stream, so
-                        // this can never target a closed/reused descriptor.
-                        unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
-                    }
+                    interrupt();
                     return;
                 }
             });
@@ -2675,6 +2794,10 @@ mod linux_daemon {
                 fault,
                 handle: Some(handle),
             }
+        }
+
+        fn fault_handle(&self) -> Arc<OnceLock<String>> {
+            Arc::clone(&self.fault)
         }
 
         /// Owned first-failure reason, if the watchdog halted forwarding.
@@ -2880,6 +3003,19 @@ mod linux_daemon {
         Ok(())
     }
 
+    fn direct_outer_connector(mat_dir: &Path) -> Result<OpenSslOuterTlsConnector, String> {
+        let outer_ca_path = mat_dir.join("outer-ca.pem");
+        if outer_ca_path.exists() {
+            let pem = fs::read(&outer_ca_path)
+                .map_err(|_| "daemon connect: cannot read outer-ca.pem".to_string())?;
+            OpenSslOuterTlsConnector::with_root_certificates(&pem)
+                .map_err(|_| "daemon connect: invalid outer-ca.pem".to_string())
+        } else {
+            OpenSslOuterTlsConnector::web_pki()
+                .map_err(|_| "daemon connect: web-PKI roots unavailable".to_string())
+        }
+    }
+
     /// Connect, then keep business on one authenticated circuit at a time.
     ///
     /// The initial dial keeps the pre-authorization fallback: only a transport
@@ -2926,17 +3062,7 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
     ) -> Result<(), String> {
-        let outer_ca_path = mat_dir.join("outer-ca.pem");
-        let outer_conn = if outer_ca_path.exists() {
-            let pem = fs::read(&outer_ca_path)
-                .map_err(|_| "daemon connect: cannot read outer-ca.pem".to_string())?;
-            OpenSslOuterTlsConnector::with_root_certificates(&pem)
-                .map_err(|_| "daemon connect: invalid outer-ca.pem".to_string())?
-        } else {
-            OpenSslOuterTlsConnector::web_pki()
-                .map_err(|_| "daemon connect: web-PKI roots unavailable".to_string())?
-        };
-
+        let outer_conn = direct_outer_connector(mat_dir)?;
         let budget = Arc::new(ConnectionBudget::new());
         let link_client = LinkClient::new(
             Box::new(outer_conn),
@@ -3929,6 +4055,8 @@ mod linux_daemon {
                 failover_events: AtomicU64::new(0),
                 path_epoch: AtomicU64::new(1),
                 active_path: AtomicU8::new(PATH_PRIMARY),
+                multi_active_count: AtomicU8::new(0),
+                multi_active_lanes: std::array::from_fn(|_| multi_active::LaneCounters::default()),
             })
         }
 

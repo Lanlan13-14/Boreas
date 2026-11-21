@@ -15,6 +15,11 @@
 #   BOREAS_NETEM_RATE_MBIT=100 BOREAS_NETNS_EDGE_LIFETIME_SECONDS=180 \
 #     bash tools/release/netns_daemon_smoke.sh /path/to/the/candidate/boreas
 # Runs warm 1-stream and then warm 4-stream rounds, full duplex in each round.
+# Direct multi-active fixture, using the same signed PKI/TUN setup and binary:
+#   BOREAS_NETNS_E2E_ACTIVE_LANES=4 bash tools/release/netns_daemon_smoke.sh /path/to/boreas
+# Observes separate established TCP sockets, sends four verified TCP flows per
+# direction, asserts progress on each authenticated lane, then removes only
+# one transport and checks that both cohorts tear down without success.
 # Set BOREAS_MULTISTREAM_BYTES for total measured bytes per direction per round
 # (32 MiB by default); BOREAS_PERF_TIMEOUT_SECONDS bounds each worker/round.
 set -euo pipefail
@@ -29,7 +34,24 @@ case "${BOREAS_NETNS_TCPV4_GSO:-0}" in
   1) TUN_GSO_ARGS=(--tun-tcpv4-gso) ;;
   *) echo 'ERROR: BOREAS_NETNS_TCPV4_GSO must be 0 or 1' >&2; exit 1 ;;
 esac
+ACTIVE_LANES="${BOREAS_NETNS_E2E_ACTIVE_LANES:-0}"
+ACTIVE_LANE_ARGS=()
+case "$ACTIVE_LANES" in
+  0) ;;
+  2|3|4) ACTIVE_LANE_ARGS=(--e2e-active-lanes "$ACTIVE_LANES") ;;
+  *) echo 'ERROR: BOREAS_NETNS_E2E_ACTIVE_LANES must be 0, 2, 3 or 4' >&2; exit 1 ;;
+esac
 PRIVATE_DNS="${BOREAS_NETNS_PRIVATE_DNS:-0}"
+if [[ "$ACTIVE_LANES" != 0 && ( "$PRIVATE_DNS" != 0 || ${#TUN_GSO_ARGS[@]} != 0 ||
+    "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ||
+    -n "${BOREAS_NETNS_HOOK:-}" ) ]]; then
+  echo 'ERROR: multi-active fixture is separate from DNS, GSO, netem, performance and routing hooks' >&2
+  exit 1
+fi
+if [[ "$ACTIVE_LANES" != 0 ]]; then
+  # More room for slow CI provisioning, but each application probe is bounded.
+  export BOREAS_NETNS_EDGE_LIFETIME_SECONDS=60
+fi
 if [[ "$PRIVATE_DNS" != 0 && "$PRIVATE_DNS" != 1 ]]; then
   echo 'ERROR: BOREAS_NETNS_PRIVATE_DNS must be 0 or 1' >&2
   exit 1
@@ -906,7 +928,7 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --status-state-owner-uid "$STATE_OWNER_UID" \
   "${CORE_POLICY_ARGS[@]}" "${CORE_DNS_ARGS[@]}" \
   --listen "192.0.2.1:8443" \
-  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" \
+  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" "${ACTIVE_LANE_ARGS[@]}" \
   --mtu "$TUN_MTU" \
   --max-seconds "$CORE_LIFETIME_SECONDS" \
   > "$WORK/core.out" 2> "$WORK/core.err" &
@@ -939,7 +961,7 @@ run_node "$EDGE_NS" "$BIN" daemon connect \
   --connect "192.0.2.1:8443" \
   --tls-name "wss.boreas.test" \
   --ws-host "wss.boreas.test:8443" \
-  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" \
+  --tun-name "btun0" "${TUN_GSO_ARGS[@]}" "${ACTIVE_LANE_ARGS[@]}" \
   --mtu "$TUN_MTU" \
   --max-seconds "$EDGE_LIFETIME_SECONDS" \
   > "$WORK/edge.out" 2> "$WORK/edge.err" &
@@ -972,8 +994,11 @@ probe_ctl_state connected_wait_start core "$CORE_STATE/control.sock"
 probe_ctl_state connected_wait_start edge "$EDGE_STATE/control.sock"
 mono_ms CONNECTED_WAIT_START_MS || CONNECTED_WAIT_START_MS=''
 CONNECTED=0
-for _ in $(seq 1 100); do
-  if "$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>/dev/null | grep -q '"daemon_connected":true'; then
+CONNECTED_POLLS=100
+if [[ "$ACTIVE_LANES" != 0 ]]; then CONNECTED_POLLS=920; fi
+for _ in $(seq 1 "$CONNECTED_POLLS"); do
+  if "$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>/dev/null | grep -q '"daemon_connected":true' &&
+     { [[ "$ACTIVE_LANES" == 0 ]] || "$BIN" ctl status --socket "$CORE_STATE/control.sock" 2>/dev/null | grep -q '"daemon_connected":true'; }; then
     CONNECTED=1
     break
   fi
@@ -1020,6 +1045,107 @@ if [[ "$PRIVATE_DNS" == 1 ]]; then
     exit 1
   fi
   echo 'private_dns_pin_withdrawal=core_halted_fail_closed'
+  exit 0
+fi
+
+if [[ "$ACTIVE_LANES" != 0 ]]; then
+  # Both owners must publish all admitted lanes, not merely a connected first
+  # socket. Bound every kernel inspection to the test's disposable namespaces.
+  "$BIN" ctl status --socket "$CORE_STATE/control.sock" > "$WORK/core-active-before.json"
+  "$BIN" ctl status --socket "$EDGE_STATE/control.sock" > "$WORK/edge-active-before.json"
+  timeout 5 ip netns exec "$EDGE_NS" ss -Hnt state established dst 192.0.2.1:8443 > "$WORK/active-sockets.txt"
+  python3 - "$ACTIVE_LANES" "$WORK" <<'PYNETNS'
+import json
+import pathlib
+import sys
+
+expected = int(sys.argv[1])
+work = pathlib.Path(sys.argv[2])
+sockets = (work / "active-sockets.txt").read_text().splitlines()
+ports = {line.split()[-2].rsplit(":", 1)[1] for line in sockets}
+assert len(sockets) == len(ports) == expected, sockets
+for role, metric in (("core", "inbound_connections"), ("edge", "outbound_upstreams")):
+    status = json.loads((work / f"{role}-active-before.json").read_text())
+    assert status["daemon_connected"] is True and status["status_fresh"] is True, status
+    assert status[metric] == expected and status["security_mode"] == "e2e-required", status
+    assert [row["lane"] for row in status["multi_active_lanes"]] == list(range(1, expected + 1))
+print(f"distinct_established_underlay_sockets={expected}")
+PYNETNS
+  PROBE="$(dirname "$PERF_SCRIPT")/netns_multi_active_probe.py"
+  probe_pids=()
+  ip netns exec "$CORE_NS" timeout 20 python3 "$PROBE" receive 10.20.1.1 10.20.1.2 &
+  probe_pids+=("$!")
+  ip netns exec "$EDGE_NS" timeout 20 python3 "$PROBE" receive 10.20.1.2 10.20.1.1 &
+  probe_pids+=("$!")
+  probe_ready=0
+  for _ in $(seq 1 80); do
+    if ip netns exec "$CORE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.1:18082' &&
+       ip netns exec "$EDGE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.2:18082'; then
+      probe_ready=1
+      break
+    fi
+    sleep 0.05
+  done
+  (( probe_ready )) || { echo 'ERROR: multi-active probe listeners did not start' >&2; exit 1; }
+  ip netns exec "$CORE_NS" timeout 20 python3 "$PROBE" send 10.20.1.1 10.20.1.2 &
+  probe_pids+=("$!")
+  ip netns exec "$EDGE_NS" timeout 20 python3 "$PROBE" send 10.20.1.2 10.20.1.1 &
+  probe_pids+=("$!")
+  probe_failed=0
+  for pid in "${probe_pids[@]}"; do
+    wait "$pid" || probe_failed=1
+  done
+  (( ! probe_failed )) || { echo 'ERROR: multi-active integrity probe failed' >&2; exit 1; }
+  "$BIN" ctl status --socket "$CORE_STATE/control.sock" > "$WORK/core-active-after.json"
+  "$BIN" ctl status --socket "$EDGE_STATE/control.sock" > "$WORK/edge-active-after.json"
+  python3 - "$ACTIVE_LANES" "$WORK" <<'PYNETNS'
+import json
+import pathlib
+import sys
+
+expected = int(sys.argv[1])
+work = pathlib.Path(sys.argv[2])
+for role in ("core", "edge"):
+    status = json.loads((work / f"{role}-active-after.json").read_text())
+    lanes = status["multi_active_lanes"]
+    assert status["daemon_connected"] is True and status["status_fresh"] is True, status
+    assert len(lanes) == expected, lanes
+    assert all(row["tx_packets"] > 0 and row["rx_packets"] > 0 for row in lanes), lanes
+    assert status["failover_events"] == 0 and status["standby_ready"] is False, status
+    print(f"{role}_authenticated_lane_progress={json.dumps(lanes, separators=(',', ':'))}")
+PYNETNS
+  # Destroy exactly one selected Edge socket. The peer observes a real
+  # unauthenticated transport loss, not a simulated queue or close_notify.
+  IFS= read -r first_socket < "$WORK/active-sockets.txt"
+  read -r -a socket_fields <<< "$first_socket"
+  local_address="${socket_fields[${#socket_fields[@]}-2]}"
+  local_port="${local_address##*:}"
+  [[ "$local_port" =~ ^[0-9]+$ ]]
+  timeout 5 ip netns exec "$EDGE_NS" ss -K src "192.0.2.2:$local_port" dst 192.0.2.1:8443
+  for role in edge core; do
+    pid="$(<"$WORK/$role.pid")"
+    for _ in $(seq 1 100); do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.05
+    done
+    if kill -0 "$pid" 2>/dev/null || wait "$pid"; then
+      echo "ERROR: $role did not fail closed promptly after a single lane was destroyed" >&2
+      report_failure_evidence
+      exit 1
+    fi
+    if [[ "$(<"$WORK/$role.err")" != *'daemon multi-active: lane '* &&
+          "$(<"$WORK/$role.err")" != *'daemon multi-active: inbound lane worker disconnected'* ]]; then
+      echo "ERROR: $role did not attribute cancellation to a lane fault" >&2
+      report_failure_evidence
+      exit 1
+    fi
+  done
+  remaining_sockets="$(timeout 5 ip netns exec "$EDGE_NS" ss -Hnt state established dst 192.0.2.1:8443)"
+  if [[ -n "$remaining_sockets" ]]; then
+    echo 'ERROR: established multi-active socket remained after joint cancellation' >&2
+    exit 1
+  fi
+  echo 'multi_active_lane_loss=both_cohorts_halted_fail_closed'
   exit 0
 fi
 
