@@ -1269,9 +1269,11 @@ mod linux_daemon {
                 config.endpoint
             ))
         })?;
-        lock_gate(&config.status_store, &config.status_path).map_err(|e| {
+        let slots = revocation_slots(config.policy.local, config.expected_peer)
+            .map_err(StandbyDialFailure::Protocol)?;
+        lock_revocation_gate(&config.status_store, &config.status_path, slots).map_err(|e| {
             StandbyDialFailure::Protocol(format!(
-                "standby {}: durable status gate failed before dial: {e}",
+                "standby {}: durable status/identity gate failed before dial: {e}",
                 config.endpoint
             ))
         })?;
@@ -1338,9 +1340,9 @@ mod linux_daemon {
                 config.endpoint
             ))
         })?;
-        lock_gate(&config.status_store, &config.status_path).map_err(|e| {
+        lock_revocation_gate(&config.status_store, &config.status_path, slots).map_err(|e| {
             StandbyDialFailure::Protocol(format!(
-                "standby: durable status gate failed after hop handshake: {e}"
+                "standby: durable status/identity gate failed after hop handshake: {e}"
             ))
         })?;
         // This session owns its socket from here on, so the interruptible window
@@ -1410,7 +1412,19 @@ mod linux_daemon {
         if shared.stop.load(Ordering::SeqCst) || shared.rejected.load(Ordering::SeqCst) {
             return;
         }
-        let published = publish_standby_slot(&shared.slot, &shared.counters.standby_ready, link);
+        // Serialize publication with durable acceptance by the watchdog. The
+        // dial has already polled the mailbox; this is only a committed-state
+        // check with no file IO, under the same lock as the publication.
+        let published = {
+            let store = lock_mutex(&shared.config.status_store);
+            if let Err(reason) = revocation_slots(shared.config.policy.local, shared.config.expected_peer)
+                .and_then(|slots| check_committed_identity_revocations(&store, slots))
+            {
+                reject_standby(&shared, reason);
+                return;
+            }
+            publish_standby_slot(&shared.slot, &shared.counters.standby_ready, link)
+        };
         if published.is_some() {
             // A verified session was already held; keep it and drop this one.
             return;
@@ -1762,6 +1776,23 @@ mod linux_daemon {
             .ok_or_else(|| "daemon: invalid verified endpoint slot".to_string())
     }
 
+    fn revocation_slots(local: PeerIdentity, peer: PeerIdentity) -> Result<[AuthenticatedPeer; 2], String> {
+        Ok([
+            auth_slot(local.net_id, local.node_id, local.identity_generation)?,
+            auth_slot(peer.net_id, peer.node_id, peer.identity_generation)?,
+        ])
+    }
+
+    fn lock_revocation_gate(
+        store: &Mutex<StatusStore>,
+        status_path: &Path,
+        slots: [AuthenticatedPeer; 2],
+    ) -> Result<(), String> {
+        let mut guard = lock_mutex(store);
+        status_gate(&mut guard, status_path, now_utc_us()?, Instant::now())?;
+        check_identity_revocations(&mut guard, status_path, slots)
+    }
+
     /// Poll one atomically published local object. A missing mailbox does not
     /// remove a committed denial. Errors are fail-closed, not revocation claims.
     fn check_identity_revocations(
@@ -1798,6 +1829,13 @@ mod linux_daemon {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(format!("daemon: identity revocation mailbox open failed: {e}")),
         }
+        check_committed_identity_revocations(store, endpoints)
+    }
+
+    fn check_committed_identity_revocations(
+        store: &StatusStore,
+        endpoints: [AuthenticatedPeer; 2],
+    ) -> Result<(), String> {
         for endpoint in endpoints {
             if store.identity_revoked(&endpoint)
                 .map_err(|e| format!("daemon: identity revocation state unusable: {e}"))?
@@ -2877,6 +2915,7 @@ mod linux_daemon {
             None
         };
 
+        let slots = revocation_slots(session_policy.local, remote_peer)?;
         let business_started = Instant::now();
         let deadline = max_seconds.map(|seconds| business_started + Duration::from_secs(seconds));
         let mut packets_before = 0u64;
@@ -2898,16 +2937,16 @@ mod linux_daemon {
                 policy_window.check().map_err(|e| {
                     format!("daemon connect: policy window failed before E2E circuit: {e}")
                 })?;
-                lock_gate(&status_store, status_path).map_err(|e| {
-                    format!("daemon connect: durable status gate failed before E2E circuit: {e}")
+                lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
+                    format!("daemon connect: durable status/identity gate failed before E2E circuit: {e}")
                 })?;
                 // The circuit borrows this session for the whole epoch, so the
                 // standby is a distinct object that this loop only polls.
                 let e2e = open_e2e(&mut link.session, &e2e_backend, remote_peer, 1)
                     .map_err(|e| format!("daemon connect: pq768 E2E circuit rejected: {e}"))?;
                 // Last business-admission boundary before the packet loop starts.
-                lock_gate(&status_store, status_path).map_err(|e| {
-                    format!("daemon connect: durable status gate failed before business: {e}")
+                lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
+                    format!("daemon connect: durable status/identity gate failed before business: {e}")
                 })?;
                 if epoch > 1 {
                     // The rebuilt circuit has passed the final status/policy
@@ -2959,8 +2998,8 @@ mod linux_daemon {
             policy_window.check().map_err(|e| {
                 format!("daemon connect: policy window failed before promotion: {e}")
             })?;
-            lock_gate(&status_store, status_path).map_err(|e| {
-                format!("daemon connect: durable status gate failed before promotion: {e}")
+            lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
+                format!("daemon connect: durable status/identity gate failed before promotion: {e}")
             })?;
 
             let reason = match &report.stop {
@@ -3005,9 +3044,9 @@ mod linux_daemon {
                     policy_window.check().map_err(|e| {
                         format!("daemon connect: policy window failed during standby wait: {e}")
                     })?;
-                    lock_gate(&status_store, status_path).map_err(|e| {
+                    lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                         format!(
-                            "daemon connect: durable status gate failed during standby wait: {e}"
+                            "daemon connect: durable status/identity gate failed during standby wait: {e}"
                         )
                     })?;
                     standby.as_mut().and_then(StandbyManager::take)

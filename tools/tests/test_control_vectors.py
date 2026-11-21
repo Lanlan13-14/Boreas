@@ -280,8 +280,15 @@ class RelayTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_identity_revocation_control_carries_exact_evidence(self):
+        end = control.parse_control(bytes.fromhex("1400"))
+        self.assertEqual(end, {"message": "IdentityRevocation", "evidence_hex": None})
+        carrier = b"BRIR\0\0\0\x01" + bytes(64 + 3309) + b"\xa0"
+        parsed = control.parse_control(b"\x14\x01" + carrier)
+        self.assertEqual(parsed["evidence_hex"], carrier.hex())
+
     def test_unregistered_subtypes_are_rejected(self):
-        for subtype in (0, 0x0B, 0x0F, 0x14, 0x1F, 0xFF):
+        for subtype in (0, 0x0B, 0x0F, 0x15, 0x1F, 0xFF):
             with self.subTest(subtype=subtype):
                 with self.assertRaises(control.Reject) as caught:
                     control.parse_control(bytes([subtype]))

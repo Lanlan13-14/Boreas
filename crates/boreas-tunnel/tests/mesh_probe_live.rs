@@ -21,10 +21,11 @@ use boreas_pki::{
         issue_node_dir, sign_network_policy_dir, sign_status_file,
     },
     root_authorization::{MAX_CHAIN_DEPTH, Purpose, RootAuthorizationCandidate, Scope},
-    status_store::StatusStore,
+    status_store::{AuthenticatedPeer, IDENTITY_REVOCATION_MAGIC, StatusStore},
     verify_network_policy,
 };
 use boreas_proto::{
+    authority_revocation::{AuthorityRevocation, RevocationClass, RevocationScope},
     messages::{PathRole, SignedObject, SignerRole, SignerSignatures},
     objects::{
         self, CoreLsa, ManagementObject, MldsaParameterSet, Neighbor, ObjectBody, ObjectType,
@@ -33,7 +34,7 @@ use boreas_proto::{
 };
 use boreas_tunnel::{
     ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
-    mesh_probe::{Candidate, Error, MeshProbe, Selected, management_trust, utc_now},
+    mesh_probe::{Candidate, Error, MeshProbe, Selected, mesh_trust, utc_now},
     resource::{Admission, Limits},
 };
 use openssl::{
@@ -234,12 +235,14 @@ impl Fixture {
     fn status(&self, id: usize) -> StatusStore {
         let path = &self.node(id).path;
         let now = utc_now().unwrap();
-        let trust = management_trust(&self.roots, &self.policy, now).unwrap();
-        let mut store = StatusStore::open(
+        let (trust, identity_trust) = mesh_trust(&self.roots, &self.policy, now).unwrap();
+        let mut store = StatusStore::open_with_identity_revocations(
             path.join("status.state"),
             NET,
             fs::metadata(path).unwrap().uid(),
             trust,
+            self.policy.root_key_fingerprint(),
+            identity_trust,
         )
         .unwrap();
         store
@@ -539,4 +542,172 @@ fn signed_fixed_route_transfers_bidirectional_e2e_and_rebuilds_after_path_loss()
     assert_ne!(lost, replacement);
     let through_two = fixed_exchange(&f, &[1, 2, 3, 4], false).unwrap();
     assert_ne!(through_two, replacement);
+}
+
+fn identity_evidence(f: &Fixture, subject: AuthenticatedPeer, authority: bool) -> Vec<u8> {
+    let ca = f._temp.0.join("ca");
+    let (name, issuer): (&str, &[u8]) = if authority {
+        ("ia", b"identity-authority-v1")
+    } else {
+        ("status", b"status-signer-v1")
+    };
+    let now = utc_now().unwrap();
+    let tbs = AuthorityRevocation {
+        net_id: subject.net_id(),
+        class: RevocationClass::Identity,
+        subject_node_id: subject.node_id(),
+        identity_generation: subject.identity_generation(),
+        issuer_key_id: issuer.to_vec(),
+        issuer_generation: 1,
+        scope: RevocationScope::default(),
+        seq: 1,
+        issued_at: now,
+        next_update: now + 60_000_000,
+    }
+    .encode_tbs()
+    .unwrap();
+    let input = AuthorityRevocation::signature_input(&tbs).unwrap();
+    let mut evidence = IDENTITY_REVOCATION_MAGIC.to_vec();
+    for algorithm in ["ed25519", "mldsa65"] {
+        let key =
+            PKey::private_key_from_der(&read(&ca, &format!("{name}.{algorithm}.key"))).unwrap();
+        evidence.extend_from_slice(&sign(&key, &input));
+    }
+    evidence.extend_from_slice(&tbs);
+    evidence
+}
+
+#[test]
+fn original_identity_revocation_is_relayed_between_distinct_cores_and_invalidates_fixed_route() {
+    use boreas_tunnel::mesh_relay::with_fixed_endpoint;
+
+    let f = Fixture::new();
+    // The subject isn't either participant in either 1→2 or 2→3 exchange.
+    let subject = AuthenticatedPeer::new(NET, 0x0301, 1).unwrap();
+    let successor = AuthenticatedPeer::new(NET, 0x0301, 2).unwrap();
+    let evidence = identity_evidence(&f, subject, true);
+    let wrong_authority = identity_evidence(&f, subject, false);
+    let mut sender = f.status(1);
+    assert!(
+        sender
+            .accept_identity_revocation(&wrong_authority, utc_now().unwrap())
+            .is_err()
+    );
+    assert!(!sender.identity_revoked(&subject).unwrap());
+    sender
+        .accept_identity_revocation(&evidence, utc_now().unwrap())
+        .unwrap();
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let (listener12, target12) = listener();
+    thread::scope(|scope| {
+        let acceptor = scope.spawn(|| f.respond(listener12, 2));
+        f.probe(1, &mut sender)
+            .select(
+                &[Candidate {
+                    target: &target12,
+                    signed_identity: &f.node(2).identity,
+                }],
+                &outer,
+            )
+            .unwrap();
+        acceptor.join().unwrap().unwrap();
+    });
+
+    // Reopen Core 2's independent store before forwarding what it received.
+    let mut sender2 = f.status(2);
+    assert!(sender2.identity_revoked(&subject).unwrap());
+    assert!(!sender2.identity_revoked(&successor).unwrap());
+    assert_eq!(
+        sender2
+            .relayable_identity_revocations(utc_now().unwrap())
+            .unwrap(),
+        vec![evidence.as_slice()]
+    );
+    let mut receiver = f.status(3);
+    assert!(!receiver.identity_revoked(&subject).unwrap());
+    let status_cutoff = receiver
+        .current_fresh(utc_now().unwrap(), Instant::now())
+        .unwrap()
+        .deadline();
+    let (listener32, target32) = listener();
+    let mut probe = f.probe(3, &mut receiver);
+    let route_members = [3, 2, 4].map(|id| f.node(id).identity.as_slice());
+    let preauthorized = probe.authorize_fixed_route(&route_members).unwrap();
+    let admission = Admission::new(Limits {
+        handshakes_global: 1,
+        authenticated_global: 1,
+        authenticated_per_peer: 1,
+        bytes_global: 1024 * 1024,
+    });
+    thread::scope(|scope| {
+        let f = &f;
+        let acceptor = scope.spawn(move || {
+            let mut probe2 = f.probe(2, &mut sender2);
+            let n = f.node(2);
+            let outer = OpenSslOuterTlsAcceptor::from_pem_files(
+                n.path.join("outer.pem"),
+                n.path.join("outer.key"),
+            )
+            .unwrap();
+            probe2.respond(
+                accept_socket(listener32),
+                &f.node(3).identity,
+                &outer,
+                &Admission::new(Limits {
+                    handshakes_global: 1,
+                    authenticated_global: 1,
+                    authenticated_per_peer: 1,
+                    bytes_global: 1024 * 1024,
+                }),
+            )
+        });
+        let hop = probe
+            .dial(
+                &[Candidate {
+                    target: &target32,
+                    signed_identity: &f.node(2).identity,
+                }],
+                &outer,
+                &admission,
+            )
+            .unwrap();
+        assert_eq!(admission.snapshot().unwrap().authenticated, 1);
+        assert!(matches!(
+            probe.authorize_fixed_route(&route_members),
+            Err(Error::IdentityRevoked)
+        ));
+        assert_eq!(
+            with_fixed_endpoint::<()>(&mut probe, &preauthorized, hop, |_| {
+                panic!("revoked route admitted to business")
+            }),
+            Err(Error::IdentityRevoked)
+        );
+        let credits = admission.snapshot().unwrap();
+        assert_eq!(
+            (credits.handshakes, credits.authenticated, credits.bytes),
+            (0, 0, 0)
+        );
+        let unaffected_route = [1, 2, 3].map(|id| f.node(id).identity.as_slice());
+        assert!(probe.authorize_fixed_route(&unaffected_route).is_ok());
+        acceptor.join().unwrap().unwrap();
+    });
+    drop(probe);
+    assert_eq!(receiver.sequence(), Some(1));
+    assert!(
+        receiver
+            .current_fresh(utc_now().unwrap(), Instant::now())
+            .unwrap()
+            .deadline()
+            <= status_cutoff
+    );
+    drop(receiver);
+    let mut receiver = f.status(3);
+    assert!(receiver.identity_revoked(&subject).unwrap());
+    assert!(!receiver.identity_revoked(&successor).unwrap());
+    assert_eq!(
+        receiver
+            .relayable_identity_revocations(utc_now().unwrap())
+            .unwrap(),
+        vec![evidence.as_slice()]
+    );
 }

@@ -74,10 +74,7 @@ use crate::{
     root_authorization::VerifiedIssuerAuthorization,
 };
 
-/// Ed25519 signature length accepted for this profile.
-pub const ED25519_SIGNATURE_LEN: usize = 64;
-/// ML-DSA-65 signature length accepted for this profile.
-pub const MLDSA65_SIGNATURE_LEN: usize = 3309;
+pub use boreas_proto::authority_revocation::{ED25519_SIGNATURE_LEN, MLDSA65_SIGNATURE_LEN};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -130,6 +127,7 @@ pub struct AuthorityRevocationTrust {
 /// An issuer record plus the root-authorization grant window that made it
 /// trustworthy. `IssuerRecord` has no validity fields of its own, so this bound
 /// must be retained here instead of being dropped during conversion.
+#[derive(PartialEq, Eq)]
 struct TrustedIssuer {
     record: IssuerRecord,
     not_before: u64,
@@ -147,6 +145,20 @@ impl AuthorityRevocationTrust {
 
     pub fn net_id(&self) -> [u8; 16] {
         self.net_id
+    }
+
+    pub(crate) fn same_issuers(&self, expected: &Self) -> bool {
+        self.net_id == expected.net_id && self.issuers == expected.issuers
+    }
+
+    pub(crate) fn can_relay(&self, object: &AuthorityRevocation, now: u64) -> bool {
+        object.issued_at <= now
+            && now < object.next_update
+            && self.issuers.get(&object.issuer_key_id).is_some_and(|issuer| {
+                issuer.record.issuer_generation == object.issuer_generation
+                    && issuer.not_before <= now
+                    && now < issuer.expires
+            })
     }
 
     pub fn issuer_count(&self) -> usize {

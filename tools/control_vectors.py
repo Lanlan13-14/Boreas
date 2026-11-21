@@ -65,6 +65,7 @@ SUBTYPE_CAPS = {
     17: 4096,
     18: 256,
     19: 256,
+    20: 19767,
 }
 
 SUBTYPE_NAMES = {
@@ -82,6 +83,7 @@ SUBTYPE_NAMES = {
     17: "CircuitAccept",
     18: "CircuitReset",
     19: "CircuitClose",
+    20: "IdentityRevocation",
 }
 
 # PeerRole wire values, in the same order as the Rust enum.
@@ -714,6 +716,12 @@ def parse_control(data: bytes, tbs_decoder: Callable[[bytes], dict[str, Any]] | 
         return parse_circuit_close(data, "CircuitReset")
     if subtype == SUBTYPE_CIRCUIT_CLOSE:
         return parse_circuit_close(data, "CircuitClose")
+    if subtype == 20:
+        if data == b"\x14\x00":
+            return {"message": "IdentityRevocation", "evidence_hex": None}
+        if len(data) > 3383 and data.startswith(b"\x14\x01BRIR\x00\x00\x00\x01"):
+            return {"message": "IdentityRevocation", "evidence_hex": data[2:].hex()}
+        raise Reject("wrong_length")
     # Lease / Lsa / Grant / Revoke: subtype + exactly one SignedObject envelope,
     # and the envelope's object type must be one the subtype registers.
     parsed = parse_signed_object(data[1:], tbs_decoder)

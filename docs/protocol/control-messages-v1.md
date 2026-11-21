@@ -1,6 +1,6 @@
 # Candidate Control message payloads v1
 
-**Status: candidate / not frozen. Revision 3.** This document and `boreas-proto::messages` define the candidate typed wire formats for TLS session negotiation, enrollment, directory/management distribution, probes, drain notices and circuit control. They do **not** define TLS, certificate policy, signature verification, identity authorization, circuit TLS, or production route policy. Fixed raw vectors live in `vectors/control-messages-candidate-v1.json` and are decoded by Rust tests; the independent Python checker is authoritative evidence only after it is wired into CI.
+**Status: candidate / not frozen. Revision 4.** This document and `boreas-proto::messages` define the candidate typed wire formats for TLS session negotiation, enrollment, directory/management distribution, probes, drain notices and circuit control. They do **not** define TLS, certificate policy, signature verification, identity authorization, circuit TLS, or production route policy. Fixed raw vectors live in `vectors/control-messages-candidate-v1.json` and are decoded by Rust tests; the independent Python checker is authoritative evidence only after it is wired into CI.
 
 ## Encoding conventions
 
@@ -26,8 +26,9 @@ Every registered control subtype has a typed schema. There is no opaque fallback
 | `0x11` | CircuitAccept | matching CircuitOpen exists | 4096 | CircuitAccept |
 | `0x12` | CircuitReset | circuit opening or established | 256 | CircuitReset |
 | `0x13` | CircuitClose | circuit established | 256 | CircuitClose |
+| `0x14` | IdentityRevocation | accepted Core–Core, e2e-required, neither opening nor established circuit | 19767 | independent signed carrier or end marker |
 
-`0x00`, `0x0B..=0x0F` and `0x14..=0xFF` are unregistered and reject with `unknown_subtype`.
+`0x00`, `0x0B..=0x0F` and `0x15..=0xFF` are unregistered and reject with `unknown_subtype`. The mesh `0x14` extension is a candidate deviation from the base plan's reserved range, not available in the generic daemon. See [authority-specific revocation](authority-revocation-v1.md#explicit-core-adjacency-distribution-and-route-denial) for the bounded exchange and the distinction from legacy `0x08`.
 
 **Lease cap deviation (reported conflict).** Master plan §5.4 lists Lease at 4 KiB. A single Ed25519+ML-DSA-87 signature pair is 64+4627 bytes; an AttachmentLease requires Primary + Core co-signature, so two pairs (9382 B) plus TBS and envelope headers cannot fit 4 KiB. The candidate registry therefore uses 16 KiB for Lease. This is a plan/registry conflict requiring review before freeze; it is not a silent protocol change. The same arithmetic means signed envelopes must be budgeted before the per-subtype cap is applied.
 

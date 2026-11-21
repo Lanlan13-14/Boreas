@@ -260,6 +260,8 @@ pub enum PayloadSchema {
     DirectoryPage,
     /// One [`SignedObject`] envelope.
     SignedObject,
+    /// Independent identity revocation evidence or end marker.
+    IdentityRevocation,
     /// Typed Probe ping/pong.
     Probe,
     /// Typed Drain notice.
@@ -287,7 +289,7 @@ pub struct ControlSchema {
 
 /// Candidate control registry in the order documented in
 /// `docs/protocol/control-messages-v1.md`.
-pub const CONTROL_SCHEMAS: [ControlSchema; 14] = [
+pub const CONTROL_SCHEMAS: [ControlSchema; 15] = [
     ControlSchema {
         subtype: ControlType::SessionHello,
         name: "SessionHello",
@@ -349,6 +351,12 @@ pub const CONTROL_SCHEMAS: [ControlSchema; 14] = [
         payload: PayloadSchema::Drain,
     },
     ControlSchema {
+        subtype: ControlType::IdentityRevocation,
+        name: "IdentityRevocation",
+        body_cap: ControlType::IdentityRevocation.body_cap(),
+        payload: PayloadSchema::IdentityRevocation,
+    },
+    ControlSchema {
         subtype: ControlType::CircuitOpen,
         name: "CircuitOpen",
         body_cap: ControlType::CircuitOpen.body_cap(),
@@ -386,10 +394,11 @@ const fn schema_index(subtype: ControlType) -> usize {
         ControlType::Revoke => 7,
         ControlType::Probe => 8,
         ControlType::Drain => 9,
-        ControlType::CircuitOpen => 10,
-        ControlType::CircuitAccept => 11,
-        ControlType::CircuitReset => 12,
-        ControlType::CircuitClose => 13,
+        ControlType::IdentityRevocation => 10,
+        ControlType::CircuitOpen => 11,
+        ControlType::CircuitAccept => 12,
+        ControlType::CircuitReset => 13,
+        ControlType::CircuitClose => 14,
     }
 }
 
@@ -1204,6 +1213,7 @@ pub enum ControlBody {
     Revoke(Revoke),
     Probe(Probe),
     Drain(Drain),
+    IdentityRevocation(Option<Vec<u8>>),
     CircuitOpen(CircuitOpen),
     CircuitAccept(CircuitAccept),
     CircuitReset(CircuitReset),
@@ -1223,6 +1233,7 @@ impl ControlBody {
             Self::Revoke(_) => ControlType::Revoke,
             Self::Probe(_) => ControlType::Probe,
             Self::Drain(_) => ControlType::Drain,
+            Self::IdentityRevocation(_) => ControlType::IdentityRevocation,
             Self::CircuitOpen(_) => ControlType::CircuitOpen,
             Self::CircuitAccept(_) => ControlType::CircuitAccept,
             Self::CircuitReset(_) => ControlType::CircuitReset,
@@ -1270,11 +1281,57 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
         })),
         ControlType::Probe => Ok(ControlBody::Probe(Probe::decode(body)?)),
         ControlType::Drain => Ok(ControlBody::Drain(Drain::decode(body)?)),
+        ControlType::IdentityRevocation => Ok(ControlBody::IdentityRevocation(
+            decode_identity_revocation(body)?.map(|raw| raw.to_vec()),
+        )),
         ControlType::CircuitOpen => Ok(ControlBody::CircuitOpen(CircuitOpen::decode(body)?)),
         ControlType::CircuitAccept => Ok(ControlBody::CircuitAccept(CircuitAccept::decode(body)?)),
         ControlType::CircuitReset => Ok(ControlBody::CircuitReset(CircuitReset::decode(body)?)),
         ControlType::CircuitClose => Ok(ControlBody::CircuitClose(CircuitClose::decode(body)?)),
     }
+}
+
+/// Frame exactly one signed carrier, or end a bounded exchange. This checks
+/// shape only; the independent authority verifier owns admission.
+pub fn encode_identity_revocation(evidence: Option<&[u8]>) -> Result<Vec<u8>, MessageError> {
+    let mut out = vec![ControlType::IdentityRevocation as u8, u8::from(evidence.is_some())];
+    if let Some(raw) = evidence {
+        check_identity_revocation_carrier(raw)?;
+        out.extend_from_slice(raw);
+    }
+    Ok(out)
+}
+
+pub fn decode_identity_revocation(body: &[u8]) -> Result<Option<&[u8]>, MessageError> {
+    match body {
+        [subtype, tag, rest @ ..] if *subtype == ControlType::IdentityRevocation as u8 => {
+            match (*tag, rest) {
+                (0, []) => Ok(None),
+                (1, raw) => {
+                    check_identity_revocation_carrier(raw)?;
+                    Ok(Some(raw))
+                }
+                _ => Err(MessageError::WrongLength),
+            }
+        }
+        [subtype, ..] if *subtype != ControlType::IdentityRevocation as u8 => {
+            Err(MessageError::BadSubtype(*subtype))
+        }
+        _ => Err(MessageError::WrongLength),
+    }
+}
+
+fn check_identity_revocation_carrier(raw: &[u8]) -> Result<(), MessageError> {
+    use crate::authority_revocation::{
+        IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES, SIGNED_CARRIER_HEADER_LEN,
+    };
+    if raw.len() > MAX_IDENTITY_REVOCATION_BYTES {
+        return Err(MessageError::BodyTooLarge(raw.len() + 2));
+    }
+    if raw.len() <= SIGNED_CARRIER_HEADER_LEN || !raw.starts_with(IDENTITY_REVOCATION_MAGIC) {
+        return Err(MessageError::WrongLength);
+    }
+    Ok(())
 }
 
 impl Lease {
@@ -2335,8 +2392,22 @@ mod tests {
     }
 
     #[test]
+    fn identity_revocation_carrier_is_not_a_status_envelope() {
+        use crate::authority_revocation::{IDENTITY_REVOCATION_MAGIC, SIGNED_CARRIER_HEADER_LEN};
+        assert_eq!(decode_identity_revocation(&[20, 0]), Ok(None));
+        for bad in [&[20, 0, 0][..], &[20, 2], &[20, 1], &[20]] {
+            assert_eq!(decode_identity_revocation(bad), Err(MessageError::WrongLength));
+        }
+        let mut raw = vec![0; SIGNED_CARRIER_HEADER_LEN + 1];
+        raw[..IDENTITY_REVOCATION_MAGIC.len()].copy_from_slice(IDENTITY_REVOCATION_MAGIC);
+        let encoded = encode_identity_revocation(Some(&raw)).unwrap();
+        assert_eq!(decode_identity_revocation(&encoded), Ok(Some(raw.as_slice())));
+        assert_eq!(parse_control_body(&encoded), Ok(ControlBody::IdentityRevocation(Some(raw))));
+    }
+
+    #[test]
     fn registry_caps_and_all_subtype_bytes() {
-        let caps: [(ControlType, usize); 14] = [
+        let caps: [(ControlType, usize); 15] = [
             (ControlType::SessionHello, 4096),
             (ControlType::SessionAccept, 4096),
             (ControlType::Enrollment, 16384),
@@ -2347,6 +2418,7 @@ mod tests {
             (ControlType::Revoke, 16384),
             (ControlType::Probe, 256),
             (ControlType::Drain, 256),
+            (ControlType::IdentityRevocation, 19767),
             (ControlType::CircuitOpen, 4096),
             (ControlType::CircuitAccept, 4096),
             (ControlType::CircuitReset, 256),

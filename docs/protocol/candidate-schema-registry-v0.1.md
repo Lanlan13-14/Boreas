@@ -17,7 +17,7 @@ Control body cannot be empty because its first byte selects the registered subty
 
 ## Control subtype registry
 
-Subtype is the first body byte. The listed body caps include that byte. Every unlisted subtype rejects; `0x0b..0x0f` and `0x14..0xff` remain reserved.
+Subtype is the first body byte. The listed body caps include that byte. The following table records the base registry. The explicit Core adjacency profile separately proposes `0x14` for [independently signed IdentityRevocation](authority-revocation-v1.md#explicit-core-adjacency-distribution-and-route-denial); `0x0b..0x0f` and `0x15..0xff` remain reserved.
 
 | Byte | Candidate name | Candidate legal state | Max body |
 |---:|---|---|---:|

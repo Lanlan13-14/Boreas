@@ -1473,6 +1473,12 @@ impl FreshStatus<'_> {
     pub fn peer_revocation(&self, peer: &AuthenticatedPeer) -> PeerRevocation {
         self.store.peer_revocation(peer)
     }
+
+    /// Independently verified identity denial; separate from snapshot entries.
+    #[cfg(target_os = "linux")]
+    pub fn identity_revoked(&self, peer: &AuthenticatedPeer) -> Result<bool, Error> {
+        self.store.identity_revoked(peer)
+    }
 }
 
 fn snapshot_from_verified(verified: &VerifiedObject, net: [u8; 16]) -> Result<Snapshot, Error> {

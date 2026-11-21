@@ -5,15 +5,11 @@ use crate::authority_revocation::{
     AuthorityRevocationTrust, ED25519_SIGNATURE_LEN, MLDSA65_SIGNATURE_LEN,
     VerifiedAuthorityRevocation,
 };
-use boreas_proto::authority_revocation::{AuthorityRevocation, MAX_TBS_LEN};
-
-/// Local mailbox carrier: magic, Ed25519 signature, ML-DSA-65 signature, exact TBS.
-/// The carrier itself adds no signing authority or unsigned policy fields.
-pub const IDENTITY_REVOCATION_MAGIC: &[u8; 8] = b"BRIR\0\0\0\x01";
-pub const MAX_IDENTITY_REVOCATION_BYTES: usize =
-    IDENTITY_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN + MAX_TBS_LEN;
-const MAX_DECISIONS: usize = 16;
-pub(super) const MAX_EXTENSION_BYTES: usize = 32 + 1 + MAX_DECISIONS * (12 + MAX_IDENTITY_REVOCATION_BYTES);
+use boreas_proto::authority_revocation::{AuthorityRevocation, MAX_IDENTITY_REVOCATIONS};
+pub use boreas_proto::authority_revocation::{
+    IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES,
+};
+pub(super) const MAX_EXTENSION_BYTES: usize = 32 + 1 + MAX_IDENTITY_REVOCATIONS * (12 + MAX_IDENTITY_REVOCATION_BYTES);
 
 type Key<'a> = (&'a [u8], u64, u16, u64);
 
@@ -61,7 +57,7 @@ impl Decisions {
     pub(super) fn decode(reader: &mut Reader<'_>, utc_floor: u64) -> Result<Self, Error> {
         let root = reader.take(32)?.try_into().map_err(|_| Error::Corrupt)?;
         let count = usize::from(reader.u8()?);
-        if count == 0 || count > MAX_DECISIONS {
+        if count == 0 || count > MAX_IDENTITY_REVOCATIONS {
             return Err(Error::Corrupt);
         }
         let mut evidence: Vec<Evidence> = Vec::with_capacity(count);
@@ -121,6 +117,33 @@ fn verify(
 }
 
 impl StatusStore {
+    /// Bind an existing store to the exact local root and issuer grants, not
+    /// just to a network id or the presence of an identity verifier.
+    pub fn has_same_identity_authorities(
+        &self,
+        root: [u8; 32],
+        expected: &AuthorityRevocationTrust,
+    ) -> bool {
+        self.identity_trust.as_ref().is_some_and(|(pinned, trust)| {
+            *pinned == root && trust.same_issuers(expected)
+        })
+    }
+
+    /// Export original signed carriers only from committed evidence and only
+    /// while still admissible on a new recipient. Never send acceptance UTC.
+    pub fn relayable_identity_revocations(&mut self, utc_us: u64) -> Result<Vec<&[u8]>, Error> {
+        if self.is_frozen() {
+            return Err(Error::Frozen);
+        }
+        let now = self.observe_trusted_utc(utc_us)?;
+        let (_, trust) = self.identity_trust.as_ref().ok_or(Error::RevocationPermission)?;
+        Ok(self.state.identity.iter()
+            .flat_map(|decisions| &decisions.evidence)
+            .filter(|record| trust.can_relay(&record.object, now))
+            .map(|record| record.raw.as_slice())
+            .collect())
+    }
+
     /// Verify a fresh, independent IdentityAuthority decision and commit it before
     /// exposing the denial. The caller uses the same trusted UTC source as status.
     /// A signed object is terminal for its exact identity generation once accepted;
@@ -166,7 +189,7 @@ impl StatusStore {
                 index
             }
             Err(index) => {
-                if decisions.evidence.len() >= MAX_DECISIONS {
+                if decisions.evidence.len() >= MAX_IDENTITY_REVOCATIONS {
                     return Err(Error::RevocationTooLarge);
                 }
                 decisions.evidence.insert(index, Evidence::new(raw.to_vec(), now)?);
@@ -292,11 +315,13 @@ mod tests {
         assert!(!store.identity_revoked(&other).unwrap());
         assert!(matches!(store.accept_identity_revocation(&sign(b"ia", 2, 1, 700), 201), Err(Error::RevocationStale)));
         assert!(matches!(store.accept_identity_revocation(&sign(b"ia", 2, 2, 701), 201), Err(Error::IdentityRevocationConflict)));
+        assert_eq!(store.relayable_identity_revocations(250).unwrap(), vec![raw.as_slice()]);
         assert!(matches!(
             store.accept_identity_revocation(&sign(b"ia", 3, 3, 700), 500),
             Err(Error::AuthorityRevocation(crate::authority_revocation::Error::IssuerNotValid))
         ));
         store.accept_identity_revocation(&raw, 500).unwrap();
+        assert!(store.relayable_identity_revocations(500).unwrap().is_empty());
         assert!(store.identity_revoked(&peer).unwrap());
         // Exercise failure on the decision commit, not on the preliminary UTC observation.
         let replacement = sign(b"ia", 3, 3, 700);
