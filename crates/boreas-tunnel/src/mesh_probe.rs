@@ -438,6 +438,11 @@ impl<'a> MeshProbe<'a> {
         })?;
         let remote_lsa_expiry = remote.valid_until();
         let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
+        let selected = Selected {
+            core_id: peer.id,
+            attempts: 1,
+            signed_lsa: received[1..].to_vec(),
+        };
         Ok(Adjacency {
             session: accepted.session,
             socket,
@@ -445,11 +450,7 @@ impl<'a> MeshProbe<'a> {
             peer,
             remote_lsa_expiry,
             remote_lsa_id: remote.object_id(),
-            selected: Selected {
-                core_id: peer.id,
-                attempts: 1,
-                signed_lsa: received[1..].to_vec(),
-            },
+            selected,
             _credits: (accepted.credit, accepted.buffer_credit),
         })
     }

@@ -21,7 +21,7 @@ use crate::{
     CircuitReject, EstablishedSession, OpenSslE2eBackend, PeerIdentity, PkiIdentityExtractor,
     TunnelError,
     e2e::{E2eCircuit, accept_e2e, open_e2e},
-    mesh_probe::{Adjacency, Core, Error, MeshProbe, utc_now},
+    mesh_probe::{Adjacency, Core, Error, MeshProbe},
     resource::Admission,
     runtime::bounded_link_operation,
 };
@@ -177,7 +177,7 @@ fn control(session: &mut EstablishedSession, kind: ControlType) -> Result<Frame,
 
 fn pump(
     sockets: [&TcpStream; 2],
-    mut sessions: [&mut EstablishedSession; 2],
+    sessions: [&mut EstablishedSession; 2],
     open: CircuitOpen,
     pos: usize,
     deadline: Instant,
