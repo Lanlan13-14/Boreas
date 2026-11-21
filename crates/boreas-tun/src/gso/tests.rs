@@ -113,7 +113,9 @@ fn exact_multiple_respects_df_and_allows_scratch_reuse() {
     let mut scratch = [0; 136];
     for _ in 0..2 {
         let mut segments = segment_tcpv4(&input, 68, &mut scratch).unwrap();
-        for (i, data) in input[VNET + 40..].chunks_exact(28).enumerate() {
+        let (chunks, remainder) = input[VNET + 40..].as_chunks::<28>();
+        assert!(remainder.is_empty());
+        for (i, data) in chunks.iter().enumerate() {
             let segment = segments.next().unwrap();
             valid_output(segment, 68);
             assert_eq!(&segment[6..8], &[0x40, 0]);

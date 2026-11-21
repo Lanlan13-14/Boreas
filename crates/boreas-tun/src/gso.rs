@@ -214,12 +214,12 @@ fn tcp_checksum(packet: &[u8]) -> u16 {
     // Start with the folded pseudo-header sum; the TCP checksum field is zero.
     // At most 64,000 input bytes, so even an unfolded sum fits in u32.
     let mut sum = u32::from(pseudo_sum(packet));
-    let words = packet[IPV4_LEN..].chunks_exact(2);
-    if let [tail] = words.remainder() {
+    let (words, remainder) = packet[IPV4_LEN..].as_chunks::<2>();
+    if let [tail] = remainder {
         sum += u32::from(*tail) << 8;
     }
     for word in words {
-        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        sum += u32::from(u16::from_be_bytes(*word));
     }
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
