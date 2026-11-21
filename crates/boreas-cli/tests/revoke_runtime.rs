@@ -1,8 +1,4 @@
-//! Runtime revocation: a real dual-signed StatusSnapshot changes who may forward.
-//!
-//! The production `StatusStore` refuses every non-empty revocation payload, so this
-//! exercises [`boreas_cli::daemon_revoke`] through the same verifier the store uses
-//! and the same poll decision the business loop calls before forwarding.
+//! Production must not derive an identity denial from a dual-signed status snapshot.
 
 #![cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
 
@@ -10,7 +6,7 @@ use boreas_pki::Authority;
 use boreas_pki::management::{
     IssuerRecord, IssuerScope, MANAGEMENT_SCHEMA_VERSION, ManagementTrust,
 };
-use boreas_pki::revoke_cleanup::CleanupTable;
+use boreas_pki::status_store::{AuthenticatedPeer, Error, StatusStore};
 use boreas_proto::messages::{ED25519_SIGNATURE_LEN, SignedObject, SignerRole, SignerSignatures};
 use boreas_proto::objects::{
     ManagementObject, MldsaParameterSet, ObjectType, StatusSnapshot, SubjectIdentity,
@@ -18,11 +14,11 @@ use boreas_proto::objects::{
 use boreas_proto::revocation::{IssuerClass, RevocationEntry, RevocationPayload};
 use openssl::pkey::{KeyType, PKey, Private};
 use openssl::sign::Signer;
+use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, time::Instant};
 
 const NET: [u8; 16] = [0x42; 16];
 const REVOKED_NODE: u16 = 2;
 const REVOKED_GENERATION: u64 = 1;
-const OTHER_NODE: u16 = 3;
 
 struct StatusSigner {
     key_id: Vec<u8>,
@@ -122,90 +118,33 @@ fn identity_revocation() -> Vec<u8> {
 }
 
 #[test]
-fn revocation_stops_only_the_named_peer() {
-    use boreas_cli::daemon_revoke::{
-        ForwardPoll, RevocationSet, apply_signed_status, poll_peer_forward,
-    };
+fn dual_signed_status_cannot_revoke_an_identity_or_advance_the_status_sequence() {
+    use boreas_pki::authority_revocation::AuthorityRevocationTrust;
 
+    let dir = std::env::temp_dir().join(format!("boreas-status-no-relay-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     let signer = StatusSigner::generate();
-    let mut trust = trust_for(&signer);
-    let mut set = RevocationSet::new();
-    let mut cleanup = CleanupTable::default();
-    let mut forwarded = 0u64;
-    let mut failures = 0u64;
-
-    assert_eq!(
-        poll_peer_forward(
-            &set,
-            REVOKED_NODE,
-            REVOKED_GENERATION,
-            &mut forwarded,
-            &mut failures
-        ),
-        ForwardPoll::Forward
-    );
-    assert_eq!(forwarded, 1);
-    assert_eq!(failures, 0);
-
-    let raw = signer.sign(100, 1_000, 1, &identity_revocation());
-    let applied = apply_signed_status(&mut trust, &raw, 200, &mut set, &mut cleanup).unwrap();
-    assert_eq!(applied.sequence, 1);
-    assert!(set.contains(REVOKED_NODE, REVOKED_GENERATION));
-
-    assert_eq!(
-        poll_peer_forward(
-            &set,
-            REVOKED_NODE,
-            REVOKED_GENERATION,
-            &mut forwarded,
-            &mut failures
-        ),
-        ForwardPoll::Revoked
-    );
-    assert_eq!(forwarded, 1, "a revoked peer must not be forwarded again");
-    assert_eq!(failures, 1, "revocation counts one failed forward");
-
-    assert_eq!(
-        poll_peer_forward(
-            &set,
-            OTHER_NODE,
-            REVOKED_GENERATION,
-            &mut forwarded,
-            &mut failures
-        ),
-        ForwardPoll::Forward
-    );
-    assert_eq!(forwarded, 2);
-    assert!(!set.contains(OTHER_NODE, REVOKED_GENERATION));
-    assert!(
-        !set.contains(REVOKED_NODE, 2),
-        "a later generation of the same node is not revoked"
-    );
-}
-
-#[test]
-fn expired_or_mis_signed_snapshot_does_not_change_the_set() {
-    use boreas_cli::daemon_revoke::{RevocationSet, RevokeApplyError, apply_signed_status};
-
-    let signer = StatusSigner::generate();
-    let mut trust = trust_for(&signer);
-    let mut set = RevocationSet::new();
-    let mut cleanup = CleanupTable::default();
-    let raw = signer.sign(100, 1_000, 1, &identity_revocation());
-
-    let expired = apply_signed_status(&mut trust, &raw, 1_000, &mut set, &mut cleanup);
-    assert_eq!(expired, Err(RevokeApplyError::SnapshotRejected));
-    assert!(set.is_empty());
-    assert!(cleanup.lookup(REVOKED_NODE, REVOKED_GENERATION).is_none());
-
-    let mut forged = raw.clone();
-    let last = forged.len() - 1;
-    forged[last] ^= 0x01;
-    let rejected = apply_signed_status(&mut trust, &forged, 200, &mut set, &mut cleanup);
-    assert_eq!(rejected, Err(RevokeApplyError::SnapshotRejected));
-    assert!(set.is_empty(), "a bad signature must not revoke anyone");
-
-    let accepted = apply_signed_status(&mut trust, &raw, 200, &mut set, &mut cleanup).unwrap();
-    assert_eq!(accepted.revoked_peers, 1);
-    assert!(set.contains(REVOKED_NODE, REVOKED_GENERATION));
+    let mut store = StatusStore::open_with_identity_revocations(
+        dir.join("status.state"),
+        NET,
+        fs::metadata(&dir).unwrap().uid(),
+        trust_for(&signer),
+        [1; 32],
+        AuthorityRevocationTrust::new(NET),
+    )
+    .unwrap();
+    let peer = AuthenticatedPeer::new(NET, REVOKED_NODE, REVOKED_GENERATION).unwrap();
+    let now = Instant::now();
+    let raw = signer.sign(100, 1_000, 2, &identity_revocation());
+    assert!(matches!(store.accept_signed_snapshot(&raw, 200, now), Err(Error::RevocationPermission)));
+    assert_eq!(store.sequence(), None);
+    assert!(!store.identity_revoked(&peer).unwrap());
+    let clean = signer.sign(100, 1_000, 1, &[]);
+    store.accept_signed_snapshot(&clean, 200, now).unwrap();
+    assert_eq!(store.sequence(), Some(1));
+    assert!(!store.identity_revoked(&peer).unwrap());
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
 }

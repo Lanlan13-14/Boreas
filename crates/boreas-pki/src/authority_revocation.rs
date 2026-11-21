@@ -2,8 +2,8 @@
 //!
 //! This module verifies the independent
 //! [`boreas_proto::authority_revocation::AuthorityRevocation`] object. It does not
-//! reuse `StatusSnapshot.revocations`, does not extend `objects::ObjectType` and
-//! does not enable any daemon path.
+//! reuse `StatusSnapshot.revocations` or extend `objects::ObjectType`. The
+//! Linux daemon uses it through the separate identity extension of `StatusStore`.
 //!
 //! # Authority separation
 //!
@@ -45,10 +45,9 @@
 //! both signatures verified against a provisioned authority and that both the
 //! object and its issuer-grant validity intervals contain the caller-supplied
 //! `now`. It does not provide a durable sequence watermark, anti-replay storage,
-//! clock trust or resource cleanup. The later durable integration must compare
-//! `seq`, persist the accepted watermark and apply the scope to live handles. A
-//! UTC rollback can revive an expired token; there is no trusted-clock service
-//! here.
+//! clock trust or resource cleanup. The status store owns replay and persistence;
+//! the daemon owns the authenticated session handles. This verifier has no
+//! independent trusted-clock service.
 //!
 //! No public constructor exists for [`VerifiedAuthorityRevocation`]; only
 //! [`AuthorityRevocationTrust::verify`] creates one. The token fields are private,

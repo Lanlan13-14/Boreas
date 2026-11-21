@@ -1,6 +1,6 @@
 # Authority-specific revocation candidate v1 (Identity enabled)
 
-Status: **candidate, not frozen protocol and not production acceptance.** This document specifies a new, authority-specific revocation object. It is deliberately independent of `StatusSnapshot.revocations`, `objects::ObjectType` and the old `StatusStore`/`revoke_cleanup` model. It does not enable a daemon path, does not provide durable replay protection and does not claim `G-REVOKE`.
+Status: **candidate protocol with a bounded Linux daemon Identity slice; not a `G-REVOKE` claim.** The signed object is independent of `StatusSnapshot.revocations`, `objects::ObjectType` and the status-relay model. The daemon's production status policy continues to reject any non-empty snapshot revocations.
 
 Only the `Identity` class is enabled. `Core`, `Route` and `Direct` have schema bytes so a later assignment cannot silently change the wire shape, but `AuthorityRevocationTrust::verify` returns `UnsupportedClass` for them. There is no caller boolean and no fallback authority path.
 
@@ -81,7 +81,17 @@ The issuer grant validity is **not** a field of `IssuerRecord`. The trust must t
 
 `VerifiedAuthorityRevocation` has private fields and no public constructor. It exposes read-only getters for network, class, subject, identity generation, issuer key id/generation, the canonical class scope, sequence, the revocation object's validity window, the issuer grant's validity window, a digest of the exact TBS, and `is_fresh_at(now)`. There is no signing capability in the token.
 
-The token proves only that this exact object and both signatures verified against a provisioned authority and that **both** the object and its issuer-grant intervals contained the caller-supplied UTC. It does **not** prove current freshness after the caller keeps it, durable anti-replay, global sequence monotonicity, clock trust or cleanup of any live resource. `freshness()` is the intersection of the object and issuer-grant windows, and `is_fresh_at` uses it. The durable integration (lead-owned) must persist the accepted sequence watermark, compare strictly increasing sequence per authority/scope, and apply the revocation to its own handles.
+The token proves only that this exact object and both signatures verified against a provisioned authority and that **both** the object and its issuer-grant intervals contained the caller-supplied UTC. It does **not** prove current freshness after the caller keeps it, durable anti-replay, global sequence monotonicity, clock trust or cleanup of any live resource. `freshness()` is the intersection of the object and issuer-grant windows, and `is_fresh_at` uses it. The daemon makes a separate durable acceptance decision before querying the resulting denial for its own endpoints.
+
+## Linux daemon delivery and replay state
+
+Publish an optional regular file `identity-revocation.signed` in `--material-dir` by atomic rename. The local carrier is `BRIR\0\0\0\x01` (eight bytes), followed by the 64-byte Ed25519 signature, the 3309-byte ML-DSA-65 signature, and the exact canonical TBS. The carrier is not a network message. Missing input is not an undo; malformed, untrusted, stale, conflicting or unpersistable input halts the gated daemon without reporting a new verified denial. Restrict write access to the material directory.
+
+The daemon derives both verifiers from one read of the root bundle, compares its fingerprint with the verified identity's exact root, and adds only verified IdentityAuthority grants to the independent verifier. New decisions require a fresh object and grant at the status store's effective trusted UTC. Sequence increases per `(issuer key id, issuer generation, node id, identity generation)` under that network/root. Exact already-committed evidence is idempotent and does not renew anything; the same TBS with different valid signatures is also idempotent while fresh. Lower sequences and same-sequence different TBS are errors; neither replaces the committed decision. Decisions are terminal for the exact generation once committed: input expiry prevents new acceptance but does not reinstate the identity. Issue a new identity generation to recover that slot.
+
+The existing private locked status state uses its existing atomic staging/rename/fsync procedure. A v1 image stays unchanged until the first independently verified decision, then the v2 image stores bounded exact signed evidence, acceptance UTC and the root fingerprint. Reopen re-verifies evidence against the same root and issuer grant at the recorded acceptance time; current startup trust verification remains unchanged. Up to 16 authority/scope records are retained without eviction; capacity exhaustion fails closed. Older implementations that do not support v2 refuse the image. Whole-image rollback/deletion by the trusted state owner is outside this mechanism.
+
+Both `serve` and `connect` check denials at startup and before forwarding on each authenticated E2E path. The existing watchdog polls the mailbox during business (normally 500 ms), checks the path's exact local and remote node generations, and uses its existing owned-socket shutdown and circuit error path. Invalid input or persistence errors use that same fault path. This is not a guarantee of instantaneous cessation of I/O already in flight, peer-wide cleanup, or delivery to other daemons.
 
 ## Non-Identity classes are fail-closed
 
@@ -95,8 +105,8 @@ This is deliberate: "no evidence" means no token, not a weaker bool.
 
 ## What is not implemented
 
-- No durable revocation sequence watermark, anti-replay store, rollback protection or partition handling.
-- No daemon wiring, no socket/route/lease cleanup, no `G-REVOKE` claim.
+- No network distribution, partition guarantee, arbitrary-capacity journal, retention/rotation workflow for historical issuer authorizations, or external monotonic rollback anchor.
+- No general registry-based cleanup of all sockets, circuits, grants, leases or routes; no `G-REVOKE` claim.
 - No Core, Route or Direct token issuance in v1.
 - `IdentityAuthority` role scope is derived from the permanent node slot (octet 1 = Core, 2..=251 = Edge); the object does not carry a separate role byte. A future role-bearing identity profile may tighten this.
 - Root pin provenance, certificate-chain validation and key rotation are unchanged from the existing PKI candidates.
