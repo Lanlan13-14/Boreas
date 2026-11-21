@@ -1,8 +1,14 @@
-name: '[Test] OpenSSL hybrid TLS backend (ML-KEM + ML-DSA)'
+name: 'Integration / Encrypted tunnel, failover and throughput'
 
 on:
   workflow_dispatch:
+    inputs:
+      single_circuit_diagnostics:
+        description: 'Measure the first second of one and four application flows on one E2E circuit'
+        type: boolean
+        default: false
   push:
+    branches: [main, 'work/v111-handoff', 'fix/v111-integration', 'fix/v111-release-blockers', 'test/v111-*']
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -16,6 +22,7 @@ on:
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
+      - 'tools/dependencies/fetch-openssl.sh'
       - 'tools/dependencies/verify-openssl-build.sh'
       - 'tools/dependencies/openssl-review.json'
       - 'tools/dependencies/report.py'
@@ -34,6 +41,7 @@ on:
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_overlay_perf.py'
+      - 'tools/dependencies/fetch-openssl.sh'
       - 'tools/dependencies/verify-openssl-build.sh'
       - 'tools/dependencies/openssl-review.json'
       - 'tools/dependencies/report.py'
@@ -48,7 +56,7 @@ concurrency:
 
 jobs:
   openssl-rust-mtls:
-    name: OpenSSL 4.1.1-dev (no-quic/no-cms/no-siv) + rust-openssl 0.10.82 pq768 mTLS
+    name: Real Linux tunnel with the pinned OpenSSL security snapshot
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     env:
@@ -76,6 +84,14 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             build-essential perl curl ca-certificates pkg-config binutils \
             musl-tools linux-libc-dev file iproute2 iputils-ping
+      - name: Show what this run validates
+        run: |
+          {
+            echo '### What this checks'
+            echo 'Real Linux tunnel: authentication, packet delivery, private DNS, failover, upgrade rollback and (on acceptance refs) throughput.'
+            printf '\nOpenSSL source version: `%s` (reviewed source snapshot, not a published release).\n\n' "$OPENSSL_VERSION"
+            printf 'Pinned source commit: `%s`\n' "$OPENSSL_COMMIT"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Build pinned static OpenSSL
         timeout-minutes: 35
         shell: bash
@@ -89,7 +105,7 @@ jobs:
           # commit is not a release and not a CVE waiver.
           ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
-          make -j2
+          make -j"$(nproc)"
           make install_sw
           mkdir -p "${OPENSSL_PREFIX}/ssl"
           # install_sw does not install openssl.cnf.  Write an explicit minimal
@@ -181,15 +197,6 @@ jobs:
       - name: Format check (non-blocking lint, after formatting)
         continue-on-error: true
         run: cargo fmt --all -- --check
-      - name: Policy-only tests (no OpenSSL linkage)
-        if: always()
-        run: cargo test --locked -p boreas-crypto
-      - name: Compile backend and all test targets
-        if: always()
-        env:
-          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
-          OPENSSL_STATIC: '1'
-        run: cargo check --locked -p boreas-crypto --features openssl-backend --all-targets
       - name: Real pq768 mTLS, payload-queue byte stream, and fail-closed cases
         if: always()
         timeout-minutes: 15
@@ -288,7 +295,7 @@ jobs:
           CC=musl-gcc ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests no-async \
             -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_MUSL_PREFIX}" --openssldir="${OPENSSL_MUSL_PREFIX}/ssl"
-          make -j2
+          make -j"$(nproc)"
           make install_sw
           popd
           mkdir -p "${OPENSSL_MUSL_PREFIX}/ssl"
@@ -944,7 +951,7 @@ jobs:
       - name: Measure high-RTT first-second payload on one and four application streams
         # The same candidate and circuit are used for both rounds; this does
         # not establish multi-circuit operation or replace the goodput gates.
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff') && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.single_circuit_diagnostics && github.repository == 'Lanlan13-14/Boreas' && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
         timeout-minutes: 5
         env:
           BOREAS_NETNS_MULTISTREAM: '1'

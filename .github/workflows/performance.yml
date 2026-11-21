@@ -1,8 +1,9 @@
-name: '[Test] pq768 netem RTT, loss, rate and full duplex'
+name: 'Integration / Network delay, loss and routing matrix'
 
 on:
   workflow_run:
-    workflows: ['[Test] OpenSSL hybrid TLS backend (ML-KEM + ML-DSA)']
+    workflows: ['Integration / Encrypted tunnel, failover and throughput']
+    branches: [main]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -10,17 +11,22 @@ on:
         description: 'Successful main-branch rust-tls run containing the tested binary'
         required: true
         type: string
+      run_window_diagnostic:
+        description: 'Compare short and long transfers using the same binary'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: perf-netem-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: perf-netem-${{ github.event_name }}-${{ github.event.workflow_run.head_sha || inputs.source_run_id || github.sha }}
   cancel-in-progress: true
 
 jobs:
   source:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     name: Validate exact trusted backend artifact source
     runs-on: ubuntu-24.04
     outputs:
@@ -198,6 +204,7 @@ jobs:
           retention-days: 14
 
   window-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_window_diagnostic
     # Independent read-only diagnostic: same validated source binary, same
     # one-way 200 ms / 0.1% loss / 100 Mbit profile as the strict netem gate,
     # with an 8 MiB probe and a 64 MiB probe. Both samples run even if the

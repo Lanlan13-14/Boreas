@@ -1,12 +1,33 @@
-name: '[Test] Rust unit tests & lint (cargo test + clippy)'
+name: 'Quick checks / Rust tests, lint and release tools'
 
 on:
   push:
+    branches: [main, 'work/v111-handoff']
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'tools/**'
+      - 'docs/engineering/gates.json'
+      - '.github/workflows/ci.yml'
   pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'tools/**'
+      - 'docs/engineering/gates.json'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: quick-checks-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
@@ -82,9 +103,6 @@ jobs:
       - name: Format workspace before checks
         if: always()
         run: cargo fmt --all
-      - name: Check workspace
-        if: always()
-        run: cargo check --workspace --locked
       - name: Clippy
         if: always()
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

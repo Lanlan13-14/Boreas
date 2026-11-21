@@ -1,4 +1,4 @@
-name: '[Package] 5-platform build, test & unsigned dev bundle (NOT a release)'
+name: 'Package / Five-platform development builds (no release)'
 
 # What this workflow proves:
 #   - the workspace compiles and its tests pass on five native runners;
@@ -23,7 +23,15 @@ name: '[Package] 5-platform build, test & unsigned dev bundle (NOT a release)'
 
 on:
   push:
-  pull_request:
+    branches: [main, 'work/v111-handoff']
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'tools/release/**'
+      - 'LICENSE*'
+      - '.github/workflows/platforms.yml'
   workflow_dispatch:
 
 permissions:

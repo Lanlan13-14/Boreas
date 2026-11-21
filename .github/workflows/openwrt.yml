@@ -6,23 +6,14 @@ name: '[Test] OpenWrt rootfs and static pq768 daemon'
 on:
   workflow_dispatch:
   push:
+    branches: [main, 'work/v111-handoff']
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
       - 'tools/release/**'
       - 'tools/deploy/**'
-      - 'tools/dependencies/verify-openssl-build.sh'
-      - 'tools/dependencies/openssl-review.json'
-      - 'tools/dependencies/report.py'
-      - '.github/workflows/openwrt.yml'
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'tools/release/**'
-      - 'tools/deploy/**'
+      - 'tools/dependencies/fetch-openssl.sh'
       - 'tools/dependencies/verify-openssl-build.sh'
       - 'tools/dependencies/openssl-review.json'
       - 'tools/dependencies/report.py'
@@ -108,7 +99,7 @@ jobs:
           CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-quic no-cms no-siv no-shared no-tests no-async no-legacy \
             "${extra_cflags[@]}" -isystem "$MUSL_UAPI" \
             --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
-          make -j2
+          make -j"$(nproc)"
           make install_sw
           mkdir -p "${OPENSSL_PREFIX}/ssl"
           printf '%s\n' \

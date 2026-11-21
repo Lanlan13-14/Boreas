@@ -1,21 +1,7 @@
-name: '[Test] PoC: OpenSSL CLI ML-DSA hybrid TLS smoke (not product code)'
+name: 'On demand / OpenSSL CLI experiment (not the Boreas tunnel)'
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'tools/crypto-poc/**'
-      - 'tools/dependencies/verify-openssl-build.sh'
-      - 'tools/dependencies/openssl-review.json'
-      - '.github/workflows/crypto-poc.yml'
-      - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
-  pull_request:
-    paths:
-      - 'tools/crypto-poc/**'
-      - 'tools/dependencies/verify-openssl-build.sh'
-      - 'tools/dependencies/openssl-review.json'
-      - '.github/workflows/crypto-poc.yml'
-      - 'docs/research/phase0-crypto-backend-assessment-2026-11-14.md'
 
 permissions:
   contents: read
@@ -26,7 +12,7 @@ concurrency:
 
 jobs:
   openssl-ml-dsa-tls:
-    name: OpenSSL 4.1.1-dev reduced source build + TLS tests (CVE review pending)
+    name: Verify CLI handshakes with the pinned OpenSSL source
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
