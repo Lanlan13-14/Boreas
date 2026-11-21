@@ -148,13 +148,36 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         now_utc: u64,
         is_current: F,
     ) -> Result<Option<Self>, Error> {
+        Self::try_new_for_path(
+            config,
+            circuit,
+            usize::from(circuit.mtu_cap()),
+            material,
+            started,
+            now_utc,
+            is_current,
+        )
+    }
+
+    pub(crate) fn try_new_for_path(
+        config: Config,
+        circuit: &E2eCircuit<'_>,
+        mtu: usize,
+        material: Material<'_>,
+        started: Instant,
+        now_utc: u64,
+        is_current: F,
+    ) -> Result<Option<Self>, Error> {
+        if config.enabled && mtu > usize::from(circuit.mtu_cap()) {
+            return Err(Error::InvalidMtuOrNetwork);
+        }
         Self::try_bind(
             config,
             Binding {
                 material,
                 core: circuit.local(),
                 edge: circuit.info().peer,
-                mtu: usize::from(circuit.mtu_cap()),
+                mtu,
             },
             started,
             now_utc,
@@ -283,7 +306,7 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
 
     /// After the first invalidation the service permanently drops all queues and
     /// TCP state. In particular, a UTC rollback cannot resume a stale runtime.
-    fn check_live(&mut self, now_utc: u64) -> bool {
+    pub(crate) fn check_live(&mut self, now_utc: u64) -> bool {
         if self.runtime.is_none() {
             return false;
         }
@@ -297,6 +320,10 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         }
         self.last_utc = now_utc;
         true
+    }
+
+    pub(crate) fn dns_vip(&self) -> Ipv4Addr {
+        self.dns_vip
     }
 
     /// Queue a packet from this binding only. `false` means the packet was not
@@ -343,7 +370,7 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dns_runtime::tests::{
         Fixture, dns_payload, dns_query, fixture_at, sign, udp_datagram,
@@ -399,6 +426,28 @@ mod tests {
             .unwrap(),
             mtu: 1500,
         }
+    }
+
+    pub(crate) fn signed_packet_binding<F: Fn() -> bool + Send + Sync>(
+        f: &Fixture,
+        mtu: usize,
+        is_current: F,
+    ) -> (PeerIdentity, DnsPacketService<F>) {
+        let policy = token(f, Capability::Replica, f.local.identity_generation);
+        let bindings = Binding {
+            mtu,
+            ..binding(f, &policy)
+        };
+        let dns = DnsPacketService::try_bind(
+            Config { enabled: true },
+            bindings,
+            Instant::now(),
+            NOW,
+            is_current,
+        )
+        .unwrap()
+        .unwrap();
+        (bindings.edge, dns)
     }
 
     fn packet(source: [u8; 4], name: &str, rrtype: u16) -> Vec<u8> {

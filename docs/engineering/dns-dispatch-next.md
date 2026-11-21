@@ -57,11 +57,35 @@ increment after the bounded TCP upstream (`fc234cd`), informed by the sibling
   circuit, and keep authorization current through actual reply delivery. This
   seam is not a multi-circuit admission controller; recreating it resets rate
   state. The current IPv4 packet profile accepts only MTUs 1280–1500.
-- Nothing attaches this owner to `PacketPath`, TUN, a daemon, or an Edge
-  resolver. There is no discovery or advertisement, host/LAN listener, IPv6,
-  public forwarding from packets, persisted policy/snapshot selection, or live
-  revocation feed. No wire format or capability changed, and the default is
-  disabled. This is not production DNS or an end-to-end leak claim.
+- `PacketPath::try_new_over_e2e_with_private_dns` opts one real Core–Edge E2E
+  path into UDP/53 only. `step_inbound` consumes a frame from the verified
+  Edge permanent VIP to the reserved DNS VIP, never gives it to the host TUN,
+  and writes only a runtime-produced DNS VIP:53 reply to that same Edge and
+  query source port on the same circuit. The path enforces its selected MTU,
+  even if the hop cap is higher. Before each partial write and flush it
+  resamples UTC and checks the service's monotonic deadline and owner gate;
+  observed invalidation poisons the path. The checks cannot retract bytes an
+  in-progress blocking transport operation already accepted. The standard
+  constructor still rejects the DNS VIP in both directions.
+- The Linux daemon still uses the standard constructor. The Core hook is the
+  `PacketPath::try_new_over_e2e` site in `daemon.rs::drive_business_path`, for
+  the initial `serve` path only, after E2E and final status admission. Before
+  switching that call, add explicit Core-only pinned DNS provisioning: retain
+  the exact durable-accepted `VerifiedNetworkPolicy` and its independently
+  provisioned root, verify the dual-signed service policy and signer grant and
+  the signer-signed authority with that root/policy, and pin their exact
+  current versions with anti-rollback and an invalidation source. Bind the
+  nonblocking gate to the exact circuit and both generations, watchdog/status
+  and revocation state, signed policy/business deadlines, and the pinned DNS
+  versions. The session owner must bound/interrupt blocked writes at the
+  effective deadline; reserve request/reply capacity if using a packet-count
+  budget, and report TX stats for replies sent during inbound steps. No
+  `|| true`, implicit reload, promotion to a standby, or discovery fallback.
+- No Edge resolver, Edge-side DNS VIP authorization or host route, packet TCP
+  DNS, discovery, advertisement, host/LAN listener, IPv6, public forwarding,
+  replication, persisted DNS snapshot selection, or new revocation feed was
+  added. Neither wire format nor negotiated capabilities changed. This is not
+  production DNS or an end-to-end leak claim.
 
 Regression coverage includes loopback TCP wire tests with a sentinel listener
 for private negative/failure/stale/authorization outcomes, lookalike public
