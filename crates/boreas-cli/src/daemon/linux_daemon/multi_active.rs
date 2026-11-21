@@ -401,7 +401,7 @@ fn run_lane(
     let gate = || {
         remaining_startup(cohort, ctx.until)?;
         run.policy_window.check()?;
-        lock_revocation_gate(&run.store, run.status_path, ctx.slots)
+        lock_revocation_gate(run.store, run.status_path, ctx.slots)
     };
     gate()?;
     let hop_until = (Instant::now() + HANDSHAKE_TIMEOUT).min(ctx.until);
