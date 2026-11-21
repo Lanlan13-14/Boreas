@@ -154,6 +154,7 @@ DIAGNOSTIC_TIMING_PHASES='outer_tls|ws_handshake|inner_tls|session_handshake|con
 DIAGNOSTIC_TIMING_PATTERN='^boreas-diagnostic-timing phase=('"$DIAGNOSTIC_TIMING_PHASES"') elapsed_us=[0-9]{1,20}$'
 DIAGNOSTIC_IO_PATTERN='^boreas-io-timing max_outbound_us=[0-9]{1,20} max_inbound_us=[0-9]{1,20} outbound_ge_1ms=[0-9]{1,20} inbound_ge_1ms=[0-9]{1,20}$'
 DIAGNOSTIC_TUN_PATTERN='^boreas-tun-forwarding checked_reads=[0-9]{1,20} empty_reads=[0-9]{1,20} read_errors=[0-9]{1,20} reused_writes=[0-9]{1,20} write_errors=[0-9]{1,20}$'
+DIAGNOSTIC_STALL_PATTERN='^boreas-inbound-stalls source=(buffered|socket) steps_ge_1ms=[0-9]{1,20} outer_read_us=[0-9]{1,20} outer_write_or_flush_us=[0-9]{1,20} outside_outer_us=[0-9]{1,20} tun_ready_after=[0-9]{1,20} tun_unknown_after=[0-9]{1,20}$'
 DIAGNOSTIC_TIMING_REPORTED=0
 
 report_diagnostic_timing() {
@@ -167,7 +168,7 @@ report_diagnostic_timing() {
     [[ -f "$log" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
       if [[ "$line" =~ $DIAGNOSTIC_TIMING_PATTERN || "$line" =~ $DIAGNOSTIC_IO_PATTERN ||
-            "$line" =~ $DIAGNOSTIC_TUN_PATTERN ]]; then
+            "$line" =~ $DIAGNOSTIC_TUN_PATTERN || "$line" =~ $DIAGNOSTIC_STALL_PATTERN ]]; then
         printf '%s %s\n' "$node" "$line"
       fi
     done < "$log"

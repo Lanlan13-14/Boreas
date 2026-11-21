@@ -497,7 +497,7 @@ impl LinkClient {
         // being mistaken for a fresh allowance if the backend returns just
         // before the shutdown lands.
         remaining_handshake_budget(deadline)?;
-        let transport = DeadlineIo::new(outer, deadline);
+        let transport = DeadlineIo::new(outer, deadline, diagnostics);
         let websocket = {
             let _timer = DiagnosticTimer::start("ws_handshake", diagnostics);
             ws::client_handshake_until(transport, &target.ws_host, &target.path, deadline)?
@@ -658,7 +658,7 @@ impl LinkServer {
         // being mistaken for a fresh allowance if the backend returns just
         // before the shutdown lands.
         remaining_handshake_budget(deadline)?;
-        let transport = DeadlineIo::new(outer, deadline);
+        let transport = DeadlineIo::new(outer, deadline, diagnostic_timing_enabled());
         self.accept_established(transport, handshake, buffer_credit, policy, deadline)
     }
 

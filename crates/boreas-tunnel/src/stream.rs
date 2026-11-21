@@ -6,6 +6,7 @@
 //! message and TLS record boundaries are independent; callers must never rely
 //! on one message containing exactly one record.
 
+use std::cell::Cell;
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,6 +162,60 @@ impl Duplex for openssl::ssl::SslStream<TcpStream> {
     }
 }
 
+/// Time spent inside the outer stream during one observed operation. These
+/// are monotonic wall-clock totals, not raw TCP wait or CPU time. The outer
+/// stream includes outer TLS in production and can itself perform several
+/// transport calls or wait in the opposite direction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OuterIoTiming {
+    pub read: Duration,
+    pub write_or_flush: Duration,
+}
+
+thread_local! {
+    static OUTER_IO_TIMING: Cell<Option<OuterIoTiming>> = const { Cell::new(None) };
+}
+
+/// Observe outer-stream calls made synchronously on this thread by `operation`.
+/// The link must have been opened with diagnostic timing enabled. This never
+/// changes the result, I/O order, stream state or deadlines of the operation.
+/// Nested observations are isolated, and unwind restores the previous scope.
+pub fn observe_outer_io<T>(operation: impl FnOnce() -> T) -> (T, OuterIoTiming) {
+    struct Restore(Option<OuterIoTiming>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OUTER_IO_TIMING.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let _restore = Restore(OUTER_IO_TIMING.with(|slot| slot.replace(Some(Default::default()))));
+    let result = operation();
+    let timing = OUTER_IO_TIMING.with(|slot| slot.get().unwrap_or_default());
+    (result, timing)
+}
+
+fn timed_outer_call<T>(enabled: bool, reading: bool, operation: impl FnOnce() -> T) -> T {
+    if !enabled || !OUTER_IO_TIMING.with(|slot| slot.get().is_some()) {
+        return operation();
+    }
+    let started = Instant::now();
+    let result = operation();
+    let elapsed = started.elapsed();
+    OUTER_IO_TIMING.with(|slot| {
+        if let Some(mut timing) = slot.get() {
+            let total = if reading {
+                &mut timing.read
+            } else {
+                &mut timing.write_or_flush
+            };
+            *total = total.saturating_add(elapsed);
+            slot.set(Some(timing));
+        }
+    });
+    result
+}
+
 /// Never ask the OS for a zero-duration timeout: on multiple platforms zero
 /// means "wait forever", which would disable the very bound being installed.
 const MIN_IO_TIMEOUT: Duration = Duration::from_millis(1);
@@ -189,14 +244,16 @@ pub(crate) struct DeadlineIo<T> {
     inner: T,
     deadline: Instant,
     armed: AtomicBool,
+    diagnostics: bool,
 }
 
 impl<T: Duplex> DeadlineIo<T> {
-    pub(crate) fn new(inner: T, deadline: Instant) -> Self {
+    pub(crate) fn new(inner: T, deadline: Instant, diagnostics: bool) -> Self {
         Self {
             inner,
             deadline,
             armed: AtomicBool::new(true),
+            diagnostics,
         }
     }
 
@@ -254,10 +311,8 @@ impl<T: Duplex> Read for DeadlineIo<T> {
             return Ok(0);
         }
         self.prepare()?;
-        match self.inner.read(out) {
-            Ok(read) => Ok(read),
-            Err(error) => Err(self.map_error(error)),
-        }
+        let result = timed_outer_call(self.diagnostics, true, || self.inner.read(out));
+        result.map_err(|error| self.map_error(error))
     }
 }
 
@@ -267,18 +322,14 @@ impl<T: Duplex> Write for DeadlineIo<T> {
             return Ok(0);
         }
         self.prepare()?;
-        match self.inner.write(buf) {
-            Ok(written) => Ok(written),
-            Err(error) => Err(self.map_error(error)),
-        }
+        let result = timed_outer_call(self.diagnostics, false, || self.inner.write(buf));
+        result.map_err(|error| self.map_error(error))
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.prepare()?;
-        match self.inner.flush() {
-            Ok(()) => Ok(()),
-            Err(error) => Err(self.map_error(error)),
-        }
+        let result = timed_outer_call(self.diagnostics, false, || self.inner.flush());
+        result.map_err(|error| self.map_error(error))
     }
 }
 
@@ -379,7 +430,7 @@ mod tests {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(10))
             .expect("future deadline");
-        let mut io = DeadlineIo::new(probe, deadline);
+        let mut io = DeadlineIo::new(probe, deadline, false);
 
         let error = io
             .read(&mut [0u8; 1])
@@ -392,9 +443,42 @@ mod tests {
     }
 
     #[test]
+    fn observing_outer_io_does_not_change_deadline_or_retry_reads() {
+        let probe = Probe::default();
+        let mut io = DeadlineIo::new(probe, Instant::now() + Duration::from_secs(10), true);
+        let (result, _) = observe_outer_io(|| io.read(&mut [0u8; 1]));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(io.inner.reads(), 1);
+
+        io.clear_handshake_deadline().expect("clear deadline");
+        let (result, _) = observe_outer_io(|| io.read(&mut [0u8; 1]));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(io.inner.reads(), 2);
+        assert_eq!(io.inner.timeout(), None);
+    }
+
+    #[test]
+    fn outer_io_observation_is_isolated_and_restores_scope_after_unwind() {
+        let marker = OuterIoTiming {
+            read: Duration::from_millis(7),
+            write_or_flush: Duration::ZERO,
+        };
+        let (_, total) = observe_outer_io(|| {
+            OUTER_IO_TIMING.with(|slot| slot.set(Some(marker)));
+            let (value, nested) = observe_outer_io(|| 42);
+            assert_eq!(value, 42);
+            assert_eq!(nested, OuterIoTiming::default());
+            assert!(std::panic::catch_unwind(|| observe_outer_io(|| panic!("scope test"))).is_err());
+            assert_eq!(OUTER_IO_TIMING.with(Cell::get), Some(marker));
+        });
+        assert_eq!(total, marker);
+        assert_eq!(OUTER_IO_TIMING.with(Cell::get), None);
+    }
+
+    #[test]
     fn expired_deadline_fails_before_touching_the_transport() {
         let probe = Probe::default();
-        let mut io = DeadlineIo::new(probe, Instant::now());
+        let mut io = DeadlineIo::new(probe, Instant::now(), false);
 
         let error = io
             .read(&mut [0u8; 1])
@@ -409,7 +493,7 @@ mod tests {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(10))
             .expect("future deadline");
-        let mut io = DeadlineIo::new(probe, deadline);
+        let mut io = DeadlineIo::new(probe, deadline, false);
 
         io.clear_handshake_deadline().expect("clear deadline");
         assert_eq!(io.inner.timeout(), None);

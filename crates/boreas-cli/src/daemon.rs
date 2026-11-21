@@ -3173,12 +3173,70 @@ mod linux_daemon {
         std::env::var_os("BOREAS_DIAGNOSTIC_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"))
     }
 
+    const SLOW_PATH_STEP: Duration = Duration::from_millis(1);
+
+    // Per-path totals of *slow* inbound steps, split by what triggered the
+    // read. Neither trigger guarantees a complete decrypted packet. Residual
+    // wall time includes higher layers, host delivery, and scheduling; it is
+    // not CPU time. A readable TUN after a step indicates queued outbound work
+    // at that instant, not when the work arrived or whether packets were lost.
+    #[derive(Default)]
+    struct InboundStalls {
+        steps_ge_1ms: u64,
+        outer_read_us: u128,
+        outer_write_or_flush_us: u128,
+        outside_outer_us: u128,
+        tun_ready_after: u64,
+        tun_unknown_after: u64,
+    }
+
+    impl InboundStalls {
+        fn observe(
+            &mut self,
+            elapsed: Duration,
+            outer: boreas_tunnel::stream::OuterIoTiming,
+            tun_ready: Option<bool>,
+        ) {
+            self.steps_ge_1ms = self.steps_ge_1ms.saturating_add(1);
+            self.outer_read_us = self.outer_read_us.saturating_add(outer.read.as_micros());
+            self.outer_write_or_flush_us = self
+                .outer_write_or_flush_us
+                .saturating_add(outer.write_or_flush.as_micros());
+            let outside = elapsed.saturating_sub(outer.read.saturating_add(outer.write_or_flush));
+            self.outside_outer_us = self.outside_outer_us.saturating_add(outside.as_micros());
+            match tun_ready {
+                Some(true) => self.tun_ready_after = self.tun_ready_after.saturating_add(1),
+                Some(false) => (),
+                None => self.tun_unknown_after = self.tun_unknown_after.saturating_add(1),
+            }
+        }
+    }
+
+    // Observation only: never read the packet or consume socket/TUN error state.
+    // Unknown includes a virtual TUN, poll interruption, and terminal events;
+    // the normal path still handles each one exactly as it did before.
+    fn diagnostic_tun_ready(fd: Option<i32>) -> Option<bool> {
+        let mut pfd = libc::pollfd {
+            fd: fd?,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` points to a single initialized pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 || pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return None;
+        }
+        Some(pfd.revents & libc::POLLIN != 0)
+    }
+
     #[derive(Default)]
     struct PathIoTiming {
         max_outbound_us: u128,
         max_inbound_us: u128,
         outbound_over_1ms: u64,
         inbound_over_1ms: u64,
+        inbound_buffered: InboundStalls,
+        inbound_socket: InboundStalls,
     }
 
     impl PathIoTiming {
@@ -3190,9 +3248,30 @@ mod linux_daemon {
                 (&mut self.max_inbound_us, &mut self.inbound_over_1ms)
             };
             *max = (*max).max(us);
-            if us >= 1_000 {
+            if elapsed >= SLOW_PATH_STEP {
                 *stalls = stalls.saturating_add(1);
             }
+        }
+
+        fn inbound_step<T>(
+            &mut self,
+            buffered: bool,
+            tun_fd: Option<i32>,
+            operation: impl FnOnce() -> T,
+        ) -> T {
+            let started = Instant::now();
+            let (result, outer) = boreas_tunnel::stream::observe_outer_io(operation);
+            let elapsed = started.elapsed();
+            self.observe(false, elapsed);
+            if elapsed >= SLOW_PATH_STEP {
+                let bucket = if buffered {
+                    &mut self.inbound_buffered
+                } else {
+                    &mut self.inbound_socket
+                };
+                bucket.observe(elapsed, outer, diagnostic_tun_ready(tun_fd));
+            }
+            result
         }
     }
 
@@ -3205,6 +3284,22 @@ mod linux_daemon {
                 self.outbound_over_1ms,
                 self.inbound_over_1ms,
             );
+            let mut stderr = std::io::stderr().lock();
+            for (source, stalls) in [
+                ("buffered", &self.inbound_buffered),
+                ("socket", &self.inbound_socket),
+            ] {
+                let _ = writeln!(
+                    stderr,
+                    "boreas-inbound-stalls source={source} steps_ge_1ms={} outer_read_us={} outer_write_or_flush_us={} outside_outer_us={} tun_ready_after={} tun_unknown_after={}",
+                    stalls.steps_ge_1ms,
+                    stalls.outer_read_us,
+                    stalls.outer_write_or_flush_us,
+                    stalls.outside_outer_us,
+                    stalls.tun_ready_after,
+                    stalls.tun_unknown_after,
+                );
+            }
         }
     }
 
@@ -3549,11 +3644,11 @@ mod linux_daemon {
                 } else if !buffered && !socket_ready {
                     break;
                 }
-                let started = io_timing.as_ref().map(|_| Instant::now());
-                let result = path.step_inbound();
-                if let (Some(timing), Some(started)) = (&mut io_timing, started) {
-                    timing.observe(false, started.elapsed());
-                }
+                let result = if let Some(timing) = &mut io_timing {
+                    timing.inbound_step(buffered, tun.raw_fd(), || path.step_inbound())
+                } else {
+                    path.step_inbound()
+                };
                 match result {
                     Ok(Some(_len)) => {
                         made_progress = true;
@@ -3983,6 +4078,39 @@ mod linux_daemon {
             assert!(!iteration_progress(false, 3, 3));
             assert!(iteration_progress(false, 3, 4));
             assert!(iteration_progress(true, 0, 0));
+        }
+
+        #[test]
+        fn diagnostic_readiness_does_not_consume_input_or_mask_terminal_events() {
+            let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let fd = Some(reader.as_raw_fd());
+            assert_eq!(diagnostic_tun_ready(None), None);
+            assert_eq!(diagnostic_tun_ready(fd), Some(false));
+            writer.write_all(b"x").expect("make readable");
+            assert_eq!(diagnostic_tun_ready(fd), Some(true));
+            let mut byte = [0];
+            reader.read_exact(&mut byte).expect("input still present");
+            assert_eq!(&byte, b"x");
+            drop(writer);
+            assert_eq!(diagnostic_tun_ready(fd), None);
+        }
+
+        #[test]
+        fn diagnostic_stall_accounting_keeps_outer_directions_separate() {
+            let mut stalls = InboundStalls::default();
+            let outer = boreas_tunnel::stream::OuterIoTiming {
+                read: Duration::from_millis(5),
+                write_or_flush: Duration::from_millis(2),
+            };
+            stalls.observe(Duration::from_millis(8), outer, Some(true));
+            // Even an inconsistent sample cannot underflow the residual.
+            stalls.observe(Duration::from_millis(6), outer, None);
+            assert_eq!(stalls.steps_ge_1ms, 2);
+            assert_eq!(stalls.outer_read_us, 10_000);
+            assert_eq!(stalls.outer_write_or_flush_us, 4_000);
+            assert_eq!(stalls.outside_outer_us, 1_000);
+            assert_eq!(stalls.tun_ready_after, 1);
+            assert_eq!(stalls.tun_unknown_after, 1);
         }
 
         /// Concurrent upstream sockets are bounded: one business connection plus
