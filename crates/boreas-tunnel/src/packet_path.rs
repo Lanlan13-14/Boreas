@@ -730,7 +730,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     state: PathState,
     stats: PacketStats,
     outbound_batch: Vec<u8>,
-    outbound_scratch: [u8; MAX_MTU],
+    // Linux TUN may truncate to the supplied read length; reserve a guard byte.
+    outbound_scratch: [u8; MAX_MTU + 1],
     inbound_scratch: Vec<u8>,
 }
 
@@ -840,7 +841,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             outbound_batch: Vec::new(),
             // Keep this independent of the path MTU: the host adapter must read
             // at its own MTU, then policy checks the complete packet below.
-            outbound_scratch: [0; MAX_MTU],
+            outbound_scratch: [0; MAX_MTU + 1],
             inbound_scratch: Vec::new(),
         })
     }
@@ -1919,7 +1920,7 @@ mod tests {
                 &self,
                 scratch: &'buf mut [u8],
             ) -> Result<Option<Cow<'buf, [u8]>>, TunError> {
-                assert_eq!(scratch.len(), MAX_MTU);
+                assert_eq!(scratch.len(), MAX_MTU + 1);
                 if let Some(previous) = self.address.replace(Some(scratch.as_ptr())) {
                     assert_eq!(scratch.as_ptr(), previous);
                 }

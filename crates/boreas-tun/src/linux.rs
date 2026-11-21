@@ -284,7 +284,7 @@ impl LinuxTunQueue {
     }
     /// Non-blocking single-syscall read when `O_NONBLOCK` is enabled on the queue.
     pub fn try_read_packet(&self) -> Result<Option<Vec<u8>>, LinuxTunError> {
-        let mut packet = vec![0; self.mtu()];
+        let mut packet = vec![0; self.mtu() + 1];
         let len = match self.try_read_packet_into(&mut packet)? {
             Some(bytes) => bytes.len(),
             None => return Ok(None),
@@ -293,14 +293,15 @@ impl LinuxTunQueue {
         Ok(Some(packet))
     }
     /// Non-blocking read into caller-owned storage when `O_NONBLOCK` is enabled.
-    /// Storage shorter than the device MTU is rejected before reading. Only the
-    /// returned slice holds a validated packet; a read never exceeds the device MTU.
+    /// Storage shorter than MTU + 1 is rejected before reading. The extra
+    /// byte distinguishes an exact-MTU packet from a truncated oversized read;
+    /// returned packets never exceed the device MTU.
     pub fn try_read_packet_into<'buf>(
         &self,
         scratch: &'buf mut [u8],
     ) -> Result<Option<&'buf [u8]>, LinuxTunError> {
         let buf = scratch
-            .get_mut(..self.mtu())
+            .get_mut(..self.mtu() + 1)
             .ok_or(LinuxTunError::InvalidConfiguration)?;
         let fd = self
             .fd
@@ -315,7 +316,7 @@ impl LinuxTunQueue {
             Err(err) => return Err(err),
         };
         let packet = &buf[..n];
-        inspect_packet(packet).map_err(LinuxTunError::Packet)?;
+        validate_read_packet(packet, self.mtu())?;
         Ok(Some(packet))
     }
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
@@ -352,15 +353,24 @@ impl PacketIo for LinuxTunQueue {
 }
 
 fn read_packet_fd(fd: RawFd, mtu: usize) -> Result<Option<Vec<u8>>, LinuxTunError> {
-    let mut b = vec![0; mtu];
+    let mut b = vec![0; mtu + 1];
     let n = read_fd(fd, &mut b)?;
     if n == 0 {
         return Ok(None);
     }
     b.truncate(n);
-    inspect_packet(&b).map_err(LinuxTunError::Packet)?;
+    validate_read_packet(&b, mtu)?;
     Ok(Some(b))
 }
+
+fn validate_read_packet(packet: &[u8], mtu: usize) -> Result<(), LinuxTunError> {
+    if packet.len() > mtu {
+        return Err(LinuxTunError::Packet(Error::PacketTooLarge { mtu }));
+    }
+    inspect_packet(packet).map_err(LinuxTunError::Packet)?;
+    Ok(())
+}
+
 fn set_mtu_sysfs(name: &str, mtu: usize) -> Result<(), LinuxTunError> {
     let path = format!("/sys/class/net/{name}/mtu");
     let mut f = OpenOptions::new().write(true).open(path)?;
@@ -497,18 +507,23 @@ mod tests {
         tx.send(&[]).unwrap();
         assert!(queue.try_read_packet_into(&mut scratch).unwrap().is_none());
 
-        // With scratch larger than the MTU, the syscall must still read only
-        // MTU bytes. A packet claiming MTU + 1 bytes thus fails length validation.
-        let mut oversized = [0u8; MTU + 1];
+        // The guard byte catches both a one-byte overflow and a truncated
+        // longer read. An exact-MTU packet still fits in the same scratch.
+        let mut oversized = [0u8; MTU + 2];
         oversized[..MTU].copy_from_slice(&big);
-        oversized[4..6].copy_from_slice(&((MTU + 1 - 40) as u16).to_be_bytes());
+        for bytes in [&oversized[..MTU + 1], oversized.as_slice()] {
+            tx.send(bytes).unwrap();
+            assert!(matches!(
+                queue.try_read_packet_into(&mut scratch),
+                Err(LinuxTunError::Packet(Error::PacketTooLarge { mtu: MTU }))
+            ));
+        }
+        tx.send(&big).unwrap();
+        assert_eq!(queue.try_read_packet().unwrap(), Some(big.to_vec()));
         tx.send(&oversized).unwrap();
         assert!(matches!(
-            queue.try_read_packet_into(&mut scratch),
-            Err(LinuxTunError::Packet(Error::InvalidLength))
+            queue.read_packet(),
+            Err(LinuxTunError::Packet(Error::PacketTooLarge { mtu: MTU }))
         ));
-        assert_eq!(scratch[MTU], 0xa5);
-        tx.send(&small).unwrap();
-        assert_eq!(queue.try_read_packet().unwrap(), Some(small.to_vec()));
     }
 }
