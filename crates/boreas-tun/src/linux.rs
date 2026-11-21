@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Error, MAX_IP_PACKET, PacketIo, inspect_packet};
+use super::{Error, InspectedPacket, MAX_IP_PACKET, PacketIo, PacketRead};
 
 const IFNAMSIZ: usize = 16;
 const IFF_TUN: libc::c_short = 0x0001;
@@ -300,6 +300,15 @@ impl LinuxTunQueue {
         &self,
         scratch: &'buf mut [u8],
     ) -> Result<Option<&'buf [u8]>, LinuxTunError> {
+        self.try_read_inspected_into(scratch)
+            .map(|packet| packet.map(InspectedPacket::bytes))
+    }
+
+    /// As [`Self::try_read_packet_into`], retaining structural validation.
+    pub fn try_read_inspected_into<'buf>(
+        &self,
+        scratch: &'buf mut [u8],
+    ) -> Result<Option<InspectedPacket<'buf>>, LinuxTunError> {
         let buf = scratch
             .get_mut(..self.mtu() + 1)
             .ok_or(LinuxTunError::InvalidConfiguration)?;
@@ -315,17 +324,21 @@ impl LinuxTunQueue {
             }
             Err(err) => return Err(err),
         };
-        let packet = &buf[..n];
-        validate_read_packet(packet, self.mtu())?;
-        Ok(Some(packet))
+        inspect_at_mtu(&buf[..n], self.mtu()).map(Some)
     }
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
-        if packet.len() > self.device.mtu {
-            return Err(LinuxTunError::Packet(Error::PacketTooLarge {
-                mtu: self.device.mtu,
-            }));
-        }
-        inspect_packet(packet).map_err(LinuxTunError::Packet)?;
+        let packet = inspect_at_mtu(packet, self.mtu())?;
+        self.write_checked_bytes(packet.bytes())
+    }
+
+    /// The immutable proof reuses parsing, not the local device MTU check.
+    pub fn write_inspected_packet(&self, packet: InspectedPacket<'_>) -> Result<(), LinuxTunError> {
+        let bytes = packet.bytes();
+        check_mtu(bytes, self.mtu())?;
+        self.write_checked_bytes(bytes)
+    }
+
+    fn write_checked_bytes(&self, packet: &[u8]) -> Result<(), LinuxTunError> {
         let fd = self
             .fd
             .lock()
@@ -345,10 +358,18 @@ impl PacketIo for LinuxTunQueue {
         })
     }
     fn write_packet(&self, p: &[u8]) -> Result<(), Error> {
-        LinuxTunQueue::write_packet(self, p).map_err(|e| match e {
-            LinuxTunError::Packet(p) => p,
-            _ => Error::QueueClosed,
-        })
+        LinuxTunQueue::write_packet(self, p).map_err(queue_error)
+    }
+
+    fn write_inspected_packet(&self, p: InspectedPacket<'_>) -> Result<(), Error> {
+        LinuxTunQueue::write_inspected_packet(self, p).map_err(queue_error)
+    }
+}
+
+fn queue_error(error: LinuxTunError) -> Error {
+    match error {
+        LinuxTunError::Packet(p) => p,
+        _ => Error::QueueClosed,
     }
 }
 
@@ -359,16 +380,20 @@ fn read_packet_fd(fd: RawFd, mtu: usize) -> Result<Option<Vec<u8>>, LinuxTunErro
         return Ok(None);
     }
     b.truncate(n);
-    validate_read_packet(&b, mtu)?;
+    inspect_at_mtu(&b, mtu)?;
     Ok(Some(b))
 }
 
-fn validate_read_packet(packet: &[u8], mtu: usize) -> Result<(), LinuxTunError> {
+fn check_mtu(packet: &[u8], mtu: usize) -> Result<(), LinuxTunError> {
     if packet.len() > mtu {
         return Err(LinuxTunError::Packet(Error::PacketTooLarge { mtu }));
     }
-    inspect_packet(packet).map_err(LinuxTunError::Packet)?;
     Ok(())
+}
+
+fn inspect_at_mtu(packet: &[u8], mtu: usize) -> Result<InspectedPacket<'_>, LinuxTunError> {
+    check_mtu(packet, mtu)?;
+    InspectedPacket::new(packet).map_err(LinuxTunError::Packet)
 }
 
 fn set_mtu_sysfs(name: &str, mtu: usize) -> Result<(), LinuxTunError> {

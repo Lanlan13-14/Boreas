@@ -252,7 +252,7 @@ mod linux_daemon {
         messages::{PathRole, Suite},
     };
     use boreas_tun::{
-        Error as TunError, PacketIo, VirtualTun,
+        Error as TunError, InspectedPacket, PacketIo, PacketRead, VirtualTun,
         linux::{LinuxTunDevice, LinuxTunError, LinuxTunQueue, TunConfig},
     };
     use boreas_tunnel::{
@@ -422,16 +422,33 @@ mod linux_daemon {
                 .map_err(tun_read_error)
         }
 
+        fn read_for_forwarding<'buf>(
+            &self,
+            scratch: &'buf mut [u8],
+        ) -> Result<Option<PacketRead<'buf>>, TunError> {
+            self.queue
+                .try_read_inspected_into(scratch)
+                .map(|packet| packet.map(PacketRead::Inspected))
+                .map_err(tun_read_error)
+        }
+
         fn write_packet(&self, packet: &[u8]) -> Result<(), TunError> {
-            self.queue.write_packet(packet).map_err(|e| match e {
-                boreas_tun::linux::LinuxTunError::Packet(p) => p,
-                boreas_tun::linux::LinuxTunError::Io(io_err)
-                    if io_err.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    TunError::QueueFull
-                }
-                _ => TunError::QueueClosed,
-            })
+            self.queue.write_packet(packet).map_err(tun_write_error)
+        }
+
+        fn write_inspected_packet(&self, packet: InspectedPacket<'_>) -> Result<(), TunError> {
+            self.queue
+                .write_inspected_packet(packet)
+                .map_err(tun_write_error)
+        }
+    }
+
+    fn tun_write_error(error: LinuxTunError) -> TunError {
+        match error {
+            LinuxTunError::Io(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                TunError::QueueFull
+            }
+            other => tun_read_error(other),
         }
     }
 

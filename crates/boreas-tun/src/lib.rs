@@ -414,6 +414,48 @@ struct Queues {
     cap: [usize; 2],
     closed: bool,
 }
+/// An immutable packet and its structural validation result, bound to the
+/// exact bytes inspected. This does not prove MTU, source, destination or
+/// circuit authorization; those checks still belong to each consumer.
+#[derive(Clone, Copy, Debug)]
+pub struct InspectedPacket<'a> {
+    bytes: &'a [u8],
+    info: PacketInfo,
+}
+
+impl<'a> InspectedPacket<'a> {
+    pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
+        Ok(Self {
+            bytes,
+            info: inspect_packet(bytes)?,
+        })
+    }
+
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn info(self) -> PacketInfo {
+        self.info
+    }
+}
+
+/// A host read may carry proof of structural checks the adapter already did.
+/// Legacy adapters need not parse sooner or change their error classification.
+pub enum PacketRead<'a> {
+    Bytes(Cow<'a, [u8]>),
+    Inspected(InspectedPacket<'a>),
+}
+
+impl AsRef<[u8]> for PacketRead<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes.as_ref(),
+            Self::Inspected(packet) => packet.bytes(),
+        }
+    }
+}
+
 pub trait PacketIo {
     fn read_packet(&self) -> Result<Option<Vec<u8>>, Error>;
 
@@ -429,7 +471,22 @@ pub trait PacketIo {
         self.read_packet().map(|packet| packet.map(Cow::Owned))
     }
 
+    /// Forwarding read with optional proof of structural validation.
+    fn read_for_forwarding<'buf>(
+        &self,
+        scratch: &'buf mut [u8],
+    ) -> Result<Option<PacketRead<'buf>>, Error> {
+        self.read_packet_with_scratch(scratch)
+            .map(|packet| packet.map(PacketRead::Bytes))
+    }
+
     fn write_packet(&self, packet: &[u8]) -> Result<(), Error>;
+
+    /// Write the exact bytes already structurally checked by the caller.
+    /// The adapter must still enforce its own MTU and I/O constraints.
+    fn write_inspected_packet(&self, packet: InspectedPacket<'_>) -> Result<(), Error> {
+        self.write_packet(packet.bytes())
+    }
 }
 impl VirtualTun {
     /// Create connected in-memory endpoints; capacities bound each receive direction independently.

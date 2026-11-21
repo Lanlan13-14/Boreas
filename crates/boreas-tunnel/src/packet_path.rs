@@ -67,7 +67,9 @@ use std::{
 };
 
 use boreas_crypto::NodeRole;
-use boreas_tun::{Error as TunError, IpVersion, PacketInfo, PacketIo, inspect_packet};
+use boreas_tun::{Error as TunError, InspectedPacket, IpVersion, PacketInfo, PacketIo, PacketRead};
+#[cfg(all(test, feature = "openssl-inner-tls"))]
+use boreas_tun::inspect_packet;
 
 use crate::e2e::E2eCircuit;
 use crate::relay::MAX_RELAY_HOPS;
@@ -465,7 +467,8 @@ impl PointToPoint {
     /// The source must be the local permanent VIP and the destination the peer
     /// permanent VIP. Nothing else is authorized, in either address position.
     pub fn authorize_outbound(&self, packet: &[u8]) -> Result<PacketInfo, PacketDeny> {
-        self.authorize(packet, Direction::HostToPeer)
+        self.authorize_bytes(packet, Direction::HostToPeer)
+            .map(InspectedPacket::info)
     }
 
     /// Validate and authorize one packet the peer delivered for the host stack.
@@ -473,10 +476,31 @@ impl PointToPoint {
     /// The source must be the peer permanent VIP and the destination the local
     /// permanent VIP.
     pub fn authorize_inbound(&self, packet: &[u8]) -> Result<PacketInfo, PacketDeny> {
-        self.authorize(packet, Direction::PeerToHost)
+        self.authorize_bytes(packet, Direction::PeerToHost)
+            .map(InspectedPacket::info)
     }
 
-    fn authorize(&self, packet: &[u8], direction: Direction) -> Result<PacketInfo, PacketDeny> {
+    fn authorize_bytes<'packet>(
+        &self,
+        packet: &'packet [u8],
+        direction: Direction,
+    ) -> Result<InspectedPacket<'packet>, PacketDeny> {
+        self.check_packet_envelope(packet)?;
+        self.authorize_inspected(InspectedPacket::new(packet)?, direction)
+    }
+
+    fn authorize_host_read(&self, packet: &PacketRead<'_>) -> Result<PacketInfo, PacketDeny> {
+        match packet {
+            PacketRead::Bytes(bytes) => self.authorize_outbound(bytes),
+            PacketRead::Inspected(packet) => {
+                self.check_packet_envelope(packet.bytes())?;
+                self.authorize_inspected(*packet, Direction::HostToPeer)
+                    .map(InspectedPacket::info)
+            }
+        }
+    }
+
+    fn check_packet_envelope(&self, packet: &[u8]) -> Result<(), PacketDeny> {
         if packet.len() > self.mtu {
             return Err(PacketDeny::MtuExceeded);
         }
@@ -484,13 +508,18 @@ impl PointToPoint {
             return Err(PacketDeny::EmptyPacket);
         };
         match first >> 4 {
-            4 => {}
-            6 => return Err(PacketDeny::Ipv6NotNegotiated),
-            _ => return Err(PacketDeny::UnknownVersion),
+            4 => Ok(()),
+            6 => Err(PacketDeny::Ipv6NotNegotiated),
+            _ => Err(PacketDeny::UnknownVersion),
         }
-        // Structural validation only: length, header, checksum, fragment fields.
-        // `inspect_packet` never decides authorization; the address rules below do.
-        let info = inspect_packet(packet)?;
+    }
+
+    fn authorize_inspected<'packet>(
+        &self,
+        packet: InspectedPacket<'packet>,
+        direction: Direction,
+    ) -> Result<InspectedPacket<'packet>, PacketDeny> {
+        let info = packet.info();
         if info.version != IpVersion::V4 {
             return Err(PacketDeny::Ipv6NotNegotiated);
         }
@@ -512,7 +541,7 @@ impl PointToPoint {
                 }
             }
         }
-        Ok(info)
+        Ok(packet)
     }
 }
 
@@ -970,7 +999,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             && attempts < max_attempts
         {
             attempts += 1;
-            let packet = match self.io.read_packet_with_scratch(&mut self.outbound_scratch) {
+            let packet = match self.io.read_for_forwarding(&mut self.outbound_scratch) {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
                 Err(error) => {
@@ -979,7 +1008,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                 }
             };
             let bytes = packet.as_ref();
-            match self.policy.authorize_outbound(bytes) {
+            match self.policy.authorize_host_read(&packet) {
                 Ok(info) => {
                     let prefix = match packet_frame_prefix(bytes, self.policy.mtu()) {
                         Ok(prefix) => prefix,
@@ -1083,14 +1112,14 @@ fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     policy: &PointToPoint,
     scratch: &mut [u8],
 ) -> Result<Option<usize>, PacketPathError> {
-    let packet = match io.read_packet_with_scratch(scratch) {
+    let packet = match io.read_for_forwarding(scratch) {
         Ok(Some(packet)) => packet,
         Ok(None) => return Ok(None),
         Err(error) => return Err(PacketPathError::from_host_error(error)),
     };
     let bytes = packet.as_ref();
     let length = policy
-        .authorize_outbound(bytes)
+        .authorize_host_read(&packet)
         .map_err(PacketPathError::Denied)?
         .packet_len;
     // Copy the packet directly into a contiguous, bounded frame for the stream.
@@ -1170,11 +1199,11 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     if !read_packet_frame_into(circuit, policy.mtu(), packet)? {
         return Ok(None);
     }
-    let length = policy
-        .authorize_inbound(packet)
-        .map_err(PacketPathError::Denied)?
-        .packet_len;
-    match io.write_packet(packet) {
+    let packet = policy
+        .authorize_bytes(packet, Direction::PeerToHost)
+        .map_err(PacketPathError::Denied)?;
+    let length = packet.info().packet_len;
+    match io.write_inspected_packet(packet) {
         Ok(()) => Ok(Some(length)),
         Err(TunError::QueueFull) => Err(PacketPathError::HostQueueFull),
         Err(TunError::QueueClosed) => Err(PacketPathError::HostQueueClosed),
