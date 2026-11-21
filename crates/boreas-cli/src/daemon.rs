@@ -409,6 +409,7 @@ mod linux_daemon {
     /// ready work without a per-packet sleep.
     struct NonBlockingLinuxTun {
         queue: LinuxTunQueue,
+        tcpv4_gso: bool,
         metrics: Option<TunForwardingMetrics>,
     }
 
@@ -538,6 +539,13 @@ mod linux_daemon {
     }
 
     impl TunEndpoint {
+        fn uses_tcpv4_gso(&self) -> bool {
+            match self {
+                Self::Real { io, .. } => io.tcpv4_gso,
+                Self::Virtual { .. } => false,
+            }
+        }
+
         fn packet_io(&self) -> &dyn PacketIo {
             match self {
                 Self::Real { io, .. } => io,
@@ -2245,6 +2253,7 @@ mod linux_daemon {
                 _device: dev,
                 io: NonBlockingLinuxTun {
                     queue,
+                    tcpv4_gso: tun_tcpv4_gso,
                     metrics: diagnostic_timing_enabled().then(TunForwardingMetrics::default),
                 },
                 name: actual_name,
@@ -2459,6 +2468,22 @@ mod linux_daemon {
     fn poll_additional_inbound(sock_fd: i32, tun_fd: Option<i32>) -> Result<bool, String> {
         let (socket, tun) = poll_io(sock_fd, tun_fd, Duration::ZERO)?;
         Ok(socket && !tun)
+    }
+
+    // Linux uapi linux/sockios.h. Count unsent bytes only, not the congestion
+    // window or all bytes in flight. This is a preflight hint, not a hard cap.
+    const TCP_UNSENT_LENGTH: libc::c_ulong = 0x894b;
+    const GSO_SEND_HIGH_WATER: libc::c_int = 256 * 1024;
+
+    fn gso_send_has_room(sock_fd: i32) -> Result<bool, String> {
+        let mut unsent: libc::c_int = 0;
+        // SAFETY: this sole socket owner provides a valid fd and the ioctl
+        // writes one initialized C integer to the supplied pointer.
+        let rc = unsafe { libc::ioctl(sock_fd, TCP_UNSENT_LENGTH as _, &mut unsent) };
+        if rc != 0 || unsent < 0 {
+            return Err("daemon: cannot measure TCP unsent bytes for GSO".into());
+        }
+        Ok(unsent < GSO_SEND_HIGH_WATER)
     }
 
     /// Whether one loop iteration did work.
@@ -3528,6 +3553,7 @@ mod linux_daemon {
 
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;
+        let protect_gso_send = tun.uses_tcpv4_gso();
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -3595,7 +3621,11 @@ mod linux_daemon {
                 })
                 .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
             let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
-            if out_limit > 0 {
+            // When both sides write into full receive windows, neither can
+            // reach the inbound turn. Leave packets in the host queue before
+            // framing/encrypting them so the inbound path still makes progress.
+            let send_deferred = out_limit > 0 && protect_gso_send && !gso_send_has_room(sock_fd)?;
+            if out_limit > 0 && !send_deferred {
                 let started = io_timing.as_ref().map(|_| Instant::now());
                 let result = path.step_outbound_batch(out_limit, MAX_OUTBOUND_BATCH_BYTES);
                 if let (Some(timing), Some(started)) = (&mut io_timing, started) {
@@ -3684,7 +3714,11 @@ mod linux_daemon {
                         // current burst before starting another socket read.
                         // Keep the first inbound attempt on every turn, so a
                         // busy TUN cannot starve incoming traffic.
-                        poll_additional_inbound(sock_fd, tun.raw_fd())?
+                        if send_deferred {
+                            poll_io(sock_fd, None, Duration::ZERO)?.0
+                        } else {
+                            poll_additional_inbound(sock_fd, tun.raw_fd())?
+                        }
                     };
                     if !buffered && !socket_ready {
                         break;
@@ -3749,7 +3783,14 @@ mod linux_daemon {
                     // One wait on both sources: an outbound packet arriving on
                     // the TUN wakes the loop immediately, and a TUN HUP/ERR is
                     // fail-closed inside `poll_io` instead of idling forever.
-                    poll_io(sock_fd, tun.raw_fd(), IDLE_POLL_TIMEOUT)?;
+                    let (tun_fd, wait) = if send_deferred {
+                        // The kernel can drain without making a readable event.
+                        // Recheck briefly without spinning on a ready TUN.
+                        (None, Duration::from_millis(1))
+                    } else {
+                        (tun.raw_fd(), IDLE_POLL_TIMEOUT)
+                    };
+                    poll_io(sock_fd, tun_fd, wait)?;
                 }
             }
         };
@@ -4118,6 +4159,16 @@ mod linux_daemon {
             }
             let error = result.expect_err("a dead TUN must fail closed");
             assert!(error.contains("TUN"), "unexpected error: {error}");
+        }
+
+        #[test]
+        fn gso_send_room_requires_a_live_tcp_socket() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let socket = TcpStream::connect(listener.local_addr().expect("address"))
+                .expect("connect");
+            let (_peer, _) = listener.accept().expect("accept");
+            assert_eq!(gso_send_has_room(socket.as_raw_fd()), Ok(true));
+            assert!(gso_send_has_room(-1).is_err());
         }
 
         #[test]
