@@ -83,6 +83,7 @@ pub(crate) struct Core {
     pub(crate) id: u8,
     pub(crate) identity: VerifiedNodeIdentity,
     pub(crate) until: u64,
+    object_id: [u8; 32],
 }
 
 impl Core {
@@ -101,6 +102,7 @@ impl Core {
             id: node.home_core_id,
             until: identity.expires().min(object.valid_until()),
             identity,
+            object_id: object.object_id(),
         })
     }
 
@@ -132,7 +134,7 @@ pub struct Candidate<'a> {
     pub signed_identity: &'a [u8],
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Selected {
     pub core_id: u8,
     pub attempts: usize,
@@ -148,6 +150,7 @@ pub struct Adjacency {
     pub(crate) expires: Instant,
     pub(crate) peer: Core,
     pub(crate) remote_lsa_expiry: u64,
+    remote_lsa_id: [u8; 32],
     selected: Selected,
     _credits: (
         crate::resource::ConnectionCredit,
@@ -347,6 +350,7 @@ impl<'a> MeshProbe<'a> {
                 expires,
                 peer,
                 remote_lsa_expiry,
+                remote_lsa_id: remote.object_id(),
                 selected: Selected {
                     core_id: id,
                     attempts: index + 1,
@@ -440,6 +444,7 @@ impl<'a> MeshProbe<'a> {
             expires,
             peer,
             remote_lsa_expiry,
+            remote_lsa_id: remote.object_id(),
             selected: Selected {
                 core_id: peer.id,
                 attempts: 1,
@@ -508,6 +513,12 @@ impl<'a> MeshProbe<'a> {
             if link.session.local() != self.local() {
                 return Err(Error::Identity);
             }
+            if !self
+                .trust
+                .is_current_core_lsa(link.peer.id, link.remote_lsa_id)
+            {
+                return Err(Error::Lsa);
+            }
             deadline = deadline
                 .min(link.expires)
                 .min(self.authority_deadline(&link.peer, link.remote_lsa_expiry)?);
@@ -563,6 +574,20 @@ impl<'a> MeshProbe<'a> {
         f: impl FnOnce(&FreshStatus<'_>, u64) -> T,
     ) -> Result<T, Error> {
         let observed = utc_now()?;
+        for node in [&self.local, peer] {
+            if !self
+                .trust
+                .is_current_identity(node.identity.node_id(), node.object_id)
+            {
+                return Err(Error::Identity);
+            }
+        }
+        if !self
+            .trust
+            .is_current_core_lsa(self.local.id, self.local_lsa.object_id())
+        {
+            return Err(Error::Lsa);
+        }
         let now = observed.max(self.status.last_trusted_utc());
         let fresh = self
             .status

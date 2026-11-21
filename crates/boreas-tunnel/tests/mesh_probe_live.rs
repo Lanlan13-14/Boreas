@@ -398,8 +398,9 @@ fn fixed_exchange(f: &Fixture, ids: &[usize], cut_path: bool) -> Result<[u8; 16]
         .collect();
     let mut sockets: Vec<_> = (1..ids.len()).map(|_| listener()).collect();
     let destinations: Vec<_> = sockets.iter().map(|(_, target)| target.clone()).collect();
+    let marker = if cut_path { 0x55 } else { ids.len() as u8 };
     let payload = (0..100_000u32)
-        .map(|i| (i.wrapping_mul(43) >> 7) as u8)
+        .map(|i| ((i.wrapping_mul(43) >> 7) as u8) ^ marker)
         .collect::<Vec<_>>();
     let response = *b"authenticated endpoint response";
     let outer_client = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
@@ -460,7 +461,14 @@ fn fixed_exchange(f: &Fixture, ids: &[usize], cut_path: bool) -> Result<[u8; 16]
                         outer_client,
                         &admission,
                     )?;
-                    let forwarded = forward_fixed(&mut probe, &route, left, right, &admission)?;
+                    assert_eq!(admission.snapshot().unwrap().authenticated, 2);
+                    let forwarded = forward_fixed(&mut probe, &route, left, right, &admission);
+                    let credits = admission.snapshot().unwrap();
+                    assert_eq!(
+                        (credits.handshakes, credits.authenticated, credits.bytes),
+                        (0, 0, 0)
+                    );
+                    let forwarded = forwarded?;
                     Ok((forwarded.circuit_id, Some(forwarded.ciphertext_bytes)))
                 }
             };

@@ -320,6 +320,20 @@ impl ManagementTrust {
         self.node_identities.get(&node_id)
     }
 
+    /// Whether an already-verified identity is still the live process-local
+    /// watermark for its node. Callers must separately verify a signature and
+    /// check revocation and expiry; this is not durable replay state.
+    pub fn is_current_identity(&self, node_id: u16, object_id: [u8; 32]) -> bool {
+        self.replay.get(&ReplayKey::NodeIdentity(node_id))
+            .is_some_and(|head| !head.conflicted && head.object_id == object_id)
+    }
+
+    /// Check a previously verified LSA against the current process-local slot.
+    pub fn is_current_core_lsa(&self, core_id: u8, object_id: [u8; 32]) -> bool {
+        self.replay.get(&ReplayKey::CoreLsa(core_id))
+            .is_some_and(|head| !head.conflicted && head.object_id == object_id)
+    }
+
     /// Provision an out-of-band trust anchor with no root-delegation window.
     /// Use [`Self::add_verified_issuer`] for root-delegated trust instead.
     pub fn add_issuer(&mut self, issuer: IssuerRecord) -> Result<(), Error> {
