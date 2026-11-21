@@ -2451,10 +2451,21 @@ mod tests {
             (&valid, Ok(Some(valid.len()))),
         ] {
             let mut frame = InboundSource::new(encode_packet_frame(bytes, policy.mtu()).unwrap());
-            assert_eq!(
-                inbound_once(&io, &mut frame, &policy, &mut scratch),
-                expected
+            let delivery = inbound_once(
+                &io,
+                &mut frame,
+                &policy,
+                &mut scratch,
+                #[cfg(feature = "openssl-inner-tls")]
+                None,
             );
+            let length = delivery.map(|item| {
+                item.map(|delivery| {
+                    assert_eq!(delivery.reply_len, None);
+                    delivery.length
+                })
+            });
+            assert_eq!(length, expected);
         }
         assert_eq!(io.0.into_inner(), vec![valid]);
     }
