@@ -304,10 +304,7 @@ mod linux {
                         ErrorKind::WouldBlock
                             | ErrorKind::Interrupted
                             | ErrorKind::ConnectionAborted
-                    ) =>
-                {
-                    ()
-                }
+                    ) => {}
                 Err(e) => return Err(format!("mesh accept: {}", e.kind())),
             }
         }
