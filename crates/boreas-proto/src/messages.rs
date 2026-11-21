@@ -1586,6 +1586,16 @@ pub struct RelayFragment {
     pub payload: Vec<u8>,
 }
 
+/// Validated view of one relay fragment without copying its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayFragmentRef<'a> {
+    pub circuit_id: [u8; 16],
+    pub direction: u8,
+    pub byte_offset: u64,
+    pub hops_remaining: u8,
+    pub payload: &'a [u8],
+}
+
 impl RelayFragment {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         if self.direction > 1 {
@@ -1648,6 +1658,17 @@ impl RelayFragment {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, MessageError> {
+        let view = Self::decode_ref(data)?;
+        Ok(Self {
+            circuit_id: view.circuit_id,
+            direction: view.direction,
+            byte_offset: view.byte_offset,
+            hops_remaining: view.hops_remaining,
+            payload: view.payload.to_vec(),
+        })
+    }
+
+    pub fn decode_ref(data: &[u8]) -> Result<RelayFragmentRef<'_>, MessageError> {
         if data.len() < RELAY_FRAGMENT_FIXED_LEN {
             return Err(MessageError::WrongLength);
         }
@@ -1673,12 +1694,12 @@ impl RelayFragment {
         byte_offset
             .checked_add(u64::try_from(declared).map_err(|_| MessageError::OffsetOverflow)?)
             .ok_or(MessageError::OffsetOverflow)?;
-        Ok(Self {
+        Ok(RelayFragmentRef {
             circuit_id,
             direction,
             byte_offset,
             hops_remaining,
-            payload: data[RELAY_FRAGMENT_FIXED_LEN..].to_vec(),
+            payload: &data[RELAY_FRAGMENT_FIXED_LEN..],
         })
     }
 }

@@ -306,7 +306,7 @@ impl<'a> CircuitStream<'a> {
         let frame = self.session.recv_frame()?;
         match frame.header.kind {
             Kind::RelayCircuit => {
-                let fragment = RelayFragment::decode(&frame.body)?;
+                let fragment = RelayFragment::decode_ref(&frame.body)?;
                 if fragment.circuit_id != self.circuit_id {
                     return Err(CircuitReject::UnknownCircuit.into());
                 }
@@ -329,8 +329,8 @@ impl<'a> CircuitStream<'a> {
                     .recv_offset
                     .checked_add(advance)
                     .ok_or(TunnelError::Circuit(CircuitReject::OffsetMismatch))?;
-                self.inbound = fragment.payload;
-                self.inbound_pos = 0;
+                self.inbound_pos = frame.body.len() - fragment.payload.len();
+                self.inbound = frame.body;
                 Ok(())
             }
             Kind::Control => {
@@ -1448,7 +1448,10 @@ mod tests {
                 let mut buffer = vec![0u8; 200_000];
                 let mut total = 0usize;
                 while total < buffer.len() {
-                    let read = circuit.read_bytes(&mut buffer[total..]).expect("read");
+                    // Force repeated reads within each fragment without
+                    // returning its header bytes to the circuit consumer.
+                    let end = (total + 997).min(buffer.len());
+                    let read = circuit.read_bytes(&mut buffer[total..end]).expect("read");
                     if read == 0 {
                         break;
                     }
