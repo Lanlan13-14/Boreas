@@ -44,6 +44,7 @@ mod node;
 mod pki_cmd;
 mod render;
 mod tui;
+mod update;
 
 use std::env;
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -347,6 +348,10 @@ fn run_with_columns(
         Some("status") => run_status(&args[1..], lang, stdout_tty, columns),
         Some("menu") => run_menu(&args[1..], lang, stdout_tty, columns),
         Some("console") => run_console(&args[1..], lang, stdout_tty, columns),
+        Some("update-check") => update::run(&args[1..], lang),
+        Some("--version") if args.len() == 1 => {
+            (0, format!("Boreas {}", update::local_build()), String::new())
+        }
         Some("confirm") => run_confirm(&args[1..]),
         Some("config-check") => run_config_check(&args[1..]),
         Some("config-migrate") => run_config_migrate(&args[1..]),
@@ -818,6 +823,9 @@ impl ConsoleIo {
             ConsoleEffect::ServiceStart => self.service("start"),
             ConsoleEffect::ServiceStop => self.service("stop"),
             ConsoleEffect::CheckConfig => self.config_check(),
+            ConsoleEffect::CheckUpdate(channel) => {
+                ConsoleOutcome::rows(update::check(channel, lang).1)
+            }
             ConsoleEffect::ConfigWizard => self.config_wizard_start(lang),
             ConsoleEffect::ConfigWizardInput(values) => self.config_wizard_preview(values, lang),
             ConsoleEffect::ConfigWizardSave(values) => self.config_wizard_save(values, lang),
@@ -1239,10 +1247,29 @@ where
         }
 
         let is_refresh = matches!(step, ConsoleEffect::RefreshStatus);
+        let is_update = matches!(step, ConsoleEffect::CheckUpdate(_));
+        if is_update {
+            writeln!(
+                out,
+                "{}",
+                update::localized(
+                    state.lang,
+                    "Checking release metadata (up to 5 seconds)...",
+                    "正在检查发布元数据（最长 5 秒）……",
+                    "正在檢查發布中繼資料（最長 5 秒）……",
+                )
+            )
+            .and_then(|()| out.flush())
+            .map_err(|_| "console write failed".to_string())?;
+        }
         let is_wizard_start = matches!(step, ConsoleEffect::ConfigWizard);
         let is_wizard_preview = matches!(step, ConsoleEffect::ConfigWizardInput(_));
         let is_wizard_save = matches!(step, ConsoleEffect::ConfigWizardSave(_));
         let outcome = perform(step, state.lang);
+        if is_update {
+            state.notice_rows = outcome.rows;
+            continue;
+        }
         if is_wizard_start {
             // Retain loaded endpoints for the reducer's next field transitions.
             if let Some((primary, backup)) = outcome.endpoints {
@@ -1489,7 +1516,9 @@ fn help_text() -> String {
     let mut text = "boreas — Phase 0 policy/config/console foundation\n\n\
      USAGE:\n\
      \x20 boreas [doctor|self-check|status [--json]|menu [--json] [--narrow]|console [--json] [--socket <p>] [--config <f>] [--service <u>]|confirm <action> <typed...>|config-check <path>|config-migrate <path>|config-save-candidate ...|node serve|node connect|help]\n\
-     \x20 boreas-easy   (line-mode console: menu, service status/start/stop)\n\n\
+     \x20 boreas-easy   (line-mode console: menu, service status/start/stop, updates)\n\
+     \x20 boreas --version          local CLI build identity\n\
+     \x20 boreas update-check [--channel stable|pre]  read-only (default: stable)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\
@@ -2728,6 +2757,32 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(screen.matches("BOREAS CONSOLE").count(), 2);
         assert!(screen.contains("> [2] Identity & DIR"));
         assert!(!screen.as_bytes().contains(&0x1B));
+    }
+
+    #[test]
+    fn update_screen_checks_only_on_request_and_keeps_channel_results_separate() {
+        use std::io::BufReader;
+        use crate::update::Channel;
+
+        let mut reader = BufReader::new(&b"7\n\nc\n2\nc\nb\nq\n"[..]);
+        let mut state = ConsoleState::new(Lang::En, false);
+        let mut effects = Vec::new();
+        let mut out = Vec::new();
+        drive_console(&mut state, &mut reader, &mut out, |effect, _lang| {
+            let ConsoleEffect::CheckUpdate(channel) = effect else {
+                panic!("unexpected effect: {effect:?}");
+            };
+            effects.push(channel);
+            ConsoleOutcome::rows(vec![format!("fixture-{}", channel.key())])
+        })
+        .unwrap();
+        assert_eq!(effects, [Channel::Stable, Channel::Pre]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Local build:"));
+        assert!(out.contains("Auto-update blocked:"));
+        assert_eq!(out.matches("fixture-stable").count(), 1);
+        assert_eq!(out.matches("fixture-pre").count(), 1);
+        assert!(!out.contains('\x1b'));
     }
 
     #[test]

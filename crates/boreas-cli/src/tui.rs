@@ -20,6 +20,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::i18n::{Lang, Msg, text};
 use crate::render::{BOX_WIDTH, display_width};
+use crate::update::{self, Channel, localized};
 
 /// Inner content width of the boxed screen: total minus the two border
 /// columns and one padding space on each side. Same basis as
@@ -345,7 +346,7 @@ fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
             "安全模式与吊销",
             "e2e-required 策略 / 状态快照与吊销 / RPF 审计",
         ),
-        (Lang::ZhCn, 7) => ("可恢复热升级", "独立验双签清单 / 升级日志切换 / supervisor"),
+        (Lang::ZhCn, 7) => ("检查更新", "稳定版 / 预览版；仅检查，不安装"),
         (Lang::ZhCn, 8) => (
             "服务与脱敏诊断",
             "启停守护进程 / 净化控制符日志 / 导出脱敏诊断包",
@@ -378,10 +379,7 @@ fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
             "安全模式與吊銷",
             "e2e-required 策略 / 狀態快照與吊銷 / 本機審計",
         ),
-        (Lang::ZhTw, 7) => (
-            "可恢復熱升級",
-            "獨立驗雙簽章清單 / 升級日誌切換 / 外部守護回退",
-        ),
+        (Lang::ZhTw, 7) => ("檢查更新", "穩定版 / 預覽版；只檢查，不安裝"),
         (Lang::ZhTw, 8) => (
             "服務與脫敏診斷",
             "啟停守護行程 / 淨化控制符日誌 / 匯出脫敏診斷包",
@@ -414,10 +412,7 @@ fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
             "Mode & Revoke",
             "e2e-required policy, status snapshot, RPF audit",
         ),
-        (Lang::En, 7) => (
-            "Safe Upgrade",
-            "Verify dual-sig manifest, journal & supervisor",
-        ),
+        (Lang::En, 7) => ("Update", "Check stable / pre-release; no installation"),
         (Lang::En, 8) => (
             "Service & Diag",
             "Manage daemon, sanitized logs, redacted bundle",
@@ -583,6 +578,8 @@ pub const DETAIL_ROWS: usize = 8;
 pub enum ConsoleView {
     /// The nine-entry §10.4.1 menu.
     Menu,
+    /// Entry 7: read-only release discovery.
+    Update,
     /// Entry 8: service status / start / stop / config check.
     Service,
     /// Typed-phrase confirmation before a mutating service action.
@@ -632,6 +629,8 @@ pub enum ConsoleEffect {
     ServiceStart,
     ServiceStop,
     CheckConfig,
+    /// Fetch advisory release metadata on explicit operator action.
+    CheckUpdate(Channel),
     /// Open the endpoint-only config wizard.
     ConfigWizard,
     /// Process a field or exact PREVIEW confirmation.
@@ -660,6 +659,7 @@ pub struct ConsoleState {
     pub narrow: bool,
     pub no_color: bool,
     pub notice_rows: Vec<String>,
+    update_channel: Channel,
     /// Candidate endpoint values for the read-only preview flow.
     pub config_primary: Option<String>,
     pub config_backup: Option<Option<String>>,
@@ -690,6 +690,7 @@ impl ConsoleState {
             narrow: false,
             no_color: false,
             notice_rows: Vec::new(),
+            update_channel: Channel::default(),
             config_primary: None,
             config_backup: None,
             config_step: ConfigWizardStep::Menu,
@@ -703,6 +704,7 @@ impl ConsoleState {
     pub fn apply(&mut self, line: &str) -> ConsoleEffect {
         match self.view {
             ConsoleView::Menu => self.apply_menu(line.trim()),
+            ConsoleView::Update => self.apply_update(line.trim()),
             ConsoleView::Service => self.apply_service(line.trim()),
             ConsoleView::Confirm => self.apply_confirm(line),
             ConsoleView::Notice => self.apply_notice(line.trim()),
@@ -737,18 +739,43 @@ impl ConsoleState {
         }
     }
 
-    /// Entry dispatch. Only 1 (telemetry) and 8 (service) have a backend; 6
-    /// and 9 are refused because this build must not change the security mode,
-    /// revoke, or uninstall.
+    /// Entry dispatch. 6 and 9 are refused because this build must not
+    /// change the security mode, revoke, or uninstall.
     fn open_selected(&mut self) -> ConsoleEffect {
         match self.selected {
             1 => ConsoleEffect::Telemetry,
             6 | 9 => self.notice(vec![text(self.lang, Msg::NoticeRefused).to_string()]),
+            7 => {
+                self.view = ConsoleView::Update;
+                self.notice_rows.clear();
+                ConsoleEffect::None
+            }
             8 => {
                 self.view = ConsoleView::Service;
                 ConsoleEffect::None
             }
             _ => self.notice(vec![text(self.lang, Msg::NoticeNotImplemented).to_string()]),
+        }
+    }
+
+    fn apply_update(&mut self, cmd: &str) -> ConsoleEffect {
+        match cmd {
+            "1" | "2" => {
+                self.update_channel = if cmd == "1" { Channel::Stable } else { Channel::Pre };
+                self.notice_rows.clear();
+                ConsoleEffect::None
+            }
+            "" | "c" => ConsoleEffect::CheckUpdate(self.update_channel),
+            "b" => {
+                self.view = ConsoleView::Menu;
+                self.notice_rows.clear();
+                ConsoleEffect::None
+            }
+            "q" | "quit" => ConsoleEffect::Quit,
+            _ => {
+                self.notice_rows = vec![text(self.lang, Msg::NoticeUnknownCommand).into()];
+                ConsoleEffect::None
+            }
         }
     }
 
@@ -1004,6 +1031,17 @@ impl ConsoleState {
         let base = self.menu_model(version);
         match self.view {
             ConsoleView::Menu => render_menu(&base),
+            ConsoleView::Update => render_detail(
+                &base,
+                localized(self.lang, "Update", "检查更新", "檢查更新"),
+                &self.update_rows(),
+                localized(
+                    self.lang,
+                    "[c/Enter] Check   [b] Back   [q] Quit",
+                    "[c/Enter] 检查   [b] 返回   [q] 退出",
+                    "[c/Enter] 檢查   [b] 返回   [q] 離開",
+                ),
+            ),
             ConsoleView::Service => render_detail(
                 &base,
                 text(self.lang, Msg::HeadingService),
@@ -1033,6 +1071,23 @@ impl ConsoleState {
                 )
             }
         }
+    }
+
+    fn update_rows(&self) -> Vec<String> {
+        let lang = self.lang;
+        let mut rows = vec![
+            format!("{}: {}", localized(lang, "Local build", "本机构建", "本機組建"), update::local_build()),
+            format!(
+                "{} [1] {}   {} [2] {}",
+                if self.update_channel == Channel::Stable { ">" } else { " " },
+                localized(lang, "Stable", "稳定版", "穩定版"),
+                if self.update_channel == Channel::Pre { ">" } else { " " },
+                localized(lang, "Pre-release", "预览版", "預覽版"),
+            ),
+            update::blocked(lang).into(),
+        ];
+        rows.extend(self.notice_rows.iter().cloned());
+        rows
     }
 
     fn service_rows(&self) -> Vec<String> {
@@ -1339,7 +1394,7 @@ const ZH_CN_ORACLE: &str = "\
 │    [4] 目录租约与路由   身份-挂靠-LSA 名录 / 子网路由裁决 / 权威 DNS      │
 │    [5] 压测与回源探针   boreas bench 分层开销 / probe 回源与流控检测      │
 │    [6] 安全模式与吊销   e2e-required 策略 / 状态快照与吊销 / RPF 审计     │
-│    [7] 可恢复热升级     独立验双签清单 / 升级日志切换 / supervisor        │
+│     [7] 检查更新         稳定版 / 预览版；仅检查，不安装                  │
 │    [8] 服务与脱敏诊断   启停守护进程 / 净化控制符日志 / 导出脱敏诊断包    │
 │    [9] 解绑或干净卸载   撤销挂靠租约 / 清理本实例网卡、规则与版本目录     │
 ├───────────────────────────────────────────────────────────────────────────┤
@@ -1721,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn console_only_telemetry_and_service_have_a_backend() {
+    fn console_entries_without_backends_get_an_honest_notice() {
         let mut state = ConsoleState::new(Lang::En, false);
         state.selected = 1;
         assert_eq!(state.apply(""), ConsoleEffect::Telemetry);
@@ -1731,7 +1786,7 @@ mod tests {
         assert_eq!(state.apply(""), ConsoleEffect::None);
         assert_eq!(state.view, ConsoleView::Service);
 
-        for entry in [2u8, 3, 4, 5, 7] {
+        for entry in [2u8, 3, 4, 5] {
             let mut state = ConsoleState::new(Lang::En, false);
             state.selected = entry;
             assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
@@ -1892,6 +1947,7 @@ mod tests {
     fn console_quit_works_from_every_view() {
         for view in [
             ConsoleView::Menu,
+            ConsoleView::Update,
             ConsoleView::Service,
             ConsoleView::Confirm,
             ConsoleView::Notice,
@@ -1934,6 +1990,7 @@ mod tests {
     fn detail_screens_stay_18_by_77_in_every_language() {
         for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
             for view in [
+                ConsoleView::Update,
                 ConsoleView::Service,
                 ConsoleView::Confirm,
                 ConsoleView::Notice,
