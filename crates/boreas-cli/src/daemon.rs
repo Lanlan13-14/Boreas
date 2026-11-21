@@ -45,8 +45,8 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 
 pub fn daemon_usage() -> &'static str {
     "Usage:
-  boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
-  boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
+  boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
+  boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
   Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
   and set [dns].zone to the signed private suffix; see docs/engineering/dns-daemon-deployment.md."
 }
@@ -444,6 +444,16 @@ mod linux_daemon {
         }
     }
 
+    impl Drop for NonBlockingLinuxTun {
+        fn drop(&mut self) {
+            if self.metrics.is_some()
+                && let Some((read_syscalls, delivered_segments)) = self.queue.gso_read_counts()
+            {
+                eprintln!("boreas-tun-gso read_syscalls={read_syscalls} delivered_segments={delivered_segments}");
+            }
+        }
+    }
+
     impl PacketIo for NonBlockingLinuxTun {
         fn read_packet(&self) -> Result<Option<Vec<u8>>, TunError> {
             self.queue.try_read_packet().map_err(tun_read_error)
@@ -506,6 +516,7 @@ mod linux_daemon {
     fn tun_read_error(error: LinuxTunError) -> TunError {
         match error {
             LinuxTunError::Packet(packet_error) => packet_error,
+            LinuxTunError::Gso(_) => TunError::VirtioInvalid,
             _ => TunError::QueueClosed,
         }
     }
@@ -1874,6 +1885,7 @@ mod linux_daemon {
         let mut max_packets: Option<u64> = None;
         let mut max_seconds: Option<u64> = None;
         let mut virtual_tun = false;
+        let mut tun_tcpv4_gso = false;
         let mut status_state_file: Option<PathBuf> = None;
         let mut status_state_owner_uid: Option<u32> = None;
         let mut policy_tbs: Option<PathBuf> = None;
@@ -1893,6 +1905,11 @@ mod linux_daemon {
                     virtual_tun = true;
                     i += 1;
                 }
+                "--tun-tcpv4-gso" if !tun_tcpv4_gso => {
+                    tun_tcpv4_gso = true;
+                    i += 1;
+                }
+                "--tun-tcpv4-gso" => return Err("daemon: duplicate --tun-tcpv4-gso".into()),
                 flag => {
                     let val = args
                         .get(i + 1)
@@ -1961,6 +1978,9 @@ mod linux_daemon {
             }
         }
 
+        if tun_tcpv4_gso && (provisioned || virtual_tun) {
+            return Err("daemon: --tun-tcpv4-gso requires a newly created real Linux TUN".into());
+        }
         if provisioned && virtual_tun {
             return Err("daemon: verified service requires a provisioned real TUN".into());
         }
@@ -2227,7 +2247,7 @@ mod linux_daemon {
                     name: tun_name,
                     mtu,
                     multi_queue: false,
-                    vnet_header: false,
+                    vnet_header: tun_tcpv4_gso,
                 })
             }
             .map_err(|e| format!("daemon Linux TUN setup failed: {e:?}"))?;
