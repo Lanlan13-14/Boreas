@@ -424,7 +424,7 @@ fn run_lane(
     let mut circuit = if edge {
         open_e2e_with_l3_profile_until(
             session,
-            &run.backend,
+            run.backend,
             run.policy.expected_peer,
             1,
             run.profile,
@@ -434,7 +434,7 @@ fn run_lane(
     } else {
         accept_e2e_with_l3_profile_until(
             session,
-            &run.backend,
+            run.backend,
             run.policy.expected_peer,
             run.profile,
             interrupt,
