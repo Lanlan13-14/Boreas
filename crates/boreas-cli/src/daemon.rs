@@ -46,7 +46,9 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 pub fn daemon_usage() -> &'static str {
     "Usage:
   boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
-  boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]"
+  boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--virtual-tun]
+  Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
+  and set [dns].zone to the signed private suffix; see docs/engineering/dns-daemon-deployment.md."
 }
 
 /// Query an active daemon control socket and parse a live [`StatusSnapshot`].
@@ -263,7 +265,7 @@ mod linux_daemon {
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, accept_e2e, open_e2e},
         failover,
-        packet_path::{PacketPath, PacketPathError, PacketStats},
+        packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
         resource::{Admission, Limits},
         session::{EstablishedSession, SessionPolicy},
     };
@@ -272,6 +274,10 @@ mod linux_daemon {
         Config, CryptoSuite as CfgSuite, NodeRole as CfgRole, RuntimeCapabilities,
         SecurityMode as CfgMode,
     };
+
+    use private_dns::{Interrupt as DnsInterrupt, PinnedDns};
+
+    mod private_dns;
 
     const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(10);
     const VIRTUAL_IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -1877,6 +1883,8 @@ mod linux_daemon {
         let mut policy_root_pq: Option<PathBuf> = None;
         let mut policy_state_file: Option<PathBuf> = None;
         let mut policy_state_owner_uid: Option<u32> = None;
+        let mut dns_dir: Option<PathBuf> = None;
+        let mut dns_pin: Option<PathBuf> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -1921,6 +1929,8 @@ mod linux_daemon {
                                 "daemon: invalid --network-policy-state-owner-uid".to_string()
                             })?);
                         }
+                        "--private-dns-dir" if dns_dir.is_none() => dns_dir = Some(val.into()),
+                        "--private-dns-pin" if dns_pin.is_none() => dns_pin = Some(val.into()),
                         "--listen" => listen_spec = Some(val.clone()),
                         "--connect" => connect_spec = Some(val.clone()),
                         "--tls-name" => tls_name = Some(val.clone()),
@@ -2047,17 +2057,22 @@ mod linux_daemon {
             root_ed25519_der: &policy_root_ed_path,
             root_mldsa65_der: &policy_root_pq_path,
         };
-        let network_context = crate::network_policy_runtime::verify_and_record_default_policy(
-            policy_inputs,
-            &policy_state_path,
-            &config.paths.state_dir,
-            cfg_net_id,
-            verified.root_fingerprint,
-            policy_state_owner_uid.ok_or_else(|| {
-                "daemon: `--network-policy-state-owner-uid` is required".to_string()
-            })?,
-        )
-        .map_err(|error| format!("daemon network policy rejected: {error}"))?;
+        let (network_policy, network_root) =
+            crate::network_policy_runtime::verify_and_record_policy_material(
+                policy_inputs,
+                &policy_state_path,
+                &config.paths.state_dir,
+                cfg_net_id,
+                verified.root_fingerprint,
+                policy_state_owner_uid.ok_or_else(|| {
+                    "daemon: `--network-policy-state-owner-uid` is required".to_string()
+                })?,
+            )
+            .map_err(|error| format!("daemon network policy rejected: {error}"))?;
+
+        let network_context = network_policy
+            .require_default_runtime()
+            .map_err(|e| format!("daemon network context rejected: {e}"))?;
 
         // The signed policy is the sole address authority. A config prefix that
         // does not equal the verified context would let a node derive/use an
@@ -2101,6 +2116,57 @@ mod linux_daemon {
 
         let local_peer = local_vn.peer_identity();
         let remote_peer = peer_vn.peer_identity();
+
+        let private_dns = match (dns_dir, dns_pin) {
+            (None, None) => None,
+            (Some(dir), Some(pin)) if !virtual_tun => {
+                let dns = config
+                    .dns
+                    .as_ref()
+                    .ok_or("daemon: private DNS requires [dns].zone")?;
+                let zone = dns
+                    .zone
+                    .as_deref()
+                    .ok_or("daemon: private DNS requires [dns].zone")?;
+                let core = if mode == Mode::Serve {
+                    local_peer
+                } else {
+                    remote_peer
+                };
+                let pinned = PinnedDns::load(
+                    &dir,
+                    pin,
+                    network_policy,
+                    &network_root,
+                    core,
+                    zone,
+                    verified.local.valid_until().min(peer_obj.valid_until()),
+                )?;
+                if dns
+                    .listen_vip
+                    .as_deref()
+                    .is_some_and(|vip| vip.parse::<std::net::Ipv4Addr>() != Ok(pinned.vip))
+                {
+                    return Err(
+                        "daemon: [dns].listen_vip is not the signed-prefix reserved DNS VIP".into(),
+                    );
+                }
+                if mode == Mode::Connect
+                    && connect_spec.is_none()
+                    && config.uplinks.backup.is_some()
+                {
+                    return Err(
+                        "daemon: private DNS requires a single Core path (no DNS standby)".into(),
+                    );
+                }
+                Some(pinned)
+            }
+            _ => {
+                return Err(
+                    "daemon: private DNS requires both pin and directory and a real TUN".into(),
+                );
+            }
+        };
 
         let extractor = Arc::new(
             PkiIdentityExtractor::new(vec![local_vn, peer_vn])
@@ -2281,6 +2347,7 @@ mod linux_daemon {
                 max_packets,
                 max_seconds,
                 &counters,
+                private_dns.as_ref(),
             ),
             Mode::Connect => {
                 let explicit_connect = connect_spec.is_some();
@@ -2311,6 +2378,7 @@ mod linux_daemon {
                     max_packets,
                     max_seconds,
                     &counters,
+                    private_dns.as_ref(),
                 )
             }
         }
@@ -2595,6 +2663,7 @@ mod linux_daemon {
         max_packets: Option<u64>,
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
+        private_dns: Option<&PinnedDns>,
     ) -> Result<(), String> {
         let listen_addr = resolve_addr(&listen_spec)?;
         let outer_acc = OpenSslOuterTlsAcceptor::from_pem_files(
@@ -2707,7 +2776,9 @@ mod linux_daemon {
 
         counters.inbound_connections.store(1, Ordering::SeqCst);
         counters.path_epoch.store(1, Ordering::SeqCst);
-        counters.connected.store(true, Ordering::SeqCst);
+        if private_dns.is_none() {
+            counters.connected.store(true, Ordering::SeqCst);
+        }
 
         let res = drive_business_path(
             "serve",
@@ -2724,6 +2795,7 @@ mod linux_daemon {
             None,
             None,
             counters,
+            private_dns,
         );
 
         counters.connected.store(false, Ordering::SeqCst);
@@ -2788,6 +2860,7 @@ mod linux_daemon {
         max_packets: Option<u64>,
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
+        private_dns: Option<&PinnedDns>,
     ) -> Result<(), String> {
         let outer_ca_path = mat_dir.join("outer-ca.pem");
         let outer_conn = if outer_ca_path.exists() {
@@ -2960,7 +3033,9 @@ mod linux_daemon {
                 }
                 counters.path_epoch.store(epoch, Ordering::SeqCst);
                 counters.outbound_upstreams.store(1, Ordering::SeqCst);
-                counters.connected.store(true, Ordering::SeqCst);
+                if private_dns.is_none() {
+                    counters.connected.store(true, Ordering::SeqCst);
+                }
                 let result = drive_business_path(
                     "connect",
                     link.fd,
@@ -2976,6 +3051,7 @@ mod linux_daemon {
                     identity,
                     standby.as_mut(),
                     counters,
+                    private_dns,
                 );
                 counters.connected.store(false, Ordering::SeqCst);
                 counters.outbound_upstreams.store(0, Ordering::SeqCst);
@@ -3155,9 +3231,99 @@ mod linux_daemon {
         expected: Option<BusinessIdentity>,
         mut standby: Option<&mut StandbyManager>,
         counters: &Arc<LiveCounters>,
+        private_dns: Option<&PinnedDns>,
     ) -> Result<PathReport, String> {
-        let mut path = PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
-            .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
+        let local_e2e = e2e.local();
+        let peer_e2e = e2e.info().peer;
+        let endpoints = [
+            auth_slot(
+                local_e2e.net_id,
+                local_e2e.node_id,
+                local_e2e.identity_generation,
+            )?,
+            auth_slot(
+                peer_e2e.net_id,
+                peer_e2e.node_id,
+                peer_e2e.identity_generation,
+            )?,
+        ];
+        let dns_lease = if let Some(dns) = private_dns {
+            // Static DNS never borrows a future status renewal. Pin the exact
+            // admitted window after checking revocation for these generations.
+            policy_window.check()?;
+            let mut guard = lock_mutex(&status_store);
+            status_gate(&mut guard, status_path, now_utc_us()?, Instant::now())?;
+            check_identity_revocations(&mut guard, status_path, endpoints)?;
+            let fresh = guard
+                .current_fresh(now_utc_us()?, Instant::now())
+                .map_err(|e| format!("daemon: DNS status expired before bind: {e:?}"))?;
+            let until = fresh
+                .valid_until()
+                .ok_or("daemon: DNS status UTC cutoff unavailable")?;
+            let sequence = fresh.sequence();
+            let dns_deadline = fresh
+                .deadline()
+                .min(policy_window.deadline())
+                .min(deadline.unwrap_or_else(|| policy_window.deadline()));
+            let last_trusted_utc = guard.last_trusted_utc();
+            counters.status_sequence.store(sequence, Ordering::Relaxed);
+            Some((dns.bind(until, dns_deadline, last_trusted_utc), sequence))
+        } else {
+            None
+        };
+        // Move the circuit into one path; the lease and captured generations
+        // cannot be transplanted into a second or promoted circuit.
+        let mut path = if let (Some(dns), Some((lease, sequence))) = (private_dns, &dns_lease) {
+            let active = Arc::clone(lease);
+            let counters = Arc::clone(counters);
+            let sequence = *sequence;
+            let current = Box::new(move || {
+                counters.status_fresh.load(Ordering::Acquire)
+                    && counters.status_sequence.load(Ordering::Acquire) == sequence
+                    && active.current()
+            });
+            if mode_name == "serve" {
+                PacketPath::try_new_over_e2e_with_private_dns(
+                    tun.packet_io(),
+                    e2e,
+                    mtu,
+                    PrivateDnsProvision {
+                        material: dns.material(),
+                        utc: Box::new(|| now_utc_us().ok()),
+                        is_current: current,
+                    },
+                )
+            } else {
+                PacketPath::try_new_over_e2e_with_edge_dns(
+                    tun.packet_io(),
+                    e2e,
+                    mtu,
+                    dns.material().authority,
+                    current,
+                )
+            }
+        } else {
+            PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
+        }
+        .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
+        let _dns_interrupt = if let (Some(dns), Some((lease, sequence))) = (private_dns, &dns_lease)
+        {
+            let fd = duplicate_shutdown_fd(sock_fd)
+                .ok_or("daemon: cannot duplicate private DNS session socket")?;
+            let counters = Arc::clone(counters);
+            let sequence = *sequence;
+            Some(DnsInterrupt::start(
+                dns,
+                Arc::clone(lease),
+                fd,
+                move || {
+                    counters.status_fresh.load(Ordering::Acquire)
+                        && counters.status_sequence.load(Ordering::Acquire) == sequence
+                },
+            )?)
+        } else {
+            None
+        };
         let identity = business_identity(&path);
         if let Some(expected) = expected
             && expected != identity
@@ -3173,20 +3339,16 @@ mod linux_daemon {
         // Declared after `path` on purpose: the watchdog is stopped and joined
         // before the E2E stream (and its socket) is dropped, so `shutdown()` can
         // never target a recycled descriptor.
-        let local = path.local_endpoint();
-        let peer = path.peer_endpoint();
-        let endpoints = [
-            auth_slot(local.net_id(), local.node_id(), local.identity_generation())?,
-            auth_slot(peer.net_id(), peer.node_id(), peer.identity_generation())?,
-        ];
-        // Synchronous check closes the gap before the watchdog's first poll.
-        let admission = {
-            let mut guard = lock_mutex(&status_store);
-            check_identity_revocations(&mut guard, status_path, endpoints)
-        };
-        if let Err(reason) = admission {
-            path.close();
-            return Err(reason);
+        if private_dns.is_none() {
+            // Synchronous check closes the gap before the watchdog's first poll.
+            let admission = {
+                let mut guard = lock_mutex(&status_store);
+                check_identity_revocations(&mut guard, status_path, endpoints)
+            };
+            if let Err(reason) = admission {
+                path.close();
+                return Err(reason);
+            }
         }
         let watchdog = StatusWatchdog::start(
             status_store,
@@ -3197,6 +3359,16 @@ mod linux_daemon {
             STATUS_RECHECK_INTERVAL,
             Some(endpoints),
         );
+        let dns_current = || {
+            dns_lease.as_ref().is_none_or(|(lease, sequence)| {
+                counters.status_fresh.load(Ordering::Acquire)
+                    && counters.status_sequence.load(Ordering::Acquire) == *sequence
+                    && lease.current()
+            })
+        };
+        if !dns_current() {
+            return Err("daemon: private DNS authorization lost before business".into());
+        }
         if mode_name == "connect" && packets_before == 0 && expected.is_none() {
             // The initial Edge circuit is authenticated and has a bound packet
             // path. Future promotions must never answer the one-shot challenge.
@@ -3205,6 +3377,15 @@ mod linux_daemon {
                 return Err(reason);
             }
             report_trial_ready(tun)?;
+        }
+
+        if dns_lease.is_some() {
+            if !dns_current() || watchdog.fault().is_some() {
+                return Err("daemon: private DNS authorization lost before business".into());
+            }
+            // Generic circuit connectivity, not DNS readiness. A successful
+            // Edge query is the only confirmation of the remote DNS service.
+            counters.connected.store(true, Ordering::SeqCst);
         }
 
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
@@ -3240,6 +3421,11 @@ mod linux_daemon {
                     path.close_gracefully();
                     break PathStop::Budget("max_packets_reached");
                 }
+            }
+
+            if !dns_current() {
+                path.close();
+                return Err("daemon: private DNS authorization lost (fail-closed)".into());
             }
 
             // Standby maintenance is one non-blocking transport poll plus, at
@@ -3343,6 +3529,12 @@ mod linux_daemon {
                     if total >= limit {
                         break;
                     }
+                    // One inbound request can synchronously emit one reply.
+                    // Do not enter that step without room for both packets.
+                    if private_dns.is_some() && mode_name == "serve" && limit - total < 2 {
+                        path.close_gracefully();
+                        break 'outer PathStop::Budget("max_packets_dns_pair_reserve");
+                    }
                 }
                 if step > 0 {
                     buffered = path.has_buffered_input();
@@ -3372,6 +3564,14 @@ mod linux_daemon {
                         counters
                             .rx_bytes
                             .store(stats.inbound_bytes, Ordering::Relaxed);
+                        if private_dns.is_some() && mode_name == "serve" {
+                            counters
+                                .tx_packets
+                                .store(stats.outbound_packets, Ordering::Relaxed);
+                            counters
+                                .tx_bytes
+                                .store(stats.outbound_bytes, Ordering::Relaxed);
+                        }
                     }
                     Ok(None) => {
                         if let Some(reason) = watchdog.fault() {
@@ -3415,6 +3615,10 @@ mod linux_daemon {
         // reported: never print `"status":"ok"` for a halted section 3.4 condition.
         if let Some(reason) = watchdog.fault() {
             return Err(reason);
+        }
+
+        if !matches!(&stop, PathStop::Budget("max_seconds_reached")) && !dns_current() {
+            return Err("daemon: private DNS authorization lost (fail-closed)".into());
         }
 
         Ok(PathReport {

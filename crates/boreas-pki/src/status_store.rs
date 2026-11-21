@@ -1427,6 +1427,11 @@ impl FreshStatus<'_> {
         self.seq
     }
 
+    /// Exclusive signed UTC cutoff of this snapshot and its delegation.
+    pub fn valid_until(&self) -> Option<u64> {
+        self.store.snapshot_valid_until
+    }
+
     /// Captured process-local deadline. A watchdog must not sleep past this
     /// instant, even when its normal poll interval is longer.
     pub fn deadline(&self) -> Instant {
