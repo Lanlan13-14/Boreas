@@ -916,6 +916,26 @@ jobs:
             rc=$?
           fi
           printf 'sample_scope=diagnostic-only\nsample_exit=%s\n' "$rc" | tee -a "$log"
+      - name: Measure high-RTT first-second payload on one and four application streams
+        # The same candidate and circuit are used for both rounds; this does
+        # not establish multi-circuit operation or replace the goodput gates.
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/fix/v111-integration' && (steps.candidate_delayed.outcome == 'success' || steps.candidate_delayed.outcome == 'failure') }}
+        timeout-minutes: 5
+        env:
+          BOREAS_NETNS_MULTISTREAM: '1'
+          BOREAS_MULTISTREAM_BYTES: '8388608'
+          BOREAS_NETEM_RTT_MS: '200'
+          BOREAS_NETEM_LOSS_PERCENT: '0.1'
+          BOREAS_NETEM_RATE_MBIT: '100'
+          BOREAS_MAX_PING_MS: '415'
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '100'
+          BOREAS_PERF_TIMEOUT_SECONDS: '45'
+          BOREAS_DIAGNOSTIC_TIMING: '0'
+        run: |
+          set -euo pipefail
+          sudo -E timeout --kill-after=5s 135s bash tools/release/netns_daemon_smoke.sh \
+            hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            2>&1 | tee rust-tls-netns-multistream.log
       - name: Upload non-secret CI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -937,6 +957,7 @@ jobs:
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log
             rust-tls-netns-gigabit-*.log
+            rust-tls-netns-multistream.log
             rust-tls-perf-environment.txt
             rust-tls-initial-backup.log
             rust-tls-initial-backup-negative.log
