@@ -1112,6 +1112,18 @@ for label, sender_path, receiver_path in zip(labels, sys.argv[1::2], sys.argv[2:
         continue
     print(f"overlay_{label}_receiver_integrity=verified")
 
+    # Receiver-only diagnostics; never feed these into the throughput gate.
+    # The per-worker JSON files are removed by the fixture's cleanup.
+    first_second_status = receiver.get("first_second_status")
+    first_second_bytes = receiver.get("first_second_bytes")
+    if (first_second_status in ("complete", "incomplete")
+        and type(first_second_bytes) is int and 0 < first_second_bytes <= expected_bytes):
+        print(f"overlay_{label}_first_second_status={first_second_status}")
+        print(f"overlay_{label}_first_second_bytes={first_second_bytes}")
+    else:
+        print(f"overlay_{label}_first_second_status=unavailable")
+        print(f"overlay_{label}_first_second_bytes=unavailable")
+
     # Optional diagnostic fields never replace the end-to-end regression bound.
     for field in ("connect_seconds", "send_seconds", "digest_seconds", "payload_send_mbps"):
         value = result.get(field)

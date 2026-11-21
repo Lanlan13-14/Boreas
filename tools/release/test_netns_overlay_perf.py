@@ -239,16 +239,18 @@ class SenderPhaseTests(unittest.TestCase):
 
 
 class ReceiverDiagnosticTests(unittest.TestCase):
-    def test_first_byte_to_eof_is_logged_to_stderr_only(self):
-        payload = b"receiver-diagnostic" * 16
-        connection = _FakeReceiverConnection([payload[:17], payload[17:]])
+    def _run_receiver(self, chunks, times, *, expected_bytes=None):
+        payload = b"".join(chunks)
+        connection = _FakeReceiverConnection(chunks)
         listener = _FakeListener(connection)
         clock = mock.Mock()
-        clock.monotonic.side_effect = [40.0, 40.75]
+        clock.monotonic.side_effect = times
         stdout = io.StringIO()
         stderr = io.StringIO()
+        if expected_bytes is None:
+            expected_bytes = len(payload)
         with (
-            mock.patch.object(netns_overlay_perf, "TOTAL_BYTES", len(payload)),
+            mock.patch.object(netns_overlay_perf, "TOTAL_BYTES", expected_bytes),
             mock.patch.object(netns_overlay_perf, "time", clock),
             mock.patch.object(
                 netns_overlay_perf.socket, "socket", return_value=listener
@@ -256,7 +258,14 @@ class ReceiverDiagnosticTests(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            netns_overlay_perf.receiver("127.0.0.1")
+            if len(payload) == expected_bytes:
+                netns_overlay_perf.receiver("127.0.0.1")
+            else:
+                with self.assertRaisesRegex(
+                    SystemExit, "receiver got .* bytes, expected"
+                ):
+                    netns_overlay_perf.receiver("127.0.0.1")
+        self.assertEqual(clock.monotonic.call_count, len(times))
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(listener.address, ("127.0.0.1", netns_overlay_perf.PORT))
         self.assertEqual(listener.backlog, 1)
@@ -267,8 +276,47 @@ class ReceiverDiagnosticTests(unittest.TestCase):
         log = json.loads(stderr.getvalue())
         self.assertEqual(log["role"], "receiver")
         self.assertEqual(log["bytes"], len(payload))
-        self.assertEqual(log["first_byte_to_eof_seconds"], 0.75)
         self.assertEqual(log["sha256"], digest)
+        return log
+
+    def test_early_eof_reports_incomplete_count_on_stderr_only(self):
+        log = self._run_receiver([b"first", b"second"], [40.0, 40.5, 40.75])
+        self.assertEqual(log["first_byte_to_eof_seconds"], 0.75)
+        self.assertEqual(log["first_second_bytes"], 11)
+        self.assertEqual(log["first_second_status"], "incomplete")
+
+    def test_deadline_and_later_payload_are_excluded_but_still_hashed(self):
+        for crossing_at in (41.0, 41.125):
+            with self.subTest(crossing_at=crossing_at):
+                log = self._run_receiver(
+                    [b"first", b"second", b"crossing", b"later"],
+                    [40.0, 40.999999, crossing_at, 41.75],
+                )
+                self.assertEqual(log["first_byte_to_eof_seconds"], 1.75)
+                self.assertEqual(log["first_second_bytes"], 11)
+                self.assertEqual(log["first_second_status"], "complete")
+
+    def test_eof_at_deadline_completes_window_without_more_payload(self):
+        log = self._run_receiver([b"first"], [40.0, 41.0])
+        self.assertEqual(log["first_second_bytes"], 5)
+        self.assertEqual(log["first_second_status"], "complete")
+
+    def test_clock_invalidates_diagnostic_without_changing_digest(self):
+        for times in (
+            [math.nan, 41.75],
+            [40.0, math.inf, 41.75],
+            [40.0, 40.5, 40.25],
+        ):
+            with self.subTest(times=times):
+                log = self._run_receiver([b"first", b"second"], times)
+                self.assertIsNone(log["first_second_bytes"])
+                self.assertEqual(log["first_second_status"], "unavailable")
+
+    def test_empty_stream_has_no_window_and_still_fails_byte_count(self):
+        log = self._run_receiver([], [40.0], expected_bytes=1)
+        self.assertIsNone(log["first_byte_to_eof_seconds"])
+        self.assertIsNone(log["first_second_bytes"])
+        self.assertEqual(log["first_second_status"], "no-payload")
 
 
 class _LoopbackServer(threading.Thread):
@@ -440,6 +488,8 @@ class BaselineProbeTests(unittest.TestCase):
         )
         log = json.loads(stderr.getvalue())
         self.assertEqual(log["role"], "baseline-receiver")
+        self.assertNotIn("first_second_bytes", log)
+        self.assertNotIn("first_second_status", log)
         self.assertEqual(log["scope"], netns_overlay_perf.BASELINE_SCOPE)
         self.assertEqual(log["gate"], "not-applicable")
         self.assertEqual(log["acceptance"], "never")

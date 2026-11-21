@@ -11,6 +11,17 @@ denominator and remains the smoke regression bound. A phase field is null when
 that interval is not measurable, so a diagnostic problem never turns an
 otherwise successful probe into a failure.
 
+The overlay receiver also reports `first_second_bytes` and
+`first_second_status` for one stream. Bytes are counted in whole nonempty
+`recv` returns timestamped in [first nonempty return, first return + 1 s).
+This is application-observed delivery, affected by read batching and receiver
+scheduling, not wire arrival or sender goodput. `complete` means a later read
+(possibly EOF) reached the deadline, not that the sender offered load for the
+whole window. An earlier EOF gives `incomplete` with the observed byte count.
+`no-payload` and `unavailable` (invalid clock sample while observing the
+window) have null counts. Neither peer waits for the window. No cross-process
+clock is used.
+
 The `sample`/`summarize` modes are diagnostic-only. `sample` runs inside one
 network namespace and periodically records `ss -tin` TCP_INFO for the underlay
 pair plus `tc -s qdisc` and `ip -s link` counters; `summarize` turns that NDJSON
@@ -246,12 +257,17 @@ def parse_link(text: str) -> dict:
     return stats
 
 
-def _receive_stream(local_ip: str, port: int, timeout: float) -> dict:
+def _receive_stream(
+    local_ip: str, port: int, timeout: float, *, measure_first_second: bool = False
+) -> dict:
     """Receive one bounded stream and return its digest evidence."""
 
     digest = hashlib.sha256()
     received = 0
     first_byte_at = None
+    first_second_status = "no-payload" if measure_first_second else None
+    first_second_bytes = None
+    last_observed_at = None
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((local_ip, port))
@@ -262,25 +278,54 @@ def _receive_stream(local_ip: str, port: int, timeout: float) -> dict:
             connection.settimeout(timeout)
             while True:
                 data = connection.recv(len(CHUNK))
+                # Timestamp before hashing. After the window closes, only EOF
+                # needs another timestamp for the existing duration diagnostic.
+                if (
+                    not data
+                    or first_byte_at is None
+                    or first_second_status == "incomplete"
+                ):
+                    observed_at = time.monotonic()
+                    if data and first_byte_at is None:
+                        first_byte_at = observed_at
+                        if measure_first_second:
+                            if math.isfinite(observed_at):
+                                last_observed_at = observed_at
+                                first_second_bytes = len(data)
+                                first_second_status = "incomplete"
+                            else:
+                                first_second_status = "unavailable"
+                    elif first_second_status == "incomplete":
+                        window_elapsed = _interval(first_byte_at, observed_at)
+                        if window_elapsed is None or observed_at < last_observed_at:
+                            first_second_bytes = None
+                            first_second_status = "unavailable"
+                        elif window_elapsed >= 1.0:
+                            first_second_status = "complete"
+                        else:
+                            first_second_bytes += len(data)
+                            last_observed_at = observed_at
                 if not data:
+                    finished = observed_at
                     break
-                if first_byte_at is None:
-                    first_byte_at = time.monotonic()
                 digest.update(data)
                 received += len(data)
-            finished = time.monotonic()
             connection.sendall(digest.hexdigest().encode("ascii"))
     first_byte_to_eof = None
     if first_byte_at is not None:
-        first_byte_to_eof = _rounded_seconds(
-            _interval(first_byte_at, finished)
-        )
-    return {
+        first_byte_to_eof = _rounded_seconds(_interval(first_byte_at, finished))
+    result = {
         "role": "receiver",
         "bytes": received,
         "first_byte_to_eof_seconds": first_byte_to_eof,
         "sha256": digest.hexdigest(),
     }
+    if measure_first_second:
+        result.update(
+            first_second_bytes=first_second_bytes,
+            first_second_status=first_second_status,
+        )
+    return result
 
 
 def _send_stream(
@@ -346,7 +391,9 @@ def _send_stream(
 
 
 def receiver(local_ip: str) -> None:
-    result = _receive_stream(local_ip, PORT, TIMEOUT_SECONDS)
+    result = _receive_stream(
+        local_ip, PORT, TIMEOUT_SECONDS, measure_first_second=True
+    )
     # This diagnostic line is receiver-only and deliberately goes to stderr:
     # the smoke parses the sender's stdout as one JSON object.
     print(json.dumps(result, sort_keys=True), file=sys.stderr)
