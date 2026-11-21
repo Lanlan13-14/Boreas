@@ -35,8 +35,26 @@ use crate::{
     resource::Admission, runtime::bounded_link_operation,
 };
 
+mod directory_sync;
+
 pub const ATTEMPT_LIMIT: Duration = Duration::from_secs(5);
 const MAX_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Copy)]
+enum HopPurpose {
+    Business(Option<(Instant, [u8; 32])>),
+    // A separately provisioned transport adjacency, not a business edge.
+    Directory,
+}
+
+impl HopPurpose {
+    fn route(self) -> Option<(Instant, [u8; 32])> {
+        match self {
+            Self::Business(route) => route,
+            Self::Directory => None,
+        }
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
@@ -47,6 +65,8 @@ pub enum Error {
     IdentityRevoked,
     Clock,
     NoRoute,
+    /// A configured Core has no seed and no learned directory head yet.
+    DirectoryPending,
     WrongReply,
     /// An authenticated hop advanced a graph member; rebuild before retrying.
     TopologyChanged,
@@ -197,6 +217,7 @@ pub struct Adjacency {
     pub(crate) session: EstablishedSession,
     pub(crate) socket: TcpStream,
     pub(crate) expires: Instant,
+    attempt_until: Instant,
     pub(crate) peer: Core,
     pub(crate) remote_lsa_expiry: u64,
     remote_lsa_id: [u8; 32],
@@ -354,6 +375,17 @@ impl<'a> MeshProbe<'a> {
         admission: &Admission,
         route: Option<(Instant, [u8; 32])>,
     ) -> Result<Adjacency, Error> {
+        self.dial_for(candidates, outer, admission, HopPurpose::Business(route))
+    }
+
+    fn dial_for(
+        &mut self,
+        candidates: &[Candidate<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+        purpose: HopPurpose,
+    ) -> Result<Adjacency, Error> {
+        let route = purpose.route();
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
         }
@@ -374,7 +406,12 @@ impl<'a> MeshProbe<'a> {
             {
                 return Err(Error::Identity);
             }
-            let score = neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
+            let score = match purpose {
+                HopPurpose::Business(_) => {
+                    neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?
+                }
+                HopPurpose::Directory => (0, 0),
+            };
             ordered.push((score.0, score.1, peer.id, peer, candidate.target));
         }
         ordered.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2));
@@ -441,7 +478,7 @@ impl<'a> MeshProbe<'a> {
             })?;
             let raw = &received[1..];
             let (remote, now) = self.verify_remote_lsa(&peer, Some(raw), false)?;
-            let changed = match self.check_hop_advertisement(&remote, id, now, route) {
+            let changed = match self.check_hop_advertisement(&remote, id, now, purpose) {
                 Ok(()) => false,
                 Err(Error::TopologyChanged) => true,
                 Err(e) => return Err(e),
@@ -463,6 +500,7 @@ impl<'a> MeshProbe<'a> {
                 session,
                 socket,
                 expires,
+                attempt_until: deadline,
                 peer,
                 remote_lsa_expiry,
                 remote_lsa_id: remote.object_id(),
@@ -510,6 +548,24 @@ impl<'a> MeshProbe<'a> {
         admission: &Admission,
         route: Option<(Instant, [u8; 32])>,
     ) -> Result<Adjacency, Error> {
+        self.accept_for(
+            tcp,
+            signed_peer_identity,
+            outer,
+            admission,
+            HopPurpose::Business(route),
+        )
+    }
+
+    fn accept_for(
+        &mut self,
+        tcp: TcpStream,
+        signed_peer_identity: &[u8],
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+        purpose: HopPurpose,
+    ) -> Result<Adjacency, Error> {
+        let route = purpose.route();
         let now = effective_utc(self.status)?;
         let peer = Core::from_object(
             &self
@@ -521,7 +577,9 @@ impl<'a> MeshProbe<'a> {
         if peer.id == self.local.id {
             return Err(Error::Identity);
         }
-        neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
+        if matches!(purpose, HopPurpose::Business(_)) {
+            neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
+        }
         let mut deadline = self.deadline(&peer)?;
         if let Some((route_deadline, _)) = route {
             deadline = deadline.min(route_deadline);
@@ -559,7 +617,7 @@ impl<'a> MeshProbe<'a> {
             recv_control(session, ControlType::Lsa)
         })?;
         let (remote, now) = self.verify_remote_lsa(&peer, Some(&received[1..]), false)?;
-        let changed = match self.check_hop_advertisement(&remote, peer.id, now, route) {
+        let changed = match self.check_hop_advertisement(&remote, peer.id, now, purpose) {
             Ok(()) => false,
             Err(Error::TopologyChanged) => true,
             Err(e) => return Err(e),
@@ -590,6 +648,7 @@ impl<'a> MeshProbe<'a> {
             session: accepted.session,
             socket,
             expires,
+            attempt_until: deadline,
             peer,
             remote_lsa_expiry,
             remote_lsa_id: remote.object_id(),
@@ -702,7 +761,11 @@ impl<'a> MeshProbe<'a> {
         if let Some(raw) = signed {
             match self.trust.verify_core_lsa(raw, core.id, now) {
                 Ok(object) => {
-                    self.remote_lsas.insert(core.id, object.clone());
+                    if !object.is_duplicate() || !self.remote_lsas.contains_key(&core.id) {
+                        self.remote_lsas.insert(core.id, object.clone());
+                    } else if use_directory {
+                        return Ok((self.remote_lsas[&core.id].clone(), now));
+                    }
                     return Ok((object, now));
                 }
                 Err(ManagementError::StaleSequence) if use_directory => (),
@@ -714,7 +777,10 @@ impl<'a> MeshProbe<'a> {
         // A missing seed or a still-valid, authenticated older seed can use
         // the directory head. Neither an invalid seed nor a poisoned/expired
         // head can extend authority or resurrect an older route.
-        let head = self.remote_lsas.get(&core.id).ok_or(Error::Lsa)?;
+        let head = self
+            .remote_lsas
+            .get(&core.id)
+            .ok_or(Error::DirectoryPending)?;
         if !self.trust.is_current_core_lsa(core.id, head.object_id()) {
             return Err(Error::Lsa);
         }
@@ -727,13 +793,15 @@ impl<'a> MeshProbe<'a> {
         remote: &VerifiedObject,
         id: u8,
         now: u64,
-        route: Option<(Instant, [u8; 32])>,
+        purpose: HopPurpose,
     ) -> Result<(), Error> {
         let lsa = lsa(remote, id, now)?;
-        if route.is_some_and(|(_, expected)| expected != remote.object_id()) {
-            return Err(Error::TopologyChanged);
+        if let HopPurpose::Business(route) = purpose {
+            if route.is_some_and(|(_, expected)| expected != remote.object_id()) {
+                return Err(Error::TopologyChanged);
+            }
+            neighbor(lsa, self.local.id)?;
         }
-        neighbor(lsa, self.local.id)?;
         Ok(())
     }
 

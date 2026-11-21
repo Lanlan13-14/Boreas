@@ -40,7 +40,7 @@ mod linux {
     use boreas_tun::linux::{LinuxTunDevice, LinuxTunQueue};
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
-        mesh_probe::{Error, MeshProbe, utc_now},
+        mesh_probe::{Candidate, Error, MeshProbe, utc_now},
         mesh_route::{DirectoryCore, RouteLocator},
         packet_path::{MAX_MTU, MIN_MTU},
         resource::{Admission, Limits},
@@ -57,6 +57,7 @@ mod linux {
     const MAX_ROUTES: usize = 3;
     const POLL: Duration = Duration::from_millis(50);
     const RETRY: Duration = Duration::from_millis(500);
+    const DIRECTORY_POLL: Duration = Duration::from_secs(5);
     const MAX_PEM: usize = 64 * 1024;
 
     #[derive(Deserialize)]
@@ -75,6 +76,19 @@ mod linux {
         tun: Option<String>,
         mtu: Option<usize>,
         routes: Vec<Route>,
+        #[serde(default)]
+        directory: Vec<DirectoryLink>,
+    }
+
+    // Strictly lower slot initiates, higher slot listens; prohibiting reverse
+    // edges avoids circular waits in the single-owner runtime.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DirectoryLink {
+        peer: u8,
+        listen: Option<SocketAddr>,
+        next: Option<SocketAddr>,
+        tls_name: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -158,6 +172,25 @@ mod linux {
                     return Err("invalid or duplicate dedicated mesh listener/next target".into());
                 }
             }
+            let mut adjacent = BTreeSet::new();
+            for d in &self.directory {
+                let outgoing = local < d.peer;
+                if d.peer == local
+                    || !peers.contains(&d.peer)
+                    || !adjacent.insert(d.peer)
+                    || d.listen.is_some() == outgoing
+                    || d.next.is_some() != outgoing
+                    || d.tls_name.is_some() != outgoing
+                    || d.listen
+                        .is_some_and(|a| a.port() == 0 || !listens.insert(a))
+                    || d.next.is_some_and(|a| {
+                        a.port() == 0 || a.ip().is_unspecified() || !targets.insert(a)
+                    })
+                    || d.tls_name.as_deref().is_some_and(|s| !valid_tls_name(s))
+                {
+                    return Err("invalid or duplicate dedicated directory link".into());
+                }
+            }
             Ok(())
         }
     }
@@ -207,13 +240,16 @@ mod linux {
     }
 
     fn target(route: &Route) -> Option<ClientTarget> {
-        let name = route.tls_name.clone()?;
-        Some(ClientTarget {
-            address: route.next?,
-            ws_host: name.clone(),
-            tls_server_name: name,
+        Some(client_target(route.next?, route.tls_name.as_deref()?))
+    }
+
+    fn client_target(address: SocketAddr, name: &str) -> ClientTarget {
+        ClientTarget {
+            address,
+            ws_host: name.into(),
+            tls_server_name: name.into(),
             path: "/tunnel".into(),
-        })
+        }
     }
 
     fn clock() -> Result<u64, String> {
@@ -423,10 +459,45 @@ mod linux {
             Some(pem) => OpenSslOuterTlsConnector::with_root_certificates(pem),
             None => OpenSslOuterTlsConnector::web_pki(),
         };
-        if !matches!(spec.mode, Mode::Destination) {
+        let mut directory_listeners = Vec::new();
+        let mut directory_targets = Vec::new();
+        for d in &spec.directory {
+            let i = spec
+                .peers
+                .iter()
+                .position(|&id| id == d.peer)
+                .ok_or("missing directory peer")?;
+            if let Some(addr) = d.listen {
+                let listener = TcpListener::bind(addr)
+                    .map_err(|e| format!("mesh directory bind {addr}: {}", e.kind()))?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|_| "mesh directory listener setup failed")?;
+                directory_listeners.push((i, listener));
+            } else {
+                directory_targets.push((
+                    i,
+                    client_target(
+                        d.next.ok_or("missing directory target")?,
+                        d.tls_name.as_deref().ok_or("missing directory TLS name")?,
+                    ),
+                ));
+            }
+        }
+        if !matches!(spec.mode, Mode::Destination) || !directory_targets.is_empty() {
             outer().map_err(|e| format!("mesh outer client credential: {e}"))?;
         }
-        let mut acceptor = None;
+        let acceptor = if !matches!(spec.mode, Mode::Source) || !directory_listeners.is_empty() {
+            Some(
+                OpenSslOuterTlsAcceptor::from_pem(
+                    &read(&dir.join("outer.pem"), MAX_PEM)?,
+                    &read_material(&dir.join("outer.key"), 16 * 1024, Some(owner()))?,
+                )
+                .map_err(|e| format!("mesh outer server credential: {e}"))?,
+            )
+        } else {
+            None
+        };
         let mut listeners = Vec::new();
         let targets: Vec<_> = spec.routes.iter().map(target).collect();
         let locators: Vec<_> = spec
@@ -450,6 +521,9 @@ mod linux {
         let mut ready = false;
         let mut cursor = 0;
         let mut refresh_at = Instant::now();
+        let mut dir_cursor = 0;
+        let mut prefer_directory_dial = false;
+        let mut dir_poll = vec![Instant::now(); directory_targets.len()];
         let mut last_loss = None;
         let mut preferred = None;
         let expected_ids: BTreeSet<_> = spec
@@ -464,7 +538,23 @@ mod linux {
             } else {
                 accept(&listeners, &mut cursor)?
             };
-            if ready && incoming.is_none() && !listeners.is_empty() && Instant::now() < refresh_at {
+            let due = dir_poll
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, t)| *t)
+                .and_then(|(i, due)| (Instant::now() >= *due).then_some(i));
+            let dir_incoming = if due.is_some() && prefer_directory_dial {
+                None
+            } else {
+                accept(&directory_listeners, &mut dir_cursor)?
+            };
+            if ready
+                && incoming.is_none()
+                && !listeners.is_empty()
+                && dir_incoming.is_none()
+                && due.is_none()
+                && Instant::now() < refresh_at
+            {
                 thread::sleep(POLL);
                 continue;
             }
@@ -477,9 +567,72 @@ mod linux {
                     seed_lsa: entry.lsa.as_deref(),
                 })
                 .collect();
-            let graph = probe
-                .verify_directory_graph(&local, &signed)
-                .map_err(|e| format!("mesh signed graph: {e:?}"))?;
+            if !spec.directory.is_empty() {
+                for (entry, &id) in signed.iter().zip(&spec.peers) {
+                    if probe
+                        .directory_member_id(entry.identity)
+                        .map_err(|e| format!("mesh directory member: {e:?}"))?
+                        != id
+                    {
+                        return Err(
+                            "signed directory slot differs from configured membership".into()
+                        );
+                    }
+                }
+            }
+            let previous_graph = match probe.verify_directory_graph(&local, &signed) {
+                Ok(graph) => Ok(graph),
+                Err(Error::DirectoryPending) => Err(Error::DirectoryPending),
+                Err(e) => return Err(format!("mesh signed graph: {e:?}")),
+            };
+            let members: Vec<_> = signed.iter().map(|entry| entry.identity).collect();
+            let mut synced = false;
+            if let Some((i, socket)) = dir_incoming {
+                prefer_directory_dial = true;
+                let result = probe.accept_directory(
+                    socket,
+                    members[i],
+                    &members,
+                    acceptor
+                        .as_ref()
+                        .ok_or("directory listener credential missing")?,
+                    &admission,
+                );
+                if let Err(e) = result {
+                    eprintln!("mesh directory listener refused/closed exchange: {e:?}");
+                }
+                synced = true;
+            } else if let Some(poll) = due {
+                prefer_directory_dial = false;
+                let (i, target) = &directory_targets[poll];
+                let result = probe.sync_directory(
+                    Candidate {
+                        target,
+                        signed_identity: members[*i],
+                    },
+                    &members,
+                    &outer,
+                    &admission,
+                );
+                dir_poll[poll] = Instant::now() + DIRECTORY_POLL;
+                if let Err(e) = result {
+                    eprintln!("mesh directory dial refused/closed exchange: {e:?}");
+                }
+                synced = true;
+            }
+            let graph = if synced {
+                probe.verify_directory_graph(&local, &signed)
+            } else {
+                previous_graph
+            };
+            let graph = match graph {
+                Ok(graph) => graph,
+                Err(Error::DirectoryPending) if !spec.directory.is_empty() => {
+                    thread::sleep(POLL);
+                    continue;
+                }
+                Err(e) => return Err(format!("mesh signed graph: {e:?}")),
+            };
             if !graph.core_ids().eq(expected_ids.iter().copied()) {
                 return Err("signed mesh graph slots differ from configured membership".into());
             }
@@ -494,17 +647,14 @@ mod linux {
                     }
                 }
                 if !usable {
-                    return Err("no authorized route at mesh startup".into());
+                    if spec.directory.is_empty() {
+                        return Err("no authorized route at mesh startup".into());
+                    }
+                    thread::sleep(POLL);
+                    continue;
                 }
                 tun = open_tun(&spec)?;
                 if !matches!(spec.mode, Mode::Source) {
-                    acceptor = Some(
-                        OpenSslOuterTlsAcceptor::from_pem(
-                            &read(&dir.join("outer.pem"), MAX_PEM)?,
-                            &read_material(&dir.join("outer.key"), 16 * 1024, Some(owner()))?,
-                        )
-                        .map_err(|e| format!("mesh outer server credential: {e}"))?,
-                    );
                     for (i, route) in spec.routes.iter().enumerate() {
                         let addr = route.listen.ok_or("mesh listener missing")?;
                         let listener = TcpListener::bind(addr)

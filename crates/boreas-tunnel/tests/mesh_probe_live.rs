@@ -1108,3 +1108,287 @@ fn original_identity_revocation_is_relayed_between_distinct_cores_and_invalidate
         vec![evidence.as_slice()]
     );
 }
+
+#[test]
+fn directory_converges_over_two_authenticated_hops_and_gates_business() {
+    use boreas_tunnel::mesh_route::DirectoryCore;
+
+    let f = &Fixture::new();
+    let mut a_status = f.status(1);
+    let mut b_status = f.status(2);
+    let mut c_status = f.status(3);
+    let mut a = f.probe(1, &mut a_status);
+    let mut b = f.probe(2, &mut b_status);
+    let mut c = f.probe(3, &mut c_status);
+    // Real A--B--C only. No direct A--C locator or remote LSA seed.
+    let chain = |id: usize, neighbors: &[u8]| {
+        change_lsa(f.node(id), |obj| {
+            obj.seq += 1;
+            let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+                unreachable!()
+            };
+            lsa.seq = obj.seq;
+            lsa.neighbors
+                .retain(|n| neighbors.contains(&n.peer_core_id));
+        })
+    };
+    let a_lsa = chain(1, &[2]);
+    let b_lsa = chain(2, &[1, 3]);
+    let c_lsa = chain(3, &[2]);
+    for (probe, raw) in [(&mut a, &a_lsa), (&mut b, &b_lsa), (&mut c, &c_lsa)] {
+        probe
+            .refresh_runtime_authority(&f.status, None, raw)
+            .unwrap();
+    }
+    let identities = [1, 2, 3].map(|id| f.node(id).identity.as_slice());
+    let a_members = [identities[1], identities[2]];
+    let b_members = [identities[0], identities[2]];
+    let c_members = [identities[0], identities[1]];
+    let [a_inputs, b_inputs, c_inputs] = [a_members, b_members, c_members].map(|members| {
+        members.map(|identity| DirectoryCore {
+            identity,
+            seed_lsa: None,
+        })
+    });
+    for (probe, local, members) in [
+        (&mut a, identities[0], &a_inputs),
+        (&mut b, identities[1], &b_inputs),
+        (&mut c, identities[2], &c_inputs),
+    ] {
+        assert!(matches!(
+            probe.verify_directory_graph(local, members),
+            Err(Error::DirectoryPending)
+        ));
+    }
+
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let exchange = |from: &mut MeshProbe<'_>,
+                    to: &mut MeshProbe<'_>,
+                    first: usize,
+                    second: usize,
+                    from_members: &[&[u8]],
+                    to_members: &[&[u8]]| {
+        let (listener, target) = listener();
+        let from_admission = route_admission();
+        let to_admission = route_admission();
+        thread::scope(|scope| {
+            let acceptor = scope.spawn(|| {
+                to.accept_directory(
+                    accept_socket(listener),
+                    identities[first - 1],
+                    to_members,
+                    &outer_for(f, second),
+                    &to_admission,
+                )
+            });
+            let result = from.sync_directory(
+                Candidate {
+                    target: &target,
+                    signed_identity: identities[second - 1],
+                },
+                from_members,
+                &outer,
+                &from_admission,
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(acceptor.join().unwrap(), Ok(()));
+        });
+        for admission in [&from_admission, &to_admission] {
+            let snap = admission.snapshot().unwrap();
+            assert_eq!((snap.handshakes, snap.authenticated, snap.bytes), (0, 0, 0));
+        }
+    };
+    exchange(&mut a, &mut b, 1, 2, &a_members, &b_members);
+    assert!(matches!(
+        a.verify_directory_graph(identities[0], &a_inputs),
+        Err(Error::DirectoryPending)
+    ));
+    exchange(&mut b, &mut c, 2, 3, &b_members, &c_members);
+    exchange(&mut a, &mut b, 1, 2, &a_members, &b_members);
+    let a_old = a.verify_directory_graph(identities[0], &a_inputs).unwrap();
+    assert_eq!(a_old.signed_lsa(3), Some(c_lsa.as_slice()));
+    for (probe, local, members) in [
+        (&mut a, identities[0], &a_inputs),
+        (&mut b, identities[1], &b_inputs),
+        (&mut c, identities[2], &c_inputs),
+    ] {
+        let graph = probe.verify_directory_graph(local, members).unwrap();
+        assert!(graph.core_ids().eq(1..=3));
+        for (id, raw) in [(1, &a_lsa), (2, &b_lsa), (3, &c_lsa)] {
+            assert_eq!(graph.signed_lsa(id), Some(raw.as_slice()));
+        }
+        graph.authorize_path(probe, &[1, 2, 3]).unwrap();
+    }
+
+    // Use the learned directory, never fixed-route or operator-seeded input,
+    // to authorize a real nested TLS business circuit on separate sockets.
+    let b_graph = b.verify_directory_graph(identities[1], &b_inputs).unwrap();
+    let c_graph = c.verify_directory_graph(identities[2], &c_inputs).unwrap();
+    let (b_listener, b_target) = listener();
+    let (c_listener, c_target) = listener();
+    let path = &[1, 2, 3];
+    thread::scope(|scope| {
+        use boreas_tunnel::mesh_route::RouteLocator;
+        use std::io::{Read, Write};
+        let b = &mut b;
+        let c = &mut c;
+        let outer = &outer;
+        let relay = scope.spawn(move || {
+            b_graph.relay(
+                b,
+                path,
+                accept_socket(b_listener),
+                &c_target,
+                (&outer_for(f, 2), outer),
+                &route_admission(),
+            )
+        });
+        let receiver = scope.spawn(move || {
+            c_graph.respond(
+                c,
+                path,
+                accept_socket(c_listener),
+                &outer_for(f, 3),
+                &route_admission(),
+                |circuit| {
+                    let mut req = [0; 4];
+                    circuit.read_exact(&mut req)?;
+                    assert_eq!(&req, b"ping");
+                    circuit.write_all(b"pong")?;
+                    Ok(circuit.circuit_id())
+                },
+            )
+        });
+        let id = a_old
+            .connect(
+                &mut a,
+                &[RouteLocator {
+                    path,
+                    target: &b_target,
+                }],
+                outer,
+                &route_admission(),
+                |_, circuit| {
+                    circuit.write_all(b"ping")?;
+                    let mut reply = [0; 4];
+                    circuit.read_exact(&mut reply)?;
+                    assert_eq!(&reply, b"pong");
+                    Ok(circuit.circuit_id())
+                },
+            )
+            .unwrap();
+        assert_eq!(receiver.join().unwrap().unwrap(), id);
+        assert_eq!(relay.join().unwrap().unwrap().circuit_id, id);
+    });
+
+    // C withdraws its only advertised business edge. The separate,
+    // preprovisioned control adjacency still carries that signed withdrawal.
+    let withdrawn = change_lsa(f.node(3), |obj| {
+        obj.seq = 3;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = obj.seq;
+        lsa.neighbors.clear();
+    });
+    c.refresh_runtime_authority(&f.status, None, &withdrawn)
+        .unwrap();
+    exchange(&mut b, &mut c, 2, 3, &b_members, &c_members);
+    exchange(&mut a, &mut b, 1, 2, &a_members, &b_members);
+    assert!(matches!(
+        a_old.authorize_path(&mut a, &[1, 2, 3]),
+        Err(Error::Lsa)
+    ));
+    let latest = a.verify_directory_graph(identities[0], &a_inputs).unwrap();
+    assert_eq!(latest.signed_lsa(3), Some(withdrawn.as_slice()));
+    assert!(matches!(
+        latest.authorize_path(&mut a, &[1, 2, 3]),
+        Err(Error::NoRoute)
+    ));
+
+    // A different healthy B replica knows only C's earlier, valid head. When
+    // this is replayed over a new authenticated hop, A independently retains
+    // the newer original envelope and the old business path remains barred.
+    let mut replay_status = f.named_status(2, "replay.state");
+    let mut replay_b = f.probe(2, &mut replay_status);
+    replay_b
+        .refresh_runtime_authority(&f.status, None, &b_lsa)
+        .unwrap();
+    let seeds = [
+        DirectoryCore {
+            identity: identities[0],
+            seed_lsa: Some(&a_lsa),
+        },
+        DirectoryCore {
+            identity: identities[2],
+            seed_lsa: Some(&c_lsa),
+        },
+    ];
+    replay_b
+        .verify_directory_graph(identities[1], &seeds)
+        .unwrap();
+    exchange(&mut replay_b, &mut a, 2, 1, &b_members, &a_members);
+    let latest = a.verify_directory_graph(identities[0], &a_inputs).unwrap();
+    assert_eq!(latest.signed_lsa(3), Some(withdrawn.as_slice()));
+    assert!(matches!(
+        latest.authorize_path(&mut a, &[1, 2, 3]),
+        Err(Error::NoRoute)
+    ));
+
+    // Disjoint replicas may each have accepted a different, valid C-signed
+    // version 3. The receiving Core freezes C instead of taking first arrival.
+    let fork = change_lsa(f.node(3), |obj| {
+        obj.seq = 3;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = obj.seq;
+    });
+    let mut fork_status = f.named_status(2, "fork.state");
+    let mut fork_b = f.probe(2, &mut fork_status);
+    fork_b
+        .refresh_runtime_authority(&f.status, None, &b_lsa)
+        .unwrap();
+    fork_b
+        .verify_directory_graph(identities[1], &[
+            DirectoryCore {
+                identity: identities[0],
+                seed_lsa: Some(&a_lsa),
+            },
+            DirectoryCore {
+                identity: identities[2],
+                seed_lsa: Some(&fork),
+            },
+        ])
+        .unwrap();
+    let (socket, target) = listener();
+    thread::scope(|scope| {
+        let acceptor = scope.spawn(|| {
+            a.accept_directory(
+                accept_socket(socket),
+                identities[1],
+                &a_members,
+                &outer_for(f, 1),
+                &route_admission(),
+            )
+        });
+        let _ = fork_b.sync_directory(
+            Candidate {
+                target: &target,
+                signed_identity: identities[0],
+            },
+            &b_members,
+            &outer,
+            &route_admission(),
+        );
+        assert_eq!(acceptor.join().unwrap(), Err(Error::Lsa));
+    });
+    assert!(matches!(
+        a.verify_directory_graph(identities[0], &a_inputs),
+        Err(Error::Lsa)
+    ));
+    assert!(matches!(
+        latest.authorize_path(&mut a, &[1, 2, 3]),
+        Err(Error::Lsa)
+    ));
+}

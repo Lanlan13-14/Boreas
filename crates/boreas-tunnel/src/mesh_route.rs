@@ -89,27 +89,40 @@ impl MeshProbe<'_> {
         if !self.is_exact_local(&local) {
             return Err(Error::Identity);
         }
+        let mut seen = 1u32 << local.id;
         let mut vertices = BTreeMap::from([(local.id, Vertex {
             core: local,
             identity: local_identity,
             lsa: self.local_lsa().clone(),
         })]);
+        let mut pending = false;
         for (identity, seed) in others {
             let core = self.verified_core(identity)?;
             // Verify before rejecting duplicate IDs so a signed fork poisons
             // the replay slot in the long-lived owner, not merely this import.
-            let (lsa, _) = self.verify_remote_lsa(&core, seed, use_directory)?;
-            if vertices.contains_key(&core.id) {
+            let head = self.verify_remote_lsa(&core, seed, use_directory);
+            let bit = 1u32 << core.id;
+            if seen & bit != 0 {
                 return Err(Error::Lsa);
             }
-            vertices.insert(core.id, Vertex {
-                core,
-                identity,
-                lsa,
-            });
+            seen |= bit;
+            match head {
+                Ok((lsa, _)) => {
+                    vertices.insert(core.id, Vertex {
+                        core,
+                        identity,
+                        lsa,
+                    });
+                }
+                Err(Error::DirectoryPending) => pending = true,
+                Err(e) => return Err(e),
+            }
         }
         for v in vertices.values() {
             self.route_lsa_deadline(&v.core, v.lsa.object_id(), v.lsa.valid_until())?;
+        }
+        if pending {
+            return Err(Error::DirectoryPending);
         }
         Ok(VerifiedGraph {
             local: self.local(),
@@ -122,6 +135,12 @@ impl VerifiedGraph<'_> {
     /// Verified slots, independent of untrusted material filenames.
     pub fn core_ids(&self) -> impl Iterator<Item = u8> + '_ {
         self.vertices.keys().copied()
+    }
+
+    /// Original envelope captured by this snapshot, for inspection only.
+    /// A caller must still use a route authorization method for current authority.
+    pub fn signed_lsa(&self, id: u8) -> Option<&[u8]> {
+        Some(self.vertices.get(&id)?.lsa.raw_signed_object())
     }
 
     fn vertex(&self, id: u8) -> Result<&Vertex<'_>, Error> {
