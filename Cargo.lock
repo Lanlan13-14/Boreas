@@ -21,6 +21,7 @@ dependencies = [
  "boreas-crypto",
  "boreas-pki",
  "boreas-proto",
+ "boreas-supervisor",
  "boreas-tun",
  "boreas-tunnel",
  "libc",

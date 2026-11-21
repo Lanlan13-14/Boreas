@@ -477,6 +477,25 @@ mod linux_daemon {
         }
     }
 
+    /// Only trial children get the private supervisor socket. TUN readiness is
+    /// a fact about this process's verified queue, not host route convergence.
+    fn report_trial_ready(tun: &TunEndpoint) -> Result<(), String> {
+        use boreas_supervisor::ready_client::{DAEMON_STATE_SCHEMA, SOCKET_ENV, TunStatus, report_ready};
+
+        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
+            return Ok(());
+        };
+        let status = match tun {
+            TunEndpoint::Real { io, .. } => {
+                io.queue.verify().map_err(|e| format!("daemon: trial TUN queue failed verification: {e}"))?;
+                TunStatus::Ready
+            }
+            TunEndpoint::Virtual { .. } => TunStatus::Absent,
+        };
+        report_ready(Path::new(&socket), DAEMON_STATE_SCHEMA, 1, status)
+            .map_err(|e| format!("daemon: trial readiness handshake failed: {e}"))
+    }
+
     fn daemon_capabilities() -> RuntimeCapabilities {
         RuntimeCapabilities {
             dns_tcp: false,
@@ -2408,6 +2427,8 @@ mod linux_daemon {
             .map_err(|e| format!("daemon serve: policy window failed before accept: {e}"))?;
         lock_gate(&status_store, status_path)
             .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
+        // A Core is ready to accept a peer; this does not claim a peer circuit.
+        report_trial_ready(tun)?;
 
         let wait_limit = max_seconds.map(Duration::from_secs).unwrap_or(ACCEPT_WAIT);
         let accept_deadline = Instant::now() + wait_limit;
@@ -2956,6 +2977,15 @@ mod linux_daemon {
             STATUS_RECHECK_INTERVAL,
             Arc::clone(&revocations),
         );
+        if mode_name == "connect" && packets_before == 0 && expected.is_none() {
+            // The initial Edge circuit is authenticated and has a bound packet
+            // path. Future promotions must never answer the one-shot challenge.
+            policy_window.check()?;
+            if let Some(reason) = watchdog.fault() {
+                return Err(reason);
+            }
+            report_trial_ready(tun)?;
+        }
 
         let mut io_timing = (std::env::var_os("BOREAS_DIAGNOSTIC_TIMING").as_deref()
             == Some(std::ffi::OsStr::new("1")))
