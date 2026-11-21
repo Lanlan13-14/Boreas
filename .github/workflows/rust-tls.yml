@@ -843,6 +843,21 @@ jobs:
           sudo -E timeout --kill-after=5s 120s bash tools/release/netns_daemon_smoke.sh \
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-private-dns.log
+      - name: Verify four-process Core routing and failover on real TUN
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || github.ref == 'refs/heads/fix/v111-integration')
+        timeout-minutes: 5
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p boreas-cli --features openssl-inner-tls --test mesh_run_netns \
+            --no-run --message-format=json > mesh-run-build.jsonl
+          test_binary=$(python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads, sys.stdin) if x.get("reason")=="compiler-artifact" and x["target"]["name"]=="mesh_run_netns" and x.get("executable")))' < mesh-run-build.jsonl)
+          test -x "$test_binary"
+          sudo --preserve-env=OPENSSL_CONF,BOREAS_OPENSSL_BIN timeout --kill-after=5s 120s \
+            "$test_binary" --ignored --nocapture --test-threads=1 2>&1 | tee rust-tls-mesh-runtime.log
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored' rust-tls-mesh-runtime.log
       - name: Record performance runner and exact binary
         if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || github.ref == 'refs/heads/fix/v111-integration')
         run: |
@@ -964,6 +979,7 @@ jobs:
             rust-tls-supervisor-tests.log
             rust-tls-verified-systemd.log
             rust-tls-private-dns.log
+            rust-tls-mesh-runtime.log
             rust-tls-cli-tests.log
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log

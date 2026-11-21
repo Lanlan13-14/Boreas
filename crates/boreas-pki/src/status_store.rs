@@ -824,6 +824,13 @@ impl StatusStore {
             route: false,
             direct: false,
         };
+        #[cfg(target_os = "linux")]
+        if self.identity_trust.is_some() {
+            match self.identity_revoked(peer) {
+                Ok(revoked) => state.identity = revoked,
+                Err(_) => return PeerRevocation::Unknown(RevocationUnknown::Poisoned),
+            }
+        }
         for scope in &self.state.revocation.scopes {
             if scope.node_id != peer.node_id || scope.generation != peer.identity_generation {
                 continue;

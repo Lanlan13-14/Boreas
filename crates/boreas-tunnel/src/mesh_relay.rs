@@ -342,8 +342,23 @@ fn next_ready(
 pub fn with_fixed_endpoint<T>(
     probe: &mut MeshProbe<'_>,
     route: &FixedRoute,
-    mut hop: Adjacency,
+    hop: Adjacency,
     exchange: impl FnOnce(&mut E2eCircuit<'_>) -> Result<T, TunnelError>,
+) -> Result<T, Error> {
+    with_fixed_endpoint_io(probe, route, hop, |c, _| exchange(c))
+}
+
+pub(crate) struct EndpointIo<'a> {
+    pub socket: &'a TcpStream,
+    pub deadline: Instant,
+    pub check: &'a mut dyn FnMut() -> Result<(), TunnelError>,
+}
+
+pub(crate) fn with_fixed_endpoint_io<T>(
+    probe: &mut MeshProbe<'_>,
+    route: &FixedRoute,
+    mut hop: Adjacency,
+    exchange: impl FnOnce(&mut E2eCircuit<'_>, EndpointIo<'_>) -> Result<T, TunnelError>,
 ) -> Result<T, Error> {
     route.check_owner(probe)?;
     let initiator = route.position == 0;
@@ -411,13 +426,21 @@ pub fn with_fixed_endpoint<T>(
         if !initiator {
             circuit.write_all(&binding)?;
         }
-        probe
-            .check_route_utc(&route.members, remote_expiry)
-            .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))?;
-        let result = exchange(&mut circuit)?;
-        probe
-            .check_route_utc(&route.members, remote_expiry)
-            .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))?;
+        let mut check = || {
+            if Instant::now() >= deadline {
+                return Err(TunnelError::Timeout);
+            }
+            probe
+                .check_route_utc(&route.members, remote_expiry)
+                .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
+        };
+        check()?;
+        let result = exchange(&mut circuit, EndpointIo {
+            socket: &hop.socket,
+            deadline,
+            check: &mut check,
+        })?;
+        check()?;
         if initiator {
             circuit.finish_dedicated()?;
         } else {

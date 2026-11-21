@@ -17,7 +17,7 @@ pub fn run(args: &[String]) -> (u8, String, String) {
 }
 
 #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
-mod linux {
+pub(super) mod linux {
     use std::{
         fs::{File, OpenOptions},
         io::{self, Read},
@@ -49,7 +49,7 @@ mod linux {
         read_material(path, max, None)
     }
 
-    fn read_material(
+    pub(in crate::node) fn read_material(
         path: &Path,
         max: usize,
         secret_owner: Option<u32>,
@@ -73,10 +73,11 @@ mod linux {
         if !meta.is_file() || meta.len() == 0 || meta.len() > max as u64 {
             return Err("invalid mesh material file".into());
         }
-        if let Some(owner) = secret_owner
-            && ((meta.uid() != owner && meta.uid() != 0) || meta.mode() & 0o077 != 0)
-        {
-            return Err("unsafe mesh private key owner or permissions".into());
+        // SAFETY: geteuid is a pure getter for this process.
+        let owner = unsafe { libc::geteuid() };
+        let (owner, forbidden) = secret_owner.map_or((owner, 0o022), |uid| (uid, 0o077));
+        if (meta.uid() != owner && meta.uid() != 0) || meta.mode() & forbidden != 0 {
+            return Err("unsafe mesh material owner or permissions".into());
         }
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         file.take(max as u64 + 1)

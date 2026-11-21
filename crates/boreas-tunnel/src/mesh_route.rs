@@ -12,7 +12,7 @@ use crate::{
     ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
     e2e::E2eCircuit,
     mesh_probe::{ATTEMPT_LIMIT, Candidate, Core, Error, MeshProbe},
-    mesh_relay::{FixedRoute, Forwarded, forward_fixed, with_fixed_endpoint},
+    mesh_relay::{EndpointIo, FixedRoute, Forwarded, forward_fixed, with_fixed_endpoint_io},
     resource::Admission,
     ws::WsError,
 };
@@ -85,6 +85,11 @@ impl MeshProbe<'_> {
 }
 
 impl VerifiedGraph<'_> {
+    /// Verified slots, independent of untrusted material filenames.
+    pub fn core_ids(&self) -> impl Iterator<Item = u8> + '_ {
+        self.vertices.keys().copied()
+    }
+
     fn vertex(&self, id: u8) -> Result<&Vertex<'_>, Error> {
         self.vertices.get(&id).ok_or(Error::NoRoute)
     }
@@ -202,6 +207,24 @@ impl VerifiedGraph<'_> {
         admission: &Admission,
         mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>) -> Result<T, TunnelError>,
     ) -> Result<T, Error> {
+        self.connect_io(probe, locators, outer, (admission, None), |path, c, _| {
+            exchange(path, c)
+        })
+        .map_err(|e| match e {
+            Error::ConfirmedPathLost(cause) => Error::Transport(cause),
+            other => other,
+        })
+    }
+
+    pub(crate) fn connect_io<T>(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        locators: &[RouteLocator<'_>],
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        budget: (&Admission, Option<u8>),
+        mut exchange: impl FnMut(&[u8], &mut E2eCircuit<'_>, EndpointIo<'_>) -> Result<T, TunnelError>,
+    ) -> Result<T, Error> {
+        let (admission, preferred) = budget;
         self.owner(probe)?;
         if locators.is_empty() || locators.len() > MAX_ROUTE_ATTEMPTS {
             return Err(Error::NoRoute);
@@ -237,7 +260,8 @@ impl VerifiedGraph<'_> {
                 ranked.push((score, locator));
             }
         }
-        ranked.sort_unstable_by_key(|entry| entry.0);
+        ranked
+            .sort_unstable_by_key(|(score, locator)| (preferred != Some(locator.path[1]), *score));
         let mut loss = Error::NoRoute;
         for (_, locator) in ranked {
             // Recheck all route facts after the previous circuit was dropped.
@@ -263,8 +287,8 @@ impl VerifiedGraph<'_> {
                 other => other?,
             };
             let mut reported_loss = false;
-            let result = with_fixed_endpoint(probe, &route, hop, |c| {
-                let result = exchange(locator.path, c);
+            let result = with_fixed_endpoint_io(probe, &route, hop, |c, io| {
+                let result = exchange(locator.path, c, io);
                 reported_loss = result.as_ref().is_err_and(established_loss);
                 result
             });
@@ -278,7 +302,7 @@ impl VerifiedGraph<'_> {
                     for &id in locator.path {
                         self.check_vertex(probe, self.vertex(id)?)?;
                     }
-                    loss = Error::Transport(e);
+                    loss = Error::ConfirmedPathLost(e);
                 }
                 other => return other,
             }
@@ -337,6 +361,18 @@ impl VerifiedGraph<'_> {
         admission: &Admission,
         exchange: impl FnOnce(&mut E2eCircuit<'_>) -> Result<T, TunnelError>,
     ) -> Result<T, Error> {
+        self.respond_io(probe, path, incoming, outer, admission, |c, _| exchange(c))
+    }
+
+    pub(crate) fn respond_io<T>(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        path: &[u8],
+        incoming: TcpStream,
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+        exchange: impl FnOnce(&mut E2eCircuit<'_>, EndpointIo<'_>) -> Result<T, TunnelError>,
+    ) -> Result<T, Error> {
         let route = self.authorize_path(probe, path)?;
         if route.position + 1 != path.len() {
             return Err(Error::NoRoute);
@@ -349,7 +385,7 @@ impl VerifiedGraph<'_> {
             admission,
             Some(deadline),
         )?;
-        with_fixed_endpoint(probe, &route, left, exchange)
+        with_fixed_endpoint_io(probe, &route, left, exchange)
     }
 }
 

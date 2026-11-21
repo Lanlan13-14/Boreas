@@ -24,6 +24,9 @@ pub fn pki_usage() -> &'static str {
   boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role <core|edge> --home-core <1..16> --vip-octet <1..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]
   boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]
   boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>]
+  boreas pki core-request <new-private-dir> <net-id> <core> <issuer-generation> <validity-days>
+  boreas pki core-authorize <offline-ca-dir> <previous-roots> <core.request> <new-roots> <expected-core>
+  boreas pki core-sign-lsa <private-dir> <roots> <new-lsa> <core-generation> <seq> <ttl-seconds> [<peer:rtt-ms:loss-ppm>...]
   boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]
   boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE> [--record-state --state-file <ABSOLUTE> (--expect-first-use | --expect-seq <N> --expect-hash <64HEX>)]"
 }
@@ -40,10 +43,82 @@ pub fn run_pki_command(args: &[String]) -> Result<(), String> {
         "issue-node" => cmd_issue_node(&args[1..]),
         "sign-status" => cmd_sign_status(&args[1..]),
         "sign-policy" => cmd_sign_policy(&args[1..]),
+        #[cfg(target_os = "linux")]
+        "core-request" | "core-authorize" | "core-sign-lsa" => core_mesh(args),
         "verify-bundle" => cmd_verify_bundle(&args[1..]),
         "verify-policy" => cmd_verify_policy(&args[1..]),
         _ => Err("pki: unknown subcommand (run `boreas pki --help`)".to_string()),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
+fn core_mesh(args: &[String]) -> Result<(), String> {
+    use boreas_pki::provisioning::{core_mesh as provision, parse_net_id_hex};
+    use std::path::Path;
+
+    fn number<T: std::str::FromStr>(s: &str) -> Result<T, String> {
+        s.parse()
+            .map_err(|_| "pki mesh: invalid numeric input".into())
+    }
+    let now = now_utc_us()?;
+    let result = match args {
+        [command, out, net, core, generation, days] if command == "core-request" => {
+            let net = parse_net_id_hex(net).map_err(|_| "pki mesh: invalid network ID")?;
+            provision::init_core_request(
+                Path::new(out),
+                net,
+                number(core)?,
+                number(generation)?,
+                now,
+                number(days)?,
+            )
+        }
+        [command, ca, roots, request, out, expected_core] if command == "core-authorize" => {
+            provision::authorize_core(
+                Path::new(ca),
+                Path::new(roots),
+                Path::new(request),
+                Path::new(out),
+                number(expected_core)?,
+                now,
+            )
+        }
+        [
+            command,
+            keys,
+            roots,
+            out,
+            generation,
+            sequence,
+            seconds,
+            peers @ ..,
+        ] if command == "core-sign-lsa" && peers.len() <= 15 => {
+            let mut neighbors = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let mut values = peer.split(':');
+                let (Some(id), Some(rtt), Some(loss), None) =
+                    (values.next(), values.next(), values.next(), values.next())
+                else {
+                    return Err("pki mesh: expected peer:rtt-ms:loss-ppm".into());
+                };
+                neighbors.push((number(id)?, number(rtt)?, number(loss)?));
+            }
+            provision::sign_lsa(
+                Path::new(keys),
+                Path::new(roots),
+                Path::new(out),
+                &provision::LsaParams {
+                    now,
+                    core_generation: number(generation)?,
+                    sequence: number(sequence)?,
+                    ttl_seconds: number(seconds)?,
+                    neighbors: &neighbors,
+                },
+            )
+        }
+        _ => return Err("pki mesh: invalid arguments (see `boreas pki --help`)".into()),
+    };
+    result.map_err(|e| format!("pki mesh: {e}"))
 }
 
 #[cfg(feature = "openssl-inner-tls")]
