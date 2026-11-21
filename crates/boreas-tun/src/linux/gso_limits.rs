@@ -66,7 +66,9 @@ pub(super) fn configure(name: &str) -> io::Result<()> {
         1,
         index,
     );
-    for (attr, (kind, value)) in set[IFINFO_END..].chunks_exact_mut(8).zip(LIMITS) {
+    let (attributes, remainder) = set[IFINFO_END..].as_chunks_mut::<8>();
+    debug_assert!(remainder.is_empty());
+    for (attr, (kind, value)) in attributes.iter_mut().zip(LIMITS) {
         attr[..2].copy_from_slice(&8u16.to_ne_bytes());
         attr[2..4].copy_from_slice(&kind.to_ne_bytes());
         attr[4..8].copy_from_slice(&value.to_ne_bytes());
