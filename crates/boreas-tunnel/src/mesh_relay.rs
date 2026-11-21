@@ -48,6 +48,8 @@ impl FixedRoute {
         if let Some(until) = self.attempt_until {
             deadline = deadline.min(until);
         }
+        // An adjacent hop exchanging a newer LSA advances the same replay
+        // slot below; the snapshot then fails closed rather than mixing views.
         for (member, &(id, expiry)) in self.members.iter().zip(&self.advertisements) {
             deadline = deadline.min(probe.route_lsa_deadline(member, id, expiry)?);
         }
@@ -107,7 +109,7 @@ fn destination(members: &[Core]) -> PeerIdentity {
 
 impl FixedRoute {
     fn check_owner(&self, probe: &MeshProbe<'_>) -> Result<(), Error> {
-        if identity(&self.members[self.position]) != probe.local() {
+        if !probe.is_exact_local(&self.members[self.position]) {
             return Err(Error::Identity);
         }
         Ok(())

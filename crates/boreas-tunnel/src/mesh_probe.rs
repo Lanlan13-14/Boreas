@@ -407,6 +407,17 @@ impl<'a> MeshProbe<'a> {
         outer: &OpenSslOuterTlsAcceptor,
         admission: &Admission,
     ) -> Result<Adjacency, Error> {
+        self.accept_until(tcp, signed_peer_identity, outer, admission, None)
+    }
+
+    pub(crate) fn accept_until(
+        &mut self,
+        tcp: TcpStream,
+        signed_peer_identity: &[u8],
+        outer: &OpenSslOuterTlsAcceptor,
+        admission: &Admission,
+        route_deadline: Option<Instant>,
+    ) -> Result<Adjacency, Error> {
         let now = effective_utc(self.status)?;
         let peer = Core::from_object(
             &self
@@ -419,7 +430,13 @@ impl<'a> MeshProbe<'a> {
             return Err(Error::Identity);
         }
         neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
-        let deadline = self.deadline(&peer)?;
+        let mut deadline = self.deadline(&peer)?;
+        if let Some(route_deadline) = route_deadline {
+            deadline = deadline.min(route_deadline);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Status);
+        }
         let socket = tcp.try_clone().map_err(TunnelError::from)?;
         let inner = OpenSslAcceptor::from_pem_identity(self.pem, Policy::production_default())
             .map_err(|_| Error::Identity)?;
@@ -505,6 +522,10 @@ impl<'a> MeshProbe<'a> {
 
     pub(crate) fn local_lsa(&self) -> &VerifiedObject {
         &self.local_lsa
+    }
+
+    pub(crate) fn is_exact_local(&self, core: &Core) -> bool {
+        core.object_id == self.local.object_id && core.identity == self.local.identity
     }
 
     pub(crate) fn route_lsa_deadline(

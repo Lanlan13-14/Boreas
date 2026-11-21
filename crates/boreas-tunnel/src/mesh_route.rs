@@ -52,7 +52,7 @@ impl MeshProbe<'_> {
             return Err(Error::NoRoute);
         }
         let local = self.verified_core(local_identity)?;
-        if local.identity.peer_identity() != self.local() {
+        if !self.is_exact_local(&local) {
             return Err(Error::Identity);
         }
         let mut vertices = BTreeMap::from([(local.id, Vertex {
@@ -121,9 +121,6 @@ impl VerifiedGraph<'_> {
     ) -> Result<FixedRoute, Error> {
         self.owner(probe)?;
         if !(3..=MAX_ROUTE_CORES).contains(&ids.len())
-            || ids
-                .windows(2)
-                .any(|pair| self.edge(pair[0], pair[1]).is_none())
             || ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id))
         {
             return Err(Error::NoRoute);
@@ -137,7 +134,9 @@ impl VerifiedGraph<'_> {
             members.push(v.core.clone());
             advertisements.push(ad);
         }
-        if members[0].identity.node_id() >= members[ids.len() - 1].identity.node_id() {
+        if members[0].identity.node_id() >= members[ids.len() - 1].identity.node_id()
+            || self.rank(ids).is_none()
+        {
             return Err(Error::NoRoute);
         }
         let position = members
@@ -306,11 +305,13 @@ impl VerifiedGraph<'_> {
         if pos == 0 || pos + 1 >= path.len() {
             return Err(Error::NoRoute);
         }
-        let left = probe.accept(
+        let deadline = route.deadline(probe, &[])?;
+        let left = probe.accept_until(
             incoming,
             self.vertex(path[pos - 1])?.identity,
             outer.0,
             admission,
+            Some(deadline),
         )?;
         let deadline = route.deadline(probe, &[&left])?;
         let right = probe.dial_classified(
@@ -340,11 +341,13 @@ impl VerifiedGraph<'_> {
         if route.position + 1 != path.len() {
             return Err(Error::NoRoute);
         }
-        let left = probe.accept(
+        let deadline = route.deadline(probe, &[])?;
+        let left = probe.accept_until(
             incoming,
             self.vertex(path[path.len() - 2])?.identity,
             outer,
             admission,
+            Some(deadline),
         )?;
         with_fixed_endpoint(probe, &route, left, exchange)
     }
@@ -363,4 +366,34 @@ fn established_loss(error: &TunnelError) -> bool {
                 BrokenPipe | ConnectionAborted | ConnectionReset
             ))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CircuitReject, SessionReject};
+
+    #[test]
+    fn only_typed_established_path_loss_is_retryable() {
+        for error in [
+            TunnelError::Timeout,
+            TunnelError::Io(ErrorKind::Other),
+            TunnelError::Ws(WsError::BadStatus),
+            TunnelError::InnerTls("e2e handshake"),
+            TunnelError::Session(SessionReject::PeerIdentityMismatch),
+            TunnelError::Circuit(CircuitReject::ResetReceived),
+            TunnelError::Circuit(CircuitReject::OffsetMismatch),
+        ] {
+            let wrapped = std::io::Error::new(ErrorKind::InvalidData, error);
+            assert!(!established_loss(&wrapped.into()));
+        }
+        for error in [
+            TunnelError::Closed,
+            TunnelError::Ws(WsError::Closed),
+            TunnelError::Io(ErrorKind::ConnectionReset),
+        ] {
+            let wrapped = std::io::Error::new(ErrorKind::InvalidData, error);
+            assert!(established_loss(&wrapped.into()));
+        }
+    }
 }
