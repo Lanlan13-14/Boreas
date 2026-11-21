@@ -123,11 +123,15 @@ stage() {
 }
 reject() {
   local name=$1 diagnostic=$2
+  local watermark_before watermark_after
+  watermark_before=$(cat "$store/verified-release.state" 2>/dev/null || true)
   if stage "$name" >"$work/rejected" 2>&1; then
     echo "ERROR: $name unexpectedly staged" >&2; exit 1
   fi
   cat "$work/rejected"
   grep -Eiq "$diagnostic" "$work/rejected"
+  watermark_after=$(cat "$store/verified-release.state" 2>/dev/null || true)
+  [[ $watermark_before == "$watermark_after" ]]
 }
 unit_ready() {
   [[ $(systemctl show --value -p ActiveState boreas.service) == active ]]
@@ -177,6 +181,7 @@ runuser -u boreas -- "$sup" status --store "$store" --json | grep -q '"phase":"P
 journalctl --no-pager -u boreas.service | grep -F 'restarting retained verified release'
 
 systemctl stop boreas.service
+systemctl reset-failed boreas.service
 reject real 'rollback'
 emit 2 different "$bin"
 reject different 'equivocation'
@@ -191,6 +196,7 @@ unit_ready
 journalctl --no-pager -u boreas.service | grep -F 'verified trial image rejected before execution: stored binary SHA-256 mismatch'
 
 systemctl stop boreas.service
+systemctl reset-failed boreas.service
 emit 4 interrupted "$wait_bin"
 stage interrupted
 systemctl start --no-block boreas.service
@@ -220,6 +226,7 @@ unit_ready
 [[ ! -e /proc/$child && $(cat "$store/active.version") == "$old" ]]
 journalctl --no-pager -u boreas.service | grep -F 'rolled back before launch'
 systemctl stop boreas.service
+systemctl reset-failed boreas.service
 
 # An emergency minimum runnable release must also veto the fallback.
 sed -i 's/^BOREAS_MIN_RUN_SEQUENCE=1$/BOREAS_MIN_RUN_SEQUENCE=3/' /etc/boreas/service.env
