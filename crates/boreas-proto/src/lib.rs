@@ -121,27 +121,36 @@ pub struct Frame {
 /// Limit applies per feed to retained incomplete bytes plus returned frame wire bytes.
 /// It does not bound caller-held frames, global memory, transport buffers or allocator overhead.
 pub struct FrameDecoder {
-    buf: Vec<u8>,
+    header_bytes: [u8; HEADER_LEN],
+    header_len: usize,
+    // Some only after the full header is validated; until then body is empty.
+    header: Option<AppHeader>,
+    body: Vec<u8>,
     limit: usize,
     failed: bool,
 }
 impl FrameDecoder {
     pub fn new(per_connection_limit: usize) -> Self {
         Self {
-            buf: Vec::new(),
+            header_bytes: [0; HEADER_LEN],
+            header_len: 0,
+            header: None,
+            body: Vec::new(),
             limit: per_connection_limit,
             failed: false,
         }
     }
     pub fn buffered_len(&self) -> usize {
-        self.buf.len()
+        self.header_len + self.body.len()
     }
     pub fn is_failed(&self) -> bool {
         self.failed
     }
     fn fail<T>(&mut self, e: Error) -> Result<T, Error> {
         self.failed = true;
-        self.buf.clear();
+        self.header_len = 0;
+        self.header = None;
+        self.body.clear();
         Err(e)
     }
     pub fn feed(&mut self, mut input: &[u8]) -> Result<Vec<Frame>, Error> {
@@ -151,42 +160,62 @@ impl FrameDecoder {
         let mut out = Vec::new();
         let mut emitted = 0usize;
         while !input.is_empty() {
-            if self.buf.len() < HEADER_LEN {
-                let take = input.len().min(HEADER_LEN - self.buf.len());
-                if take > self.limit - emitted - self.buf.len() {
+            let header = if let Some(header) = self.header {
+                header
+            } else {
+                let take = input.len().min(HEADER_LEN - self.header_len);
+                if take > self.limit - emitted - self.header_len {
                     return self.fail(Error::BufferLimit);
                 }
-                self.buf.extend_from_slice(&input[..take]);
+                self.header_bytes[self.header_len..self.header_len + take]
+                    .copy_from_slice(&input[..take]);
+                self.header_len += take;
                 input = &input[take..];
-                if self.buf.len() < HEADER_LEN {
+                if self.header_len < HEADER_LEN {
                     break;
                 }
-            }
-            // Parse at the header boundary, before charging or accepting any body
-            // bytes. This preserves header-error priority even for a large feed.
-            let raw = self.buf[..HEADER_LEN].try_into().expect("header length checked");
-            let header = match AppHeader::parse(raw) {
-                Ok(header) => header,
-                Err(error) => return self.fail(error),
+                // Validate immediately when the header is complete, before
+                // charging or accepting any body bytes.
+                let header = match AppHeader::parse(&self.header_bytes) {
+                    Ok(header) => header,
+                    Err(error) => return self.fail(error),
+                };
+                self.header = Some(header);
+                header
             };
-            let wire_len = HEADER_LEN + header.body_len as usize;
-            let take = input.len().min(wire_len - self.buf.len());
-            if wire_len > self.limit || take > self.limit - emitted - self.buf.len() {
+            let body_len = header.body_len as usize;
+            let wire_len = HEADER_LEN + body_len;
+            let take = input.len().min(body_len - self.body.len());
+            if wire_len > self.limit || take > self.limit - emitted - self.buffered_len() {
                 return self.fail(Error::BufferLimit);
             }
-            if wire_len == self.buf.len() + take && self.buf.len() == HEADER_LEN {
+            let body = if self.body.is_empty() && take == body_len {
                 // The complete body is already contiguous in the input.
-                self.buf.clear();
-                out.push(Frame { header, body: input[..take].to_vec() });
+                input[..take].to_vec()
             } else {
-                self.buf.extend_from_slice(&input[..take]);
-                if self.buf.len() < wire_len {
+                let received = self.body.len() + take;
+                if received > self.body.capacity() {
+                    // Grow only as bytes arrive. Cap geometric growth at the
+                    // checked body length, since the frame will own this Vec.
+                    let capacity = self
+                        .body
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(received)
+                        .min(body_len);
+                    self.body.reserve_exact(capacity - self.body.len());
+                }
+                self.body.extend_from_slice(&input[..take]);
+                if received < body_len {
                     break;
                 }
-                let mut complete = std::mem::take(&mut self.buf);
-                let body = complete.split_off(HEADER_LEN);
-                out.push(Frame { header, body });
-            }
+                // For split bodies, transfer the accumulated allocation instead
+                // of allocating and copying the entire body again at completion.
+                std::mem::take(&mut self.body)
+            };
+            self.header_len = 0;
+            self.header = None;
+            out.push(Frame { header, body });
             emitted += wire_len;
             input = &input[take..];
         }
@@ -196,7 +225,7 @@ impl FrameDecoder {
         if self.failed {
             return Err(Error::Poisoned);
         }
-        if self.buf.is_empty() {
+        if self.buffered_len() == 0 {
             Ok(())
         } else {
             self.fail(Error::Truncated)
@@ -1100,6 +1129,52 @@ mod tests {
             assert_eq!(frames[1].body, b"5678");
             assert_eq!(decoder.finish(), Ok(()));
         }
+    }
+
+    #[test]
+    fn split_relay_body_preserves_wire_accounting_and_tail_errors() {
+        // Match the session's 8 KiB read granularity. The first read leaves
+        // both a verified header and part of the relay body buffered.
+        const CHUNK: usize = 8 * 1024;
+        let body = (0..16_000).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let first = wire(3, &body);
+        let second = wire(3, b"next");
+        let mut stream = first.clone();
+        stream.extend_from_slice(&second);
+
+        let mut exact = FrameDecoder::new(stream.len());
+        assert!(exact.feed(&stream[..CHUNK]).unwrap().is_empty());
+        assert_eq!(exact.buffered_len(), CHUNK);
+        assert!(exact.feed(&[]).unwrap().is_empty());
+        assert_eq!(exact.buffered_len(), CHUNK);
+        // A short second read grows the accumulator without finishing the
+        // frame. The final read must transfer that allocation unchanged.
+        let split = CHUNK + 32;
+        assert!(exact.feed(&stream[CHUNK..split]).unwrap().is_empty());
+        assert_eq!(exact.buffered_len(), split);
+        assert!(exact.body.capacity() >= body.len());
+        let allocation = exact.body.as_ptr();
+        let frames = exact.feed(&stream[split..]).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].body, body);
+        assert_eq!(frames[0].body.as_ptr(), allocation);
+        assert_eq!(frames[1].body, b"next");
+        assert_eq!(exact.buffered_len(), 0);
+        assert_eq!(exact.finish(), Ok(()));
+
+        let mut short = FrameDecoder::new(stream.len() - 1);
+        assert!(short.feed(&stream[..CHUNK]).unwrap().is_empty());
+        assert_eq!(short.feed(&stream[CHUNK..]), Err(Error::BufferLimit));
+        assert_eq!(short.buffered_len(), 0);
+        assert_eq!(short.feed(&first), Err(Error::Poisoned));
+
+        stream.truncate(first.len());
+        stream.extend_from_slice(&[0; HEADER_LEN]);
+        let mut invalid = FrameDecoder::new(stream.len());
+        assert!(invalid.feed(&stream[..CHUNK]).unwrap().is_empty());
+        assert_eq!(invalid.feed(&stream[CHUNK..]), Err(Error::BadVersion(0)));
+        assert_eq!(invalid.buffered_len(), 0);
+        assert_eq!(invalid.finish(), Err(Error::Poisoned));
     }
 
     #[test]
