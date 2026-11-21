@@ -41,7 +41,7 @@ mod linux {
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
         mesh_probe::{Error, MeshProbe, utc_now},
-        mesh_route::{RouteLocator, SignedCore},
+        mesh_route::{DirectoryCore, RouteLocator},
         packet_path::{MAX_MTU, MIN_MTU},
         resource::{Admission, Limits},
     };
@@ -329,7 +329,7 @@ mod linux {
 
     struct CoreFiles {
         identity: Vec<u8>,
-        lsa: Vec<u8>,
+        lsa: Option<Vec<u8>>,
     }
 
     struct Materials<'a> {
@@ -361,7 +361,7 @@ mod linux {
                         &self.dir.join(format!("core-{id}.signed")),
                         MAX_SIGNED_OBJECT_BYTES,
                     )?;
-                    let lsa = read(
+                    let lsa = optional(
                         &self.dir.join(format!("core-{id}-lsa.signed")),
                         MAX_SIGNED_OBJECT_BYTES,
                     )?;
@@ -472,13 +472,13 @@ mod linux {
             refresh_at = Instant::now() + RETRY;
             let signed: Vec<_> = peer_raw
                 .iter()
-                .map(|entry| SignedCore {
+                .map(|entry| DirectoryCore {
                     identity: &entry.identity,
-                    lsa: &entry.lsa,
+                    seed_lsa: entry.lsa.as_deref(),
                 })
                 .collect();
             let graph = probe
-                .verify_route_graph(&local, &signed)
+                .verify_directory_graph(&local, &signed)
                 .map_err(|e| format!("mesh signed graph: {e:?}"))?;
             if !graph.core_ids().eq(expected_ids.iter().copied()) {
                 return Err("signed mesh graph slots differ from configured membership".into());
@@ -541,6 +541,11 @@ mod linux {
                                 e.tx,
                                 e.rx
                             );
+                        }
+                        Err(Error::TopologyChanged) => {
+                            eprintln!("mesh authenticated topology changed; rebuilding graph");
+                            last_loss = None;
+                            thread::sleep(RETRY);
                         }
                         Err(
                             e @ (Error::PathUnavailable(_)

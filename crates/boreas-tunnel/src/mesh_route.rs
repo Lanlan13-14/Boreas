@@ -26,6 +26,12 @@ pub struct SignedCore<'a> {
     pub lsa: &'a [u8],
 }
 
+/// Configured Core identity and an optional operator-published LSA seed.
+pub struct DirectoryCore<'a> {
+    pub identity: &'a [u8],
+    pub seed_lsa: Option<&'a [u8]>,
+}
+
 struct Vertex<'a> {
     core: Core,
     identity: &'a [u8],
@@ -48,6 +54,34 @@ impl MeshProbe<'_> {
         local_identity: &'a [u8],
         others: &[SignedCore<'a>],
     ) -> Result<VerifiedGraph<'a>, Error> {
+        self.build_graph(
+            local_identity,
+            others.iter().map(|raw| (raw.identity, Some(raw.lsa))),
+            false,
+        )
+    }
+
+    /// Select the live LSA directory head for each configured Core. A still
+    /// valid old seed may lag an authenticated hop update. Invalid signatures,
+    /// equivocation, revocation and expiry are not path-loss signals.
+    pub fn verify_directory_graph<'a>(
+        &mut self,
+        local_identity: &'a [u8],
+        others: &[DirectoryCore<'a>],
+    ) -> Result<VerifiedGraph<'a>, Error> {
+        self.build_graph(
+            local_identity,
+            others.iter().map(|raw| (raw.identity, raw.seed_lsa)),
+            true,
+        )
+    }
+
+    fn build_graph<'a>(
+        &mut self,
+        local_identity: &'a [u8],
+        others: impl ExactSizeIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+        use_directory: bool,
+    ) -> Result<VerifiedGraph<'a>, Error> {
         if others.len() >= MAX_CORES {
             return Err(Error::NoRoute);
         }
@@ -60,17 +94,17 @@ impl MeshProbe<'_> {
             identity: local_identity,
             lsa: self.local_lsa().clone(),
         })]);
-        for raw in others {
-            let core = self.verified_core(raw.identity)?;
+        for (identity, seed) in others {
+            let core = self.verified_core(identity)?;
             // Verify before rejecting duplicate IDs so a signed fork poisons
             // the replay slot in the long-lived owner, not merely this import.
-            let lsa = self.verified_lsa(&core, raw.lsa)?;
+            let (lsa, _) = self.verify_remote_lsa(&core, seed, use_directory)?;
             if vertices.contains_key(&core.id) {
                 return Err(Error::Lsa);
             }
             vertices.insert(core.id, Vertex {
                 core,
-                identity: raw.identity,
+                identity,
                 lsa,
             });
         }
@@ -275,7 +309,7 @@ impl VerifiedGraph<'_> {
                 }],
                 outer,
                 admission,
-                Some(deadline),
+                Some((deadline, next.lsa.object_id())),
             ) {
                 Err(error @ Error::PathUnavailable(_)) => {
                     for &id in locator.path {
@@ -330,22 +364,24 @@ impl VerifiedGraph<'_> {
             return Err(Error::NoRoute);
         }
         let deadline = route.deadline(probe, &[])?;
+        let previous = self.vertex(path[pos - 1])?;
+        let next = self.vertex(path[pos + 1])?;
         let left = probe.accept_until(
             incoming,
-            self.vertex(path[pos - 1])?.identity,
+            previous.identity,
             outer.0,
             admission,
-            Some(deadline),
+            Some((deadline, previous.lsa.object_id())),
         )?;
         let deadline = route.deadline(probe, &[&left])?;
         let right = probe.dial_classified(
             &[Candidate {
                 target: outgoing,
-                signed_identity: self.vertex(path[pos + 1])?.identity,
+                signed_identity: next.identity,
             }],
             outer.1,
             admission,
-            Some(deadline),
+            Some((deadline, next.lsa.object_id())),
         )?;
         forward_fixed(probe, &route, left, right, admission)
     }
@@ -378,12 +414,13 @@ impl VerifiedGraph<'_> {
             return Err(Error::NoRoute);
         }
         let deadline = route.deadline(probe, &[])?;
+        let previous = self.vertex(path[path.len() - 2])?;
         let left = probe.accept_until(
             incoming,
-            self.vertex(path[path.len() - 2])?.identity,
+            previous.identity,
             outer,
             admission,
-            Some(deadline),
+            Some((deadline, previous.lsa.object_id())),
         )?;
         with_fixed_endpoint_io(probe, &route, left, exchange)
     }

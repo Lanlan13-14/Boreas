@@ -263,7 +263,7 @@ enum ReplayKey {
 }
 #[derive(Clone, Copy, Debug)]
 struct ReplayState {
-    seq: u64,
+    version: (u64, u64),
     issued_at: u64,
     object_id: [u8; 32],
     conflicted: bool,
@@ -324,13 +324,15 @@ impl ManagementTrust {
     /// watermark for its node. Callers must separately verify a signature and
     /// check revocation and expiry; this is not durable replay state.
     pub fn is_current_identity(&self, node_id: u16, object_id: [u8; 32]) -> bool {
-        self.replay.get(&ReplayKey::NodeIdentity(node_id))
+        self.replay
+            .get(&ReplayKey::NodeIdentity(node_id))
             .is_some_and(|head| !head.conflicted && head.object_id == object_id)
     }
 
     /// Check a previously verified LSA against the current process-local slot.
     pub fn is_current_core_lsa(&self, core_id: u8, object_id: [u8; 32]) -> bool {
-        self.replay.get(&ReplayKey::CoreLsa(core_id))
+        self.replay
+            .get(&ReplayKey::CoreLsa(core_id))
             .is_some_and(|head| !head.conflicted && head.object_id == object_id)
     }
 
@@ -400,13 +402,11 @@ impl ManagementTrust {
         ) {
             return Err(Error::InvalidIssuerKey);
         }
-        self.issuers.insert(
-            issuer.issuer_key_id.clone(),
-            TrustedIssuer {
+        self.issuers
+            .insert(issuer.issuer_key_id.clone(), TrustedIssuer {
                 record: issuer,
                 validity,
-            },
-        );
+            });
         Ok(())
     }
 
@@ -422,6 +422,17 @@ impl ManagementTrust {
         self.verify_with_issuer_time(raw_signed_object, now_us, now_us)
     }
 
+    /// Authenticate an LSA for this exact Core before changing any replay slot.
+    /// `StaleSequence` is returned only after successful signature/authority checks.
+    pub fn verify_core_lsa(
+        &mut self,
+        raw_signed_object: &[u8],
+        core_id: u8,
+        now_us: u64,
+    ) -> Result<VerifiedObject, Error> {
+        self.verify_at(raw_signed_object, now_us, now_us, Some(core_id))
+    }
+
     /// The status store can authenticate evidence at its signed time while still
     /// checking delegation expiry against a separate, conservative UTC bound.
     pub(crate) fn verify_with_issuer_time(
@@ -429,6 +440,16 @@ impl ManagementTrust {
         raw_signed_object: &[u8],
         object_now_us: u64,
         issuer_now_us: u64,
+    ) -> Result<VerifiedObject, Error> {
+        self.verify_at(raw_signed_object, object_now_us, issuer_now_us, None)
+    }
+
+    fn verify_at(
+        &mut self,
+        raw_signed_object: &[u8],
+        object_now_us: u64,
+        issuer_now_us: u64,
+        expected_lsa_core: Option<u8>,
     ) -> Result<VerifiedObject, Error> {
         if raw_signed_object.is_empty() || raw_signed_object.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::ObjectTooLarge);
@@ -474,6 +495,11 @@ impl ManagementTrust {
         if object.issuer_generation != issuer.issuer_generation {
             return Err(Error::IssuerGenerationMismatch);
         }
+        if let Some(expected) = expected_lsa_core
+            && !matches!(&object.body, ObjectBody::CoreLsa(lsa) if lsa.core_id == expected)
+        {
+            return Err(Error::OutOfScope);
+        }
         let kind = object_kind(&object.body)?;
         let is_lease = matches!(&object.body, ObjectBody::AttachmentLease(_));
         let expected_signers = if is_lease { 2 } else { 1 };
@@ -503,9 +529,13 @@ impl ManagementTrust {
             verify_signer_signatures(&issuer, &message, &signed.signers[0], SignerRole::Primary)?;
         }
         let object_id = sha256(&raw_tbs)?;
+        let generation = match &object.body {
+            ObjectBody::CoreLsa(lsa) => lsa.core_generation,
+            _ => 0,
+        };
         let duplicate = match self.record_replay(
             replay_key(&object)?,
-            object.seq,
+            (generation, object.seq),
             object.issued_at,
             object_id,
         ) {
@@ -583,7 +613,7 @@ impl ManagementTrust {
     fn record_replay(
         &mut self,
         key: ReplayKey,
-        seq: u64,
+        version: (u64, u64),
         issued_at: u64,
         object_id: [u8; 32],
     ) -> Result<bool, Error> {
@@ -594,22 +624,21 @@ impl ManagementTrust {
                 if state.conflicted {
                     return Err(Error::Equivocation);
                 }
-                if seq < state.seq {
+                if version < state.version {
                     return Err(Error::StaleSequence);
                 }
-                if seq == state.seq {
+                if version == state.version {
                     if state.object_id == object_id {
                         return Ok(true);
                     }
-                    // Same logical writer/key slot and same seq with different TBS bytes:
-                    // freeze this slot permanently instead of choosing a winner.
+                    // Freeze this slot on same-version, different TBS bytes.
                     state.conflicted = true;
                     return Err(Error::Equivocation);
                 }
                 if issued_at < state.issued_at {
                     return Err(Error::IssuedAtRegression);
                 }
-                state.seq = seq;
+                state.version = version;
                 state.issued_at = issued_at;
                 state.object_id = object_id;
                 Ok(false)
@@ -619,7 +648,7 @@ impl ManagementTrust {
                     return Err(Error::ReplayFull);
                 }
                 entry.insert(ReplayState {
-                    seq,
+                    version,
                     issued_at,
                     object_id,
                     conflicted: false,

@@ -2,6 +2,7 @@
 //! hop sessions. No graph route, application frames, or E2E secrets enter here.
 
 use std::{
+    collections::BTreeMap,
     net::TcpStream,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -14,7 +15,7 @@ use boreas_crypto::{
 use boreas_pki::{
     Authority, VerifiedNetworkContext,
     authority_revocation::AuthorityRevocationTrust,
-    management::{ManagementTrust, VerifiedObject},
+    management::{Error as ManagementError, ManagementTrust, VerifiedObject},
     provisioning::RootsBundle,
     status_store::{AuthenticatedPeer, FreshStatus, PeerRevocation, StatusStore},
 };
@@ -47,6 +48,8 @@ pub enum Error {
     Clock,
     NoRoute,
     WrongReply,
+    /// An authenticated hop advanced a graph member; rebuild before retrying.
+    TopologyChanged,
     /// TCP dial failed before emitting any TLS bytes (graph profile only).
     PathUnavailable(TunnelError),
     /// At least one confirmed business circuit lost transport, with no replay.
@@ -224,6 +227,9 @@ pub struct MeshProbe<'a> {
     trust: ManagementTrust,
     local: Core,
     local_lsa: VerifiedObject,
+    // One verified envelope per remote Core ID (at most 15). Both configured
+    // seeds and authenticated hop sessions update this same replay-backed view.
+    remote_lsas: BTreeMap<u8, VerifiedObject>,
     status: &'a mut StatusStore,
     pem: &'a PemIdentity,
 }
@@ -262,7 +268,7 @@ impl<'a> MeshProbe<'a> {
             return Err(Error::Identity);
         }
         let local_lsa = trust
-            .verify_and_authorize(local_lsa, now)
+            .verify_core_lsa(local_lsa, local.id, now)
             .map_err(|_| Error::Lsa)?;
         lsa(&local_lsa, local.id, now)?;
         Ok(Self {
@@ -270,6 +276,7 @@ impl<'a> MeshProbe<'a> {
             trust,
             local,
             local_lsa,
+            remote_lsas: BTreeMap::new(),
             status,
             pem,
         })
@@ -300,7 +307,7 @@ impl<'a> MeshProbe<'a> {
         let now = effective_utc(self.status)?;
         let verified = self
             .trust
-            .verify_and_authorize(local_lsa, now)
+            .verify_core_lsa(local_lsa, self.local.id, now)
             .map_err(|_| Error::Lsa)?;
         lsa(&verified, self.local.id, now)?;
         self.local_lsa = verified;
@@ -345,7 +352,7 @@ impl<'a> MeshProbe<'a> {
         candidates: &[Candidate<'_>],
         outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
         admission: &Admission,
-        route_deadline: Option<Instant>,
+        route: Option<(Instant, [u8; 32])>,
     ) -> Result<Adjacency, Error> {
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
@@ -374,7 +381,7 @@ impl<'a> MeshProbe<'a> {
         let mut last_dial = Error::NoRoute;
         for (index, (_, _, id, peer, target)) in ordered.into_iter().enumerate() {
             let mut deadline = self.deadline(&peer)?;
-            if let Some(route_deadline) = route_deadline {
+            if let Some((route_deadline, _)) = route {
                 deadline = deadline.min(route_deadline);
             }
             if Instant::now() >= deadline {
@@ -432,13 +439,13 @@ impl<'a> MeshProbe<'a> {
                 send_lsa(&mut session, &self.local_lsa)?;
                 recv_control(&mut session, ControlType::Lsa)
             })?;
-            let now = self.check(&peer)?;
             let raw = &received[1..];
-            let remote = self
-                .trust
-                .verify_and_authorize(raw, now)
-                .map_err(|_| Error::Lsa)?;
-            neighbor(lsa(&remote, id, now)?, self.local.id)?;
+            let (remote, now) = self.verify_remote_lsa(&peer, Some(raw), false)?;
+            let changed = match self.check_hop_advertisement(&remote, id, now, route) {
+                Ok(()) => false,
+                Err(Error::TopologyChanged) => true,
+                Err(e) => return Err(e),
+            };
             let remote_lsa_expiry = remote.valid_until();
             self.exchange_identity_revocations(
                 &mut session,
@@ -448,6 +455,9 @@ impl<'a> MeshProbe<'a> {
                 deadline,
                 true,
             )?;
+            if changed {
+                return Err(Error::TopologyChanged);
+            }
             let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
             return Ok(Adjacency {
                 session,
@@ -498,7 +508,7 @@ impl<'a> MeshProbe<'a> {
         signed_peer_identity: &[u8],
         outer: &OpenSslOuterTlsAcceptor,
         admission: &Admission,
-        route_deadline: Option<Instant>,
+        route: Option<(Instant, [u8; 32])>,
     ) -> Result<Adjacency, Error> {
         let now = effective_utc(self.status)?;
         let peer = Core::from_object(
@@ -513,7 +523,7 @@ impl<'a> MeshProbe<'a> {
         }
         neighbor(lsa(&self.local_lsa, self.local.id, now)?, peer.id)?;
         let mut deadline = self.deadline(&peer)?;
-        if let Some(route_deadline) = route_deadline {
+        if let Some((route_deadline, _)) = route {
             deadline = deadline.min(route_deadline);
         }
         if Instant::now() >= deadline {
@@ -548,12 +558,12 @@ impl<'a> MeshProbe<'a> {
             session.send_control(ControlType::Probe, &pong.encode()?)?;
             recv_control(session, ControlType::Lsa)
         })?;
-        let now = self.check(&peer)?;
-        let remote = self
-            .trust
-            .verify_and_authorize(&received[1..], now)
-            .map_err(|_| Error::Lsa)?;
-        neighbor(lsa(&remote, peer.id, now)?, self.local.id)?;
+        let (remote, now) = self.verify_remote_lsa(&peer, Some(&received[1..]), false)?;
+        let changed = match self.check_hop_advertisement(&remote, peer.id, now, route) {
+            Ok(()) => false,
+            Err(Error::TopologyChanged) => true,
+            Err(e) => return Err(e),
+        };
         let deadline = deadline.min(self.deadline(&peer)?);
         bounded_link_operation(&socket, deadline, || {
             send_lsa(&mut accepted.session, &self.local_lsa)
@@ -567,6 +577,9 @@ impl<'a> MeshProbe<'a> {
             deadline,
             false,
         )?;
+        if changed {
+            return Err(Error::TopologyChanged);
+        }
         let expires = self.authority_deadline(&peer, remote_lsa_expiry)?;
         let selected = Selected {
             core_id: peer.id,
@@ -676,18 +689,52 @@ impl<'a> MeshProbe<'a> {
         )
     }
 
-    pub(crate) fn verified_lsa(
+    pub(crate) fn verify_remote_lsa(
         &mut self,
         core: &Core,
-        signed: &[u8],
-    ) -> Result<VerifiedObject, Error> {
+        signed: Option<&[u8]>,
+        use_directory: bool,
+    ) -> Result<(VerifiedObject, u64), Error> {
+        if core.id == self.local.id {
+            return Err(Error::Lsa);
+        }
         let now = self.check(core)?;
-        let object = self
-            .trust
-            .verify_and_authorize(signed, now)
-            .map_err(|_| Error::Lsa)?;
-        lsa(&object, core.id, now)?;
-        Ok(object)
+        if let Some(raw) = signed {
+            match self.trust.verify_core_lsa(raw, core.id, now) {
+                Ok(object) => {
+                    self.remote_lsas.insert(core.id, object.clone());
+                    return Ok((object, now));
+                }
+                Err(ManagementError::StaleSequence) if use_directory => (),
+                Err(_) => return Err(Error::Lsa),
+            }
+        } else if !use_directory {
+            return Err(Error::Lsa);
+        }
+        // A missing seed or a still-valid, authenticated older seed can use
+        // the directory head. Neither an invalid seed nor a poisoned/expired
+        // head can extend authority or resurrect an older route.
+        let head = self.remote_lsas.get(&core.id).ok_or(Error::Lsa)?;
+        if !self.trust.is_current_core_lsa(core.id, head.object_id()) {
+            return Err(Error::Lsa);
+        }
+        lsa(head, core.id, now)?;
+        Ok((head.clone(), now))
+    }
+
+    fn check_hop_advertisement(
+        &self,
+        remote: &VerifiedObject,
+        id: u8,
+        now: u64,
+        route: Option<(Instant, [u8; 32])>,
+    ) -> Result<(), Error> {
+        let lsa = lsa(remote, id, now)?;
+        if route.is_some_and(|(_, expected)| expected != remote.object_id()) {
+            return Err(Error::TopologyChanged);
+        }
+        neighbor(lsa, self.local.id)?;
+        Ok(())
     }
 
     pub(crate) fn local_lsa(&self) -> &VerifiedObject {

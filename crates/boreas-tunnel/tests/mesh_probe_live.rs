@@ -811,6 +811,95 @@ fn graph_rejects_forgery_and_does_not_use_withdrawn_or_superseded_edges() {
 }
 
 #[test]
+fn authenticated_hop_refreshes_directory_without_using_the_old_graph() {
+    use boreas_tunnel::mesh_route::{DirectoryCore, RouteLocator};
+
+    let f = Fixture::new();
+    let mut status = f.status(1);
+    let mut probe = f.probe(1, &mut status);
+    let original = graph_inputs(&f, 1);
+    let mut seeds: Vec<_> = original
+        .iter()
+        .map(|raw| DirectoryCore {
+            identity: raw.identity,
+            seed_lsa: Some(raw.lsa),
+        })
+        .collect();
+    let local = &f.node(1).identity;
+    let old = probe.verify_directory_graph(local, &seeds).unwrap();
+    let update = change_lsa(f.node(2), |obj| {
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        // Same sequence in a higher generation is a new version, not a fork.
+        lsa.core_generation = 2;
+        lsa.neighbors.retain(|n| n.peer_core_id != 4);
+    });
+    let (server, target) = listener();
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let primary = [1, 2, 4];
+    thread::scope(|scope| {
+        let peer = scope.spawn(|| {
+            let mut status = f.status(2);
+            let mut probe = f.probe(2, &mut status);
+            probe
+                .refresh_runtime_authority(&f.status, None, &update)
+                .unwrap();
+            probe.respond(
+                accept_socket(server),
+                local,
+                &outer_for(&f, 2),
+                &route_admission(),
+            )
+        });
+        assert_eq!(
+            old.connect(
+                &mut probe,
+                &[RouteLocator {
+                    path: &primary,
+                    target: &target
+                }],
+                &outer,
+                &route_admission(),
+                |_, _| -> Result<(), TunnelError> {
+                    panic!("a superseded graph must not enter business I/O")
+                }
+            ),
+            Err(Error::TopologyChanged)
+        );
+        peer.join().unwrap().unwrap();
+    });
+    assert!(matches!(
+        old.authorize_path(&mut probe, &primary),
+        Err(Error::Lsa)
+    ));
+    for seed in [Some(f.node(2).lsa.as_slice()), None] {
+        seeds[0].seed_lsa = seed;
+        let graph = probe.verify_directory_graph(local, &seeds).unwrap();
+        assert!(matches!(
+            graph.authorize_path(&mut probe, &primary),
+            Err(Error::NoRoute)
+        ));
+        graph.authorize_path(&mut probe, &[1, 3, 4]).unwrap();
+    }
+    // A wrongly filed, valid third-party LSA must not mutate its own slot.
+    let foreign = change_lsa(f.node(3), |obj| {
+        obj.seq = 2;
+        let ObjectBody::CoreLsa(lsa) = &mut obj.body else {
+            unreachable!()
+        };
+        lsa.seq = 2;
+    });
+    seeds[0].seed_lsa = Some(&foreign);
+    assert!(matches!(
+        probe.verify_directory_graph(local, &seeds),
+        Err(Error::Lsa)
+    ));
+    seeds[0].seed_lsa = None;
+    assert!(probe.verify_directory_graph(local, &seeds).is_ok());
+}
+
+#[test]
 fn verified_graph_does_not_fallback_after_wrong_first_hop_spki() {
     use boreas_tunnel::mesh_route::RouteLocator;
 
