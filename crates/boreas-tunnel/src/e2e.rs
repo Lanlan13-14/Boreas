@@ -518,6 +518,12 @@ pub fn accept_circuit<'a>(
 pub trait E2eStream: Duplex {
     fn close_stream(&mut self) -> io::Result<()>;
 
+    /// Read application bytes, allowing zero on a nonempty buffer only if
+    /// the peer's authenticated TLS shutdown was observed.
+    fn read_with_authenticated_eof(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
     fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
         Err(TunnelError::Unsupported("dedicated circuit close"))
@@ -910,7 +916,11 @@ impl<'a> E2eCircuit<'a> {
 
 impl Read for E2eCircuit<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(out)
+        if self.l3_profile == E2eL3Profile::SINGLE_LANE {
+            self.stream.read(out)
+        } else {
+            self.stream.read_with_authenticated_eof(out)
+        }
     }
 }
 

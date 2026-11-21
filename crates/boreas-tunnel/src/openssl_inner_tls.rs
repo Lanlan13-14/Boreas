@@ -156,6 +156,10 @@ impl E2eStream for EstablishedStream<CircuitStream<'_>> {
         self.close_notify()
     }
 
+    fn read_with_authenticated_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        EstablishedStream::read_with_authenticated_eof(self, out)
+    }
+
     #[cfg(target_os = "linux")]
     fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
         self.close_notify()?;

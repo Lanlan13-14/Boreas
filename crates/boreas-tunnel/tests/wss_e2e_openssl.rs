@@ -980,6 +980,11 @@ fn real_loopback_l3_confirmation_requires_exact_opt_in_on_both_ends() {
             assert_eq!(byte, [0x5a]);
             circuit.write_all(&[0x9d]).map_err(|err| err.to_string())?;
             circuit.flush().map_err(|err| err.to_string())?;
+            if acceptor == four {
+                socket.shutdown(std::net::Shutdown::Both).map_err(|err| err.to_string())?;
+            } else {
+                circuit.close_gracefully();
+            }
             Ok(())
         });
         let link = LinkClient::new(Box::new(client_side.outer), client_side.hop);
@@ -1027,6 +1032,12 @@ fn real_loopback_l3_confirmation_requires_exact_opt_in_on_both_ends() {
                 let mut byte = [0];
                 circuit.read_exact(&mut byte).expect("read reply");
                 assert_eq!(byte, [0x9d]);
+                let shutdown = circuit.read(&mut byte);
+                if opener == four {
+                    assert!(shutdown.is_err(), "bare transport EOF is not a TLS shutdown");
+                } else {
+                    assert_eq!(shutdown.expect("authenticated TLS shutdown"), 0);
+                }
             } else {
                 use boreas_tunnel::{CircuitReject, SessionReject, TunnelError};
 

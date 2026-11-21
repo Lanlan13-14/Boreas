@@ -350,6 +350,21 @@ impl<S: Read + Write> EstablishedStream<S> {
         self.stream.ssl_read(buf).map_err(map_tls_io_error)
     }
 
+    /// Read using the blocking adapter, but distinguish an authenticated TLS
+    /// close from a bare transport EOF that `SslStream::read` can also map to
+    /// zero. Callers on dedicated authenticated paths must not report the
+    /// latter as a successful shutdown.
+    pub fn read_with_authenticated_eof(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.stream.read(buf)?;
+        if read == 0
+            && !buf.is_empty()
+            && !self.stream.get_shutdown().contains(openssl::ssl::ShutdownState::RECEIVED)
+        {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing TLS close_notify"));
+        }
+        Ok(read)
+    }
+
     /// Write application bytes to a non-blocking transport.
     ///
     /// [`io::ErrorKind::WouldBlock`] means OpenSSL needs transport write
