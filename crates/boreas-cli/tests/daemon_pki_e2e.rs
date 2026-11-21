@@ -251,6 +251,117 @@ impl Pair {
     }
 }
 
+fn identity_revocation_fixture(ca_dir: &Path, subject_generation: u64, sequence: u64) -> Vec<u8> {
+    use boreas_pki::status_store::IDENTITY_REVOCATION_MAGIC;
+    use boreas_proto::authority_revocation::{AuthorityRevocation, RevocationClass, RevocationScope};
+    use openssl::sign::Signer;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let issuer_generation = fs::read_to_string(ca_dir.join("issuer.generation"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let tbs = AuthorityRevocation {
+        net_id: [3; 16],
+        class: RevocationClass::Identity,
+        subject_node_id: 2,
+        identity_generation: subject_generation,
+        issuer_key_id: b"identity-authority-v1".to_vec(),
+        issuer_generation,
+        scope: RevocationScope::default(),
+        seq: sequence,
+        issued_at: now,
+        next_update: now + 60_000_000,
+    }
+    .encode_tbs()
+    .unwrap();
+    let message = AuthorityRevocation::signature_input(&tbs).unwrap();
+    let mut raw = IDENTITY_REVOCATION_MAGIC.to_vec();
+    for name in ["ia.ed25519.key", "ia.mldsa65.key"] {
+        let key = PKey::private_key_from_der(&fs::read(ca_dir.join(name)).unwrap()).unwrap();
+        let signature = Signer::new_without_digest(&key)
+            .unwrap()
+            .sign_oneshot_to_vec(&message)
+            .unwrap();
+        raw.extend_from_slice(&signature);
+    }
+    raw.extend_from_slice(&tbs);
+    raw
+}
+
+fn publish_identity_revocation(material: &Path, raw: &[u8]) -> PathBuf {
+    let stage = material.join("identity-revocation.stage");
+    let mailbox = material.join("identity-revocation.signed");
+    fs::write(&stage, raw).unwrap();
+    fs::rename(stage, &mailbox).unwrap();
+    mailbox
+}
+
+#[test]
+fn live_identity_revocation_closes_the_authenticated_circuit_and_survives_restart() {
+    let pair = Pair::provision("identity-revoke");
+    let core_state = pair.new_state("core");
+    let edge_state = pair.new_state("edge");
+    pair.long_lived_status(&pair.core_mat);
+    pair.long_lived_status(&pair.edge_mat);
+    let listen = format!("127.0.0.1:{}", free_port());
+    let core_cfg = pair.root.0.join("core.toml");
+    let edge_cfg = pair.root.0.join("edge.toml");
+    write_config(&core_cfg, "core", 1, 1, &pair.core_mat, &core_state, &listen);
+    write_config(&edge_cfg, "edge", 2, 2, &pair.edge_mat, &edge_state, &listen);
+
+    let mut core = spawn_serve(&core_cfg, &pair.core_mat, &core_state, &listen, "15");
+    let core_socket = core_state.join("control.sock");
+    assert!(wait_for_status(&core_socket, "\"status_fresh\":true", Duration::from_secs(10)));
+    thread::sleep(Duration::from_millis(200));
+    let mut edge = spawn_connect(&edge_cfg, &pair.edge_mat, &edge_state, "wss.boreas.test", "15");
+    assert!(wait_for_status(&core_socket, "\"daemon_connected\":true", Duration::from_secs(10)));
+
+    // First commit a correctly signed denial for another generation of this slot.
+    let other = identity_revocation_fixture(&pair.ca_dir, 2, 1);
+    publish_identity_revocation(&pair.core_mat, &other);
+    let status_state = core_state.join("status.state");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if fs::read(&status_state).unwrap().starts_with(b"BRSS\0\0\0\x02") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(fs::read(&status_state).unwrap().starts_with(b"BRSS\0\0\0\x02"));
+    assert!(ctl_status(&core_socket).unwrap().contains("\"daemon_connected\":true"));
+
+    let exact = identity_revocation_fixture(&pair.ca_dir, 1, 2);
+    let mailbox = publish_identity_revocation(&pair.core_mat, &exact);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && core.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(core.try_wait().unwrap().is_some(), "revoked Core circuit did not stop promptly");
+    let closed = core.wait_with_output().unwrap();
+    let _ = edge.kill();
+    let _ = edge.wait();
+    assert!(!closed.status.success());
+    assert!(String::from_utf8_lossy(&closed.stderr).contains("identity node 2 generation 1 revoked"));
+
+    // The mailbox is not the state; even after removal the exact generation
+    // is refused before accepting a connection on the restarted daemon.
+    fs::remove_file(mailbox).unwrap();
+    let mut restarted = spawn_serve(&core_cfg, &pair.core_mat, &core_state, &listen, "15");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && restarted.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(restarted.try_wait().unwrap().is_some(), "durable denial was not reapplied at startup");
+    let output = restarted.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("identity node 2 generation 1 revoked"));
+}
+
 fn ctl_status(socket: &Path) -> Option<String> {
     let out = Command::new(bin())
         .args(["ctl", "status", "--socket", socket.to_str().unwrap()])

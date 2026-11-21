@@ -226,7 +226,7 @@ mod linux_daemon {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::{
@@ -242,11 +242,12 @@ mod linux_daemon {
     };
     use boreas_pki::{
         Authority,
+        authority_revocation::AuthorityRevocationTrust,
         management::ManagementTrust,
         provisioning::{
             RootsBundle, parse_net_id_hex, read_status_snapshot_raw, verify_material_dir_with_roots,
         },
-        status_store::StatusStore,
+        status_store::{AuthenticatedPeer, MAX_IDENTITY_REVOCATION_BYTES, StatusStore},
     };
     use boreas_proto::{
         SecurityMode as ProtoSecurityMode,
@@ -1657,12 +1658,12 @@ mod linux_daemon {
     /// to the fingerprint from identity verification. The path was read once
     /// for identity; checking that earlier fingerprint alone would not bind
     /// a second read used to build status trust.
-    fn bound_status_trust(
+    fn bound_runtime_trust(
         roots_path: &Path,
         net_id: [u8; 16],
         expected_root_fingerprint: [u8; 32],
         now_us: u64,
-    ) -> Result<ManagementTrust, String> {
+    ) -> Result<(ManagementTrust, AuthorityRevocationTrust), String> {
         // The provisioning material reader caps roots.cbor at 64 KiB.
         const MAX_ROOTS_FILE_BYTES: usize = 64 * 1024;
         let mut raw = Vec::new();
@@ -1679,17 +1680,24 @@ mod linux_daemon {
             return Err("daemon: status NetworkRoot fingerprint does not match identity".to_string());
         }
         let mut trust = ManagementTrust::new(net_id);
+        let mut identity_trust = AuthorityRevocationTrust::new(net_id);
         let mut has_status = false;
         for authorization in authorizations {
-            has_status |= authorization.issuer_record().authority == Authority::StatusSigner;
+            let authority = authorization.issuer_record().authority;
+            has_status |= authority == Authority::StatusSigner;
             trust
                 .add_verified_issuer(&authorization)
                 .map_err(|e| format!("daemon: status trust issuer rejected: {e}"))?;
+            if authority == Authority::IdentityAuthority {
+                identity_trust
+                    .add_verified_issuer(authorization)
+                    .map_err(|e| format!("daemon: identity revocation issuer rejected: {e}"))?;
+            }
         }
         if !has_status {
             return Err("daemon: status trust missing authorized StatusSigner".to_string());
         }
-        Ok(trust)
+        Ok((trust, identity_trust))
     }
 
     /// One fail-closed status decision at a business admission boundary.
@@ -1699,8 +1707,8 @@ mod linux_daemon {
     /// `SequenceNotIncreasing` error, never a reason to silently keep using the
     /// persisted snapshot. A duplicate at the same sequence returns
     /// `DuplicateNotRenewed`; the store keeps the original monotonic deadline.
-    /// Non-empty revocation bytes are rejected by the store until a real
-    /// decoder and handle-cleanup path exist.
+    /// A StatusSigner never authorizes revocation: non-empty snapshot revocations
+    /// are rejected independently of the IdentityAuthority mailbox.
     fn status_gate(
         store: &mut StatusStore,
         status_path: &Path,
@@ -1719,6 +1727,60 @@ mod linux_daemon {
             .check(trusted_utc_us, mono_now)
             .map_err(|e| format!("status check failed: {e:?}"))?;
         Ok((fresh.sequence(), fresh.deadline()))
+    }
+
+    fn auth_slot(net: [u8; 16], node: u16, generation: u64) -> Result<AuthenticatedPeer, String> {
+        AuthenticatedPeer::new(net, node, generation)
+            .ok_or_else(|| "daemon: invalid verified endpoint slot".to_string())
+    }
+
+    /// Poll one atomically published local object. A missing mailbox does not
+    /// remove a committed denial. Errors are fail-closed, not revocation claims.
+    fn check_identity_revocations(
+        store: &mut StatusStore,
+        status_path: &Path,
+        endpoints: [AuthenticatedPeer; 2],
+    ) -> Result<(), String> {
+        let input = status_path.with_file_name("identity-revocation.signed");
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(input)
+        {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|e| format!("daemon: identity revocation mailbox: {e}"))?;
+                if !metadata.is_file() {
+                    return Err("daemon: identity revocation mailbox is not a regular file".to_string());
+                }
+                let mut raw = Vec::new();
+                file.take(MAX_IDENTITY_REVOCATION_BYTES as u64 + 1)
+                    .read_to_end(&mut raw)
+                    .map_err(|e| format!("daemon: identity revocation mailbox read failed: {e}"))?;
+                store.accept_identity_revocation(&raw, now_utc_us()?)
+                    .map_err(|e| format!("daemon: identity revocation gate failed: {e}"))?;
+                // Verification/persistence runs off the packet hot path, but the
+                // mailbox must not extend the independently captured status deadline.
+                let now = now_utc_us()?;
+                let mono_now = Instant::now();
+                store
+                    .current_fresh(now, mono_now)
+                    .and_then(|status| status.check(now, mono_now))
+                    .map_err(|e| format!("daemon: status not fresh after identity revocation check: {e}"))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("daemon: identity revocation mailbox open failed: {e}")),
+        }
+        for endpoint in endpoints {
+            if store.identity_revoked(&endpoint)
+                .map_err(|e| format!("daemon: identity revocation state unusable: {e}"))?
+            {
+                return Err(format!(
+                    "daemon: identity node {} generation {} revoked; business path denied or halted",
+                    endpoint.node_id(), endpoint.identity_generation()
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn run_mode(mode: Mode, args: &[String]) -> Result<(), String> {
@@ -1878,7 +1940,7 @@ mod linux_daemon {
         let verified =
             verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
                 .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
-        let status_trust = bound_status_trust(
+        let (status_trust, identity_trust) = bound_runtime_trust(
             &roots_path,
             cfg_net_id,
             verified.root_fingerprint,
@@ -2085,11 +2147,13 @@ mod linux_daemon {
                     .to_string(),
             );
         }
-        let mut status_store = StatusStore::open(
+        let mut status_store = StatusStore::open_with_identity_revocations(
             &status_state_file,
             cfg_net_id,
             status_state_owner_uid,
             status_trust,
+            verified.root_fingerprint,
+            identity_trust,
         )
         .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))?;
         let status_path = mat_dir.join("status.signed");
@@ -2101,6 +2165,10 @@ mod linux_daemon {
         )
         .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
         counters.status_sequence.store(gate_seq, Ordering::SeqCst);
+        check_identity_revocations(&mut status_store, &status_path, [
+            auth_slot(local_peer.net_id, local_peer.node_id, local_peer.identity_generation)?,
+            auth_slot(remote_peer.net_id, remote_peer.node_id, remote_peer.identity_generation)?,
+        ])?;
         // One process-wide store instance for every later boundary, including
         // each failover epoch: reopening on the same path would return `Busy`.
         let status_store = Arc::new(Mutex::new(status_store));
@@ -2298,7 +2366,7 @@ mod linux_daemon {
             sock_fd: i32,
             counters: Arc<LiveCounters>,
             interval: Duration,
-            revocations: Arc<Mutex<crate::daemon_revoke::RevocationSet>>,
+            endpoints: Option<[AuthenticatedPeer; 2]>,
         ) -> Self {
             let stop = Arc::new((Mutex::new(()), Condvar::new()));
             let stopped = Arc::new(AtomicBool::new(false));
@@ -2362,18 +2430,15 @@ mod linux_daemon {
                                         ))
                                     } else {
                                         counters.status_sequence.store(seq, Ordering::Relaxed);
-                                        // Publish only scopes from the snapshot the store
-                                        // just verified. A rejected snapshot never reaches
-                                        // here, so it cannot change the revocation set.
-                                        let scopes = store_guard.revocation_scopes();
-                                        lock_mutex(&revocations).sync_verified_scopes(&scopes);
                                         // Do not sleep past the captured freshness
-                                        // deadline; the normal 500 ms cadence must
-                                        // never become a post-expiry forwarding window.
+                                        // deadlines. A revocation or persistence failure
+                                        // uses the same terminal fault/shutdown path.
                                         deadline = (Instant::now() + interval)
                                             .min(status_deadline)
                                             .min(policy_window.deadline());
-                                        None
+                                        endpoints.and_then(|slots| {
+                                            check_identity_revocations(&mut store_guard, &status_path, slots).err()
+                                        })
                                     }
                                 }
                                 Err(error) => Some(format!(
@@ -3012,9 +3077,21 @@ mod linux_daemon {
         // Declared after `path` on purpose: the watchdog is stopped and joined
         // before the E2E stream (and its socket) is dropped, so `shutdown()` can
         // never target a recycled descriptor.
-        let revocations = Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new()));
-        let mut revoke_forwarded = 0u64;
-        let mut revoke_failures = 0u64;
+        let local = path.local_endpoint();
+        let peer = path.peer_endpoint();
+        let endpoints = [
+            auth_slot(local.net_id(), local.node_id(), local.identity_generation())?,
+            auth_slot(peer.net_id(), peer.node_id(), peer.identity_generation())?,
+        ];
+        // Synchronous check closes the gap before the watchdog's first poll.
+        let admission = {
+            let mut guard = lock_mutex(&status_store);
+            check_identity_revocations(&mut guard, status_path, endpoints)
+        };
+        if let Err(reason) = admission {
+            path.close();
+            return Err(reason);
+        }
         let watchdog = StatusWatchdog::start(
             status_store,
             status_path.to_path_buf(),
@@ -3022,7 +3099,7 @@ mod linux_daemon {
             sock_fd,
             Arc::clone(counters),
             STATUS_RECHECK_INTERVAL,
-            Arc::clone(&revocations),
+            Some(endpoints),
         );
 
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
@@ -3065,30 +3142,6 @@ mod linux_daemon {
             // touches the active circuit; it is not a ProbePing exchange.
             if let Some(manager) = standby.as_deref_mut() {
                 manager.maintain(Instant::now());
-            }
-
-            // Revocation is checked before either direction forwards. The set is
-            // whatever the watchdog published from the last verified snapshot; this
-            // lookup does not itself verify a signature.
-            let peer_revoked = {
-                let set = lock_mutex(&revocations);
-                crate::daemon_revoke::poll_peer_forward(
-                    &set,
-                    identity.peer_node_id,
-                    identity.peer_generation,
-                    &mut revoke_forwarded,
-                    &mut revoke_failures,
-                ) == crate::daemon_revoke::ForwardPoll::Revoked
-            };
-            if peer_revoked {
-                path.close();
-                break 'outer PathStop::Failed {
-                    kind: PathFailureKind::Protocol,
-                    reason: format!(
-                        "peer node {} generation {} revoked; business path closed before forward",
-                        identity.peer_node_id, identity.peer_generation
-                    ),
-                };
             }
 
             // Both packet sources are nonblocking here: TUN reads are single-syscall
@@ -3393,7 +3446,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_millis(10),
-                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
+                None,
             );
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut reason = None;
@@ -3476,7 +3529,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
-                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
+                None,
             );
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut reason = None;
@@ -3509,7 +3562,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
-                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
+                None,
             );
             let started = Instant::now();
             drop(watchdog);
@@ -3551,7 +3604,7 @@ mod linux_daemon {
                 -1,
                 Arc::clone(&counters),
                 Duration::from_secs(3600),
-                Arc::new(Mutex::new(crate::daemon_revoke::RevocationSet::new())),
+                None,
             );
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {

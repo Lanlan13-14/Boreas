@@ -36,8 +36,6 @@
 
 mod config;
 mod daemon;
-#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
-mod daemon_revoke;
 mod i18n;
 mod network_policy_runtime;
 mod node;

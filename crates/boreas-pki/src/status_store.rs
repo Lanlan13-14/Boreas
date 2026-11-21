@@ -35,6 +35,9 @@
 //!   handle. [`crate::revoke_cleanup`] applies class-limited drops to an in-memory
 //!   id registry only.
 //!
+//! Independent IdentityAuthority objects use a separate, Linux-only v2 image
+//! extension. The legacy status-relay behavior above is unchanged.
+//!
 //! Linux is the only durable target in this slice. Other targets expose the
 //! same API but every operation fails closed with [`Error::Unsupported`].
 //!
@@ -92,6 +95,13 @@ use boreas_proto::{
 };
 use openssl::hash::{MessageDigest, hash};
 
+#[cfg(target_os = "linux")]
+mod identity;
+#[cfg(target_os = "linux")]
+pub use identity::{IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES};
+#[cfg(target_os = "linux")]
+use crate::authority_revocation::AuthorityRevocationTrust;
+
 use crate::{
     CLOCK_ROLLBACK_TOLERANCE_US, PolicyError, STATUS_MAX_AGE_US, SnapshotResult,
     management::{self, MAX_SIGNED_OBJECT_BYTES, ManagementTrust, VerifiedObject},
@@ -108,6 +118,10 @@ use std::{
 
 #[cfg(target_os = "linux")]
 const MAGIC: &[u8; 8] = b"BRSS\0\0\0\x01";
+#[cfg(target_os = "linux")]
+const IDENTITY_MAGIC: &[u8; 8] = b"BRSS\0\0\0\x02";
+#[cfg(target_os = "linux")]
+const MAX_STATE_WITH_IDENTITY_BYTES: usize = MAX_STATUS_STATE_BYTES + identity::MAX_EXTENSION_BYTES;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const LINUX_O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
@@ -171,6 +185,12 @@ pub enum Error {
     RevocationConflict,
     /// The bounded revocation state or payload bound was exceeded.
     RevocationTooLarge,
+    /// A fresh independent authority object did not verify.
+    #[cfg(target_os = "linux")]
+    AuthorityRevocation(crate::authority_revocation::Error),
+    /// A different TBS claims the same identity-scope sequence. The prior denial remains.
+    #[cfg(target_os = "linux")]
+    IdentityRevocationConflict,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,6 +318,8 @@ struct State {
     /// The second exact signed envelope of a same-sequence conflict.
     equivocation: Option<Vec<u8>>,
     revocation: RevocationState,
+    #[cfg(target_os = "linux")]
+    identity: Option<identity::Decisions>,
 }
 #[cfg(target_os = "linux")]
 impl State {
@@ -309,6 +331,7 @@ impl State {
             snapshot: None,
             equivocation: None,
             revocation: RevocationState::default(),
+            identity: None,
         }
     }
 }
@@ -500,6 +523,8 @@ pub struct StatusStore {
     _lock: ExclusiveLock,
     #[cfg(target_os = "linux")]
     owner: u32,
+    #[cfg(target_os = "linux")]
+    identity_trust: Option<([u8; 32], AuthorityRevocationTrust)>,
     net: [u8; 16],
     trust: ManagementTrust,
     revocation_relay: RevocationRelayPolicy,
@@ -557,6 +582,33 @@ impl StatusStore {
             trusted_owner_uid,
             trust,
             RevocationRelayPolicy::none(),
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Open with independent IdentityAuthority trust. The caller must bind both
+    /// verifiers to the exact same verified NetworkRoot before calling this API.
+    /// This does not authorize any entries carried inside a status snapshot.
+    #[cfg(target_os = "linux")]
+    pub fn open_with_identity_revocations(
+        path: impl AsRef<Path>,
+        net_id: [u8; 16],
+        trusted_owner_uid: u32,
+        trust: ManagementTrust,
+        root_fingerprint: [u8; 32],
+        identity_trust: AuthorityRevocationTrust,
+    ) -> Result<Self, Error> {
+        if identity_trust.net_id() != net_id {
+            return Err(Error::WrongNetwork);
+        }
+        Self::open_inner(
+            path,
+            net_id,
+            trusted_owner_uid,
+            trust,
+            RevocationRelayPolicy::none(),
+            Some((root_fingerprint, identity_trust)),
         )
     }
 
@@ -576,7 +628,7 @@ impl StatusStore {
         trust: ManagementTrust,
         revocation_relay: RevocationRelayPolicy,
     ) -> Result<Self, Error> {
-        Self::open_inner(path, net_id, trusted_owner_uid, trust, revocation_relay)
+        Self::open_inner(path, net_id, trusted_owner_uid, trust, revocation_relay, None)
     }
 
     fn open_inner(
@@ -585,6 +637,8 @@ impl StatusStore {
         trusted_owner_uid: u32,
         trust: ManagementTrust,
         revocation_relay: RevocationRelayPolicy,
+        #[cfg(target_os = "linux")]
+        identity_trust: Option<([u8; 32], AuthorityRevocationTrust)>,
     ) -> Result<Self, Error> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -614,6 +668,7 @@ impl StatusStore {
                 path,
                 _lock: lock,
                 owner: trusted_owner_uid,
+                identity_trust,
                 net: net_id,
                 trust,
                 revocation_relay,
@@ -630,6 +685,10 @@ impl StatusStore {
                 return Err(Error::WrongNetwork);
             }
             store.verify_loaded()?;
+            if let Some(decisions) = &store.state.identity {
+                let (root, trust) = store.identity_trust.as_ref().ok_or(Error::RevocationPermission)?;
+                decisions.verify_loaded(*root, trust)?;
+            }
             Ok(store)
         }
     }
@@ -1180,13 +1239,15 @@ impl StatusStore {
         };
         validate_file(&self.path, &file, self.owner)?;
         let len = usize::try_from(file.metadata()?.len()).map_err(|_| Error::TooLarge)?;
-        if len > MAX_STATUS_STATE_BYTES {
+        if len > MAX_STATE_WITH_IDENTITY_BYTES {
             return Err(Error::TooLarge);
         }
         let mut bytes = Vec::with_capacity(len);
-        file.take(MAX_STATUS_STATE_BYTES as u64 + 1)
+        file.take(MAX_STATE_WITH_IDENTITY_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_STATUS_STATE_BYTES {
+        if bytes.len() > MAX_STATE_WITH_IDENTITY_BYTES
+            || (bytes.len() > MAX_STATUS_STATE_BYTES && !bytes.starts_with(IDENTITY_MAGIC))
+        {
             return Err(Error::TooLarge);
         }
         decode(&bytes)
@@ -1289,9 +1350,6 @@ impl StatusStore {
             )));
         }
         let bytes = encode(&self.state)?;
-        if bytes.len() > MAX_STATUS_STATE_BYTES {
-            return Err(Error::TooLarge);
-        }
         let staging = suffix(&self.path, ".staging");
         match fs::symlink_metadata(&staging) {
             Ok(_) => return Err(Error::UnsafePath),
@@ -1568,7 +1626,7 @@ fn sha256(data: &[u8]) -> Result<[u8; 32], Error> {
 #[cfg(target_os = "linux")]
 fn encode(state: &State) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(if state.identity.is_some() { IDENTITY_MAGIC } else { MAGIC });
     bytes.extend_from_slice(&state.net);
     bytes.extend_from_slice(&state.utc_floor.to_be_bytes());
     let mut flags = 0u8;
@@ -1596,11 +1654,13 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     } else if state.equivocation.is_some() {
         return Err(Error::Corrupt);
     }
-    // Deliberately no revocation block: scopes and conflict latches are model
-    // state only. Keeping the image at `BRSS\0\0\0\x01` with the same flags means
-    // an older decoder cannot encounter an unknown version or flag.
+    // The status relay model is never serialized. Only separately authenticated
+    // identity evidence permits the v2 extension; the status portion retains its cap.
     if bytes.len() > MAX_STATUS_STATE_BYTES {
         return Err(Error::TooLarge);
+    }
+    if let Some(identity) = &state.identity {
+        identity.encode(&mut bytes)?;
     }
     Ok(bytes)
 }
@@ -1608,7 +1668,9 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
 #[cfg(target_os = "linux")]
 fn decode(bytes: &[u8]) -> Result<State, Error> {
     let mut reader = Reader { bytes, position: 0 };
-    if reader.take(8)? != &MAGIC[..] {
+    let magic = reader.take(8)?;
+    let has_identity = magic == IDENTITY_MAGIC;
+    if magic != MAGIC && !has_identity {
         return Err(Error::Corrupt);
     }
     let net: [u8; 16] = reader.take(16)?.try_into().map_err(|_| Error::Corrupt)?;
@@ -1664,6 +1726,14 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
     } else {
         None
     };
+    if reader.position > MAX_STATUS_STATE_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let identity = if has_identity {
+        Some(identity::Decisions::decode(&mut reader, utc_floor)?)
+    } else {
+        None
+    };
     if reader.position != bytes.len() {
         return Err(Error::Corrupt);
     }
@@ -1678,9 +1748,9 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
         rollback_latched,
         snapshot,
         equivocation,
-        // The image carries no revocation block; the caller rebuilds this from
-        // the re-verified snapshot in `verify_loaded`.
+        // Model relay entries still come only from the re-verified snapshot.
         revocation: RevocationState::default(),
+        identity,
     })
 }
 
