@@ -229,7 +229,7 @@ mod linux_daemon {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     };
     use std::thread;
@@ -2222,7 +2222,7 @@ mod linux_daemon {
         /// and no lock is ever held across `shutdown()` or a status check.
         stop: Arc<(Mutex<()>, Condvar)>,
         stopped: Arc<AtomicBool>,
-        fault: Arc<Mutex<Option<String>>>,
+        fault: Arc<OnceLock<String>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -2238,7 +2238,7 @@ mod linux_daemon {
         ) -> Self {
             let stop = Arc::new((Mutex::new(()), Condvar::new()));
             let stopped = Arc::new(AtomicBool::new(false));
-            let fault: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let fault = Arc::new(OnceLock::new());
             let stop_bg = Arc::clone(&stop);
             let stopped_bg = Arc::clone(&stopped);
             let fault_bg = Arc::clone(&fault);
@@ -2327,15 +2327,8 @@ mod linux_daemon {
                     // Ordering: flag first (observable through `ctl status`), then the
                     // owned reason, then the syscall that unblocks the packet loop.
                     counters.status_fresh.store(false, Ordering::SeqCst);
-                    {
-                        let mut slot = match fault_bg.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if slot.is_none() {
-                            *slot = Some(message);
-                        }
-                    }
+                    // One worker publishes once; readers need no mutex in the hot path.
+                    let _ = fault_bg.set(message);
                     if let Some(fd) = shutdown_fd.as_ref() {
                         // SAFETY: `fd` is an owned duplicate of the connected
                         // outer socket. It keeps the socket alive even if the
@@ -2356,10 +2349,7 @@ mod linux_daemon {
 
         /// Owned first-failure reason, if the watchdog halted forwarding.
         fn fault(&self) -> Option<String> {
-            match self.fault.lock() {
-                Ok(slot) => (*slot).clone(),
-                Err(poisoned) => (*poisoned.into_inner()).clone(),
-            }
+            self.fault.get().cloned()
         }
     }
 
