@@ -514,3 +514,37 @@ fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn provisioned_operational_signer_is_limited_to_its_authorized_core() {
+    let fixture = Fixture::new();
+    let base = &fixture._temp.0;
+    let roots = base.join("roots-4.cbor");
+    let keys = base.join("operational-1");
+    let now = utc_now().unwrap();
+    let wrong = base.join("bad-roots.cbor");
+    assert!(
+        authorize_core(
+            &base.join("ca"),
+            &base.join("roots-2.cbor"),
+            &keys.join("core.request"),
+            &wrong,
+            4,
+            now,
+        )
+        .is_err()
+    );
+    assert!(!wrong.exists());
+    let out = base.join("bad-lsa.signed");
+    assert!(
+        sign_lsa(&keys, &roots, &out, &LsaParams {
+            now,
+            core_generation: 1,
+            sequence: 2,
+            ttl_seconds: 60,
+            neighbors: &[(1, 10, 0)],
+        })
+        .is_err()
+    );
+    assert!(!out.exists());
+}

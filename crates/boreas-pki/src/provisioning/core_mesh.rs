@@ -36,10 +36,11 @@ fn read(path: &Path, secret: bool) -> Result<Vec<u8>> {
         .custom_flags(NOFOLLOW | 0x800 | 0x80000) // NOFOLLOW, NONBLOCK, CLOEXEC.
         .open(path)?;
     let meta = file.metadata()?;
+    let forbidden = if secret { 0o077 } else { 0o022 };
     if !meta.is_file()
         || meta.len() == 0
         || meta.len() > MAX_INPUT as u64
-        || meta.mode() & if secret { 0o077 } else { 0o022 } != 0
+        || meta.mode() & forbidden != 0
     {
         return Err(invalid("unsafe Core mesh input"));
     }
