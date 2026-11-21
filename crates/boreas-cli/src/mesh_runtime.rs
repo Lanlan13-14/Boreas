@@ -24,7 +24,7 @@ mod linux {
         io::ErrorKind,
         net::{SocketAddr, TcpListener, TcpStream},
         os::unix::fs::MetadataExt,
-        path::{Path, PathBuf},
+        path::Path,
         thread,
         time::{Duration, Instant},
     };
@@ -39,7 +39,7 @@ mod linux {
     };
     use boreas_tun::linux::{LinuxTunDevice, LinuxTunQueue};
     use boreas_tunnel::{
-        ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, TunnelError,
+        ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
         mesh_probe::{Error, MeshProbe, utc_now},
         mesh_route::{RouteLocator, SignedCore},
         packet_path::{MAX_MTU, MIN_MTU},
@@ -171,9 +171,9 @@ mod linux {
         read_material(path, max, None)
     }
 
-    fn optional(path: &Path, max: usize, private: bool) -> Result<Option<Vec<u8>>, String> {
+    fn optional(path: &Path, max: usize) -> Result<Option<Vec<u8>>, String> {
         match fs::symlink_metadata(path) {
-            Ok(_) => read_material(path, max, private.then(owner)).map(Some),
+            Ok(_) => read(path, max).map(Some),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(_) => Err("mesh optional material cannot be stat'ed".into()),
         }
@@ -332,6 +332,11 @@ mod linux {
         );
     }
 
+    struct CoreFiles {
+        identity: Vec<u8>,
+        lsa: Vec<u8>,
+    }
+
     struct Materials<'a> {
         dir: &'a Path,
         peers: &'a [u8],
@@ -342,14 +347,13 @@ mod linux {
             read(&self.dir.join("local-lsa.signed"), MAX_SIGNED_OBJECT_BYTES)
         }
 
-        fn refresh(&self, probe: &mut MeshProbe<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        fn refresh(&self, probe: &mut MeshProbe<'_>) -> Result<Vec<CoreFiles>, String> {
             probe
                 .refresh_runtime_authority(
                     &read(&self.dir.join("status.signed"), MAX_SIGNED_OBJECT_BYTES)?,
                     optional(
                         &self.dir.join("identity-revocation.signed"),
                         MAX_IDENTITY_REVOCATION_BYTES,
-                        false,
                     )?
                     .as_deref(),
                     &self.lsa()?,
@@ -366,7 +370,7 @@ mod linux {
                         &self.dir.join(format!("core-{id}-lsa.signed")),
                         MAX_SIGNED_OBJECT_BYTES,
                     )?;
-                    Ok((identity, lsa))
+                    Ok(CoreFiles { identity, lsa })
                 })
                 .collect()
         }
@@ -419,7 +423,7 @@ mod linux {
         {
             return Err("local signed Core does not match configured identity".into());
         }
-        let outer_roots = optional(&dir.join("outer-ca.pem"), MAX_PEM, false)?;
+        let outer_roots = optional(&dir.join("outer-ca.pem"), MAX_PEM)?;
         let outer = || match &outer_roots {
             Some(pem) => OpenSslOuterTlsConnector::with_root_certificates(pem),
             None => OpenSslOuterTlsConnector::web_pki(),
@@ -473,7 +477,10 @@ mod linux {
             refresh_at = Instant::now() + RETRY;
             let signed: Vec<_> = peer_raw
                 .iter()
-                .map(|(id, lsa)| SignedCore { identity: id, lsa })
+                .map(|entry| SignedCore {
+                    identity: &entry.identity,
+                    lsa: &entry.lsa,
+                })
                 .collect();
             let graph = probe
                 .verify_route_graph(&local, &signed)
@@ -607,6 +614,44 @@ mod linux {
                         thread::sleep(POLL);
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Spec;
+
+        const SOURCE: &str = r#"
+mode = "source"
+peers = [2, 3, 4]
+tun = "btun0"
+mtu = 1400
+[[routes]]
+path = [1, 2, 4]
+next = "192.0.2.2:18082"
+tls_name = "core2.example.com"
+[[routes]]
+path = [1, 3, 4]
+next = "192.0.2.3:18083"
+tls_name = "core3.example.com"
+"#;
+
+        #[test]
+        fn source_routes_bind_ordered_pair_with_distinct_first_hops() {
+            let good: Spec = toml::from_str(SOURCE).unwrap();
+            assert!(good.validate(1).is_ok());
+            assert!(good.validate(2).is_err());
+            for bad in [
+                SOURCE.replace("[1, 3, 4]", "[1, 2, 3, 4]"),
+                SOURCE.replace("[1, 3, 4]", "[1, 3, 2]"),
+                SOURCE.replace("[1, 3, 4]", "[1, 3, 1, 4]"),
+                SOURCE.replace("192.0.2.3:18083", "0.0.0.0:18083"),
+                SOURCE.replace("1400", "1501"),
+                SOURCE.replace("[2, 3, 4]", "[2, 2, 3, 4]"),
+            ] {
+                let parsed: Spec = toml::from_str(&bad).unwrap();
+                assert!(parsed.validate(1).is_err());
             }
         }
     }
