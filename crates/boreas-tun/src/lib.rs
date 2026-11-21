@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod gso;
 pub mod icmp;
 #[cfg(target_os = "linux")]
 pub mod linux;
