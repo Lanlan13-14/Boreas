@@ -15,7 +15,9 @@ approved=
 case "$mode" in
   verify) [ "$#" -eq 5 ] || fail "$usage"; shift ;;
   apply)
-    [ "$#" -eq 7 ] && [ "$2" = --confirm-manifest-sha256 ] || fail "$usage"
+    if [ "$#" -ne 7 ] || [ "$2" != --confirm-manifest-sha256 ]; then
+      fail "$usage"
+    fi
     approved=$3
     [ "${#approved}" -eq 64 ] || fail 'approval must be a lowercase SHA-256'
     case "$approved" in *[!0-9a-f]*) fail 'approval must be a lowercase SHA-256' ;; esac
@@ -34,16 +36,19 @@ property() { manager show --property="$1" --value boreas.service; }
 [ "$(property FragmentPath)" = "$unit" ] || fail 'verified unit not installed'
 drop_ins=$(property DropInPaths) || fail 'cannot inspect unit drop-ins'
 [ -z "$drop_ins" ] || fail 'review and migrate unit drop-ins explicitly'
-[ "$(property Type)" = notify ] && [ "$(property NotifyAccess)" = main ] \
-  && [ "$(property User)" = boreas ] && [ "$(property Group)" = boreas ] \
-  && [ "$(id -u boreas)" -gt 0 ] || fail 'expected dedicated non-root notify unit'
+if [ "$(property Type)" != notify ] || [ "$(property NotifyAccess)" != main ] \
+  || [ "$(property User)" != boreas ] || [ "$(property Group)" != boreas ]; then
+  fail 'expected dedicated non-root notify unit'
+fi
+[ "$(id -u boreas)" -gt 0 ] || fail 'expected dedicated non-root notify unit'
 case "$(property ExecStart)" in
   *'path=/usr/local/libexec/boreas/boreas-service ; argv[]=/usr/local/libexec/boreas/boreas-service ;'*) : ;;
   *) fail 'refusing to operate on a different service' ;;
 esac
 for dir in /usr /usr/local /usr/local/libexec /usr/local/libexec/boreas /etc /etc/boreas; do
-  [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c '%u' "$dir")" = 0 ] \
-    || fail 'deployment path has an untrusted ancestor'
+  if [ ! -d "$dir" ] || [ -L "$dir" ] || [ "$(stat -c '%u' "$dir")" != 0 ]; then
+    fail 'deployment path has an untrusted ancestor'
+  fi
   [ $((0$(stat -c '%a' "$dir") & 022)) -eq 0 ] \
     || fail 'deployment path has a writable ancestor'
 done
