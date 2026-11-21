@@ -19,8 +19,13 @@ use std::path::Path;
 #[cfg(feature = "openssl-inner-tls")]
 use crate::config::NodeRole as ConfigRole;
 
+#[path = "mesh_probe.rs"]
+mod mesh_probe;
+pub use mesh_probe::SYNTAX as MESH_PROBE_SYNTAX;
+
 pub fn run(args: &[String]) -> (u8, String, String) {
     match args.first().map(String::as_str) {
+        Some("mesh-probe") => mesh_probe::run(&args[1..]),
         Some("serve") if args.len() == 4 => serve(&args[1], &args[2], &args[3]),
         Some("connect") if args.len() == 5 => connect(&args[1], &args[2], &args[3], &args[4]),
         Some("serve") => (

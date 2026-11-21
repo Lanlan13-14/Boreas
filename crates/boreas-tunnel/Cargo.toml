@@ -32,3 +32,6 @@ boreas-tun = { path = "../boreas-tun" }
 # Same reviewed release as `boreas-crypto`'s backend; used by the outer TLS
 # adapter and the certificate SPKI binding.
 openssl = { version = "=0.10.82", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.191"

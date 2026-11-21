@@ -697,12 +697,32 @@ impl StatusStore {
         self.net
     }
 
+    /// Compare configured authorities, including delegation validity, without
+    /// exposing or comparing verifier replay state.
+    pub fn has_same_authorities(&self, expected: &ManagementTrust) -> bool {
+        self.trust.same_issuers(expected)
+    }
+
     pub fn sequence(&self) -> Option<u64> {
         self.state.snapshot.as_ref().map(|snapshot| snapshot.seq)
     }
 
     pub fn last_trusted_utc(&self) -> u64 {
         self.state.utc_floor
+    }
+
+    /// Recheck a process-local, already-armed snapshot's clock cutoffs without
+    /// refreshing it or advancing its durable floor. The caller must persist
+    /// a rollback latch via `observe_trusted_utc` if this reports rollback.
+    pub fn check_active_snapshot(&self, observed: u64, mono_now: Instant) -> Result<(), Error> {
+        let seq = self.sequence().ok_or(Error::NotFresh)?;
+        let deadline = self.runtime_deadline.ok_or(Error::NotFresh)?;
+        FreshStatus {
+            store: self,
+            seq,
+            deadline,
+        }
+        .check(observed, mono_now)
     }
 
     pub fn is_clock_latched(&self) -> bool {

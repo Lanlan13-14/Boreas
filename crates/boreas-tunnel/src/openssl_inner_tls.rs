@@ -155,6 +155,24 @@ impl E2eStream for EstablishedStream<CircuitStream<'_>> {
         // carries the notification as ordinary ordered ciphertext fragments.
         self.close_notify()
     }
+
+    #[cfg(target_os = "linux")]
+    fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
+        self.close_notify()?;
+        self.get_mut().send_close()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
+        let mut byte = [0u8; 1];
+        match self.read_plaintext(&mut byte) {
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                self.get_mut().wait_close()
+            }
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(crate::CircuitReject::UnexpectedFrame.into()),
+        }
+    }
 }
 
 impl E2eTlsBackend for OpenSslE2eBackend {

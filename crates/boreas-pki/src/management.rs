@@ -154,7 +154,7 @@ impl AllowedPrefix {
 }
 
 /// Explicit issuer authority scope. Empty role/core/prefix sets authorize nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IssuerScope {
     pub allowed_roles: Vec<NodeRole>,
     pub allowed_home_cores: Vec<u8>,
@@ -188,7 +188,7 @@ impl IssuerScope {
 
 /// Provisioned issuer trust record. The public keys are DER SubjectPublicKeyInfo values
 /// imported and type-checked by `add_issuer`; they are never raw attacker-supplied blobs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuerRecord {
     pub issuer_key_id: Vec<u8>,
     pub issuer_generation: u64,
@@ -233,7 +233,7 @@ impl VerifiedObject {
         &self.raw_signed_object
     }
     /// Exclusive UTC cutoff for this object, including any root delegation.
-    pub(crate) fn valid_until(&self) -> u64 {
+    pub fn valid_until(&self) -> u64 {
         self.valid_until
     }
     pub fn is_duplicate(&self) -> bool {
@@ -269,7 +269,7 @@ struct ReplayState {
     conflicted: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TrustedIssuer {
     record: IssuerRecord,
     /// `None` is reserved for explicitly provisioned out-of-band anchors.
@@ -308,6 +308,9 @@ impl ManagementTrust {
     pub fn issuer_count(&self) -> usize {
         self.issuers.len()
     }
+    pub(crate) fn same_issuers(&self, expected: &Self) -> bool {
+        self.net_id == expected.net_id && self.issuers == expected.issuers
+    }
     /// Full envelope bytes of the most recent equivocation, if any.
     pub fn conflict_evidence(&self) -> Option<&[u8]> {
         self.conflict_evidence.as_deref()
@@ -315,6 +318,20 @@ impl ManagementTrust {
     /// Verified NodeIdentity used for the Lease Primary signer, if already accepted.
     pub fn node_identity(&self, node_id: u16) -> Option<&NodeIdentity> {
         self.node_identities.get(&node_id)
+    }
+
+    /// Whether an already-verified identity is still the live process-local
+    /// watermark for its node. Callers must separately verify a signature and
+    /// check revocation and expiry; this is not durable replay state.
+    pub fn is_current_identity(&self, node_id: u16, object_id: [u8; 32]) -> bool {
+        self.replay.get(&ReplayKey::NodeIdentity(node_id))
+            .is_some_and(|head| !head.conflicted && head.object_id == object_id)
+    }
+
+    /// Check a previously verified LSA against the current process-local slot.
+    pub fn is_current_core_lsa(&self, core_id: u8, object_id: [u8; 32]) -> bool {
+        self.replay.get(&ReplayKey::CoreLsa(core_id))
+            .is_some_and(|head| !head.conflicted && head.object_id == object_id)
     }
 
     /// Provision an out-of-band trust anchor with no root-delegation window.
