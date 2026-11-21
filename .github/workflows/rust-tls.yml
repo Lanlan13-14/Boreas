@@ -815,6 +815,19 @@ jobs:
           path: hop-node-linux
           if-no-files-found: error
           retention-days: 14
+      - name: Record performance runner and exact binary
+        if: success() && github.ref == 'refs/heads/fix/v111-release-blockers'
+        run: |
+          set -euo pipefail
+          {
+            printf 'source_sha=%s\nrunner_image=%s/%s\n' "$GITHUB_SHA" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            uname -srmo
+            LC_ALL=C lscpu
+            rustc -vV
+            ip -Version
+            tc -Version
+            sha256sum hop-node-linux/boreas-linux-x86_64-musl-pq768
+          } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples (candidate only)
         id: candidate_delayed
         if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/fix/v111-release-blockers'
@@ -884,6 +897,7 @@ jobs:
             rust-tls-netns-e2e.log
             rust-tls-netns-delayed-*.log
             rust-tls-netns-gigabit-*.log
+            rust-tls-perf-environment.txt
             rust-tls-initial-backup.log
             rust-tls-initial-backup-negative.log
           if-no-files-found: warn
