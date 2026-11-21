@@ -51,6 +51,8 @@ pub mod failover;
 pub mod h2credit;
 pub mod hedge;
 pub mod memledger;
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub mod mesh_probe;
 pub mod packet_path;
 pub mod pmtu;
 pub mod probe_budget;

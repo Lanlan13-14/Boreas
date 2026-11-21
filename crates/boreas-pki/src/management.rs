@@ -233,7 +233,7 @@ impl VerifiedObject {
         &self.raw_signed_object
     }
     /// Exclusive UTC cutoff for this object, including any root delegation.
-    pub(crate) fn valid_until(&self) -> u64 {
+    pub fn valid_until(&self) -> u64 {
         self.valid_until
     }
     pub fn is_duplicate(&self) -> bool {
