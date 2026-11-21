@@ -1041,7 +1041,14 @@ mod linux_daemon {
     /// never be auto-promoted as ordinary failover.
     fn path_failure_kind(error: &PacketPathError) -> PathFailureKind {
         match error {
-            PacketPathError::CircuitIo(_) => PathFailureKind::Transport,
+            PacketPathError::CircuitIo(
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut,
+            ) => PathFailureKind::Transport,
             _ => PathFailureKind::Protocol,
         }
     }
@@ -4522,6 +4529,9 @@ mod linux_daemon {
                 "a circuit I/O failure is transport loss"
             );
             for error in [
+                PacketPathError::CircuitProtocol,
+                PacketPathError::CircuitIo(std::io::ErrorKind::InvalidData),
+                PacketPathError::CircuitIo(std::io::ErrorKind::Other),
                 PacketPathError::TruncatedFrame,
                 PacketPathError::EmptyFrame,
                 PacketPathError::FrameTooLarge,

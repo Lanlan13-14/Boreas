@@ -75,7 +75,9 @@ use crate::dns_packet_service::{self, DnsPacketService};
 use std::time::Instant;
 
 use crate::e2e::E2eCircuit;
+use crate::error::TunnelError;
 use crate::relay::MAX_RELAY_HOPS;
+use crate::ws::WsError;
 use crate::tls::PeerIdentity;
 
 /// Width of the length prefix inside the E2E stream, in bytes.
@@ -212,6 +214,8 @@ pub enum PacketPathError {
     TruncatedFrame,
     /// The circuit stream reported an I/O error.
     CircuitIo(io::ErrorKind),
+    /// The wrapped TLS, WebSocket or circuit rejected the byte stream.
+    CircuitProtocol,
     /// The host-side packet queue is full. This slice has no retry buffer, so it
     /// fails closed instead of dropping the packet silently.
     HostQueueFull,
@@ -259,6 +263,7 @@ impl fmt::Display for PacketPathError {
             Self::FrameLengthMismatch => f.write_str("frame-length-mismatch"),
             Self::TruncatedFrame => f.write_str("frame-truncated"),
             Self::CircuitIo(kind) => write!(f, "circuit-io({kind:?})"),
+            Self::CircuitProtocol => f.write_str("circuit-protocol"),
             Self::HostQueueFull => f.write_str("host-queue-full"),
             Self::HostQueueClosed => f.write_str("host-queue-closed"),
             Self::HostRejected(error) => write!(f, "host-rejected({error})"),
@@ -709,6 +714,24 @@ pub fn decode_packet_frame(frame: &[u8], mtu: usize) -> Result<&[u8], PacketPath
     Ok(body)
 }
 
+fn circuit_io(error: io::Error) -> PacketPathError {
+    // Nested stream adapters can carry a typed protocol rejection inside
+    // InvalidData. Unwrap the verified type before deciding whether fallback
+    // is allowed; never promote on an unknown TLS alert or framing error.
+    match TunnelError::from(error) {
+        TunnelError::Io(kind) | TunnelError::Ws(WsError::Io(kind)) => {
+            PacketPathError::CircuitIo(kind)
+        }
+        TunnelError::Timeout | TunnelError::Ws(WsError::Timeout) => {
+            PacketPathError::CircuitIo(io::ErrorKind::TimedOut)
+        }
+        TunnelError::Closed | TunnelError::Ws(WsError::Closed) => {
+            PacketPathError::CircuitIo(io::ErrorKind::UnexpectedEof)
+        }
+        _ => PacketPathError::CircuitProtocol,
+    }
+}
+
 /// Read one frame's 2-byte prefix.
 ///
 /// `Ok(false)` means the stream ended cleanly before a frame started. A stream
@@ -739,7 +762,7 @@ fn read_prefix<C: Read + ?Sized>(
                     return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
                 }
             }
-            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+            Err(error) => return Err(circuit_io(error)),
         }
     }
     Ok(true)
@@ -1429,13 +1452,13 @@ fn write_outbound<C: Write>(
         dns.check()?;
         circuit
             .flush()
-            .map_err(|e| PacketPathError::CircuitIo(e.kind()))?;
+            .map_err(circuit_io)?;
         return dns.check();
     }
     write_all_bounded(circuit, frame)?;
     circuit
         .flush()
-        .map_err(|e| PacketPathError::CircuitIo(e.kind()))
+        .map_err(circuit_io)
 }
 
 /// Write a whole frame, bounded on "no progress".
@@ -1472,7 +1495,7 @@ fn write_all_guarded<C: Write + ?Sized>(
                     return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
                 }
             }
-            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+            Err(error) => return Err(circuit_io(error)),
         }
     }
     Ok(())
@@ -1498,7 +1521,7 @@ fn read_exact_bounded<C: Read + ?Sized>(
                     return Err(PacketPathError::CircuitIo(io::ErrorKind::Interrupted));
                 }
             }
-            Err(error) => return Err(PacketPathError::CircuitIo(error.kind())),
+            Err(error) => return Err(circuit_io(error)),
         }
     }
     Ok(())
@@ -1659,7 +1682,7 @@ fn dispatch_private_dns<C: Write>(
     // bytes already accepted by an underlying blocking write cannot be recalled.
     write_all_guarded(circuit, &frame[..frame_len], || dns.live_utc().map(|_| ()))?;
     dns.live_utc()?;
-    circuit.flush().map_err(|error| PacketPathError::CircuitIo(error.kind()))?;
+    circuit.flush().map_err(circuit_io)?;
     dns.live_utc()?;
     Ok(Some(info.packet_len))
 }
@@ -1708,6 +1731,20 @@ mod tests {
 
     const NET: [u8; 16] = [0x2a; 16];
     const GENERATION: u64 = 7;
+
+    #[test]
+    fn circuit_io_preserves_transport_and_protocol_distinction() {
+        use io::ErrorKind::{ConnectionReset, InvalidData, TimedOut, UnexpectedEof};
+        for (wrapped, expected) in [
+            (TunnelError::Io(ConnectionReset), PacketPathError::CircuitIo(ConnectionReset)),
+            (TunnelError::Timeout, PacketPathError::CircuitIo(TimedOut)),
+            (TunnelError::Ws(WsError::Closed), PacketPathError::CircuitIo(UnexpectedEof)),
+            (TunnelError::Circuit(crate::CircuitReject::OffsetMismatch), PacketPathError::CircuitProtocol),
+            (TunnelError::Ws(WsError::BadAcceptKey), PacketPathError::CircuitProtocol),
+        ] {
+            assert_eq!(circuit_io(io::Error::new(InvalidData, wrapped)), expected);
+        }
+    }
 
     #[test]
     fn caller_buffer_frame_matches_wire_bytes_and_preserves_tail() {
