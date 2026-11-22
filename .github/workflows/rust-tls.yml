@@ -281,7 +281,10 @@ jobs:
           for test in \
             'update::signed::tests::authenticates_exact_manifest_and_reports_metadata_only' \
             'update::signed::tests::requires_both_signatures_exact_bytes_and_local_root' \
-            'update::signed::tests::stops_on_transport_error_or_short_signature_and_never_falls_back'; do
+            'update::signed::tests::stops_on_transport_error_or_short_signature_and_never_falls_back' \
+            'update::signed::online::tests::no_artifact_request_before_both_signatures_and_exact_operator_approval' \
+            'update::signed::online::tests::rejects_redirect_timeout_wrong_size_digest_elf_and_expiry_before_handoff' \
+            'update::signed::online::tests::prepares_exact_nonexecutable_inputs_for_existing_apply_then_removes_spool'; do
             grep -Fx "test $test ... ok" rust-tls-cli-tests.log
           done
           grep -E '^test [[:alnum:]_:]+::offline_pool_migration_cli_roundtrip_with_pinned_root_and_no_overwrite \.\.\. ok$' rust-tls-cli-tests.log
