@@ -147,6 +147,8 @@ def _parse_tcp_info(record: dict, line: str) -> None:
     """Attach only the TCP_INFO fields the kernel actually printed."""
 
     tokens = line.split()
+    if tokens and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", tokens[0]) and len(tokens) > 1 and tokens[1].startswith("wscale:"):
+        record["congestion"] = tokens[0]
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -184,8 +186,12 @@ def _parse_tcp_info(record: dict, line: str) -> None:
                 record["bytes_acked"] = _to_int(value)
             elif key == "bytes_received":
                 record["bytes_received"] = _to_int(value)
-            elif key in ("bytes_retrans", "notsent"):
+            elif key in ("bytes_retrans", "notsent", "snd_wnd", "rcv_space"):
                 record[key] = _to_int(value)
+            elif key in ("busy", "rwnd_limited", "sndbuf_limited"):
+                match = re.fullmatch(r"(\d+)ms(?:\(\d+(?:\.\d+)?%\))?", value)
+                if match:
+                    record[key + "_ms"] = int(match.group(1))
             elif key == "unacked":
                 record["unacked"] = _to_int(value)
             elif key == "minrtt":
@@ -929,6 +935,9 @@ def summarize(label: str, path: str) -> list[str]:
             cwnd_values: list[int] = []
             rto_values: list[float] = []
             delivery_values: list[float] = []
+            windows: list[int] = []
+            receive_space: list[int] = []
+            algorithms: set[str] = set()
             for row in socket_rows:
                 sockets = _socket_map(row)
                 for key in persistent:
@@ -937,6 +946,13 @@ def summarize(label: str, path: str) -> list[str]:
                         continue
                     if isinstance(record.get("notsent"), int):
                         notsent_values.append(record["notsent"])
+                    if isinstance(record.get("snd_wnd"), int):
+                        windows.append(record["snd_wnd"])
+                    if isinstance(record.get("rcv_space"), int):
+                        receive_space.append(record["rcv_space"])
+                    algorithm = record.get("congestion")
+                    if isinstance(algorithm, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", algorithm):
+                        algorithms.add(algorithm)
                     if isinstance(record.get("cwnd"), int):
                         cwnd_values.append(record["cwnd"])
                     if isinstance(record.get("rto_ms"), (int, float)):
@@ -960,6 +976,15 @@ def summarize(label: str, path: str) -> list[str]:
                 prefix + "_retrans_total_delta=" + _plain(retrans),
                 prefix + "_bytes_retrans_delta=" + _plain(retrans_bytes),
                 prefix + "_notsent_peak_bytes=" + _plain(max(notsent_values, default=None)),
+                prefix + "_congestion=" + (",".join(sorted(algorithms)) or "unavailable"),
+                prefix + "_snd_wnd_min_bytes=" + _plain(min(windows, default=None)),
+                prefix + "_snd_wnd_max_bytes=" + _plain(max(windows, default=None)),
+                prefix + "_rcv_space_max_bytes=" + _plain(max(receive_space, default=None)),
+                *(
+                    prefix + "_" + field + "_delta="
+                    + _plain(_total_delta(first_sockets, last_sockets, persistent, field))
+                    for field in ("busy_ms", "rwnd_limited_ms", "sndbuf_limited_ms")
+                ),
                 prefix
                 + "_delivery_rate_max_mbps="
                 + _format(max(delivery_values) / 1e6 if delivery_values else None),
