@@ -210,14 +210,9 @@ fn is_easy_entrypoint(argv0: &str) -> bool {
     base.strip_suffix(".exe").unwrap_or(base) == "boreas-easy"
 }
 
-/// Capability facts for this binary.
-///
-/// No runtime is integrated: `crates/boreas-tunnel` exposes only in-process
-/// session APIs, there is no `control.sock`, and `boreas_dns::TcpDnsSupport`
-/// reports `Unsupported`. When the tunnel crate publishes
-/// `runtime_capabilities()`, this function must forward it verbatim instead of
-/// hardcoding `NO_RUNTIME`; until then every capability-gated field is refused
-/// rather than assumed.
+/// Standalone config tools have no bound daemon profile. The Linux daemon
+/// validates capabilities separately with its launch arguments; a generic
+/// config check cannot attest to TUN, pinned DNS material or an E2E circuit.
 fn runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities::NO_RUNTIME
 }

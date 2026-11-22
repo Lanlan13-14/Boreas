@@ -110,12 +110,14 @@ Before this refusal can be lifted, trusted genesis/network-policy binding, ident
 
 ## `[dns].tcp` is capability-gated, not schema-banned
 
-`Config::parse_toml` / `Config::read_file` take [`RuntimeCapabilities`]. `[dns].tcp = true` is refused only when `capabilities.dns_tcp` is false, and the error names the missing integration rather than calling the field illegal. In this binary `runtime_capabilities()` returns `NO_RUNTIME`, because:
-
-- `crates/boreas-tunnel` currently exposes only in-process session APIs (`LinkClient::connect`, `LinkServer::accept`) — no status snapshot and no `/run/boreas/control.sock`;
-- `boreas_dns::TcpDnsSupport` is authoritative and currently reports `Unsupported` (the `pub mod tcp` driver is a prototype awaiting runtime integration).
-
-When the tunnel crate publishes `runtime_capabilities()`, `main.rs` must forward it verbatim. Unit tests flip the same document from rejected to accepted by changing only the capability value, which proves the gate is capability-driven.
+`Config::parse_toml` / `Config::read_file` take `RuntimeCapabilities`. Only the
+OpenSSL-enabled Linux `daemon serve` / `daemon connect` profile with a real TUN
+(no GSO) and both `--private-dns-dir` and `--private-dns-pin` can accept
+`[dns].tcp = true`. Both endpoints must opt in, and launch still verifies the
+signed zone, material and circuit. The general `config-check`, `config-migrate`
+and console paths have no bound daemon profile and do not accept this setting.
+See [private DNS deployment](../engineering/dns-daemon-deployment.md) for route
+and quarantine requirements. Default `false` leaves TCP disabled.
 
 ## Resource limits and safe file handling
 

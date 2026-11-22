@@ -287,7 +287,7 @@ pub struct PacketRuntime<D = AuthoritativeDns> {
     iface: Interface,
     device: QueueDevice,
     sockets: SocketSet<'static>,
-    tcp: TcpDnsServer,
+    tcp: Option<TcpDnsServer>,
     dns: D,
     packet_config: PacketConfig,
     listen: IpAddress,
@@ -310,7 +310,7 @@ impl PacketRuntime {
         listen: IpAddress,
         config: PacketRuntimeConfig,
     ) -> Result<Self, PacketRuntimeError> {
-        Self::with_backend(dns, packet_config, listen, config)
+        Self::with_backend(dns, packet_config, listen, config, true)
     }
 
     /// Drive the legacy packet model with its explicit source map and authority.
@@ -337,11 +337,13 @@ impl PacketRuntime {
 impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
     /// Own a single dispatcher for both packet transports. Polling this
     /// runtime never uses the dispatcher's blocking/public upstream path.
-    /// This constructor requires an IPv4-only packet configuration.
+    /// This constructor requires an IPv4-only packet configuration. When
+    /// `tcp_enabled` is false it allocates no TCP listeners or socket buffers.
     pub fn new_private_dispatcher(
         dispatcher: QueryDispatcher<A>,
         packet_config: PacketConfig,
         config: PacketRuntimeConfig,
+        tcp_enabled: bool,
     ) -> Result<Self, PacketRuntimeError> {
         if packet_config.dns_v6().is_some() {
             return Err(PacketRuntimeError::InvalidConfiguration);
@@ -351,6 +353,7 @@ impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
             packet_config,
             IpAddress::Ipv4(packet_config.dns_v4()),
             config,
+            tcp_enabled,
         )
     }
 
@@ -385,6 +388,7 @@ impl<D> PacketRuntime<D> {
         packet_config: PacketConfig,
         listen: IpAddress,
         config: PacketRuntimeConfig,
+        tcp_enabled: bool,
     ) -> Result<Self, PacketRuntimeError> {
         let max_packet_bytes = packet_config.max_packet_bytes();
         if max_packet_bytes > MAX_DEVICE_MTU || !config.validate(max_packet_bytes) {
@@ -429,8 +433,10 @@ impl<D> PacketRuntime<D> {
             addr: Some(listen),
             port: DNS_TCP_PORT,
         };
-        let tcp =
-            TcpDnsServer::new(tcp, endpoint, &mut sockets).map_err(PacketRuntimeError::Tcp)?;
+        let tcp = tcp_enabled
+            .then(|| TcpDnsServer::new(tcp, endpoint, &mut sockets))
+            .transpose()
+            .map_err(PacketRuntimeError::Tcp)?;
         Ok(Self {
             iface,
             device,
@@ -535,7 +541,8 @@ impl<D> PacketRuntime<D> {
                     Err(_) => stats.dropped_malformed += 1,
                 },
                 6 => {
-                    let is_dns_tcp = meta.destination == self.listen_ip
+                    let is_dns_tcp = self.tcp.is_some()
+                        && meta.destination == self.listen_ip
                         && tcp_destination_port(&packet, meta.header_len) == Some(DNS_TCP_PORT);
                     if !is_dns_tcp {
                         stats.dropped_unsupported += 1;
@@ -549,19 +556,30 @@ impl<D> PacketRuntime<D> {
             }
         }
 
-        let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
-        stats.tcp_frames =
-            self.tcp
-                .process_with(
-                    &mut self.sockets,
-                    &authorizer,
-                    now,
-                    |source, query| match authorizer.peer(source) {
-                        Some(peer) => answer(&self.dns, peer, query, None),
-                        None => Ok(None),
-                    },
-                );
-        let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
+        if let Some(tcp) = self.tcp.as_mut() {
+            self.iface.poll_maintenance(now);
+            // Drain at most one bounded device queue; enforce application
+            // authorization/expiry before dispatching buffered TCP payloads.
+            for _ in 0..stats.tcp_injected {
+                let _ = self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets);
+            }
+            stats.tcp_frames = tcp.process_with(
+                &mut self.sockets,
+                &authorizer,
+                now,
+                |source, query| match authorizer.peer(source) {
+                    Some(peer) => answer(&self.dns, peer, query, None),
+                    None => Ok(None),
+                },
+            );
+            for _ in 0..self.queue_packets {
+                if self.iface.poll_egress(now, &mut self.device, &mut self.sockets)
+                    == smoltcp::iface::PollResult::None
+                {
+                    break;
+                }
+            }
+        }
         stats.output_queued = self.device.output_len();
         stats
     }
@@ -591,7 +609,7 @@ impl<D> PacketRuntime<D> {
     }
 
     pub fn tcp_connection_capacity(&self) -> usize {
-        self.tcp.connection_capacity()
+        self.tcp.as_ref().map_or(0, TcpDnsServer::connection_capacity)
     }
 }
 
@@ -957,6 +975,59 @@ mod tests {
         assert!(closed, "server FIN not observed after half-close");
     }
 
+    #[test]
+    fn tcp_retransmits_without_input_and_reclaims_idle_slot() {
+        use std::time::Duration;
+
+        let mut runtime = PacketRuntime::new(
+            dns(),
+            packet_config(),
+            IpAddress::Ipv4(SERVER4),
+            PacketRuntimeConfig {
+                tcp: TcpDnsConfig {
+                    max_connections: 1,
+                    idle_timeout: Duration::from_secs(10),
+                    ..TcpDnsConfig::default()
+                },
+                ..PacketRuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        let mut client = client_side(IpAddress::Ipv4(CLIENT4), 11);
+        let handle = start_connect(&mut client, 53_000);
+        let _ = client.iface.poll(Instant::from_millis(10), &mut client.device, &mut client.sockets);
+        let syn = client.device.take_outbound().unwrap();
+        runtime.push_input(&syn).unwrap();
+        assert_eq!(runtime.poll(Instant::from_millis(10), &AllowClient).tcp_injected, 1);
+        let first = runtime.pop_output().unwrap();
+        assert_eq!(first[33] & 0x12, 0x12); // initial SYN/ACK is lost
+        let retry = runtime.poll(Instant::from_millis(3_010), &AllowClient);
+        assert_eq!(retry.input_drained, 0);
+        let retry = runtime.pop_output().unwrap();
+        assert_eq!(&retry[20..32], &first[20..32]); // tuple, SEQ and ACK identical
+        assert_eq!(retry[33] & 0x12, 0x12);
+        client.device.push_inbound(retry);
+        let _ = client.iface.poll_ingress_single(
+            Instant::from_millis(3_010),
+            &mut client.device,
+            &mut client.sockets,
+        );
+        for n in 1..=8 {
+            transfer(&mut client, &mut runtime, 3_010 + n * 10, &AllowClient);
+        }
+        assert!(client.sockets.get::<tcp::Socket>(handle).may_send());
+        // Application inactivity (measured from the SYN), no inbound event.
+        assert_eq!(runtime.poll(Instant::from_millis(10_011), &AllowClient).input_drained, 0);
+        let reset = runtime.pop_output().unwrap();
+        assert_ne!(reset[33] & 0x04, 0);
+        let _ = runtime.poll(Instant::from_millis(10_012), &AllowClient);
+        let next = start_connect(&mut client, 53_001);
+        for n in 1..=8 {
+            transfer(&mut client, &mut runtime, 10_020 + n * 10, &AllowClient);
+        }
+        assert!(client.sockets.get::<tcp::Socket>(next).may_send());
+    }
+
     impl ClientAuthorizer for AllowClient {
         fn authorized_node(&self, peer: AuthenticatedPeerSource) -> Option<u16> {
             (peer.address() == IpAddr::V4(CLIENT4)).then_some(2)
@@ -988,6 +1059,7 @@ mod tests {
             dispatcher,
             PacketConfig::new_ipv4(Ipv4Addr::new(10, 20, 0, 0), 1500).unwrap(),
             PacketRuntimeConfig::default(),
+            true,
         )
         .unwrap();
         let mut client = client_side(IpAddress::Ipv4(CLIENT4), 11);

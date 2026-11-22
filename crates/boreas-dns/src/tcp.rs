@@ -23,6 +23,7 @@ pub const DEFAULT_RX_BYTES_PER_CONNECTION: usize = 8192;
 pub const DEFAULT_TX_BYTES_PER_CONNECTION: usize = 8192;
 pub const DEFAULT_MAX_FRAMES_PER_POLL: usize = 16;
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_MAX_CONNECTION_AGE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TcpDnsError {
@@ -40,6 +41,7 @@ pub struct TcpDnsConfig {
     pub max_frame_bytes: usize,
     pub max_frames_per_poll: usize,
     pub idle_timeout: Duration,
+    pub max_connection_age: Duration,
 }
 
 impl Default for TcpDnsConfig {
@@ -51,6 +53,7 @@ impl Default for TcpDnsConfig {
             max_frame_bytes: MAX_QUERY_BYTES,
             max_frames_per_poll: DEFAULT_MAX_FRAMES_PER_POLL,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_connection_age: DEFAULT_MAX_CONNECTION_AGE,
         }
     }
 }
@@ -67,7 +70,9 @@ impl TcpDnsConfig {
             || self.tx_bytes_per_connection > MAX_TCP_BUFFER_BYTES_PER_CONNECTION
             || self.max_frames_per_poll == 0
             || self.max_frames_per_poll > 1024
-            || self.idle_timeout.is_zero()
+            || self.idle_timeout.as_millis() == 0
+            || self.max_connection_age < self.idle_timeout
+            || self.max_connection_age > DEFAULT_MAX_CONNECTION_AGE
             || self
                 .max_frame_bytes
                 .checked_add(2)
@@ -103,7 +108,7 @@ struct Connection {
     transmit: Vec<u8>,
     transmit_offset: usize,
     last_activity: smoltcp::time::Instant,
-    active: bool,
+    opened_at: Option<smoltcp::time::Instant>,
     peer_closed: bool,
 }
 
@@ -161,7 +166,7 @@ impl TcpDnsServer {
                 transmit: Vec::with_capacity(config.tx_bytes_per_connection),
                 transmit_offset: 0,
                 last_activity: smoltcp::time::Instant::from_millis(0),
-                active: false,
+                opened_at: None,
                 peer_closed: false,
             });
         }
@@ -203,6 +208,10 @@ impl TcpDnsServer {
         for conn in &mut self.connections {
             let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
             if socket.is_listening() {
+                // An embryonic RST can send smoltcp straight back to LISTEN.
+                if conn.opened_at.is_some() {
+                    reset_connection(conn, now);
+                }
                 continue;
             }
             if socket.state() == tcp::State::Closed {
@@ -215,12 +224,14 @@ impl TcpDnsServer {
                 // do not attempt to listen on that still-live state.
                 continue;
             }
-            if socket.is_active() && !conn.active {
-                conn.active = true;
+            if conn.opened_at.is_none() {
+                conn.opened_at = Some(now);
                 conn.last_activity = now;
             }
-            if socket.is_active()
-                && now - conn.last_activity >= duration_to_smoltcp(self.config.idle_timeout)
+            if now - conn.last_activity >= duration_to_smoltcp(self.config.idle_timeout)
+                || conn.opened_at.is_some_and(|opened| {
+                    now - opened >= duration_to_smoltcp(self.config.max_connection_age)
+                })
             {
                 socket.abort();
                 reset_connection(conn, now);
@@ -246,6 +257,12 @@ impl TcpDnsServer {
             ) {
                 // Handshake still in progress; `may_recv()` is false in SynReceived
                 // and must not be mistaken for a peer FIN half-close.
+                continue;
+            }
+
+            // Budget exhaustion must not skip authorization and expiry checks
+            // on later slots in the pool.
+            if completed >= self.config.max_frames_per_poll {
                 continue;
             }
 
@@ -292,14 +309,22 @@ impl TcpDnsServer {
                 continue;
             }
             if completed >= self.config.max_frames_per_poll {
-                break;
+                continue;
             }
             // FIN with an incomplete DNS frame is invalid. FIN after complete
             // requests permits queued response transmission before local close.
             if !socket.may_recv() {
                 if !conn.receive.is_empty() {
-                    socket.abort();
-                    reset_connection(conn, now);
+                    // A complete frame may still be waiting for staging space
+                    // behind a previous response. Only reject a partial frame.
+                    let complete = conn.receive.get(..2).is_some_and(|prefix| {
+                        let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
+                        conn.receive.len() >= length + 2
+                    });
+                    if !complete {
+                        socket.abort();
+                        reset_connection(conn, now);
+                    }
                 } else {
                     conn.peer_closed = true;
                 }
@@ -398,7 +423,7 @@ fn reset_connection(conn: &mut Connection, now: smoltcp::time::Instant) {
     conn.transmit.clear();
     conn.transmit_offset = 0;
     conn.last_activity = now;
-    conn.active = false;
+    conn.opened_at = None;
     conn.peer_closed = false;
 }
 

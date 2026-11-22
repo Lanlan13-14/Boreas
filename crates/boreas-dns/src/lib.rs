@@ -594,7 +594,8 @@ fn u32_at(data: &[u8], at: usize) -> Result<u32, DnsError> {
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// TCP DNS is intentionally not implemented. Do not interpret TCP segments as DNS messages.
+/// Legacy capability marker for callers without a bound packet owner. See
+/// [`packet_runtime`] for TCP support driven by an authenticated owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TcpDnsSupport {
     Unsupported,

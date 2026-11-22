@@ -842,11 +842,12 @@ pub struct PacketPath<'a, C, P: ?Sized> {
 #[cfg(feature = "openssl-inner-tls")]
 type DnsLiveness<'a> = Box<dyn Fn() -> bool + Send + Sync + 'a>;
 
-/// Explicit opt-in for the single Core's private IPv4 UDP/53 responder.
+/// Explicit opt-in for the single Core's private IPv4 DNS responder.
 /// These inputs must be selected and pinned by the E2E owner, not the peer.
 #[cfg(feature = "openssl-inner-tls")]
 pub struct PrivateDnsProvision<'a> {
     pub material: dns_packet_service::Material<'a>,
+    pub tcp: bool,
     /// Fresh UTC Unix microseconds, or `None` on clock failure.
     pub utc: Box<dyn Fn() -> Option<u64> + Send + Sync + 'a>,
     /// Nonblocking gate for this circuit, both identities, and the exact
@@ -863,6 +864,7 @@ struct EdgeDns<'a> {
     zone: &'a str,
     current: DnsLiveness<'a>,
     pending: std::collections::VecDeque<EdgeQuery>,
+    tcp: Option<EdgeTcpFlows>,
 }
 
 #[cfg(feature = "openssl-inner-tls")]
@@ -910,9 +912,67 @@ impl EdgeDns<'_> {
     }
 }
 
+// Match an Edge-originated TCP tuple, not individual packets to DNS messages.
+// Linux and smoltcp own TCP sequence/ACK validation and stream reassembly.
+// This table only limits which ports on the authenticated Edge are reachable
+// from the authenticated DNS VIP. No state is created by inbound packets.
+#[cfg(feature = "openssl-inner-tls")]
+#[derive(Default)]
+struct EdgeTcpFlows(std::collections::VecDeque<(u16, Instant)>);
+
+#[cfg(feature = "openssl-inner-tls")]
+impl EdgeTcpFlows {
+    const CAPACITY: usize = 64;
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(75);
+
+    fn expire(&mut self) {
+        self.0.retain(|(_, opened)| opened.elapsed() < Self::MAX_AGE);
+    }
+
+    fn outbound(&mut self, client: u16, flags: u8) -> bool {
+        self.expire();
+        let position = self.0.iter().position(|&(port, _)| port == client);
+        if flags & (TCP_SYN | TCP_ACK | TCP_RST | TCP_FIN) == TCP_SYN {
+            if let Some(index) = position {
+                self.0.remove(index);
+            } else if self.0.len() == Self::CAPACITY {
+                self.0.pop_front();
+            }
+            self.0.push_back((client, Instant::now()));
+            return true;
+        }
+        if let Some(index) = position {
+            if flags & TCP_RST != 0 {
+                self.0.remove(index);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn inbound(&mut self, client: u16, flags: u8) -> bool {
+        self.expire();
+        // Do not deliver an unsolicited server-side open, even on a known port.
+        if flags & (TCP_SYN | TCP_ACK) == TCP_SYN {
+            return false;
+        }
+        self.0.iter().any(|&(port, _)| port == client)
+    }
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+const TCP_FIN: u8 = 0x01;
+#[cfg(feature = "openssl-inner-tls")]
+const TCP_SYN: u8 = 0x02;
+#[cfg(feature = "openssl-inner-tls")]
+const TCP_RST: u8 = 0x04;
+#[cfg(feature = "openssl-inner-tls")]
+const TCP_ACK: u8 = 0x10;
+
 #[cfg(feature = "openssl-inner-tls")]
 struct PrivateDns<'a> {
     service: DnsPacketService<DnsLiveness<'a>>,
+    tcp: bool,
     utc: Box<dyn Fn() -> Option<u64> + Send + Sync + 'a>,
 }
 
@@ -989,7 +1049,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let started = Instant::now();
         let now = (provision.utc)().ok_or(PacketPathError::DnsAuthorizationLost)?;
         let service = DnsPacketService::try_new_for_path(
-            dns_packet_service::Config { enabled: true },
+            dns_packet_service::Config { enabled: true, tcp: provision.tcp },
             path.circuit.as_ref().ok_or(PacketPathError::Closed)?,
             mtu,
             provision.material,
@@ -1001,12 +1061,13 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         .ok_or(PacketPathError::DnsAuthorizationLost)?;
         path.private_dns = Some(PrivateDns {
             service,
+            tcp: provision.tcp,
             utc: provision.utc,
         });
         Ok(path)
     }
 
-    /// Opt one Edge–Core E2E path into private UDP/53. Nothing changes in
+    /// Opt one Edge–Core E2E path into private DNS. Nothing changes in
     /// the normal permanent VIP pair, and there is no peer discovery/failover.
     #[cfg(feature = "openssl-inner-tls")]
     pub fn try_new_over_e2e_with_edge_dns(
@@ -1014,6 +1075,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         circuit: E2eCircuit<'a>,
         mtu: usize,
         authority: &'a boreas_pki::dns_authority::VerifiedDnsAuthority,
+        tcp: bool,
         is_current: Box<dyn Fn() -> bool + Send + Sync + 'a>,
     ) -> Result<Self, PacketPathError> {
         let context = circuit
@@ -1033,6 +1095,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             zone: authority.zone(),
             current: is_current,
             pending: Default::default(),
+            tcp: tcp.then(EdgeTcpFlows::default),
         };
         dns.check()?;
         let mut path = Self::try_new_over_e2e(io, circuit, mtu)?;
@@ -1369,6 +1432,22 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         }
     }
 
+    /// Advance the Core's in-process DNS TCP endpoint even without inbound
+    /// frames. Flush at most `max_packets` complete IP packets on this circuit.
+    /// Only the same path owner may call this and the ordinary I/O steps.
+    #[cfg(feature = "openssl-inner-tls")]
+    pub fn step_private_dns(&mut self, max_packets: usize) -> Result<usize, PacketPathError> {
+        self.check_open()?;
+        let Some(dns) = self.private_dns.as_mut().filter(|dns| dns.tcp) else {
+            return Ok(0);
+        };
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let result = poll_private_dns(circuit, &self.policy, dns, max_packets, &mut self.stats);
+        result.map_err(|error| self.fail(error))
+    }
+
     fn check_open(&self) -> Result<(), PacketPathError> {
         match self.state {
             PathState::Open => Ok(()),
@@ -1443,12 +1522,19 @@ fn authorize_outbound_read(
             PacketRead::Inspected(packet) => packet.info(),
             PacketRead::Bytes(bytes) => policy.inspect_bytes(bytes)?.info(),
         };
-        if info.destination == IpAddr::V4(dns.vip)
-            && let Ok((port, 53, message)) = edge_udp_dns(bytes, info)
-            && let Some(question) = boreas_dns::PrivateQuestion::query(message, dns.zone)
-        {
-            dns.remember(port, question);
-            return Ok(info);
+        if info.destination == IpAddr::V4(dns.vip) {
+            if let Ok((port, 53, message)) = edge_udp_dns(bytes, info)
+                && let Some(question) = boreas_dns::PrivateQuestion::query(message, dns.zone)
+            {
+                dns.remember(port, question);
+                return Ok(info);
+            }
+            if let Ok((client, 53, flags)) = dns_tcp_segment(bytes, info)
+                && let Some(flows) = dns.tcp.as_mut()
+                && flows.outbound(client, flags)
+            {
+                return Ok(info);
+            }
         }
     }
     ordinary
@@ -1581,15 +1667,25 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         if info.destination != IpAddr::V4(policy.local_vip()) {
             return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
         }
-        let (port, client, message) =
-            edge_udp_dns(packet.bytes(), info).map_err(PacketPathError::Denied)?;
-        let Some(question) =
-            boreas_dns::PrivateQuestion::response(message, dns.zone).filter(|_| port == 53)
-        else {
-            return Err(PacketPathError::Denied(PacketDeny::BadHeader));
-        };
         dns.check()?;
-        if !dns.take_reply(client, &question) {
+        let expected = if info.protocol == 6 {
+            let (port, client, flags) = dns_tcp_segment(packet.bytes(), info)
+                .map_err(PacketPathError::Denied)?;
+            let Some(flows) = dns.tcp.as_mut().filter(|_| port == 53) else {
+                return Err(PacketPathError::Denied(PacketDeny::BadHeader));
+            };
+            flows.inbound(client, flags)
+        } else {
+            let (port, client, message) =
+                edge_udp_dns(packet.bytes(), info).map_err(PacketPathError::Denied)?;
+            let Some(question) =
+                boreas_dns::PrivateQuestion::response(message, dns.zone).filter(|_| port == 53)
+            else {
+                return Err(PacketPathError::Denied(PacketDeny::BadHeader));
+            };
+            dns.take_reply(client, &question)
+        };
+        if !expected {
             // A delayed response, an evicted query, or a wrong transaction is
             // never written to TUN. It does not tear down an otherwise live path.
             return Ok(Some(InboundDelivery {
@@ -1643,19 +1739,47 @@ fn edge_udp_dns(packet: &[u8], info: PacketInfo) -> Result<(u16, u16, &[u8]), Pa
         return Err(PacketDeny::BadLength);
     }
     // Optional IPv4 UDP checksum. Nonzero checksums include the pseudo-header.
-    if udp[6..8] != [0, 0] {
-        let mut sum = u32::from(len) + 17;
-        for word in packet[12..20].chunks(2).chain(udp.chunks(2)) {
-            sum += u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]));
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        if sum != 0xffff {
-            return Err(PacketDeny::BadChecksum);
-        }
+    if udp[6..8] != [0, 0] && !transport_checksum_valid(packet, 17, udp) {
+        return Err(PacketDeny::BadChecksum);
     }
     Ok((source, destination, &udp[8..]))
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn dns_tcp_segment(packet: &[u8], info: PacketInfo) -> Result<(u16, u16, u8), PacketDeny> {
+    if info.version != IpVersion::V4
+        || info.header_len != 20
+        || info.fragment.is_some()
+        || info.protocol != 6
+        || packet.len() < 40
+    {
+        return Err(PacketDeny::BadHeader);
+    }
+    let segment = &packet[20..];
+    let header_len = usize::from(segment[12] >> 4) * 4;
+    let source = u16::from_be_bytes([segment[0], segment[1]]);
+    let destination = u16::from_be_bytes([segment[2], segment[3]]);
+    if !(20..=segment.len()).contains(&header_len) || source == 0 || destination == 0 {
+        return Err(PacketDeny::BadHeader);
+    }
+    // TCP checksum is mandatory; the Linux DNS TCP profile has no TUN offload.
+    if !transport_checksum_valid(packet, 6, segment) {
+        return Err(PacketDeny::BadChecksum);
+    }
+    Ok((source, destination, segment[13]))
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn transport_checksum_valid(packet: &[u8], protocol: u8, segment: &[u8]) -> bool {
+    // Both callers already checked the whole IPv4 packet against the path MTU.
+    let mut sum = segment.len() as u32 + u32::from(protocol);
+    for word in packet[12..20].chunks(2).chain(segment.chunks(2)) {
+        sum += u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum == 0xffff
 }
 
 #[cfg(feature = "openssl-inner-tls")]
@@ -1665,13 +1789,25 @@ fn dispatch_private_dns<C: Write>(
     dns: &mut PrivateDns<'_>,
     query: InspectedPacket<'_>,
 ) -> Result<Option<usize>, PacketPathError> {
-    let (client_port, port) = dns_udp_ports(query.bytes(), query.info())?;
+    let info = query.info();
+    let (client_port, port) = if dns.tcp && info.protocol == 6 {
+        let (client, port, _) = dns_tcp_segment(query.bytes(), info)
+            .map_err(PacketPathError::Denied)?;
+        (client, port)
+    } else {
+        dns_udp_ports(query.bytes(), info)?
+    };
     if port != 53 {
         return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
     }
     let now = dns.live_utc()?;
     if !dns.service.push_input(query.bytes(), now) {
         dns.live_utc()?;
+        return Ok(None);
+    }
+    if dns.tcp {
+        // Both transports share this bounded dispatcher. TCP may emit zero,
+        // one, or multiple packets unrelated to the most recent input packet.
         return Ok(None);
     }
     let now = dns.live_utc()?;
@@ -1681,11 +1817,56 @@ fn dispatch_private_dns<C: Write>(
         dns.live_utc()?;
         return Ok(None);
     };
-    let reply = policy.inspect_bytes(&reply).map_err(PacketPathError::Denied)?;
+    write_private_dns(circuit, policy, dns, &reply, Some(client_port)).map(Some)
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn poll_private_dns<C: Write>(
+    circuit: &mut C,
+    policy: &PointToPoint,
+    dns: &mut PrivateDns<'_>,
+    max_packets: usize,
+    stats: &mut PacketStats,
+) -> Result<usize, PacketPathError> {
+    let now = dns.live_utc()?;
+    dns.service.poll(now).ok_or(PacketPathError::DnsAuthorizationLost)?;
+    let mut sent = 0;
+    for _ in 0..max_packets.min(16) {
+        let now = dns.live_utc()?;
+        let Some(reply) = dns.service.pop_output(now) else {
+            dns.live_utc()?;
+            break;
+        };
+        let length = write_private_dns(circuit, policy, dns, &reply, None)?;
+        stats.outbound_packets = stats.outbound_packets.saturating_add(1);
+        stats.outbound_bytes = stats.outbound_bytes.saturating_add(length as u64);
+        sent += 1;
+    }
+    dns.live_utc()?;
+    Ok(sent)
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn write_private_dns<C: Write>(
+    circuit: &mut C,
+    policy: &PointToPoint,
+    dns: &mut PrivateDns<'_>,
+    bytes: &[u8],
+    udp_client: Option<u16>,
+) -> Result<usize, PacketPathError> {
+    let reply = policy.inspect_bytes(bytes).map_err(PacketPathError::Denied)?;
     let info = reply.info();
+    let (port, client) = if dns.tcp && info.protocol == 6 {
+        let (port, client, _) = dns_tcp_segment(reply.bytes(), info)
+            .map_err(PacketPathError::Denied)?;
+        (port, client)
+    } else {
+        dns_udp_ports(reply.bytes(), info)?
+    };
     if info.source != IpAddr::V4(dns.service.dns_vip())
         || info.destination != IpAddr::V4(policy.peer_vip())
-        || dns_udp_ports(reply.bytes(), info)? != (53, client_port)
+        || port != 53
+        || udp_client.is_some_and(|expected| expected != client)
     {
         return Err(PacketPathError::Denied(PacketDeny::BadHeader));
     }
@@ -1697,7 +1878,7 @@ fn dispatch_private_dns<C: Write>(
     dns.live_utc()?;
     circuit.flush().map_err(circuit_io)?;
     dns.live_utc()?;
-    Ok(Some(info.packet_len))
+    Ok(info.packet_len)
 }
 
 impl PacketPathError {
@@ -2056,6 +2237,7 @@ mod tests {
             zone: "private.example",
             current: Box::new(|| true),
             pending: Default::default(),
+            tcp: None,
         };
         let question = dns_query("host.private.example", 1);
         for (source, destination, port, body, allow) in [
@@ -2115,6 +2297,82 @@ mod tests {
                 deliver.then_some(bytes.as_slice())
             );
         }
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn edge_tcp_dns_allows_only_opened_authenticated_tuples() {
+        let edge = [10, 20, 1, 2];
+        let core = [10, 20, 1, 1];
+        let vip = [10, 20, 0, 53];
+        let policy = PointToPoint::try_new(edge.into(), core.into(), DEFAULT_MTU).unwrap();
+        let mut dns = EdgeDns {
+            vip: vip.into(),
+            zone: "private.example",
+            current: Box::new(|| true),
+            pending: Default::default(),
+            tcp: None,
+        };
+        let segment = |src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, flags| {
+            let mut tcp = [0; 20];
+            tcp[..2].copy_from_slice(&sport.to_be_bytes());
+            tcp[2..4].copy_from_slice(&dport.to_be_bytes());
+            tcp[12] = 0x50;
+            tcp[13] = flags;
+            let mut pseudo = src.to_vec();
+            pseudo.extend_from_slice(&dst);
+            pseudo.extend_from_slice(&[0, 6, 0, 20]);
+            pseudo.extend_from_slice(&tcp);
+            tcp[16..18].copy_from_slice(&checksum_value(&pseudo).to_be_bytes());
+            let mut packet = ipv4(src, dst, &tcp);
+            packet[9] = 6;
+            packet[10..12].fill(0);
+            let checksum = checksum_value(&packet[..20]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            packet
+        };
+        let authorize = |bytes: &[u8], dns: &mut EdgeDns<'_>| {
+            let packet = InspectedPacket::new(bytes).unwrap();
+            authorize_outbound_read(&policy, &PacketRead::Inspected(packet), Some(dns)).is_ok()
+        };
+        let syn = segment(edge, vip, 40_000, 53, TCP_SYN);
+        assert!(!authorize(&syn, &mut dns));
+        dns.tcp = Some(EdgeTcpFlows::default());
+        assert!(!authorize(&segment(edge, vip, 40_000, 53, TCP_ACK), &mut dns));
+        assert!(!authorize(&segment(edge, vip, 40_000, 54, TCP_SYN), &mut dns));
+        assert!(!authorize(&segment(core, vip, 40_000, 53, TCP_SYN), &mut dns));
+        let mut bad_checksum = syn.clone();
+        bad_checksum[24] ^= 1;
+        assert!(!authorize(&bad_checksum, &mut dns));
+        assert!(authorize(&syn, &mut dns));
+        let (device, host) = VirtualTun::try_pair(4, 4, DEFAULT_MTU).unwrap();
+        let mut scratch = Vec::new();
+        for (bytes, reject, deliver) in [
+            (segment(vip, edge, 53, 40_001, TCP_SYN | TCP_ACK), false, false),
+            (segment(vip, edge, 53, 40_000, TCP_SYN), false, false),
+            (segment(vip, core, 53, 40_000, TCP_SYN | TCP_ACK), true, false),
+            (segment(vip, edge, 54, 40_000, TCP_SYN | TCP_ACK), true, false),
+            (segment(vip, edge, 53, 40_000, TCP_SYN | TCP_ACK), false, true),
+        ] {
+            let frame = encode_packet_frame(&bytes, DEFAULT_MTU).unwrap();
+            let mut stream = InboundSource::new(frame);
+            let result = inbound_once(&device, &mut stream, &policy, &mut scratch, None, Some(&mut dns));
+            assert_eq!(result.is_err(), reject);
+            assert_eq!(host.read_packet().unwrap(), deliver.then_some(bytes));
+        }
+        let flows = dns.tcp.as_mut().unwrap();
+        let expired = Instant::now().checked_sub(EdgeTcpFlows::MAX_AGE);
+        if let Some(expired) = expired {
+            flows.0[0].1 = expired;
+            assert!(!flows.inbound(40_000, TCP_ACK));
+        }
+        for port in 1..=65 {
+            assert!(flows.outbound(port, TCP_SYN));
+        }
+        assert_eq!(flows.0.len(), EdgeTcpFlows::CAPACITY);
+        assert!(!flows.inbound(1, TCP_ACK));
+        assert!(flows.outbound(2, TCP_RST));
+        assert!(!flows.inbound(2, TCP_ACK));
     }
 
     #[cfg(feature = "openssl-inner-tls")]
@@ -2249,7 +2507,7 @@ mod tests {
             };
             let mut path = PacketPath::try_new(&device, circuit, endpoints, MTU).unwrap();
             if enable {
-                path.private_dns = Some(PrivateDns { service, utc: Box::new(move || utc) });
+                path.private_dns = Some(PrivateDns { service, tcp: false, utc: Box::new(move || utc) });
             }
             // Even on an enabled path, host writes cannot use the DNS VIP.
             host.write_packet(&udp_datagram(vip, edge, 53, 40_000, b"host", true))

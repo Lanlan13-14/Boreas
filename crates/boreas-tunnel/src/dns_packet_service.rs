@@ -36,6 +36,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Config {
     pub enabled: bool,
+    pub tcp: bool,
 }
 
 /// Current policy and authority tokens selected by the circuit owner.
@@ -280,12 +281,24 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         let dispatcher = QueryDispatcher::new(authority.zone(), Some(snapshot), None, client)
             .map_err(|_| Error::InvalidAuthority)?;
         let mut seed = [0; 8];
-        openssl::rand::rand_bytes(&mut seed).map_err(|_| Error::RuntimeUnavailable)?;
+        if config.tcp {
+            openssl::rand::rand_bytes(&mut seed).map_err(|_| Error::RuntimeUnavailable)?;
+        }
         let runtime =
-            PacketRuntime::new_private_dispatcher(dispatcher, packet, PacketRuntimeConfig {
-                random_seed: u64::from_ne_bytes(seed),
-                ..PacketRuntimeConfig::default()
-            })
+            PacketRuntime::new_private_dispatcher(
+                dispatcher,
+                packet,
+                PacketRuntimeConfig {
+                    tcp: boreas_dns::tcp::TcpDnsConfig {
+                        idle_timeout: Duration::from_secs(10),
+                        max_connection_age: Duration::from_secs(60),
+                        ..Default::default()
+                    },
+                    random_seed: u64::from_ne_bytes(seed),
+                    ..PacketRuntimeConfig::default()
+                },
+                config.tcp,
+            )
             .map_err(|_| Error::RuntimeUnavailable)?;
         let mut instance = Self {
             runtime: Some(runtime),
@@ -439,7 +452,7 @@ pub(crate) mod tests {
             ..binding(f, &policy)
         };
         let dns = DnsPacketService::try_bind(
-            Config { enabled: true },
+            Config { enabled: true, tcp: false },
             bindings,
             Instant::now(),
             NOW,
@@ -473,7 +486,7 @@ pub(crate) mod tests {
         for service in [&no_replica, &wrong_generation] {
             assert!(matches!(
                 DnsPacketService::try_bind(
-                    Config { enabled: true },
+                    Config { enabled: true, tcp: false },
                     binding(&f, service),
                     Instant::now(),
                     NOW,
@@ -491,7 +504,7 @@ pub(crate) mod tests {
         let live = AtomicBool::new(true);
         let open = || {
             DnsPacketService::try_bind(
-                Config { enabled: true },
+                Config { enabled: true, tcp: false },
                 binding(&f, &policy),
                 Instant::now(),
                 NOW,

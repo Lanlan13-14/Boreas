@@ -11,7 +11,7 @@ reset and half-close are handled by the TCP stack, not by DNS packet code.
 
 `TcpDnsConfig` fixes the socket count, receive/transmit byte capacity per
 connection, DNS frame maximum (at most 4096 bytes), complete frames per `process`
-call, and an idle timeout. The socket pool is a fixed-size set of real TCP
+call, an idle timeout, and an absolute active-connection age limit. The socket pool is a fixed-size set of real TCP
 sockets. There is no unbounded accept backlog. Each connection's parser and
 pending response are bounded by these values. A length prefix of zero, a length
 above the configured frame maximum, malformed DNS, resolver refusal, or a
@@ -35,6 +35,11 @@ The caller remains responsible for scheduling timely bounded interface polls,
 route/VIP setup in the overlay, propagating peer revocation, and global process
 resource budgeting. DNS negative answers still omit SOA records, and the DNS
 wire implementation accepts one question per message. No recursion is offered.
+
+The Linux daemon's opt-in private DNS profile integrates this endpoint on one
+authenticated Core–Edge circuit. See
+[deployment](../../../../docs/engineering/dns-daemon-deployment.md) for the
+signed binding, route, resource limits, and netns acceptance case.
 
 ## Verification
 

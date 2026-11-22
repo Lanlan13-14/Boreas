@@ -56,8 +56,8 @@ if [[ "$PRIVATE_DNS" != 0 && "$PRIVATE_DNS" != 1 ]]; then
   echo 'ERROR: BOREAS_NETNS_PRIVATE_DNS must be 0 or 1' >&2
   exit 1
 fi
-if [[ "$PRIVATE_DNS" == 1 && ( "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ) ]]; then
-  echo 'ERROR: DNS netns slice is not a performance/netem scenario' >&2
+if [[ "$PRIVATE_DNS" == 1 && ( "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" || ${#TUN_GSO_ARGS[@]} != 0 ) ]]; then
+  echo 'ERROR: DNS netns slice excludes GSO, performance and netem' >&2
   exit 1
 fi
 if [[ "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 ]]; then
@@ -76,6 +76,12 @@ if [[ ! "$EDGE_LIFETIME_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || \
    (( EDGE_LIFETIME_SECONDS < 33 || EDGE_LIFETIME_SECONDS > 660 )); then
   echo 'ERROR: BOREAS_NETNS_EDGE_LIFETIME_SECONDS must be a canonical integer in 33..660' >&2
   exit 1
+fi
+if [[ "$PRIVATE_DNS" == 1 ]]; then
+  # Time for the idle timer and pin-withdrawal probes, independent of the
+  # lifetime configured for other fixtures.
+  TUN_MTU=1280
+  EDGE_LIFETIME_SECONDS=45
 fi
 CORE_LIFETIME_SECONDS=$(( EDGE_LIFETIME_SECONDS + 2 ))
 # The test harness, not the daemon, creates the explicitly provisioned fixture.
@@ -857,7 +863,7 @@ EOF
 chmod 0600 "$WORK/edge.toml"
 if [[ "$PRIVATE_DNS" == 1 ]]; then
   for label in core edge; do
-    printf '\n[dns]\nzone = "private.boreas.test"\nlisten_vip = "10.20.0.53"\n' >> "$WORK/$label.toml"
+    printf '\n[dns]\nzone = "private.boreas.test"\nlisten_vip = "10.20.0.53"\ntcp = true\n' >> "$WORK/$label.toml"
   done
 fi
 
@@ -987,7 +993,8 @@ ip netns exec "$EDGE_NS" ip addr add 10.20.1.2/32 dev btun0
 ip netns exec "$EDGE_NS" ip link set btun0 up
 ip netns exec "$EDGE_NS" ip route add 10.20.1.1/32 dev btun0
 if [[ "$PRIVATE_DNS" == 1 ]]; then
-  ip -n "$EDGE_NS" route add 10.20.0.53/32 dev btun0 src 10.20.1.2
+  # Force the full signed answer to span multiple TCP segments.
+  ip -n "$EDGE_NS" route add 10.20.0.53/32 dev btun0 src 10.20.1.2 advmss 600
 fi
 
 run_hook ready
@@ -1045,6 +1052,19 @@ if [[ "$PRIVATE_DNS" == 1 ]]; then
   done
   echo 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed'
   ip netns exec "$EDGE_NS" ping -c 2 -W 2 -I 10.20.1.2 10.20.1.1
+  # Keep an established DNS TCP stream across pin withdrawal. The client
+  # exits on its own bounded timeout if the gate or signaling fails.
+  ip netns exec "$EDGE_NS" python3 "$DNS_FIXTURE" withdrawal \
+    "$WORK/dns-client-ready" "$WORK/dns-client-withdrawn" &
+  dns_client_pid=$!
+  for _ in $(seq 1 60); do
+    if [[ -f "$WORK/dns-client-ready" ]]; then break; fi
+    sleep 0.05
+  done
+  if [[ ! -f "$WORK/dns-client-ready" ]]; then
+    echo 'ERROR: DNS TCP stream not established before pin withdrawal' >&2
+    exit 1
+  fi
   # Withdraw the independently mounted pin while the circuit is active.
   # A successful clean exit is wrong; require a real DNS invalidation reason.
   mv "$DNS_PIN" "$DNS_PIN.withdrawn"
@@ -1065,6 +1085,8 @@ if [[ "$PRIVATE_DNS" == 1 ]]; then
     exit 1
   fi
   echo 'private_dns_pin_withdrawal=core_halted_fail_closed'
+  touch "$WORK/dns-client-withdrawn"
+  wait "$dns_client_pid"
   exit 0
 fi
 

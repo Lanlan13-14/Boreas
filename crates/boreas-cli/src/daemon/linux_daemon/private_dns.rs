@@ -31,6 +31,7 @@ pub(super) struct PinnedDns {
     service: VerifiedDnsServicePolicy,
     authority: VerifiedDnsAuthority,
     pub(super) vip: Ipv4Addr,
+    pub(super) tcp: bool,
     until_utc: u64,
     deadline: Instant,
     loaded_utc: u64,
@@ -66,6 +67,7 @@ impl PinnedDns {
         root: &NetworkRootPin,
         core: PeerIdentity,
         zone: &str,
+        tcp: bool,
         identities_until: u64,
     ) -> Result<Self, String> {
         use boreas_proto::{dns_authority, dns_service_policy};
@@ -143,6 +145,7 @@ impl PinnedDns {
             service,
             authority,
             vip: Ipv4Addr::new(a, b, 0, 53),
+            tcp,
             until_utc,
             deadline,
             loaded_utc: now,

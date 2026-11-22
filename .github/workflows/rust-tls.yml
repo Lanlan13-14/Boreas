@@ -863,7 +863,7 @@ jobs:
           retention-days: 14
       - name: Verify opt-in private DNS on real Core and Edge TUNs
         id: acceptance_private_dns
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -874,6 +874,9 @@ jobs:
             2>&1 | tee rust-tls-private-dns.log
           grep -Fx 'private_dns=verified_signed_a_nxdomain_and_out_of_scope_drop' rust-tls-private-dns.log
           grep -Fx 'private_dns_rrset=verified_complete_a_and_tc_without_partial_answers' rust-tls-private-dns.log
+          grep -Fx 'private_dns_tcp=verified_split_prefix_pipelining_full_rrset_and_fin' rust-tls-private-dns.log
+          grep -Fx 'private_dns_tcp_denials=scope_frame_port_and_idle_timeout' rust-tls-private-dns.log
+          grep -Fx 'private_dns_tcp_pin_withdrawal=no_later_dns_data_on_open_stream' rust-tls-private-dns.log
           grep -Fx 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed' rust-tls-private-dns.log
           grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
       - name: Verify four-process Core routing and failover on real TUN

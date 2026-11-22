@@ -19,9 +19,9 @@
 //! * **Not TCP DNS.** `TCP:53` to the DNS VIP is classified and refused without
 //!   any response. Real DNS-over-TCP must be driven by
 //!   `boreas_dns::tcp::TcpDnsServer` over a real `smoltcp::iface::Interface` and
-//!   `Device` that owns the DNS VIP; no such device/interface is wired here, so
-//!   the daemon capability `dns_tcp` stays `false`. This module never fabricates
-//!   TCP segments.
+//!   `Device` that owns the DNS VIP. The daemon's opt-in TCP profile uses the
+//!   separate `dns_packet_service` binding, not this UDP responder. This module
+//!   never fabricates TCP segments.
 //! * **Not IPv6.** IPv6 packets (including the reserved `dns_vip6`) are ignored.
 //!   The verified policy has an IPv4 overlay prefix and no ULA, so no IPv6 VIP or
 //!   `AAAA` record can be authorized. IPv6 is therefore off by default and has no

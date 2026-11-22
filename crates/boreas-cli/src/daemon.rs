@@ -51,7 +51,8 @@ pub fn daemon_usage() -> &'static str {
   with the same value and MTU on both ends. Connect requires explicit --connect; no standby,
   private DNS, GSO, virtual TUN or --max-packets in this profile.
   Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
-  and set [dns].zone to the signed private suffix; see docs/engineering/dns-daemon-deployment.md."
+  and set [dns].zone to the signed private suffix. Set [dns].tcp = true on both ends
+  for bounded DNS-over-TCP without TUN GSO; see docs/engineering/dns-daemon-deployment.md."
 }
 
 /// Query an active daemon control socket and parse a live [`StatusSnapshot`].
@@ -597,9 +598,9 @@ mod linux_daemon {
             .map_err(|e| format!("daemon: supervised readiness handshake failed: {e}"))
     }
 
-    fn daemon_capabilities() -> RuntimeCapabilities {
+    fn daemon_capabilities(private_dns_tcp_profile: bool) -> RuntimeCapabilities {
         RuntimeCapabilities {
-            dns_tcp: false,
+            dns_tcp: private_dns_tcp_profile,
             control_socket: true,
             e2e_relay: true,
         }
@@ -2046,7 +2047,11 @@ mod linux_daemon {
         let cfg_file = config_path.ok_or_else(|| "daemon: `--config` is required".to_string())?;
         let mat_dir =
             material_dir.ok_or_else(|| "daemon: `--material-dir` is required".to_string())?;
-        let config = Config::read_file(&cfg_file, daemon_capabilities())
+        let dns_tcp_profile = dns_dir.is_some()
+            && dns_pin.is_some()
+            && !virtual_tun
+            && !tun_tcpv4_gso;
+        let config = Config::read_file(&cfg_file, daemon_capabilities(dns_tcp_profile))
             .map_err(|e| format!("daemon config rejected: {e}"))?;
 
         if config.security.mode != CfgMode::E2eRequired {
@@ -2196,6 +2201,7 @@ mod linux_daemon {
                     &network_root,
                     core,
                     zone,
+                    dns.tcp,
                     verified.local.valid_until().min(peer_obj.valid_until()),
                 )?;
                 if dns
@@ -3630,6 +3636,7 @@ mod linux_daemon {
                     mtu,
                     PrivateDnsProvision {
                         material: dns.material(),
+                        tcp: dns.tcp,
                         utc: Box::new(|| now_utc_us().ok()),
                         is_current: current,
                     },
@@ -3640,6 +3647,7 @@ mod linux_daemon {
                     e2e,
                     mtu,
                     dns.material().authority,
+                    dns.tcp,
                     current,
                 )
             }
@@ -3737,6 +3745,7 @@ mod linux_daemon {
         // can also write synchronously. Preserve preflight on all GSO paths.
         let protect_send = gso_may_have_pending || (tun_fd.is_some() && private_dns.is_none());
         let mut send_deferred_since = None;
+        let dns_tcp_core = mode_name == "serve" && private_dns.is_some_and(|dns| dns.tcp);
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -3808,7 +3817,34 @@ mod linux_daemon {
                     usize::try_from(limit.saturating_sub(total)).unwrap_or(usize::MAX)
                 })
                 .unwrap_or(MAX_OUTBOUND_BATCH_PACKETS);
-            let out_limit = remaining_budget.min(MAX_OUTBOUND_BATCH_PACKETS);
+            // The real TUN poll below wakes at least every IDLE_POLL_TIMEOUT
+            // when idle. On busy turns, poll after each bounded inbound batch
+            // (on the next turn), independently of which transport fed DNS.
+            // Drain a bounded number of generated packets, including timers,
+            // and charge each actual transmission to the existing budget.
+            let dns_sent = if dns_tcp_core {
+                match path.step_private_dns(remaining_budget) {
+                    Ok(sent) => sent,
+                    Err(error) => {
+                        if let Some(reason) = watchdog.fault() {
+                            return Err(reason);
+                        }
+                        break 'outer PathStop::Failed {
+                            kind: path_failure_kind(&error),
+                            reason: format!("private DNS packet output error: {error:?}"),
+                        };
+                    }
+                }
+            } else {
+                0
+            };
+            if dns_sent > 0 {
+                made_progress = true;
+                let stats = path.stats();
+                counters.tx_packets.store(stats.outbound_packets, Ordering::Relaxed);
+                counters.tx_bytes.store(stats.outbound_bytes, Ordering::Relaxed);
+            }
+            let out_limit = remaining_budget.saturating_sub(dns_sent).min(MAX_OUTBOUND_BATCH_PACKETS);
             // When both sides write into full receive windows, neither can
             // reach the inbound turn. Leave packets in the host queue before
             // framing/encrypting them so the inbound path still makes progress.
@@ -3933,9 +3969,11 @@ mod linux_daemon {
                     if total >= limit {
                         break;
                     }
-                    // One inbound request can synchronously emit one reply.
-                    // Do not enter that step without room for both packets.
-                    if private_dns.is_some() && mode_name == "serve" && limit - total < 2 {
+                    // Only UDP-only Core DNS may synchronously emit a reply
+                    // from this step. TCP-profile output is drained separately.
+                    if private_dns.is_some() && mode_name == "serve" && !dns_tcp_core
+                        && limit - total < 2
+                    {
                         path.close_gracefully();
                         break 'outer PathStop::Budget("max_packets_dns_pair_reserve");
                     }
