@@ -636,6 +636,41 @@ pub struct E2eCircuit<'a> {
     mtu_cap: u16,
     l3_profile: E2eL3Profile,
     private_dns_only: bool,
+    read_ahead: Option<ReadAhead>,
+}
+
+// A single TLS plaintext record. Never wait for the buffer to fill.
+const READ_AHEAD_BYTES: usize = 16 * 1024;
+
+struct ReadAhead {
+    bytes: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl ReadAhead {
+    fn new() -> Self {
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0 }
+    }
+
+    fn pending(&self) -> bool {
+        self.start < self.end
+    }
+
+    fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if !self.pending() {
+            self.start = 0;
+            self.end = 0;
+            self.end = source.read(&mut self.bytes)?;
+        }
+        let len = (self.end - self.start).min(out.len());
+        out[..len].copy_from_slice(&self.bytes[self.start..self.start + len]);
+        self.start += len;
+        Ok(len)
+    }
 }
 
 // Application confirmation inside E2E TLS, not a cryptographic handshake.
@@ -867,7 +902,18 @@ impl<'a> E2eCircuit<'a> {
 
     /// Whether E2E TLS or a lower layer already holds inbound bytes.
     pub fn has_buffered_input(&self) -> bool {
-        self.stream.has_buffered_input()
+        self.read_ahead.as_ref().is_some_and(ReadAhead::pending)
+            || self.stream.has_buffered_input()
+    }
+
+    /// Amortize record reads for the default authenticated direct packet path.
+    /// Call only after application confirmation and before forwarding packets.
+    pub fn enable_direct_read_ahead(&mut self) {
+        if self.l3_profile == E2eL3Profile::SINGLE_LANE && !self.private_dns_only
+            && self.read_ahead.is_none()
+        {
+            self.read_ahead = Some(ReadAhead::new());
+        }
     }
 
     pub fn info(&self) -> E2eInfo {
@@ -940,7 +986,9 @@ impl<'a> E2eCircuit<'a> {
 
 impl Read for E2eCircuit<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.l3_profile.active_lanes() == 1 && !self.private_dns_only {
+        if let Some(buffer) = &mut self.read_ahead {
+            buffer.read(self.stream.as_mut(), out)
+        } else if self.l3_profile.active_lanes() == 1 && !self.private_dns_only {
             self.stream.read(out)
         } else {
             self.stream.read_with_authenticated_eof(out)
@@ -1056,6 +1104,7 @@ fn finish_e2e<'a>(
         mtu_cap,
         l3_profile,
         private_dns_only: false,
+        read_ahead: None,
     })
 }
 
@@ -1463,6 +1512,39 @@ mod tests {
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn direct_read_ahead_carries_partial_reads_and_eof() {
+        struct Chunks { reads: usize }
+        impl Read for Chunks {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => { out[..5].copy_from_slice(b"abcde"); Ok(5) }
+                    2 => Err(io::ErrorKind::Interrupted.into()),
+                    3 => { out[0] = b'f'; Ok(1) }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut stream = Chunks { reads: 0 };
+        let mut buffer = ReadAhead::new();
+        assert_eq!(buffer.read(&mut stream, &mut []).unwrap(), 0);
+        assert_eq!(stream.reads, 0);
+        let mut out = [0; 8];
+        assert_eq!(buffer.read(&mut stream, &mut out[..2]).unwrap(), 2);
+        assert_eq!(&out[..2], b"ab");
+        assert!(buffer.pending());
+        assert_eq!(buffer.read(&mut stream, &mut out).unwrap(), 3);
+        assert_eq!(&out[..3], b"cde");
+        assert_eq!(stream.reads, 1);
+        assert!(!buffer.pending());
+        assert_eq!(buffer.read(&mut stream, &mut out).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(buffer.read(&mut stream, &mut out).unwrap(), 1);
+        assert_eq!(out[0], b'f');
+        assert_eq!(buffer.read(&mut stream, &mut out).unwrap(), 0);
+        assert!(!buffer.pending());
+    }
 
     /// No TLS is performed here. This is only an in-memory/test-socket seam for
     /// exercising confirmation ordering; it is not production crypto evidence.

@@ -3816,7 +3816,7 @@ mod linux_daemon {
         mode_name: &str,
         sock_fd: i32,
         tun: &TunEndpoint,
-        e2e: E2eCircuit<'_>,
+        mut e2e: E2eCircuit<'_>,
         mtu: usize,
         status_path: &Path,
         policy_window: PolicyWindow,
@@ -3830,6 +3830,9 @@ mod linux_daemon {
         private_dns: Option<&PinnedDns>,
         replica_epoch: Option<private_dns_replica::Epoch>,
     ) -> Result<PathReport, String> {
+        if private_dns.is_none() && tun.raw_fd().is_some() {
+            e2e.enable_direct_read_ahead();
+        }
         let local_e2e = e2e.local();
         let peer_e2e = e2e.info().peer;
         let endpoints = [
