@@ -1001,6 +1001,11 @@ class UnderlaySummarizeTests(unittest.TestCase):
                             "bytes_received": received,
                             "cwnd": cwnd,
                             "rto_ms": 200.0,
+                            "congestion": "cubic",
+                            "snd_wnd": (80_000, 10_000, 68_000)[index],
+                            "rcv_space": (50_000, 65_000, 52_000)[index],
+                            "busy_ms": 100 + index * 200,
+                            "rwnd_limited_ms": 10 + index * 60,
                             "retrans_total": retrans,
                             "delivery_rate_bps": 24_600_000.0,
                         }
@@ -1041,6 +1046,16 @@ class UnderlaySummarizeTests(unittest.TestCase):
         self.assertEqual(values["underlay_telemetry_core_rx_mbps"], "0.008")
         self.assertEqual(values["underlay_telemetry_core_cwnd_min"], "10")
         self.assertEqual(values["underlay_telemetry_core_cwnd_max"], "40")
+        for field, expected in {
+            "congestion": "cubic",
+            "snd_wnd_min_bytes": "10000",
+            "snd_wnd_max_bytes": "80000",
+            "rcv_space_max_bytes": "65000",
+            "busy_ms_delta": "400",
+            "rwnd_limited_ms_delta": "120",
+            "sndbuf_limited_ms_delta": "unavailable",
+        }.items():
+            self.assertEqual(values["underlay_telemetry_core_" + field], expected)
         self.assertEqual(values["underlay_telemetry_core_rto_max_ms"], "200.000")
         self.assertEqual(values["underlay_telemetry_core_retrans_total_delta"], "5")
         self.assertEqual(
