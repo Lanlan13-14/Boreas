@@ -349,7 +349,7 @@ boreas daemon serve|connect \
 - 同一进程/同一路径不要同时开 `StatusStore` 和另一个需要该锁的组件；`network_policy_store` 等
   使用各自的相邻锁文件，文件名不同则不冲突，但不要共用同一个 state path。
 - 已有 CI 记录 `b077538` 的 Ubuntu Rust job 有一个 supervisor durable-budget 测试报
-  “unexpected store lock”（`docs/engineering/continuation-state.md:127`）；同 SHA 的 TLS job 通过
+  “unexpected store lock”（[Ubuntu job 132727090305](https://github.com/Lanlan13-14/Boreas/actions/runs/43686202443/job/132727090305)，见[当日 CI 快照](ci-checkpoint-2026-11-15-1440.md)）；同 SHA 的 [TLS job 132727090180](https://github.com/Lanlan13-14/Boreas/actions/runs/43686202466/job/132727090180) 通过
   12 个 status-store 测试。该失败发生在 supervisor 的 store lock 生命周期，不是 `StatusStore`
   本身；但说明锁/继承类测试在 CI 上确实敏感，新增 daemon 测试不要用同一临时路径并发 open，
   也不要用 sleep/重试掩盖 `Busy`。

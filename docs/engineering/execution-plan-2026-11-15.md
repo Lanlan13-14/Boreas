@@ -1,18 +1,12 @@
 # Boreas 主计划执行与验收任务书
 
-日期：2026-11-15，Asia/Singapore。状态：执行中；不是完成报告。
+日期：2026-11-15，Asia/Singapore。状态：历史工程规划；工作包是验收要求，不是当前实现状态。
 
-## 1. 授权、基线和不可变规则
+## 1. 规范基线和验收规则
 
-用户目标：同步 GitHub `Lanlan13-14/Boreas` 的 `main`，按指定主计划审核并修复全部缺口，完善 README、部署教程和严肃、无 Emoji 的发布机制。用户进一步要求先写详细严密计划，主要交由 GPT-6 Luna 实现，减少主代理 token 消耗。
-
-- 指定原件：`C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md`。
-- 仓库基线：[v1.11.0 主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md)。两份文件于本轮实际 SHA-256 比对一致：`23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`，925 行。
-- 本轮初始本地 HEAD `dac120a5029bb3e6b430bd67670c4df6085fed26`；远端同步目标 `8457d0637c5714c08b73163b80e5e3e371f29c00`。本地领先 6、落后 14 个提交，另有 staged/unstaged/untracked 工作。
-- 先建立 `backup/pre-sync-20261115`，再将原工作树完整记录为 `22d268c8018d81512a396e88f2e780b0ee0ed704`，随后合并远端；不 reset、不丢弃、不 force-push。
+- 仓库基线：[v1.11.0 主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md)。历史比对记录：所提供原件与仓库副本的 SHA-256 一致：`23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`，925 行。
 - 所有编译、格式化、lint、Python/Rust 测试在 GitHub Actions 执行，不在本机运行；Git、静态阅读、API 状态/日志提取不算测试。
-- 按用户最新偏好，后续实现与修复默认委派 `lightcode/deepseek-v4.1-flash`，不再默认由 Luna 主写。已有 Luna 写任务先停止并交接已写范围，再启动 Flash，禁止同文件并发写入；历史任务记录仍保留实际执行模型，不改写为 Flash 完成。主代理负责分工、最终 diff 审查、提交、正常推送、证据核对。
-- 不请求批准，不输出凭据，不把 ReleaseRoot/NetworkRoot 私钥放入 CI，不用真实生产密钥作测试。
+- 不输出凭据，不把 ReleaseRoot/NetworkRoot 私钥放入 CI，不用真实生产密钥作测试。
 - 不能以政策模块、测试桩、单机回环、单元测试或绿色平台构建替代实际产品集成、真实环境测量或独立安全评审。
 - 不降低 hybrid KEX/ML-DSA、双签 AND、新鲜度、资源硬限额或失败关闭要求来换取测试通过。
 
@@ -41,7 +35,7 @@ P00 -> P09 供应链/文档（持续更新）
 P05 + P06 + P07 + P08 + P09 -> P10 规模/故障/外部审计 -> 生产审批
 ```
 
-一次最多交付一个可审查功能切片；分工禁止重叠写同一文件。子代理不得提交推送、不得自行改 production ledger 为 approved。共享接口需要先报告主代理再修改消费者，不能建立第二套平行架构。
+逐个交付可审查功能切片。先确定共用接口，再修改调用方，避免建立平行架构。未经相应证据审查不得修改生产门禁。
 
 ## 4. 工作包与验收合同
 
@@ -147,32 +141,13 @@ P05 + P06 + P07 + P08 + P09 -> P10 规模/故障/外部审计 -> 生产审批
 - 195均衡/291集中Backup、未认证洪泛/h2 driver/大证书链/慢读停读/目录全同步，至少30min RSS/PSS/cgroup/sockstat/队列/信用/峰值。
 - RTT50/200/400ms × loss0/0.1/1/3% × rate10/100/1000Mbit，h1/h2、DIR/CDN、单多流、GSO、低水位参数扫描。完整归档环境和样本，不能用BDP推导代替实测。
 - 1vCPU/1GiB 仅功能和有界性，生产Core规格按真实容量测量，性能不足调规格/接纳数量而不削弱安全。
-- 外部密码/组合协议审查、fuzz、依赖审计，blocking/high全部关闭；本代理或同源子代理评审不叫外部独立审计。
+- 外部密码/组合协议审查、fuzz、依赖审计，blocking/high全部关闭；项目内部评审不等同于外部独立审计。
 - 根/身份撤销、状态备份恢复、生产回退、过载和事故演练。
 - 退出条件：所有适用 gate 有原始可复现证据、审查者、exact commit、失败样本和未决项为零；否则不能生产发布。
 
-## 5. 每个 Luna 子任务必须采用的返回格式
+## 5. 历史验证记录
 
-1. 范围：只写指定文件/目录；先阅读，列接口依赖；有范围外必要更改先报告。
-2. 变更：安全不变量、真实调用路径、错误/失败/释放语义，不只列函数名。
-3. 测试：新增正负例及 Actions workflow/命令；未执行明确标“待CI”。
-4. 风险：仍有 TODO、不可实现/需外部资源项、兼容性/迁移/持久化影响。
-5. 禁止项：本地编译测试、提交推送、忽略lint、跳过坏用例、伪造证据、改gate通过、上线真实环境。
-
-## 6. 主代理集成与验收动作
-
-- 收齐所需子任务结果后审查最终 diff；不在子代理仍写同文件时运行formatter/生成器。
-- 按范围暂存与提交，完整读取异常退出，正常 push 不 force；远端自动格式化/锁提交先 fetch 再安全集成。
-- 触发必要 Actions，记录 exact SHA/run/job；失败读日志后修根因，不用重复运行碰运气。
-- 所有未完成后台任务记录ID；最终答复前收集相关结果，不将“代码已写”说成“测试已过”。
-- 每轮更新本任务书的执行日志与状态，下一工作包从最早未满足依赖开始。目标只有全部实际验收完成才结束，外部证据不足继续做能实现的工作并准确列未决项。
-
-## 7. 本轮执行日志
-
-- 已保留原始本地工作并完成安全合并，`3d5665b` 正常推送；后续 bot rustfmt 已安全合入，无 force-push。
-- 原主计划哈希已核实；逐条审计详表见 [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md)。
-- 发布报告复用修复、故障切换目标/迟滞修复、README/部署/发布规范和发布说明结构检查器已提交推送；代码提交不是测试通过，各自仍需 exact-commit Actions。
-- Refresh-lock `43678497934` 在 `8090fd6` 生成成功，compile validation 暴露 supervisor readiness 接口错误。主代理核对 manifests 未变和 artifact 哈希后恢复锁为 `dc484f6`，不放宽 `--locked`，不将恢复视为编译验收。
-- 按用户最新偏好，主写已切换 DeepSeek V4.1 Flash；Luna 在途写任务均先停止交接。监督器 fixture/Clippy、WSS 夹具修复已审查提交。`da1b278` 默认 Rust、Linux TUN、OpenSSL TLS、五平台开发打包四个工作流共 21 个 job 全通过，其中实际运行 157 tunnel lib + 15 WSS 集成/净化测试；这不是生产门禁接受。
-- Flash 正完成持久状态新鲜度和真实 E2E→PacketIo 两个分离写范围的切片；独立审查要求修正 tolerated-clock 时间基准、无续期测试敏感性、中断重试界限、协商 MTU 限制和真实 E2E+VirtualTun 构造路径覆盖。未修正代码不纳入已验证基线。
-- 下一门槛：审查上述最终 diff，通过 Actions 刷新新增 PacketIo 依赖锁，验证默认及 backend feature 的 exact commit；再接持久 FreshStatus 和真正 NodeRuntime 纵切。仍无生产 daemon、外部审计或全部门禁验收，不能从当前绿色开发基线外推。
+- 原始计划的逐项审计见 [plan-audit-2026-11-15.md](plan-audit-2026-11-15.md)；早期集成失败与恢复见 [CI 集成记录](ci-integration-2026-11-15.md)。
+- [Refresh-lock 43678497934](https://github.com/Lanlan13-14/Boreas/actions/runs/43678497934) 在 `8090fd6` 生成锁文件，但 supervisor readiness 编译验证失败；核对 manifests 和 artifact 哈希后在 `dc484f6` 恢复锁，仍不构成编译通过。
+- `da1b278` 的 Rust、Linux TUN、OpenSSL TLS、五平台开发打包共 21 个 job 成功，其中 157 个 tunnel library 和 15 个 WSS 集成/净化测试实际运行。见[当日 CI 快照](ci-checkpoint-2026-11-15-1420.md)。这些结果不证明后续提交或生产门禁。
+- 后续切片需要审查时钟容差的时间基准、无续期负例、中断重试界限、协商 MTU 和真实 E2E + VirtualTun 构造路径。发布报告复用与故障切换迟滞修复也须在各自准确提交上取证。

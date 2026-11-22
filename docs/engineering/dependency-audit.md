@@ -71,7 +71,7 @@ rust-tls、crypto-poc、openwrt 工作流固定 **3.6.5**，源码 SHA-256 为 `
 
 ## 精确升级与锁刷新计划（本次不执行）
 
-- `windows-sys =0.59.0 -> =0.61.2`：单独 PR，检查 Win32 feature 名、HANDLE/socket/接口签名与链接方式；Windows 原生设备/构建/测试全通过，兼顾 macOS/Linux 不回归。由私网代理占用者协调后改 manifest；使用既有 Refresh Cargo.lock 工作流生成受审 artifact，检查 windows-targets 等传递变化与 checksum，再由 CI `--locked` 编译/测试。
+- `windows-sys =0.59.0 -> =0.61.2`：单独 PR，检查 Win32 feature 名、HANDLE/socket/接口签名与链接方式；Windows 原生设备/构建/测试全通过，兼顾 macOS/Linux 不回归。使用既有 Refresh Cargo.lock 工作流生成受审 artifact，检查 windows-targets 等传递变化与 checksum，再由 CI `--locked` 编译/测试。
 - `foreign-types-shared =0.1.1 -> =0.3.1`：**候选而非可直接替换**。当前 openssl 经 foreign-types 0.3.2 使用 shared 0.1.1，直接引入 0.3.1 的 ForeignTypeRef trait 不保证与上游同一类型身份；先评估借用指针 trait 和 rust-openssl 支持范围。优先保持匹配上游的 0.1.1，记录 freshness debt；只有兼容 wrapper/trait 方案经 OpenSSL feature 测试后一起刷新锁，不能仅换数字。
 - 原生 OpenSSL：立即停止把 3.6.5 当持续受支持基线。目标优先评估受支持 3.5 LTS 的 **3.5.10**（仍满足项目 ML-DSA/ML-KEM 3.5+），另列 **4.1.1** 主版本迁移候选；两者当时未发布。不能自动升到已知受影响的 latest 4.1.0。若发布前必须修复，需独立审查官方 commit 补丁集、固定来源/校验、逐项安全回归和支持政策，不在本任务擅改构建基线。发行后重新查官方 release asset/signature/hash，核对 3.5/4.x 与 rust-openssl 0.10.82/openssl-sys 0.9.118 的兼容，跑现有 Actions rust-tls、crypto-poc、openwrt 的真实 hybrid TLS、ML-DSA、静态 linkage 与跨目标测试，再原子更新所有工作流 pin/hash 和审查文件。原生换版本身不一定改变 Cargo.lock；wrapper 若需升级必须有明确版本与 lock artifact 评审。
-- 其他直接依赖当日已经最新，无依据提出升级。未来任何升级依旧先 CVE 影响范围/修复版本与 MSRV/API 审查，再由专用 lock 刷新通道处理；禁止解除 `--locked`、本地顺手 `cargo update` 或覆盖私网代理正在操作的文件。
+- 其他直接依赖当日已经最新，无依据提出升级。未来任何升级依旧先 CVE 影响范围/修复版本与 MSRV/API 审查，再由专用 lock 刷新通道处理；禁止解除 `--locked`或本地直接运行 `cargo update`。

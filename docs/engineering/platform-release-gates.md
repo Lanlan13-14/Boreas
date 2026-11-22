@@ -138,7 +138,7 @@ release approver, retained reports and offline signatures remain necessary.
 
 | Gate | Required evidence (summary) | Current status | Applicable CI path / gap |
 |---|---|---|---|
-| `G-CRYPTO` | Hybrid TLS 1.3 + ML-DSA mTLS on the actual Boreas Rust/WSS path; independent interoperability; static architecture support | Open | Crypto PoC is a separate OpenSSL harness, not Boreas Rust/WSS; `rust-tls.yml` is owned by the crypto agent |
+| `G-CRYPTO` | Hybrid TLS 1.3 + ML-DSA mTLS on the actual Boreas Rust/WSS path; independent interoperability; static architecture support | Open | Crypto PoC is a separate OpenSSL harness, not Boreas Rust/WSS; `rust-tls.yml` exercises the actual backend path |
 | `G-FRAME` | AppHeader parser invariance, bounds, malformed/unknown/DoS cases | Open | Unit tests exist; no gate-level adversarial evidence |
 | `G-DATA` | VirtualTun and real LinuxTun 1 GiB transfer, hash, disconnect/congestion/reconnect | Open | No shipped data plane; real TUN only crate-level device tests |
 | `G-RESOURCE` | 195/291 connection workloads, 30 min RSS/PSS/cgroup evidence | Open | No topology runtime |

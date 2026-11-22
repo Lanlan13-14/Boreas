@@ -79,7 +79,7 @@ This last check prevents route-get-only assertions from masquerading as proof
 that the second veth actually carried the large daemon transfer. It is not a
 packet capture or exact per-flow accounting.
 
-## Required smoke hook integration (owned by root agent)
+## Required smoke hook integration
 
 The wrapper requires these small additions to the existing smoke; it does not
 edit it itself:
@@ -112,8 +112,7 @@ ensure `/dev/net/tun` is available. The wrapper also needs GNU `timeout` and
 `realpath` (coreutils). Run as root on the disposable hosted Linux runner; nested
 unprivileged containers generally lack the required netns/mount capabilities.
 
-Example steps to insert **after** the static artifact is available (the owning
-agent must select the actual artifact path and pinned action policy):
+Example steps to insert **after** the static artifact is available (use the actual artifact path and the repository’s reviewed action pin policy):
 
 ```yaml
 - name: Real static pq768 routing matrix

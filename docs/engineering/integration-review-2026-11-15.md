@@ -35,11 +35,7 @@ The Linux name conversion has been adjusted to use the byte representation of
 `c_char`, and isolated TUN tests now remount sysfs inside a private mount/network
 namespace. These changes remain unverified until Actions runs them.
 
-## Delegation and lead review
-
-Implementation is delegated to DeepSeek V4.1 Flash in disjoint ownership scopes.
-The lead reviews actual code and integration rather than accepting completion
-messages. Findings sent back for correction include:
+## Integration review findings
 
 1. TLS `PemIdentity` derived Debug exposed private-key bytes. Require redacted
    diagnostics, bounded key/certificate reads, exact peer authorization and

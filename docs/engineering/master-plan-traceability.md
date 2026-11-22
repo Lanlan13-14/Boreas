@@ -43,7 +43,7 @@
 - GitHub `main` 的精确公开基线为 `a45fac50ed795a8e3f6eb1b4e32a903b62384ffc`。TLS [44098711189](https://github.com/Lanlan13-14/Boreas/actions/runs/44098711189)、平台 [44098711266](https://github.com/Lanlan13-14/Boreas/actions/runs/44098711266) 与依赖 [44098711317](https://github.com/Lanlan13-14/Boreas/actions/runs/44098711317) 均失败；TUN [44098711277](https://github.com/Lanlan13-14/Boreas/actions/runs/44098711277) 与 native Wintun/utun [44098711238](https://github.com/Lanlan13-14/Boreas/actions/runs/44098711238) 成功，仍只证明限定范围。
 - 已下载并按 GitHub 摘要核验 TLS artifact `14334458772`（SHA-256 `10f1bde90c931beb5d0a1468f82f244ae076f43f17f73ad2c6398495fe4aeecf`）：数组 `.unwrap()` 编译错误与 packet-path 未绑定身份测试失败。平台日志证实默认测试的 CLI 无条件 dev-dependency 引入原生 OpenSSL，Linux 两架构和 Windows 无该库；不是伪装为通过的运行时测试。
 - 上述具体修复与 CLI feature 限定已正常推送为 `c955be1a1b85d8bb23238621488c3811ac4d7299`，启动 exact-SHA Rust [44103089310](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089310)、TLS [44103089622](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089622)、OpenWrt [44103089300](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089300)、平台 [44103089398](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089398)、TUN [44103089453](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089453)、依赖安全 [44103089265](https://github.com/Lanlan13-14/Boreas/actions/runs/44103089265)。终态未收齐前所有 gate 保持开放，无 pre4。
-- 按用户要求，实现继续现有代码且主要由 DeepSeek 并行负责；撤权、DNS、性能、主备、多Core、依赖、部署和 UI 是进行中写任务，不是完成声明。`G-EXTERNAL-REVIEW` 仍无独立外部证据。
+- 截至该快照，撤权、DNS、性能、主备、多 Core、依赖、部署和 UI 均仍有待验证的实现工作。`G-EXTERNAL-REVIEW` 仍无独立外部证据。
 
 ### 2026-11-17 round 27：实际 Git 状态与未提交候选（不关闭门禁）
 
@@ -51,7 +51,7 @@
 - `f6ad93d` 当前证据：Rust [44119754093](https://github.com/Lanlan13-14/Boreas/actions/runs/44119754093) 四个 job 全部 SUCCESS（locked 依赖 preflight、Ubuntu check/clippy/test、rustfmt patch、Windows check/clippy/test），TUN [44119753830](https://github.com/Lanlan13-14/Boreas/actions/runs/44119753830) SUCCESS；rust-tls [44119753821](https://github.com/Lanlan13-14/Boreas/actions/runs/44119753821) 仍在构建静态 OpenSSL，OpenWrt [44119753721](https://github.com/Lanlan13-14/Boreas/actions/runs/44119753721) 构建中，平台 [44119753812](https://github.com/Lanlan13-14/Boreas/actions/runs/44119753812) 排队，安全 [44119753952](https://github.com/Lanlan13-14/Boreas/actions/runs/44119753952) 进行中且 fixture/pin/native-review 三个 job 失败。因此只验证了 Rust/TUN 上的编译修复，TLS/OpenWrt/平台/安全未终态，不能称完成。
 - `fde8d2e` 的 CI **失败，不是完成**：五个 push workflow 失败——Rust 44112315845、rust-tls [44112316167](https://github.com/Lanlan13-14/Boreas/actions/runs/44112316167)、OpenWrt 44112316160、平台 44112315934、安全 44112316179；只有 TUN 44112316532 成功。该 rust-tls job 名称是 “OpenSSL 4.1.0 … pq768 mTLS”，**不是 CLI crypto PoC**；它在步骤 14/16 失败，日志为 E0106 与 E0425 `base_from_endpoints`/`policy`，`packet_path.rs` 两处调用但全库无定义。`5448df6` 只是该树的格式化且无自身 run，因此不是可编译 main。24 门禁与 Phase 0–5 均未改变，`gates.json` 未改（仍 24 open），无 pre4。
 - `0127a22` **不是 lock 已刷新**：它只改 `crates/boreas-cli/Cargo.toml`；API 显示 refresh-lock run [44109377920](https://github.com/Lanlan13-14/Boreas/actions/runs/44109377920) 两个 job 均 SUCCESS，但 `Cargo.lock` 无 diff（`84288e7` 在 `0127a22`/`fde8d2e`/`5448df6`/`f6ad93d`/worktree 相同，最后修改仍是 `b52ead2`），成功校验没有产生 commit。其自身 push CI 也是红的：Rust 44109366792、rust-tls 44109369248、OpenWrt 44109366797、安全 44109366832 失败，平台 44109366804 取消，TUN 44109369054 成功。更早的 refresh 44108659573 在 `dbe3c5d` 因 `dev-dependencies are not allowed to be optional: openssl` 失败且 diff 为空。
-- 未提交候选 ≠ 完成：31 个已跟踪文件 **+7456/−343** 与 10 个新文件（`revocation.rs`、DNS authority×2、`dns_runtime.rs`、mesh/sandbox 测试、4 份 docs，约 5,460 行），是 DeepSeek 8 路续写现有代码的产物；没有 commit/push、没有 exact-SHA Actions，不得作为任何门禁证据。
+- 未提交候选 ≠ 完成：31 个已跟踪文件 **+7456/−343** 与 10 个新文件（`revocation.rs`、DNS authority×2、`dns_runtime.rs`、mesh/sandbox 测试、4 份 docs，约 5,460 行），只是未提交快照；没有准确提交上的 Actions 结果，不得作为门禁证据。
 - 四个候选的硬边界（仅静态阅读）：revocation entry **没有逐条 authority 签名**，只靠部署 `RevocationRelayPolicy` 与结构规则，`StatusStore::open` 默认不授权任何 class，清理只到标识符 → `G-REVOKE` open；DNS 只有 **IPv4/UDP over `PacketIo`**，拒绝 `TCP:53`、`dns_tcp=false`、daemon 未构造 → `G-DNS` open；mesh 是四节点 loopback **模型**、固定单向 relay、非 full runtime → `G-CONVERGE`/`G-E2E`/`G-FAILOVER` open；standby 是 **same Core, alternate ingress**，非多 Core/多 peer → `G-FAILOVER` open。
 - `G-PERF` 仍 **red**：最后一次实测 run [44089808664](https://github.com/Lanlan13-14/Boreas/actions/runs/44089808664) / source `7be5abf` 为 1 MiB **2.439/2.305**、8 MiB **2.879/2.556** Mbps，均低于未变的 3 Mbps 门限；性能候选文档自述未在 Actions 跑 benchmark，不得称修复。
 
@@ -110,7 +110,7 @@
   `BOREAS_PREFIX`/`BOREAS_CONFIG`/`BOREAS_MATERIAL_DIR`,全链路一致;约束是绝对路径、拒绝顶层系统目录/`..`/符号链接
   与非 root/可写祖先,见 [ONE_CLICK.md](../deployment/ONE_CLICK.md) 第 53–59 行。(2) **网络侧自定义前缀**仍
   fail-closed:缺**签名网络策略**,在 identity/session/packet/TUN/DNS 集成完成前不启用(见
-  [continuation-state.md](continuation-state.md) 第 25 行;默认私有 VIP 如 `10.20.1.1/10.20.1.2` 仅为示例)。
+  [前缀运行时合同](prefix-runtime-next.md)；默认私有 VIP 如 `10.20.1.1/10.20.1.2` 仅为示例)。
 - **`boreas-easy`**:`argv[0]` 入口 + 行式三语控制台(`crates/boreas-cli/src/{tui,render,i18n}.rs`),
   经 `/run/boreas/control.sock`(`0600`,SO_PEERCRED 同 uid)取快照。**live control-socket 已有实际 smoke**
   (路由 matrix 每 case 的 live control status,二进制 `376da3d`),另有 fixture 修复 `118a084`、`fbdfee1`;

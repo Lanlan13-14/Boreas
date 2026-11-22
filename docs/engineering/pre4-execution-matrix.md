@@ -4,9 +4,11 @@ This is an implementation work list, not evidence of completion. The normative b
 
 The authoritative human-supplied original is `C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md`. Its SHA-256 was rechecked against the repository copy on 2026-11-16: both are `23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`. The entire Phase 0–5 plan remains in scope; the workstream table below is a prioritization aid, not a replacement or scope reduction. All 24 production gates remain open; short two-node CI successes are partial evidence only.
 
-## Current integration line
+See the [pre.4 release checklist](pre4-release-checklist.md) for current acceptance prerequisites and exact-SHA evidence. The workstream statuses below are a historical implementation snapshot.
 
-- Exact GitHub baseline before this work: `9dc1593` (`v0.1.0-pre.3` documentation).
+## Historical integration baseline
+
+- Exact GitHub baseline for this snapshot: `9dc1593` (`v0.1.0-pre.3` documentation).
 - The existing public runtime is one Linux Core/Edge IPv4 pair. Library primitives with names similar to a feature are not runtime integration or production evidence.
 - All compilation, formatting, lint, tests, benchmarks, and fault injection run in GitHub Actions. Local source inspection and `git diff --check` are not substitute test evidence.
 

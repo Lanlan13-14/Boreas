@@ -125,9 +125,7 @@ extracted DLL hash, and pass that hash to the test. The CI workflow additionally
 Authenticode signer of the extracted DLL; that check is CI policy and is not performed by this
 crate. The archive hash is a CI supply-chain pin, not a production trust root, and this repository
 does not vendor the DLL. The Actions wiring, runner
-labels (`windows-2025`, `macos-15`, `macos-15-intel`), lockfile refresh, and test-count guard are
-owned by the platform-gates workstream; the required contract is recorded here so it can be
-reviewed independently.
+labels (`windows-2025`, `macos-15`, `macos-15-intel`), lockfile refresh, and test-count guard can be reviewed against the platform contract recorded here.
 
 ## Privilege, cleanup, and failure boundaries
 

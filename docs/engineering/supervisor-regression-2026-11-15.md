@@ -57,7 +57,7 @@ line 1823 is the one consumed by the rollback assertion. `Test` only warns, `Cli
 the identical `unused variable: older` at `manifest.rs:1806`. The lint therefore predates the
 `ee4bda4` fixture work and is not introduced by it.
 
-## Static note for the main agent (not touched here)
+## Separate backend compile failure
 
 `d5a215c` run 43682623647 job 132716316415 (`OpenSSL 3.6.1 + rust-openssl 0.10.82 pq768 mTLS`)
 failed compiling a separate crate:

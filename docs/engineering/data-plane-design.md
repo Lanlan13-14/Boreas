@@ -50,4 +50,4 @@ Collection only: the poll count, 50 ms interval and daemon deadlines are unchang
 
 ## Test and release boundary
 
-Unit tests use injected `Instant` values for deterministic age/expiry transitions. No local build or tests are run by this delegated task; CI must format, compile, lint and test the workspace. Passing these unit tests would establish only these isolated state invariants, not the plan's `G-RESOURCE`, `G-DATA`, `G-PERF`, `G-E2E` or production release gates. Do not claim successful TLS/E2E, bounded total process RSS, RFC 8290 compliance, static TLS builds, or completed Phase 0.
+Unit tests use injected `Instant` values for deterministic age/expiry transitions. Formatting, builds, lint and tests run in Actions. Passing these unit tests would establish only these isolated state invariants, not the plan's `G-RESOURCE`, `G-DATA`, `G-PERF`, `G-E2E` or production release gates. Do not claim successful TLS/E2E, bounded total process RSS, RFC 8290 compliance, static TLS builds, or completed Phase 0.

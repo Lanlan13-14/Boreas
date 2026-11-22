@@ -4,12 +4,12 @@
 
 **结论：已有大量策略、解析器、状态机、设备适配器和部分真实密码/传输库接口，但尚不能称为可部署的 Boreas VPN 产品；Phase 0–5 均未验收，生产发布仍被阻止。** 单元测试数量、文档覆盖率、模拟流量哈希、静态 CLI 构建，均不能代替真实守护进程的安全数据路径。
 
-本审查完整阅读 [v1.11.0 主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) 925 行，并阅读 [门禁账本](gates.json)、现有工程状态文档和下列引用源码。审查没有运行本地编译、测试、格式化或验证脚本，没有提交、推送，也没有触发远端 CI。本文件是在主代理明确指定新增审查文档后唯一写入的文件；此前审查为只读。
+本次静态审查覆盖 [v1.11.0 主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) 925 行、[门禁账本](gates.json)、同期工程状态文档和下列引用源码；没有运行编译、测试、格式化或验证脚本。
 
 ### 版本快照与并发合并限制
 
 - 审查开始 HEAD：`dac120a5029bb3e6b430bd67670c4df6085fed26`，当时工作树已有修改和未跟踪实现，故**不是干净提交审计**。
-- `2026-11-15T12:42:56+08:00` 再采样 HEAD：`22d268c8018d81512a396e88f2e780b0ee0ed704`；MERGE_HEAD：`8457d0637c5714c08b73163b80e5e3e371f29c00`。主代理正在合并；当时索引有 10 个未解决路径，涉及 PKI、协议、supervisor、原生 TUN 和 tunnel 的清单/导出/TLS 适配器。`12:46:45+08:00` 完稿检查时 HEAD 与 MERGE_HEAD 仍相同；本报告为唯一新增的未跟踪审查文件。
+- `2026-11-15T12:42:56+08:00` 再采样 HEAD：`22d268c8018d81512a396e88f2e780b0ee0ed704`；MERGE_HEAD：`8457d0637c5714c08b73163b80e5e3e371f29c00`。当时合并未完成，索引有 10 个未解决路径，涉及 PKI、协议、supervisor、原生 TUN 和 tunnel 的清单/导出/TLS 适配器。`12:46:45+08:00` 完稿检查时 HEAD 与 MERGE_HEAD 仍相同。
 - 冲突标记属于**合并中的瞬时状态**，不作为已经提交的产品缺陷，也不据此推断最终代码编译失败。本报告引用的是所读取的工作树片段；合并完成后必须对最终 diff、模块导出、feature、依赖和调用方复审。
 - [主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) SHA-256：`23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`。
 - [门禁账本](gates.json) SHA-256：`C0FC1C48B73ADB917C33272F7E5BC3530A96F2FE453275ABFB45D865BFC19658`。
@@ -19,7 +19,7 @@
 - [failover 策略](../../crates/boreas-tunnel/src/failover.rs) SHA-256：`CE2D6618A8846B71FBCA99126D51956EEB1832A121C97DFA6DBE216E0191FF3F`。
 - [sandbox 实现](../../crates/boreas-supervisor/src/sandbox.rs) SHA-256：`771F6F47CE3C1F7B29F67CA3599BE0175756306F40B22695F269E43E70AFEF25`。
 
-最初仓库内未找到 `BOREAS-MASTER-PLAN__7__1.md`；随后主代理通知，用户已指定外部原件 `C:\Program Files\Netease\GameViewer\Download\BOREAS-MASTER-PLAN__7__1.md`，并由主代理核对该原件同为 925 行、SHA-256 与仓库主计划完全相同。此处明确区分：**本代理完整阅读的是仓库副本；外部原件的一致性比对由主代理完成**，不再将原件描述为不存在或未提供。
+审查对象为仓库副本；同期另行比对了外部原件 `BOREAS-MASTER-PLAN__7__1.md`，记录为同为 925 行且 SHA-256 一致。
 
 ### 证据口径
 
