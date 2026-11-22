@@ -32,8 +32,9 @@ pub(super) mod linux {
     use boreas_pki::{
         management::MAX_SIGNED_OBJECT_BYTES,
         provisioning::{RootsBundle, parse_net_id_hex},
-        status_store::{MAX_IDENTITY_REVOCATION_BYTES, StatusStore},
+        status_store::{MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES, StatusStore},
     };
+    use boreas_proto::authority_revocation::SCOPED_REVOCATION_MAILBOXES;
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
         mesh_probe::{Candidate, MeshProbe, mesh_trust, utc_now},
@@ -177,20 +178,26 @@ pub(super) mod linux {
         status
             .accept_signed_snapshot(&snapshot, now, Instant::now())
             .map_err(|e| format!("mesh signed status rejected: {e:?}"))?;
-        match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(mat.join("identity-revocation.signed"))
+        for (class, name, max) in std::iter::once((None, "identity-revocation.signed", MAX_IDENTITY_REVOCATION_BYTES))
+            .chain(SCOPED_REVOCATION_MAILBOXES.map(|(class, name)| (Some(class), name, MAX_SCOPED_REVOCATION_BYTES)))
         {
-            Ok(file) => {
-                let raw = read_opened_material(file, MAX_IDENTITY_REVOCATION_BYTES, None)?;
-                let now = utc_now().map_err(|e| format!("mesh clock rejected: {e:?}"))?;
-                status
-                    .accept_identity_revocation(&raw, now)
-                    .map_err(|e| format!("mesh identity revocation rejected: {e:?}"))?;
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(mat.join(name))
+            {
+                Ok(file) => {
+                    let raw = read_opened_material(file, max, None)?;
+                    let now = utc_now().map_err(|e| format!("mesh clock rejected: {e:?}"))?;
+                    let result = match class {
+                        None => status.accept_identity_revocation(&raw, now),
+                        Some(class) => status.accept_scoped_revocation(class, &raw, now),
+                    };
+                    result.map_err(|e| format!("mesh {name} rejected: {e:?}"))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(format!("mesh {name} mailbox: {}", e.kind())),
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(format!("mesh identity revocation mailbox: {}", e.kind())),
         }
         let pem = PemIdentity {
             certificate_pem: read(&mat.join("identity.pem"), 64 * 1024)?,

@@ -150,7 +150,7 @@ impl AllowedPrefix {
     pub fn prefix_len(&self) -> u8 {
         self.prefix_len
     }
-    fn contains(&self, candidate: &Self) -> bool {
+    pub(crate) fn contains(&self, candidate: &Self) -> bool {
         self.bytes.len() == candidate.bytes.len()
             && candidate.prefix_len >= self.prefix_len
             && prefix_matches(&self.bytes, &candidate.bytes, self.prefix_len)
@@ -205,6 +205,8 @@ pub struct IssuerRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedObject {
+    /// Authenticated authority of the issuer, never inferred from the subject.
+    issuer_authority: Authority,
     /// SHA-256 of the exact TBS bytes; also the candidate `object_id` rule.
     object_id: [u8; 32],
     object: ManagementObject,
@@ -221,6 +223,10 @@ pub struct VerifiedObject {
     valid_until: u64,
 }
 impl VerifiedObject {
+    pub fn issuer_authority(&self) -> Authority {
+        self.issuer_authority
+    }
+
     pub fn object_id(&self) -> [u8; 32] {
         self.object_id
     }
@@ -435,6 +441,37 @@ impl ManagementTrust {
         now_us: u64,
     ) -> Result<VerifiedObject, Error> {
         self.verify_with_issuer_time(raw_signed_object, now_us, now_us)
+    }
+
+    /// Revalidate an exact cached attachment lease without changing replay
+    /// state. The original lease and both authorizations must still be live.
+    #[cfg(target_os = "linux")]
+    pub fn revalidate_attachment_lease(
+        &self,
+        raw: &[u8],
+        raw_identity: &[u8],
+        now: u64,
+    ) -> Result<VerifiedObject, Error> {
+        let verified = self.authenticate_at(raw, now, now, None)?;
+        let ObjectBody::AttachmentLease(lease) = &verified.object.body else {
+            return Err(Error::UnauthorizedObjectType);
+        };
+        let identity = self.authenticate_at(raw_identity, now, now, None)?;
+        let ObjectBody::NodeIdentity(node) = &identity.object.body else {
+            return Err(Error::UnknownNodeIdentity);
+        };
+        if node.node_id != lease.node_id || node.identity_generation != lease.identity_generation
+            || !self.is_current_identity(node.node_id, identity.object_id)
+        {
+            return Err(Error::StaleNodeIdentity);
+        }
+        let key = replay_key(&verified.object)?;
+        if !self.replay.get(&key).is_some_and(|head| !head.conflicted
+            && head.object_id == verified.object_id)
+        {
+            return Err(Error::StaleSequence);
+        }
+        Ok(verified)
     }
 
     /// Attach a private, exclusively locked ledger before the first CoreLSA.
@@ -670,6 +707,7 @@ impl ManagementTrust {
             verify_signer_signatures(&issuer, &message, &signed.signers[0], SignerRole::Primary)?;
         }
         Ok(VerifiedObject {
+            issuer_authority: issuer.authority,
             object_id: sha256(&raw_tbs)?,
             object,
             raw_tbs,
@@ -1953,6 +1991,207 @@ mod tests {
             bare_trust.verify_test(&raw, &lease_signatures, 200),
             Err(Error::UnknownNodeIdentity)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_revocations_persist_and_invalidate_only_owned_bindings() {
+        use boreas_proto::authority_revocation::{AuthorityRevocation, RevocationClass, RevocationScope};
+        use crate::{NetworkRootPin, authority_revocation::AuthorityRevocationTrust,
+            status_store::{AuthenticatedPeer, Error as StoreError, StatusStore,
+                IDENTITY_REVOCATION_MAGIC, SCOPED_REVOCATION_MAGIC}};
+        use std::{fs, os::unix::fs::{DirBuilderExt, MetadataExt}};
+
+        let root = TestSigner::new(40, Authority::NetworkRoot, IssuerScope::default());
+        let pin = NetworkRootPin::provisioned(NET, root.ed25519.public_key_to_der().unwrap(),
+            MldsaParameterSet::Mldsa65, root.mldsa.public_key_to_der().unwrap()).unwrap();
+        let fingerprint = pin.fingerprint().unwrap();
+        let route_scope = IssuerScope::for_route(vec![AllowedPrefix::new(vec![192, 168, 0, 0], 16).unwrap()]).unwrap();
+        let route = TestSigner::new(41, Authority::RouteAuthority, route_scope.clone());
+        let other_route = TestSigner::new(42, Authority::RouteAuthority, route_scope);
+        let roaming = TestSigner::new(43, Authority::CoreOperationalKey { core_id: 2 }, IssuerScope::default());
+        let home = TestSigner::new(44, Authority::CoreOperationalKey { core_id: 1 }, IssuerScope::default());
+        let identity = TestSigner::new(45, Authority::IdentityAuthority,
+            IssuerScope::for_identity(vec![NodeRole::Edge], vec![1]).unwrap());
+        let same_core_other_key = TestSigner::new(47, roaming.authority, IssuerScope::default());
+        let signers = [&route, &other_route, &roaming, &home, &identity, &same_core_other_key];
+        let mut management = trust_with(&signers);
+        let prefix = vec![192, 168, 10, 0];
+        let original_route = route_grant_object(&route, prefix.clone(), 24);
+        let route_grant = management.verify_and_authorize(&route.sign(&original_route), 200).unwrap();
+        let other_prefix = route_grant_object(&route, vec![192, 168, 11, 0], 24);
+        let other_prefix_grant = management.verify_and_authorize(&route.sign(&other_prefix), 200).unwrap();
+        let narrower_prefix = route_grant_object(&route, prefix.clone(), 25);
+        let narrower_grant = management.verify_and_authorize(&route.sign(&narrower_prefix), 200).unwrap();
+        let same_prefix_other_issuer = route_grant_object(&other_route, prefix.clone(), 24);
+        let other_route_grant = management.verify_and_authorize(&other_route.sign(&same_prefix_other_issuer), 200).unwrap();
+        let direct_grant = management.verify_and_authorize(&roaming.sign(&direct_grant_object(&roaming)), 200).unwrap();
+        let other_direct_grant = management.verify_and_authorize(&home.sign(&direct_grant_object(&home)), 200).unwrap();
+        let same_core_other_grant = management.verify_and_authorize(
+            &same_core_other_key.sign(&direct_grant_object(&same_core_other_key)), 200,
+        ).unwrap();
+        // ManagementTrust accepts one generation per key ID. A second verifier
+        // models a grant issued under a successor generation without replacing
+        // the trust needed to reauthenticate the historical denial.
+        let mut next_management = ManagementTrust::new(NET);
+        let mut next_record = roaming.record();
+        next_record.issuer_generation = 2;
+        next_management.add_issuer(next_record).unwrap();
+        let mut next_direct = direct_grant_object(&roaming);
+        next_direct.issuer_generation = 2;
+        let next_direct_grant = next_management.verify_and_authorize(&roaming.sign(&next_direct), 200).unwrap();
+
+        let node_ed = node_ed_key();
+        let node_ml = ml_identity_key(46);
+        let identity_object = node_identity_object(&identity, ObjectNodeRole::Edge, 1, 2, 9,
+            &node_ml.raw_public_key().unwrap());
+        let signed_identity = identity.sign(&identity_object);
+        management.verify_and_authorize(&signed_identity, 200).unwrap();
+        let lease = |core: &TestSigner, target_core_id| ManagementObject {
+            issuer_key_id: core.key_id.clone(),
+            body: ObjectBody::AttachmentLease(AttachmentLease {
+                node_id: 2, identity_generation: 9, attach_generation: 1, target_core_id,
+                not_before: 100, expires: 1_000,
+            }),
+            ..original_route.clone()
+        };
+        let signed_roaming_lease = sign_lease(&lease(&roaming, 2), &node_ed, &node_ml, &roaming);
+        let roaming_lease = management.verify_and_authorize(&signed_roaming_lease, 200).unwrap();
+        assert_eq!(management.revalidate_attachment_lease(&signed_roaming_lease, &signed_identity, 200).unwrap().object_id(), roaming_lease.object_id());
+        let mut unaccepted_identity = identity_object.clone();
+        unaccepted_identity.issued_at += 1;
+        if let ObjectBody::NodeIdentity(node) = &mut unaccepted_identity.body {
+            node.not_before = unaccepted_identity.issued_at;
+        }
+        assert_eq!(management.revalidate_attachment_lease(&signed_roaming_lease, &identity.sign(&unaccepted_identity), 200), Err(Error::StaleNodeIdentity));
+        let other_lease = sign_lease(&lease(&home, 1), &node_ed, &node_ml, &home);
+        let other_lease = management.verify_and_authorize(&other_lease, 200).unwrap();
+
+        let path = std::env::temp_dir().join(format!("boreas-scoped-status-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let uid = fs::metadata(&path).unwrap().uid();
+        let open = || {
+            let mut trust = AuthorityRevocationTrust::new(NET);
+            trust.add_network_root(&pin, fingerprint).unwrap();
+            for signer in signers {
+                trust.add_issuer(signer.record(), 100, 400).unwrap();
+            }
+            StatusStore::open_with_identity_revocations(path.join("status.state"), NET, uid,
+                ManagementTrust::new(NET), fingerprint, trust).unwrap()
+        };
+        let sign = |object: &AuthorityRevocation, signer: &TestSigner| {
+            let tbs = object.encode_tbs().unwrap();
+            let input = AuthorityRevocation::signature_input(&tbs).unwrap();
+            let mut raw = if object.class == RevocationClass::Identity { IDENTITY_REVOCATION_MAGIC }
+                else { SCOPED_REVOCATION_MAGIC }.to_vec();
+            raw.extend(sign_bytes(&signer.ed25519, &input));
+            raw.extend(sign_bytes(&signer.mldsa, &input));
+            raw.extend(tbs);
+            raw
+        };
+        let route_denial = AuthorityRevocation {
+            net_id: NET, class: RevocationClass::Route, subject_node_id: 2, identity_generation: 9,
+            issuer_key_id: route.key_id.clone(), issuer_generation: 1,
+            scope: RevocationScope { prefix, prefix_len: 24, core_id: 0 },
+            seq: 5, issued_at: 150, next_update: 300,
+        };
+        let direct_denial = AuthorityRevocation {
+            class: RevocationClass::Direct, issuer_key_id: roaming.key_id.clone(),
+            scope: RevocationScope { core_id: 2, ..RevocationScope::default() }, seq: 1,
+            ..route_denial.clone()
+        };
+        let core_denial = AuthorityRevocation {
+            class: RevocationClass::Core, subject_node_id: 257, identity_generation: 7,
+            issuer_key_id: fingerprint.to_vec(), scope: RevocationScope::default(), seq: 1,
+            ..route_denial.clone()
+        };
+        let identity_denial = AuthorityRevocation {
+            class: RevocationClass::Identity, subject_node_id: 3,
+            issuer_key_id: identity.key_id.clone(), scope: RevocationScope::default(), seq: 1,
+            ..route_denial.clone()
+        };
+        let edge = AuthenticatedPeer::new(NET, 2, 9).unwrap();
+        let edge_next = AuthenticatedPeer::new(NET, 2, 10).unwrap();
+        let core = AuthenticatedPeer::new(NET, 257, 7).unwrap();
+        let core_next = AuthenticatedPeer::new(NET, 257, 8).unwrap();
+        let home_core = AuthenticatedPeer::new(NET, 1, 7).unwrap();
+        let identity_peer = AuthenticatedPeer::new(NET, 3, 9).unwrap();
+        let route_bytes = sign(&route_denial, &route);
+        let mut status = open();
+        status.accept_identity_revocation(&sign(&identity_denial, &identity), 200).unwrap();
+        drop(status); // Existing Identity-only image must reopen before scoped upgrade.
+        let mut status = open();
+        assert!(status.identity_revoked(&identity_peer).unwrap());
+        assert!(status.accept_identity_revocation(&route_bytes, 200).is_err());
+        assert!(status.accept_scoped_revocation(RevocationClass::Direct, &route_bytes, 200).is_err());
+        let mut forged = route_bytes.clone();
+        forged[SCOPED_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN] ^= 1;
+        assert!(status.accept_scoped_revocation(RevocationClass::Route, &forged, 200).is_err());
+        let mut outside = route_denial.clone();
+        outside.scope.prefix = vec![172, 16, 0, 0];
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Route, &sign(&outside, &route), 200),
+            Err(StoreError::AuthorityRevocation(crate::authority_revocation::Error::OutOfScope))));
+        let mut wrong_core = direct_denial.clone();
+        wrong_core.scope.core_id = 1;
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Direct, &sign(&wrong_core, &roaming), 200),
+            Err(StoreError::AuthorityRevocation(crate::authority_revocation::Error::WrongAuthority))));
+        let mut wrong_root = core_denial.clone();
+        wrong_root.issuer_key_id = roaming.key_id.clone();
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Core, &sign(&wrong_root, &roaming), 200),
+            Err(StoreError::AuthorityRevocation(crate::authority_revocation::Error::WrongAuthority))));
+        let mut wrong_root_generation = core_denial.clone();
+        wrong_root_generation.issuer_generation = 2;
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Core, &sign(&wrong_root_generation, &root), 200),
+            Err(StoreError::AuthorityRevocation(crate::authority_revocation::Error::IssuerGenerationMismatch))));
+        assert!(!status.route_grant_revoked(&edge, &route_grant).unwrap());
+        assert!(!status.core_revoked(&core).unwrap());
+        status.accept_scoped_revocation(RevocationClass::Route, &route_bytes, 200).unwrap();
+        status.accept_scoped_revocation(RevocationClass::Direct, &sign(&direct_denial, &roaming), 201).unwrap();
+        assert!(!status.attachment_lease_revoked(&core, &roaming_lease).unwrap());
+        status.accept_scoped_revocation(RevocationClass::Core, &sign(&core_denial, &root), 202).unwrap();
+        drop(status);
+        assert!(matches!(StatusStore::open(path.join("status.state"), NET, uid, ManagementTrust::new(NET)),
+            Err(StoreError::RevocationPermission)));
+        let mut status = open();
+        assert!(status.identity_revoked(&identity_peer).unwrap());
+        assert!(status.core_revoked(&core).unwrap());
+        assert!(!status.identity_revoked(&core).unwrap());
+        assert!(!status.core_revoked(&core_next).unwrap());
+        assert!(status.attachment_lease_revoked(&core, &roaming_lease).unwrap());
+        assert!(!status.attachment_lease_revoked(&home_core, &other_lease).unwrap());
+        assert!(status.attachment_lease_revoked(&home_core, &roaming_lease).is_err());
+        assert!(status.route_grant_revoked(&edge, &route_grant).unwrap());
+        assert!(!status.route_grant_revoked(&edge, &other_route_grant).unwrap());
+        assert!(!status.route_grant_revoked(&edge, &other_prefix_grant).unwrap());
+        assert!(!status.route_grant_revoked(&edge, &narrower_grant).unwrap());
+        assert!(!status.route_grant_revoked(&edge_next, &route_grant).unwrap());
+        assert!(status.direct_grant_revoked(&edge, &direct_grant).unwrap());
+        assert!(!status.direct_grant_revoked(&edge, &other_direct_grant).unwrap());
+        assert!(!status.direct_grant_revoked(&edge, &same_core_other_grant).unwrap());
+        assert!(!status.direct_grant_revoked(&edge, &next_direct_grant).unwrap());
+        assert!(!status.direct_grant_revoked(&edge_next, &direct_grant).unwrap());
+        assert!(!status.identity_revoked(&edge).unwrap());
+        let mut older = route_denial.clone();
+        older.seq -= 1;
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Route, &sign(&older, &route), 203),
+            Err(StoreError::RevocationStale)));
+        let mut conflict = route_denial.clone();
+        conflict.next_update += 1;
+        assert!(matches!(status.accept_scoped_revocation(RevocationClass::Route, &sign(&conflict, &route), 204),
+            Err(StoreError::ScopedRevocationConflict)));
+        // Independently scoped lower sequence must not share the first floor.
+        let mut independent = route_denial;
+        independent.seq = 1;
+        independent.scope.prefix = vec![192, 168, 11, 0];
+        status.accept_scoped_revocation(RevocationClass::Route, &sign(&independent, &route), 205).unwrap();
+        status.accept_scoped_revocation(RevocationClass::Route, &route_bytes, 500).unwrap();
+        assert!(status.route_grant_revoked(&edge, &route_grant).unwrap());
+        assert!(status.route_grant_revoked(&edge, &other_prefix_grant).unwrap());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use boreas_pki::{
         init_ca_dir, issue_node_dir, sign_network_policy_dir, sign_status_file,
     },
 };
+use boreas_proto::authority_revocation::RevocationClass;
 use boreas_tunnel::mesh_probe::utc_now;
 use openssl::{
     pkey::{PKey, Private},
@@ -491,17 +492,26 @@ fn circuit(line: &str) -> &str {
 }
 
 fn publish_denial(f: &Fixture, dir: &Path, subject_node_id: u16) {
-    use boreas_pki::status_store::IDENTITY_REVOCATION_MAGIC;
-    use boreas_proto::authority_revocation::{
-        AuthorityRevocation, RevocationClass, RevocationScope,
+    publish_authority_denial(f, dir, subject_node_id, RevocationClass::Identity);
+}
+
+fn publish_authority_denial(f: &Fixture, dir: &Path, subject_node_id: u16, class: RevocationClass) {
+    use boreas_pki::status_store::{IDENTITY_REVOCATION_MAGIC, SCOPED_REVOCATION_MAGIC};
+    use boreas_proto::authority_revocation::{AuthorityRevocation, RevocationScope};
+    let (issuer_key_id, header, keys, name) = match class {
+        RevocationClass::Identity => (b"identity-authority-v1".to_vec(), IDENTITY_REVOCATION_MAGIC,
+            ["ia.ed25519.key", "ia.mldsa65.key"], "identity-revocation.signed"),
+        RevocationClass::Core => (f.roots.network_root_pin().unwrap().fingerprint().unwrap().to_vec(),
+            SCOPED_REVOCATION_MAGIC, ["root.ed25519.key", "root.mldsa65.key"], "core-revocation.signed"),
+        _ => unreachable!(),
     };
     let now = utc_now().unwrap();
     let tbs = AuthorityRevocation {
         net_id: NET,
-        class: RevocationClass::Identity,
+        class,
         subject_node_id,
         identity_generation: 1,
-        issuer_key_id: b"identity-authority-v1".to_vec(),
+        issuer_key_id,
         issuer_generation: 1,
         scope: RevocationScope::default(),
         seq: 1,
@@ -512,8 +522,8 @@ fn publish_denial(f: &Fixture, dir: &Path, subject_node_id: u16) {
     .unwrap();
     let msg = AuthorityRevocation::signature_input(&tbs).unwrap();
     let ca = f._temp.0.join("ca");
-    let mut raw = IDENTITY_REVOCATION_MAGIC.to_vec();
-    for name in ["ia.ed25519.key", "ia.mldsa65.key"] {
+    let mut raw = header.to_vec();
+    for name in keys {
         raw.extend(sign(
             &PKey::private_key_from_der(&read(&ca, name)).unwrap(),
             &msg,
@@ -523,7 +533,7 @@ fn publish_denial(f: &Fixture, dir: &Path, subject_node_id: u16) {
     let stage = dir.join("revocation.tmp");
     fs::write(&stage, raw).unwrap();
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::rename(stage, dir.join("identity-revocation.signed")).unwrap();
+    fs::rename(stage, dir.join(name)).unwrap();
 }
 
 fn ping(n: &Network, i: usize, destination: &str) {
@@ -670,6 +680,51 @@ fn mesh_routed_tun_live_revocation_excludes_relay_and_preserves_healthy_path() {
         circuit(&backup),
         circuit(&destination.wait_for("role=destination path=[1, 4]"))
     );
+    ping(&n, 0, "10.20.4.1");
+}
+
+#[test]
+#[ignore = "requires root, CAP_NET_ADMIN/CAP_SYS_ADMIN, real TUN, and iproute2/ping/setpriv"]
+fn mesh_root_core_revocation_withdraws_owned_path_but_keeps_admin_routes() {
+    let n = Network::setup();
+    let f = Fixture::with_topology(Topology::SignedDirectBackup);
+    let dirs = install(&f, true);
+    let mut destination = Process::spawn(&f, &n, 3, &dirs[3]);
+    let mut shared_relay = Process::spawn(&f, &n, 2, &dirs[2]);
+    let mut first_relay = Process::spawn(&f, &n, 1, &dirs[1]);
+    for process in [&mut destination, &mut shared_relay, &mut first_relay] {
+        process.wait_for("mesh ready");
+    }
+    let mut source = Process::spawn(&f, &n, 0, &dirs[0]);
+    let primary = source.wait_for("role=source path=[1, 2, 3, 4]");
+    assert_eq!(
+        circuit(&primary),
+        circuit(&destination.wait_for("role=destination path=[1, 2, 3, 4]")),
+    );
+    let admin_route = || {
+        let output = Command::new("ip")
+            .args(["-n", &n.names[0], "route", "show", "exact", "10.20.4.1/32"])
+            .output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("dev bmesh0"));
+        output.stdout
+    };
+    let before = admin_route();
+    publish_authority_denial(&f, &dirs[0], 257, RevocationClass::Core);
+    source.wait_for("mesh source route closed: CoreRevoked");
+    let backup = source.wait_for("role=source path=[1, 4]");
+    assert_ne!(circuit(&primary), circuit(&backup));
+    assert_eq!(circuit(&backup), circuit(&destination.wait_for("role=destination path=[1, 4]")));
+    assert_eq!(admin_route(), before);
+    // Mailbox deletion and process restart do not resurrect the denied route.
+    source.stop();
+    fs::remove_file(dirs[0].join("core-revocation.signed")).unwrap();
+    let mut source = Process::spawn(&f, &n, 0, &dirs[0]);
+    let reopened = source.wait_for("role=source path=[1, 4]");
+    assert_ne!(circuit(&backup), circuit(&reopened));
+    destination.wait_for(&format!("role=destination circuit={}", circuit(&reopened)));
+    assert!(!source.text().contains("role=source path=[1, 2, 3, 4]"));
+    assert_eq!(admin_route(), before);
     ping(&n, 0, "10.20.4.1");
 }
 

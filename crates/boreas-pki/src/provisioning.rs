@@ -221,6 +221,17 @@ impl RootsBundle {
         })
     }
 
+    /// Parse the exact public NetworkRoot keys; callers must still bind the
+    /// resulting fingerprint to their independently verified network context.
+    pub fn network_root_pin(&self) -> Result<NetworkRootPin, ProvisionError> {
+        Ok(NetworkRootPin::provisioned(
+            self.net_id,
+            self.root_ed25519_pub_der.clone(),
+            MldsaParameterSet::Mldsa65,
+            self.root_mldsa65_pub_der.clone(),
+        )?)
+    }
+
     /// Verify the `NetworkRoot` pin and every delegated `RootAuthorizationCandidate` at `now_us`.
     pub fn verify_all(
         &self,
@@ -230,12 +241,7 @@ impl RootsBundle {
         if self.net_id != expected_net_id {
             return Err(ProvisionError::WrongNetwork);
         }
-        let pin = NetworkRootPin::provisioned(
-            self.net_id,
-            self.root_ed25519_pub_der.clone(),
-            MldsaParameterSet::Mldsa65,
-            self.root_mldsa65_pub_der.clone(),
-        )?;
+        let pin = self.network_root_pin()?;
         let root_fp = pin.fingerprint()?;
         let mut verified = Vec::with_capacity(self.authorizations.len());
         for entry in &self.authorizations {

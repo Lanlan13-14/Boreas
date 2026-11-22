@@ -31,16 +31,15 @@ mod linux {
 
     use boreas_crypto::backend::PemIdentity;
     use boreas_pki::{
-        Authority, VerifiedNetworkContext,
-        authority_revocation::AuthorityRevocationTrust,
-        management::{MAX_SIGNED_OBJECT_BYTES, ManagementTrust},
+        VerifiedNetworkContext,
+        management::MAX_SIGNED_OBJECT_BYTES,
         provisioning::{RootsBundle, parse_net_id_hex},
-        status_store::{MAX_IDENTITY_REVOCATION_BYTES, StatusStore},
+        status_store::{MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES, StatusStore},
     };
     use boreas_tun::linux::{LinuxTunDevice, LinuxTunQueue};
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
-        mesh_probe::{Candidate, Error, MeshProbe, utc_now},
+        mesh_probe::{Candidate, Error, MeshProbe, mesh_trust, utc_now},
         mesh_route::{DirectoryCore, RouteLocator, RoutedPair},
         packet_path::{MAX_MTU, MIN_MTU},
         resource::{Admission, Limits},
@@ -413,7 +412,7 @@ mod linux {
         let roots = RootsBundle::decode(&read(roots_path, 128 * 1024)?)
             .map_err(|_| "invalid mesh roots bundle")?;
         let now = clock()?;
-        let (fingerprint, grants) = roots
+        let (fingerprint, _) = roots
             .verify_all(net, now)
             .map_err(|_| "invalid mesh root authorization")?;
         let state = &cfg.paths.state_dir;
@@ -435,25 +434,8 @@ mod linux {
         if cfg.network.overlay_prefix.base() != policy.overlay_base() {
             return Err("configured overlay does not match signed policy".into());
         }
-        let mut status_trust = ManagementTrust::new(net);
-        let mut identity_trust = AuthorityRevocationTrust::new(net);
-        let (mut has_status, mut has_identity) = (false, false);
-        for grant in grants {
-            let authority = grant.issuer_record().authority;
-            status_trust
-                .add_verified_issuer(&grant)
-                .map_err(|_| "mesh status issuer rejected")?;
-            has_status |= authority == Authority::StatusSigner;
-            if authority == Authority::IdentityAuthority {
-                identity_trust
-                    .add_verified_issuer(grant)
-                    .map_err(|_| "mesh revocation issuer rejected")?;
-                has_identity = true;
-            }
-        }
-        if !has_status || !has_identity {
-            return Err("mesh requires status and independent identity authorities".into());
-        }
+        let (status_trust, identity_trust) = mesh_trust(&roots, &policy, now)
+            .map_err(|e| format!("mesh authority trust: {e:?}"))?;
         let status = StatusStore::open_with_identity_revocations(
             state.join("status.state"),
             net,
@@ -615,6 +597,9 @@ mod linux {
         let mailbox = dir.join("identity-revocation.signed");
         probe.set_identity_revocation_mailbox(move || {
             optional(&mailbox, MAX_IDENTITY_REVOCATION_BYTES).map_err(std::io::Error::other)
+        });
+        probe.set_scoped_revocation_mailboxes(move |name| {
+            optional(&dir.join(name), MAX_SCOPED_REVOCATION_BYTES).map_err(std::io::Error::other)
         });
         let outer_roots = optional(&dir.join("outer-ca.pem"), MAX_PEM)?;
         let outer = || match &outer_roots {
@@ -847,14 +832,14 @@ mod linux {
                 if let Some(pair) = &routed {
                     match graph.authorize_routed_pair(&mut probe, pair) {
                         Ok(()) => usable = true,
-                        Err(Error::NoRoute | Error::IdentityRevoked) => (),
+                        Err(Error::NoRoute | Error::IdentityRevoked | Error::CoreRevoked) => (),
                         Err(e) => return Err(format!("mesh route authorization: {e:?}")),
                     }
                 } else {
                     for route in &spec.routes {
                         match graph.authorize_path(&mut probe, &route.path) {
                             Ok(_) => usable = true,
-                            Err(Error::NoRoute | Error::IdentityRevoked) => (),
+                            Err(Error::NoRoute | Error::IdentityRevoked | Error::CoreRevoked) => (),
                             Err(e) => return Err(format!("mesh route authorization: {e:?}")),
                         }
                     }
@@ -923,10 +908,10 @@ mod linux {
                                 e.rx
                             );
                         }
-                        Err(Error::IdentityRevoked) => {
+                        Err(e) if e.member_denial() => {
                             // This is an authority transition, not a transport
                             // retry. Rebuild and rank only still-authorized routes.
-                            eprintln!("mesh source route closed: IdentityRevoked");
+                            eprintln!("mesh source route closed: {e:?}");
                             preferred = None;
                             last_loss = None;
                         }

@@ -3,25 +3,14 @@
 //! This module verifies the independent
 //! [`boreas_proto::authority_revocation::AuthorityRevocation`] object. It does not
 //! reuse `StatusSnapshot.revocations` or extend `objects::ObjectType`. The
-//! Linux daemon uses it through the separate identity extension of `StatusStore`.
+//! Linux daemon uses it through the independent authority extensions of `StatusStore`.
 //!
 //! # Authority separation
 //!
-//! The signed object names its class. This slice fully enables only `Identity`:
-//!
-//! * `Identity` must be signed by an `IdentityAuthority` record whose
-//!   `IssuerScope` authorizes the subject's home Core and role. This is the
-//!   complete reference slice; both Ed25519 and ML-DSA-65 signatures must verify
-//!   over the exact domain-separated TBS.
-//! * `Core` (NetworkRoot), `Route` (RouteAuthority, one prefix) and `Direct`
-//!   (the CoreOperationalKey of the issuing Core, never inferred from the
-//!   subject's home Core) remain schema-reserved. `verify` returns
-//!   [`Error::UnsupportedClass`] for them in this slice; no partial token exists.
-//!
-//! Only the Identity slice is enabled. It requires a provisioned IdentityAuthority
-//! record, both signatures, the exact scope evidence and a still-valid
-//! root-authorization grant window. There is no "missing evidence means accept"
-//! path.
+//! IdentityAuthority signs Identity denials within its role/home-Core grant;
+//! the independently pinned NetworkRoot signs Core denials; RouteAuthority
+//! signs Route denials within its delegated prefix pool; only the issuing
+//! CoreOperationalKey can sign a Direct denial for its Core scope.
 //!
 //! There is no caller boolean that selects an authority. The authority comes from
 //! the provisioned [`IssuerRecord`] and is re-checked with the existing
@@ -70,8 +59,8 @@ use boreas_proto::{
 
 use crate::{
     Authority, NodeRole, ObjectKind,
-    management::{self, IssuerRecord, ManagementTrust},
-    root_authorization::VerifiedIssuerAuthorization,
+    management::{self, AllowedPrefix, IssuerRecord, IssuerScope, ManagementTrust},
+    root_authorization::{NetworkRootPin, VerifiedIssuerAuthorization},
 };
 
 pub use boreas_proto::authority_revocation::{ED25519_SIGNATURE_LEN, MLDSA65_SIGNATURE_LEN};
@@ -86,12 +75,12 @@ pub enum Error {
     IssuerGenerationMismatch,
     /// The provisioned authority cannot issue this object class.
     WrongAuthority,
-    /// Only the Identity slice is enabled; Core/Route/Direct fail closed.
+    /// Issuer is not an independently provisionable revocation authority.
     UnsupportedClass,
     /// The root-authorization grant that made this issuer trustworthy has
     /// expired or is not yet valid.
     IssuerNotValid,
-    /// The subject is outside the IdentityAuthority's configured role/home-Core scope.
+    /// The subject or target is outside the issuer's granted scope.
     OutOfScope,
     InvalidIssuerRecord,
     InvalidSignatureLength,
@@ -114,14 +103,14 @@ impl std::error::Error for Error {}
 ///
 /// The record's authority is out-of-band trust input, exactly like
 /// `ManagementTrust`; `add_issuer` does not discover or validate a certificate
-/// chain. This slice accepts only `IdentityAuthority` records; the other
-/// authorities remain schema-reserved and fail closed.
+/// chain. NetworkRoot is installed separately from delegated authorities.
 pub struct AuthorityRevocationTrust {
     net_id: [u8; 16],
     issuers: BTreeMap<Vec<u8>, TrustedIssuer>,
     /// Existing verifier used only to reuse its real issuer key parsing/type
     /// checks and duplicate-key rejection. It records no revocation state.
     validation: ManagementTrust,
+    root: Option<[u8; 32]>,
 }
 
 /// An issuer record plus the root-authorization grant window that made it
@@ -140,6 +129,7 @@ impl AuthorityRevocationTrust {
             net_id,
             issuers: BTreeMap::new(),
             validation: ManagementTrust::new(net_id),
+            root: None,
         }
     }
 
@@ -148,7 +138,7 @@ impl AuthorityRevocationTrust {
     }
 
     pub(crate) fn same_issuers(&self, expected: &Self) -> bool {
-        self.net_id == expected.net_id && self.issuers == expected.issuers
+        self.net_id == expected.net_id && self.root == expected.root && self.issuers == expected.issuers
     }
 
     pub(crate) fn can_relay(&self, object: &AuthorityRevocation, now: u64) -> bool {
@@ -165,28 +155,58 @@ impl AuthorityRevocationTrust {
         self.issuers.len()
     }
 
-    /// Provision one IdentityAuthority record after the existing issuer checks.
-    ///
-    /// `not_before` / `expires` are the root-authorization grant window the record
-    /// came from. They are retained and checked on every `verify`, because
-    /// `IssuerRecord` itself has no validity fields and an expired grant must not
-    /// keep authorizing new revocations. The record must carry an identity scope
-    /// with at least one role and one home Core and no route prefixes.
+    pub(crate) fn is_bound_to(&self, root: [u8; 32]) -> bool {
+        self.root.is_none_or(|pinned| pinned == root)
+    }
+
+    /// Bind the independent NetworkRoot. Its canonical issuer ID is the 32
+    /// fingerprint bytes and its generation is 1 for this pinned-key profile;
+    /// a signer cannot create a new sequence namespace by choosing another ID.
+    pub fn add_network_root(
+        &mut self,
+        pin: &NetworkRootPin,
+        expected_fingerprint: [u8; 32],
+    ) -> Result<(), Error> {
+        if pin.net_id() != self.net_id {
+            return Err(Error::WrongNetwork);
+        }
+        if !self.is_bound_to(expected_fingerprint)
+            || pin.fingerprint().map_err(|_| Error::InvalidIssuerRecord)? != expected_fingerprint
+            || pin.mldsa_parameter_set() != MldsaParameterSet::Mldsa65
+        {
+            return Err(Error::InvalidIssuerRecord);
+        }
+        self.insert_issuer(IssuerRecord {
+            issuer_key_id: expected_fingerprint.to_vec(),
+            issuer_generation: 1,
+            authority: Authority::NetworkRoot,
+            ed25519_public_key_der: pin.ed25519_public_key_der().to_vec(),
+            mldsa_parameter_set: MldsaParameterSet::Mldsa65,
+            mldsa_public_key_der: pin.mldsa_public_key_der().to_vec(),
+            scope: IssuerScope::default(),
+        }, 0, u64::MAX)?;
+        self.root = Some(expected_fingerprint);
+        Ok(())
+    }
+
+    /// Provision a delegated authority. Retain the grant's half-open validity
+    /// window even though `IssuerRecord` does not itself carry validity.
     pub fn add_issuer(
         &mut self,
         record: IssuerRecord,
         not_before: u64,
         expires: u64,
     ) -> Result<(), Error> {
-        if record.authority != Authority::IdentityAuthority {
-            return Err(Error::UnsupportedClass);
-        }
-        if record.mldsa_parameter_set != MldsaParameterSet::Mldsa65 {
-            return Err(Error::InvalidIssuerRecord);
-        }
-        if record.scope.allowed_roles.is_empty()
-            || record.scope.allowed_home_cores.is_empty()
-            || !record.scope.allowed_prefixes.is_empty()
+        let scope = &record.scope;
+        let valid_scope = match record.authority {
+            Authority::IdentityAuthority => !scope.allowed_roles.is_empty()
+                && !scope.allowed_home_cores.is_empty() && scope.allowed_prefixes.is_empty(),
+            Authority::RouteAuthority => scope.allowed_roles.is_empty()
+                && scope.allowed_home_cores.is_empty() && !scope.allowed_prefixes.is_empty(),
+            Authority::CoreOperationalKey { .. } => *scope == IssuerScope::default(),
+            _ => return Err(Error::UnsupportedClass),
+        };
+        if !valid_scope || record.mldsa_parameter_set != MldsaParameterSet::Mldsa65
             || not_before >= expires
         {
             return Err(Error::InvalidIssuerRecord);
@@ -194,7 +214,7 @@ impl AuthorityRevocationTrust {
         self.insert_issuer(record, not_before, expires)
     }
 
-    /// Add an IdentityAuthority record produced by the existing root-authorization
+    /// Add a delegated record produced by the existing root-authorization
     /// verifier. The grant's validity window is retained and re-checked at every
     /// verification; it is not discarded during the `IssuerRecord` conversion.
     pub fn add_verified_issuer(
@@ -204,8 +224,14 @@ impl AuthorityRevocationTrust {
         if verified.net_id() != self.net_id {
             return Err(Error::WrongNetwork);
         }
+        let fingerprint = verified.root_fingerprint();
+        if !self.is_bound_to(fingerprint) {
+            return Err(Error::InvalidIssuerRecord);
+        }
         let (not_before, expires) = verified.validity();
-        self.add_issuer(verified.issuer_record(), not_before, expires)
+        self.add_issuer(verified.issuer_record(), not_before, expires)?;
+        self.root = Some(fingerprint);
+        Ok(())
     }
 
     fn insert_issuer(
@@ -230,10 +256,7 @@ impl AuthorityRevocationTrust {
         Ok(())
     }
 
-    /// Verify one exact Identity TBS and both authority signatures, then mint an
-    /// opaque token. A missing record, expired issuer grant, bad signature, bad
-    /// time window or out-of-scope subject yields no token. Non-Identity classes
-    /// fail closed with [`Error::UnsupportedClass`].
+    /// Verify canonical TBS, exact authority and scope, and both signatures.
     pub fn verify(
         &self,
         raw_tbs: &[u8],
@@ -243,9 +266,6 @@ impl AuthorityRevocationTrust {
     ) -> Result<VerifiedAuthorityRevocation, Error> {
         let object =
             AuthorityRevocation::decode_tbs(raw_tbs).map_err(|_| Error::InvalidCandidate)?;
-        if object.class != RevocationClass::Identity {
-            return Err(Error::UnsupportedClass);
-        }
         if object.net_id != self.net_id {
             return Err(Error::WrongNetwork);
         }
@@ -270,16 +290,32 @@ impl AuthorityRevocationTrust {
         if object.issuer_generation != issuer.issuer_generation {
             return Err(Error::IssuerGenerationMismatch);
         }
-        if !crate::may_issue(issuer.authority, ObjectKind::IdentityRevocation) {
+        let (kind, target) = match object.class {
+            RevocationClass::Identity => (ObjectKind::IdentityRevocation, 0),
+            RevocationClass::Core => (ObjectKind::CoreRevocation, 0),
+            RevocationClass::Route => (ObjectKind::RouteRevocation, 0),
+            RevocationClass::Direct => (ObjectKind::DirectRevocation, object.scope.core_id),
+        };
+        if !crate::may_issue_for_core(issuer.authority, kind, target) {
             return Err(Error::WrongAuthority);
         }
-        let (home_core, role) = identity_subject_slot(object.subject_node_id)?;
-        if issuer.scope.allowed_home_cores.is_empty()
-            || !issuer.scope.allowed_home_cores.contains(&home_core)
-            || issuer.scope.allowed_roles.is_empty()
-            || !issuer.scope.allowed_roles.contains(&role)
-        {
-            return Err(Error::OutOfScope);
+        match object.class {
+            RevocationClass::Identity => {
+                let (home_core, role) = identity_subject_slot(object.subject_node_id)?;
+                if !issuer.scope.allowed_home_cores.contains(&home_core)
+                    || !issuer.scope.allowed_roles.contains(&role)
+                {
+                    return Err(Error::OutOfScope);
+                }
+            }
+            RevocationClass::Route => {
+                let prefix = AllowedPrefix::new(object.scope.prefix.clone(), object.scope.prefix_len)
+                    .map_err(|_| Error::OutOfScope)?;
+                if !issuer.scope.allowed_prefixes.iter().any(|pool| pool.contains(&prefix)) {
+                    return Err(Error::OutOfScope);
+                }
+            }
+            RevocationClass::Core | RevocationClass::Direct => (),
         }
         let message =
             AuthorityRevocation::signature_input(raw_tbs).map_err(|_| Error::InvalidCandidate)?;
@@ -313,7 +349,7 @@ impl AuthorityRevocationTrust {
     }
 }
 
-/// Opaque proof that one Identity revocation object verified. Private fields and
+/// Opaque proof that one authority revocation object verified. Private fields and
 /// no public constructor: only [`AuthorityRevocationTrust::verify`] can create it.
 #[derive(Clone, Debug)]
 pub struct VerifiedAuthorityRevocation {
@@ -363,8 +399,7 @@ impl VerifiedAuthorityRevocation {
         self.authority
     }
 
-    /// Verified class scope bytes. For the enabled `Identity` class this is the
-    /// canonical empty scope.
+    /// Verified class scope bytes.
     pub fn scope(&self) -> &RevocationScope {
         &self.scope
     }
@@ -646,6 +681,32 @@ mod tests {
     }
 
     #[test]
+    fn delegated_grants_and_root_pin_cannot_bind_different_roots_in_either_order() {
+        let (issuer_ed, issuer_pq) = keys(20);
+        let (root_ed, root_pq) = keys(21);
+        let (other_ed, other_pq) = keys(22);
+        let pin = |ed: &PKey<Private>, pq: &PKey<Private>| {
+            NetworkRootPin::provisioned(
+                NET,
+                ed.public_key_to_der().unwrap(),
+                MldsaParameterSet::Mldsa65,
+                pq.public_key_to_der().unwrap(),
+            ).unwrap()
+        };
+        let root = pin(&root_ed, &root_pq);
+        let other = pin(&other_ed, &other_pq);
+        let grant = || verified_grant(&issuer_ed, &issuer_pq, &root_ed, &root_pq, 1_000, 1_800);
+        let mut pinned_first = AuthorityRevocationTrust::new(NET);
+        pinned_first.add_network_root(&other, other.fingerprint().unwrap()).unwrap();
+        assert_eq!(pinned_first.add_verified_issuer(grant()), Err(Error::InvalidIssuerRecord));
+
+        let mut grant_first = AuthorityRevocationTrust::new(NET);
+        grant_first.add_verified_issuer(grant()).unwrap();
+        assert_eq!(grant_first.add_network_root(&other, other.fingerprint().unwrap()), Err(Error::InvalidIssuerRecord));
+        grant_first.add_network_root(&root, root.fingerprint().unwrap()).unwrap();
+    }
+
+    #[test]
     fn both_signatures_and_time_are_enforced() {
         let (ed, pq) = keys(12);
         let mut trust = AuthorityRevocationTrust::new(NET);
@@ -729,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_authority_and_non_identity_class_fail_closed() {
+    fn status_signer_and_cross_class_issuer_fail_closed() {
         let (ed, pq) = keys(15);
         let mut wrong_authority = record(&ed, &pq);
         wrong_authority.authority = Authority::StatusSigner;
@@ -739,8 +800,7 @@ mod tests {
             Error::UnsupportedClass
         );
 
-        // Only Identity is enabled in this slice. A correctly signed Core
-        // object is still refused, not silently routed to another authority.
+        // Correct signatures do not confer authority for another class.
         let mut identity = AuthorityRevocationTrust::new(NET);
         identity.add_issuer(record(&ed, &pq), 1_000, 3_000).unwrap();
         let mut core = object();
@@ -751,7 +811,7 @@ mod tests {
             identity
                 .verify(&raw, &ed_signature, &pq_signature, 1_500)
                 .unwrap_err(),
-            Error::UnsupportedClass
+            Error::WrongAuthority
         );
     }
 }

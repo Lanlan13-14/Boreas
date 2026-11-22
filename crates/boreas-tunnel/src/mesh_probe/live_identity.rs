@@ -12,18 +12,32 @@ use std::{
 };
 
 use super::*;
+use boreas_proto::authority_revocation::{
+    MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES, RevocationClass,
+    SCOPED_REVOCATION_MAILBOXES,
+};
+use std::io;
 
 const POLL: Duration = Duration::from_millis(100);
 
-type Reader<'a> = dyn Fn() -> std::io::Result<Option<Vec<u8>>> + Send + Sync + 'a;
+type Reader<'a> = dyn Fn() -> io::Result<Option<Vec<u8>>> + Send + Sync + 'a;
+type ScopedReader<'a> = dyn Fn(&str) -> io::Result<Option<Vec<u8>>> + Send + Sync + 'a;
+const SCOPED_COUNT: usize = SCOPED_REVOCATION_MAILBOXES.len();
 
 #[derive(Default)]
 pub(super) struct Mailbox<'a> {
     reader: Option<Box<Reader<'a>>>,
+    scoped_reader: Option<Box<ScopedReader<'a>>>,
     // Cache only exact carrier bytes verified by the ledger, never a mere
     // path/mtime/inode match. Deletion is not an undo and clears the cache.
-    last: Mutex<Option<Vec<u8>>>,
+    last: Mutex<Last>,
     fault: AtomicBool,
+}
+
+#[derive(Default)]
+struct Last {
+    identity: Option<Vec<u8>>,
+    scoped: [Option<Vec<u8>>; SCOPED_COUNT],
 }
 
 impl<'a> MeshProbe<'a> {
@@ -36,6 +50,15 @@ impl<'a> MeshProbe<'a> {
         read: impl Fn() -> std::io::Result<Option<Vec<u8>>> + Send + Sync + 'a,
     ) {
         self.live_identity.reader = Some(Box::new(read));
+    }
+
+    /// Register local Core, Route and Direct mailbox delivery. Filename and
+    /// carrier framing do not confer authority; the ledger verifies both.
+    pub fn set_scoped_revocation_mailboxes(
+        &mut self,
+        read: impl Fn(&str) -> io::Result<Option<Vec<u8>>> + Send + Sync + 'a,
+    ) {
+        self.live_identity.scoped_reader = Some(Box::new(read));
     }
 
     pub(crate) fn poll_identity_mailbox(&self) -> Result<(), Error> {
@@ -55,7 +78,7 @@ impl<'a> MeshProbe<'a> {
         self.poll_identity_mailbox()?;
         self.check_route_utc(members, remote_lsa_expiry)?;
         let mailbox = &self.live_identity;
-        if mailbox.reader.is_none() {
+        if mailbox.reader.is_none() && mailbox.scoped_reader.is_none() {
             return operation();
         }
         let sockets = sockets
@@ -67,7 +90,7 @@ impl<'a> MeshProbe<'a> {
         thread::scope(|scope| {
             let stop = &stop;
             let worker = thread::Builder::new()
-                .name("boreas-mesh-identity".into())
+                .name("boreas-mesh-revocation".into())
                 .spawn_scoped(scope, move || {
                     while !stop.wait() {
                         let outcome = mailbox
@@ -107,29 +130,16 @@ impl Mailbox<'_> {
 
     fn poll(&self, status: &Mutex<&mut StatusStore>) -> Result<(), Error> {
         self.check_fault()?;
-        let Some(read) = &self.reader else {
-            return Ok(());
-        };
         let result = (|| {
             let mut last = self.last.lock().map_err(|_| Error::RevocationState)?;
-            let raw = read().map_err(|_| Error::RevocationState)?;
-            if raw != *last {
-                if let Some(bytes) = raw.as_deref() {
-                    if bytes.len() > boreas_pki::status_store::MAX_IDENTITY_REVOCATION_BYTES {
-                        return Err(Error::RevocationState);
-                    }
-                    match status
-                        .lock()
-                        .map_err(|_| Error::RevocationState)?
-                        .accept_identity_revocation(bytes, utc_now()?)
-                    {
-                        // A newer denial for this exact scope may have arrived
-                        // over a hop since the operator populated the mailbox.
-                        Ok(()) | Err(boreas_pki::status_store::Error::RevocationStale) => (),
-                        Err(_) => return Err(Error::RevocationState),
-                    }
+            self.check_fault()?;
+            if let Some(read) = &self.reader {
+                update(status, &mut last.identity, read(), RevocationClass::Identity)?;
+            }
+            if let Some(read) = &self.scoped_reader {
+                for ((class, name), cache) in SCOPED_REVOCATION_MAILBOXES.iter().zip(&mut last.scoped) {
+                    update(status, cache, read(name), *class)?;
                 }
-                *last = raw;
             }
             Ok(())
         })();
@@ -138,6 +148,36 @@ impl Mailbox<'_> {
         }
         result
     }
+}
+
+fn update(
+    status: &Mutex<&mut StatusStore>,
+    last: &mut Option<Vec<u8>>,
+    raw: io::Result<Option<Vec<u8>>>,
+    class: RevocationClass,
+) -> Result<(), Error> {
+    let raw = raw.map_err(|_| Error::RevocationState)?;
+    if raw == *last {
+        return Ok(());
+    }
+    if let Some(bytes) = raw.as_deref() {
+        let identity = class == RevocationClass::Identity;
+        let max = if identity { MAX_IDENTITY_REVOCATION_BYTES } else { MAX_SCOPED_REVOCATION_BYTES };
+        if bytes.len() > max {
+            return Err(Error::RevocationState);
+        }
+        let mut store = status.lock().map_err(|_| Error::RevocationState)?;
+        let now = utc_now()?;
+        let result = if identity { store.accept_identity_revocation(bytes, now) }
+            else { store.accept_scoped_revocation(class, bytes, now) };
+        match result {
+            // The floor already contains a verified denial for this exact scope.
+            Ok(()) | Err(boreas_pki::status_store::Error::RevocationStale) => (),
+            Err(_) => return Err(Error::RevocationState),
+        }
+    }
+    *last = raw;
+    Ok(())
 }
 
 #[derive(Default)]

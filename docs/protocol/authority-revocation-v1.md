@@ -1,8 +1,6 @@
-# Authority-specific revocation candidate v1 (Identity enabled)
+# Authority-specific revocation candidate v1
 
-Status: **candidate protocol with bounded Linux daemon and explicit Core adjacency Identity slices; not a `G-REVOKE` claim.** The signed object is independent of `StatusSnapshot.revocations`, `objects::ObjectType` and the status-relay model. The daemon's production status policy continues to reject any non-empty snapshot revocations.
-
-Only the `Identity` class is enabled. `Core`, `Route` and `Direct` have schema bytes so a later assignment cannot silently change the wire shape, but `AuthorityRevocationTrust::verify` returns `UnsupportedClass` for them. There is no caller boolean and no fallback authority path.
+Status: **candidate protocol with Linux runtime Identity/Core denial, scoped grant/lease checks and Identity-only mesh distribution; not a `G-REVOKE` claim.** The signed object is independent of `StatusSnapshot.revocations`, `objects::ObjectType` and the status-relay model. Production status policy continues to reject non-empty snapshot revocations. Core, Route and Direct decisions use local publication only.
 
 ## Why a separate object
 
@@ -35,7 +33,7 @@ object = {0: version(1),
 | `Identity` | empty | 0 | 0 | every binding of `subject_node_id` / generation |
 | `Core` | empty | 0 | 0 | a Core slot `subject_node_id` / generation |
 | `Route` | exactly one prefix | canonical length | 0 | that one route prefix |
-| `Direct` | empty | 0 | 1..=16 | grants issued by that Core; **not** inferred from home Core |
+| `Direct` | empty | 0 | 1..=16 | grants issued by the named Core's exact issuer key ID/generation; **not** inferred from home Core |
 
 Structural rules: `subject_node_id` must be a permanent overlay slot (home Core 1..=16, host octet 1 or 2..=251); a `Core` subject must be a Core slot (octet 1); a `Route` prefix is IPv4 `/8..=/32` or IPv6 `/48..=/128` with all host bits zero. `Identity`, `Core` and `Direct` require an empty prefix. `seq`, `identity_generation` and `issuer_generation` are non-zero. The schema version is 1; the whole map is mandatory.
 
@@ -51,31 +49,14 @@ The object type byte is independent of `objects::ObjectType` and of the DNS auth
 
 The verifier never accepts a caller-selected authority. It looks up the provisioned issuer record by `issuer_key_id`, requires the exact `issuer_generation`, and uses the existing permission mapping `boreas_pki::may_issue` / `may_issue_for_core`:
 
-| class | required authority | status |
+| class | required authority | scope check |
 | --- | --- | --- |
-| `Identity` | `IdentityAuthority` | enabled |
-| `Core` | `NetworkRoot` | schema-reserved; `UnsupportedClass` |
-| `Route` | `RouteAuthority` | schema-reserved; `UnsupportedClass` |
-| `Direct` | `CoreOperationalKey { core_id }` | schema-reserved; `UnsupportedClass`; must eventually use the signing Core itself, never `home_core_id` |
+| `Identity` | `IdentityAuthority` | The permanent node slot's role and home Core must both be delegated. |
+| `Core` | `NetworkRoot` | The independently pinned root signs for a Core slot. Its issuer ID is the 32 fingerprint bytes, not their hex spelling; its issuer generation is `1`. |
+| `Route` | `RouteAuthority` | The canonical prefix must be inside an authorized prefix pool of the same address family. The decision matches one exact grant prefix, not a subtree. |
+| `Direct` | `CoreOperationalKey { core_id }` | The issuer's Core must equal the signed scope Core, never inferred from the beneficiary's home Core. |
 
-`may_issue` already says `IdentityAuthority` may issue `IdentityRevocation`, `NetworkRoot` may issue `CoreRevocation`, and `RouteAuthority` may issue `RouteRevocation`. `may_issue_for_core` requires `CoreOperationalKey { core_id }` to equal the target Core for `DirectRevocation`; that is the future self-issuer rule. None of these is a caller boolean.
-
-## Identity slice (enabled)
-
-`AuthorityRevocationTrust::add_issuer(record, not_before, expires)` accepts only an IdentityAuthority record. It requires an identity `IssuerScope` with at least one allowed role and one allowed home Core and no route prefixes, and a non-empty half-open grant window. It uses the existing `ManagementTrust::add_issuer` to parse and algorithm-check both Ed25519 and ML-DSA public keys and reject duplicate key ids.
-
-The issuer grant validity is **not** a field of `IssuerRecord`. The trust must therefore retain `not_before`/`expires` alongside the record, and every verification checks `not_before <= now < expires`. `add_verified_issuer` takes the window directly from `VerifiedIssuerAuthorization::validity()`; converting that token to `IssuerRecord` must not discard it. An expired or not-yet-valid root-authorization grant yields `IssuerNotValid` even when the revocation object itself is inside its own window.
-
-`AuthorityRevocationTrust::verify` then:
-
-1. decodes the exact canonical TBS and rejects any non-canonical re-encoding;
-2. requires class `Identity` (`UnsupportedClass` for others);
-3. requires the trust network and the revocation object's half-open signed interval containing `now`;
-4. requires the exact issuer key id and generation and `may_issue(authority, IdentityRevocation)`;
-5. requires the issuer grant window to contain `now`;
-6. re-derives the subject's permanent home Core and role from `subject_node_id` and requires both in the issuer scope;
-7. verifies Ed25519 **and** ML-DSA-65 over the domain-separated exact TBS;
-8. returns an opaque `VerifiedAuthorityRevocation` only if every check passed.
+The verifier checks canonical TBS, network, the half-open signed validity interval, the exact provisioned issuer key ID and generation, the issuer's half-open delegation window (if delegated), and the class and scope. It verifies Ed25519 **and** ML-DSA-65 over the exact domain-separated TBS before producing a token. Verified delegation tokens and the pinned root must agree on the root fingerprint regardless of installation order. The local `add_issuer` API is explicit out-of-band trust input, not a substitute for checking a root authorization in production. No snapshot signer or other fallback authority is accepted.
 
 ## Opaque token
 
@@ -85,11 +66,20 @@ The token proves only that this exact object and both signatures verified agains
 
 ## Linux daemon delivery and replay state
 
-Publish an optional regular file `identity-revocation.signed` in `--material-dir` by atomic rename. The local carrier is `BRIR\0\0\0\x01` (eight bytes), followed by the 64-byte Ed25519 signature, the 3309-byte ML-DSA-65 signature, and the exact canonical TBS. The carrier alone is not a control frame; the mesh control subtype below wraps it without changing any byte. Missing input is not an undo; malformed, untrusted, stale, conflicting or unpersistable input halts the gated daemon without reporting a new verified denial. Restrict write access to the material directory.
+Publish optional regular files by atomic rename in the material directory (beside `status.signed`). Restrict write access to that directory. Each file carries one decision: eight header bytes, 64-byte Ed25519 signature, 3309-byte ML-DSA-65 signature, then exact canonical TBS.
 
-The daemon derives both verifiers from one read of the root bundle, compares its fingerprint with the verified identity's exact root, and adds only verified IdentityAuthority grants to the independent verifier. New decisions require a fresh object and grant at the status store's effective trusted UTC. Sequence increases per `(issuer key id, issuer generation, node id, identity generation)` under that network/root. Exact already-committed evidence is idempotent and does not renew anything; the same TBS with different valid signatures is also idempotent while fresh. Lower sequences and same-sequence different TBS are errors; neither replaces the committed decision. Decisions are terminal for the exact generation once committed: input expiry prevents new acceptance but does not reinstate the identity. Issue a new identity generation to recover that slot.
+| Mailbox | Header | Signed class |
+| --- | --- | --- |
+| `identity-revocation.signed` | `BRIR\0\0\0\x01` | Identity |
+| `core-revocation.signed` | `BRSR\0\0\0\x01` | Core |
+| `route-revocation.signed` | `BRSR\0\0\0\x01` | Route |
+| `direct-revocation.signed` | `BRSR\0\0\0\x01` | Direct |
 
-The existing private locked status state uses its existing atomic staging/rename/fsync procedure. A v1 image stays unchanged until the first independently verified decision, then the v2 image stores bounded exact signed evidence, acceptance UTC and the root fingerprint. Reopen re-verifies evidence against the same root and issuer grant at the recorded acceptance time; current startup trust verification remains unchanged. Up to 16 authority/scope records are retained without eviction; capacity exhaustion fails closed. Older implementations that do not support v2 refuse the image. Whole-image rollback/deletion by the trusted state owner is outside this mechanism.
+The mailbox name and header must match the signed class; neither is authority. Missing input is not an undo. Malformed, untrusted, conflicting or unpersistable input fails the gate, not as a new verified denial. A lower sequence is stale; the mesh runtime mailbox watcher treats it as a no-op only after successful verification against an already committed higher sequence for that exact scope.
+
+Runtime verifiers are derived from the same root bundle and compare its fingerprint with the verified network context. New decisions require a fresh object and grant at the status store's effective trusted UTC. Under the same network/root, the replay key is `(class, issuer key ID, issuer generation, node ID, identity generation, canonical scope)`. Exact committed bytes are idempotent without renewal; the same TBS with different valid signatures is idempotent while fresh. A stale sequence or same-sequence different TBS cannot replace a committed decision. Input expiry limits admission, not the lifetime of a committed denial.
+
+The private locked status store uses atomic staging, rename and fsync. It retains the v1 (no independent decisions) and v2 (Identity only) encodings, and writes v3 after the first Core, Route or Direct decision. It stores exact signed evidence, acceptance UTC and the root fingerprint. Reopen re-verifies each decision under the same root at its recorded acceptance time. The caps are 16 Identity records and 64 scoped records total, without eviction. An implementation without v3 support cannot read a v3 image. Whole-image rollback/deletion by the trusted state owner and historical issuer-key retention/rotation are outside this mechanism.
 
 Both `serve` and `connect` check denials at startup and before forwarding on each authenticated E2E path. The existing watchdog polls the mailbox during business (normally 500 ms), checks the path's exact local and remote node generations, and uses its existing owned-socket shutdown and circuit error path. Invalid input or persistence errors use that same fault path. `connect` also checks the exact slots before and after a standby hop handshake, before taking a standby (including after a bounded wait), and around E2E admission. A watchdog fault is terminal rather than a failover event; normal ownership cleanup closes the standby, interrupts/joins any in-flight dial and releases socket credits. The backup is another ingress for the same authenticated peer, not a second Core. This is not a guarantee of instantaneous cessation of I/O already in flight or peer-wide cleanup.
 
@@ -103,24 +93,15 @@ Every receiving Core independently checks and persists evidence using the same t
 
 A committed denial of either endpoint rejects adjacency activation. Every member of an explicitly configured `FixedRoute` is checked at admission and at the existing forwarding/check boundaries, even if not an adjacent peer. A pre-authorized route does not bypass denial: a failing `forward_fixed` or `with_fixed_endpoint` call drops its owned dedicated adjacencies and admission credits. These are in-process route permissions for bounded transactions, not installed kernel routes. The control exchange runs before circuit start, not concurrently within a live fixed-route circuit.
 
-## Non-Identity classes are fail-closed
+## Runtime effect and limits
 
-`Core`, `Route` and `Direct` have schema bytes so a future assignment cannot silently change the wire shape, but this verifier returns `UnsupportedClass` before minting any token. No partially checked token exists. In particular:
+- **Identity / Core:** `daemon serve|connect` gate the authenticated endpoints. `mesh-run` also checks every authenticated path member and polls local mailboxes during active business I/O. A committed denial closes affected owned sockets; the source may rank a fresh path using only authorized members. A denied local generation stops business. Core denial concerns the exact Core generation, not all nodes homed there. Core decisions are not relayed by the Identity control frame: publish to every node at which the denial is needed.
+- **Route:** the `StatusStore` query matches a verified RouteGrant and its authenticated beneficiary (network, node, identity generation), issuer key ID/generation and exact canonical prefix and length. Because grants do not encode beneficiary generation, the owner must retain the authenticated admission binding; a negative revocation query is not a freshness or admission decision. It does not remove a kernel route or a mesh CDN path. No live RouteGrant-owned Linux route manager consumes this query in this slice.
+- **Direct:** the query matches a verified DirectGrant and its authenticated beneficiary, exact verified issuing Core, issuer key ID **and** generation. Another key on the same Core does not inherit the denial. Neither a CDN session nor a grant signed by another issuer is a matching binding. No live DirectGrant connector consumes this query in this slice.
+- **Attachment lease:** the directory exposes a guarded cache lookup, separate from raw convergence/evidence views. It revalidates current signed lease and subject identity heads and denies a revoked owner or the lease owner's captured authenticated target Core generation. It does not delete evidence. The signed lease does not carry the target's identity generation; a consumer must retain the admission binding and must not rebind a cached lease to a successor Core identity. The current mesh directory exchange is CoreLSA-only and does not operate live attachment leases.
 
-- a correctly signed Direct object is not accepted, so a roaming Core cannot be confused with the subject's home Core;
-- a correctly signed Route object is not accepted until the single-prefix scope evidence and durable route handles are implemented;
-- a NetworkRoot-signed Core object is not accepted until the Core scope semantics are frozen.
-
-This is deliberate: "no evidence" means no token, not a weaker bool.
-
-## What is not implemented
-
-- No background gossip, directory dissemination, general Edge/daemon network delivery, partition guarantee, arbitrary-capacity journal, retention/rotation workflow for historical issuer authorizations, or external monotonic rollback anchor.
-- No general registry-based cleanup of all sockets, circuits, grants, leases or routes; no `G-REVOKE` claim.
-- No Core, Route or Direct token issuance in v1.
-- `IdentityAuthority` role scope is derived from the permanent node slot (octet 1 = Core, 2..=251 = Edge); the object does not carry a separate role byte. A future role-bearing identity profile may tighten this.
-- Root pin provenance, certificate-chain validation and key rotation are unchanged from the existing PKI candidates.
+No scoped peer delivery, background gossip, partition/delivery guarantee, general resource registry or peer-wide teardown, issuer-history migration, or external monotonic rollback anchor. `IdentityAuthority` role scope is still derived from the permanent slot, not a separate role in the object. Root pin provenance and X.509 profiles are unchanged.
 
 ## Tests
 
-Actions-only; no local `cargo build`/`test`/`fmt` claim. The proto module covers canonical round trip, the independent signature input, class/scope structural rules, and truncated/trailing/non-canonical rejection. The pki module covers a real Ed25519 + ML-DSA-65 positive Identity token, independent Ed25519 and ML-DSA failures, network/time/issuer-generation/scope failures, the issuer-grant `not_before`/`expires` bound for both `add_issuer` and `add_verified_issuer`, and rejection of non-Identity classes and non-IdentityAuthority records. The live mesh fixture sends the original evidence across distinct Cores (1 to 2, reopen 2, then 2 to 3), for a third-party route member (Core 4). It checks durable replay, exact bytes, the unaffected successor generation, the preserved status cutoff, denial of a previously authorized route and release of the held adjacency's credits. A daemon fixture covers teardown of both active and standby ingress after local revocation. These are candidate tests pending the repository's GitHub Actions run, not gate evidence.
+The unit regressions cover canonical encoding, both signatures, exact class authority and grant lifetime, mismatched root/pin order, scope isolation, v2-to-v3 reopen, and stale/conflicting sequence handling. Direct tests distinguish the matching grant from a grant signed by another key on the same Core, the same key ID in a successor issuer generation, and a grant signed by a different Core. The live Identity tests retain adjacency distribution and held-resource teardown coverage. The Linux netns test publishes a local NetworkRoot-signed Core decision during business, checks cancellation and a fresh healthy path, verifies mailbox deletion/restart do not resurrect the denied path, and compares the administrator-installed route before and after. These regressions are intended for the repository's batched CI; this document does not claim a passing run.

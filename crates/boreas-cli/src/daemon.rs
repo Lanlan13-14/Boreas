@@ -255,8 +255,9 @@ mod linux_daemon {
         provisioning::{
             RootsBundle, parse_net_id_hex, read_status_snapshot_raw, verify_material_dir_with_roots,
         },
-        status_store::{AuthenticatedPeer, MAX_IDENTITY_REVOCATION_BYTES, StatusStore},
+        status_store::{AuthenticatedPeer, MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES, StatusStore},
     };
+    use boreas_proto::authority_revocation::SCOPED_REVOCATION_MAILBOXES;
     use boreas_proto::{
         SecurityMode as ProtoSecurityMode,
         messages::{PathRole, Suite},
@@ -813,18 +814,6 @@ mod linux_daemon {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
-    }
-
-    /// One status gate against the process-wide durable store.
-    ///
-    /// The store is a process-wide singleton: a second `StatusStore::open` on the
-    /// same path returns `Busy`. Every boundary — each dial, each handshake, and
-    /// each failover epoch — therefore re-verifies the exact current
-    /// `status.signed` through that one instance instead of reopening it.
-    fn lock_gate(store: &Mutex<StatusStore>, status_path: &Path) -> Result<(u64, Instant), String> {
-        let mut guard = lock_mutex(store);
-        status_gate(&mut guard, status_path, now_utc_us()?, Instant::now())
-            .map(|(seq, deadline, _)| (seq, deadline))
     }
 
     // --- bounded upstream connection management ----------------------------
@@ -1742,8 +1731,9 @@ mod linux_daemon {
         if raw.len() > MAX_ROOTS_FILE_BYTES {
             return Err("daemon: status trust root bundle exceeds size limit".to_string());
         }
-        let (fingerprint, authorizations) = RootsBundle::decode(&raw)
-            .and_then(|bundle| bundle.verify_all(net_id, now_us))
+        let bundle = RootsBundle::decode(&raw)
+            .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
+        let (fingerprint, authorizations) = bundle.verify_all(net_id, now_us)
             .map_err(|e| format!("daemon: status trust from roots failed: {e}"))?;
         if fingerprint != expected_root_fingerprint {
             return Err(
@@ -1752,6 +1742,9 @@ mod linux_daemon {
         }
         let mut trust = ManagementTrust::new(net_id);
         let mut identity_trust = AuthorityRevocationTrust::new(net_id);
+        let pin = bundle.network_root_pin().map_err(|e| format!("daemon: revocation root pin: {e}"))?;
+        identity_trust.add_network_root(&pin, fingerprint)
+            .map_err(|e| format!("daemon: revocation root pin rejected: {e}"))?;
         let mut has_status = false;
         for authorization in authorizations {
             let authority = authorization.issuer_record().authority;
@@ -1759,10 +1752,12 @@ mod linux_daemon {
             trust
                 .add_verified_issuer(&authorization)
                 .map_err(|e| format!("daemon: status trust issuer rejected: {e}"))?;
-            if authority == Authority::IdentityAuthority {
+            if matches!(authority, Authority::IdentityAuthority | Authority::RouteAuthority
+                | Authority::CoreOperationalKey { .. })
+            {
                 identity_trust
                     .add_verified_issuer(authorization)
-                    .map_err(|e| format!("daemon: identity revocation issuer rejected: {e}"))?;
+                    .map_err(|e| format!("daemon: scoped revocation issuer rejected: {e}"))?;
             }
         }
         if !has_status {
@@ -1823,41 +1818,43 @@ mod linux_daemon {
         check_identity_revocations(&mut guard, status_path, slots)
     }
 
-    /// Poll one atomically published local object. A missing mailbox does not
+    /// Poll atomically published local objects. A missing mailbox does not
     /// remove a committed denial. Errors are fail-closed, not revocation claims.
     fn check_identity_revocations(
         store: &mut StatusStore,
         status_path: &Path,
         endpoints: [AuthenticatedPeer; 2],
     ) -> Result<(), String> {
-        let input = status_path.with_file_name("identity-revocation.signed");
-        match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(input)
+        for (class, name, max) in std::iter::once((None, "identity-revocation.signed", MAX_IDENTITY_REVOCATION_BYTES))
+            .chain(SCOPED_REVOCATION_MAILBOXES.map(|(class, name)| (Some(class), name, MAX_SCOPED_REVOCATION_BYTES)))
         {
-            Ok(file) => {
-                let metadata = file.metadata().map_err(|e| format!("daemon: identity revocation mailbox: {e}"))?;
-                if !metadata.is_file() {
-                    return Err("daemon: identity revocation mailbox is not a regular file".to_string());
-                }
-                let mut raw = Vec::new();
-                file.take(MAX_IDENTITY_REVOCATION_BYTES as u64 + 1)
-                    .read_to_end(&mut raw)
-                    .map_err(|e| format!("daemon: identity revocation mailbox read failed: {e}"))?;
-                store.accept_identity_revocation(&raw, now_utc_us()?)
-                    .map_err(|e| format!("daemon: identity revocation gate failed: {e}"))?;
-                // Verification/persistence runs off the packet hot path, but the
-                // mailbox must not extend the independently captured status deadline.
-                let now = now_utc_us()?;
-                let mono_now = Instant::now();
-                store
-                    .current_fresh(now, mono_now)
-                    .and_then(|status| status.check(now, mono_now))
-                    .map_err(|e| format!("daemon: status not fresh after identity revocation check: {e}"))?;
+            let file = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(status_path.with_file_name(name))
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("daemon: {name} mailbox open failed: {e}")),
+            };
+            let metadata = file.metadata().map_err(|e| format!("daemon: {name} mailbox: {e}"))?;
+            if !metadata.is_file() || metadata.len() > max as u64 {
+                return Err(format!("daemon: invalid {name} mailbox file"));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(format!("daemon: identity revocation mailbox open failed: {e}")),
+            let mut raw = Vec::new();
+            file.take(max as u64 + 1).read_to_end(&mut raw)
+                .map_err(|e| format!("daemon: {name} mailbox read failed: {e}"))?;
+            let now = now_utc_us()?;
+            let result = match class {
+                None => store.accept_identity_revocation(&raw, now),
+                Some(class) => store.accept_scoped_revocation(class, &raw, now),
+            };
+            result.map_err(|e| format!("daemon: {name} revocation gate failed: {e}"))?;
+            // Mailbox verification cannot extend the independent snapshot cutoff.
+            let now = now_utc_us()?;
+            let mono_now = Instant::now();
+            store.current_fresh(now, mono_now).and_then(|status| status.check(now, mono_now))
+                .map_err(|e| format!("daemon: status not fresh after {name} check: {e}"))?;
         }
         check_committed_identity_revocations(store, endpoints)
     }
@@ -1867,11 +1864,14 @@ mod linux_daemon {
         endpoints: [AuthenticatedPeer; 2],
     ) -> Result<(), String> {
         for endpoint in endpoints {
-            if store.identity_revoked(&endpoint)
-                .map_err(|e| format!("daemon: identity revocation state unusable: {e}"))?
-            {
+            let identity = store.identity_revoked(&endpoint)
+                .map_err(|e| format!("daemon: identity revocation state unusable: {e}"))?;
+            let core = store.core_revoked(&endpoint)
+                .map_err(|e| format!("daemon: Core revocation state unusable: {e}"))?;
+            if identity || core {
+                let class = if identity { "identity" } else { "Core" };
                 return Err(format!(
-                    "daemon: identity node {} generation {} revoked; business path denied or halted",
+                    "daemon: {class} node {} generation {} revoked; business path denied or halted",
                     endpoint.node_id(), endpoint.identity_generation()
                 ));
             }
@@ -2913,6 +2913,7 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
     ) -> Result<(), String> {
+        let slots = revocation_slots(session_policy.local, remote_peer)?;
         let listen_addr = resolve_addr(&listen_spec)?;
         let outer_acc = OpenSslOuterTlsAcceptor::from_pem_files(
             mat_dir.join("outer.pem"),
@@ -2930,7 +2931,7 @@ mod linux_daemon {
         policy_window
             .check()
             .map_err(|e| format!("daemon serve: policy window failed before accept: {e}"))?;
-        lock_gate(&status_store, status_path)
+        lock_revocation_gate(&status_store, status_path, slots)
             .map_err(|e| format!("daemon serve: durable status gate failed before accept: {e}"))?;
         // A Core is ready to accept a peer; this does not claim a peer circuit.
         report_trial_ready(tun)?;
@@ -2956,7 +2957,7 @@ mod linux_daemon {
                         format!("daemon serve: policy window failed while waiting for peer: {e}")
                     })?;
                     if supervised && Instant::now() >= next_status_check {
-                        lock_gate(&status_store, status_path).map_err(|e| {
+                        lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                             format!(
                                 "daemon serve: durable status gate failed waiting for peer: {e}"
                             )
@@ -3003,7 +3004,7 @@ mod linux_daemon {
         policy_window
             .check()
             .map_err(|e| format!("daemon serve: policy window failed after hop handshake: {e}"))?;
-        lock_gate(&status_store, status_path).map_err(|e| {
+        lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
             format!("daemon serve: durable status gate failed after hop handshake: {e}")
         })?;
 
@@ -3025,7 +3026,7 @@ mod linux_daemon {
         policy_window
             .check()
             .map_err(|e| format!("daemon serve: policy window failed before business: {e}"))?;
-        lock_gate(&status_store, status_path).map_err(|e| {
+        lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
             format!("daemon serve: durable status gate failed before business: {e}")
         })?;
 
@@ -3132,6 +3133,7 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
     ) -> Result<(), String> {
+        let slots = revocation_slots(session_policy.local, remote_peer)?;
         let outer_conn = direct_outer_connector(mat_dir)?;
         let budget = Arc::new(ConnectionBudget::new());
         let link_client = LinkClient::new(
@@ -3147,7 +3149,7 @@ mod linux_daemon {
             policy_window
                 .check()
                 .map_err(|e| format!("daemon connect: policy window failed before dial: {e}"))?;
-            lock_gate(&status_store, status_path).map_err(|e| {
+            lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                 format!("daemon connect: durable status gate failed before dial: {e}")
             })?;
             let target = client_target(endpoint, tls_name_override, ws_host_override, ws_path)?;
@@ -3169,7 +3171,7 @@ mod linux_daemon {
                     policy_window.check().map_err(|e| {
                         format!("daemon connect: policy window failed after TCP connect: {e}")
                     })?;
-                    lock_gate(&status_store, status_path).map_err(|e| {
+                    lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                         format!("daemon connect: durable status gate failed after TCP connect: {e}")
                     })?;
                     let fd = tcp.as_raw_fd();
@@ -3184,7 +3186,7 @@ mod linux_daemon {
                     policy_window.check().map_err(|e| {
                         format!("daemon connect: policy window failed after hop handshake: {e}")
                     })?;
-                    lock_gate(&status_store, status_path).map_err(|e| {
+                    lock_revocation_gate(&status_store, status_path, slots).map_err(|e| {
                         format!(
                             "daemon connect: durable status gate failed after hop handshake: {e}"
                         )
@@ -3247,7 +3249,6 @@ mod linux_daemon {
             None
         };
 
-        let slots = revocation_slots(session_policy.local, remote_peer)?;
         let business_started = Instant::now();
         let deadline = max_seconds.map(|seconds| business_started + Duration::from_secs(seconds));
         let mut packets_before = 0u64;

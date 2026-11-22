@@ -1,17 +1,32 @@
-//! Terminal identity-generation denials, authenticated independently of status.
+//! Terminal authority denials, authenticated independently of status.
 
 use super::{Error, Reader, StatusStore, put_u32_blob};
 use crate::authority_revocation::{
     AuthorityRevocationTrust, ED25519_SIGNATURE_LEN, MLDSA65_SIGNATURE_LEN,
     VerifiedAuthorityRevocation,
 };
-use boreas_proto::authority_revocation::{AuthorityRevocation, MAX_IDENTITY_REVOCATIONS};
+use boreas_proto::{
+    authority_revocation::{
+        AuthorityRevocation, MAX_IDENTITY_REVOCATIONS, MAX_SCOPED_REVOCATIONS,
+        RevocationClass,
+    },
+    objects::ObjectBody,
+};
+use crate::management::VerifiedObject;
 pub use boreas_proto::authority_revocation::{
-    IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES,
+    IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES,
+    SCOPED_REVOCATION_MAGIC,
 };
 pub(super) const MAX_EXTENSION_BYTES: usize = 32 + 1 + MAX_IDENTITY_REVOCATIONS * (12 + MAX_IDENTITY_REVOCATION_BYTES);
 
-type Key<'a> = (&'a [u8], u64, u16, u64);
+pub(super) const MAX_SCOPED_EXTENSION_BYTES: usize =
+    32 + 1 + MAX_SCOPED_REVOCATIONS * (12 + MAX_SCOPED_REVOCATION_BYTES);
+
+type Key<'a> = (RevocationClass, &'a [u8], u64, u16, u64, &'a [u8], u8, u8);
+
+fn magic(identity: bool) -> &'static [u8; 8] {
+    if identity { IDENTITY_REVOCATION_MAGIC } else { SCOPED_REVOCATION_MAGIC }
+}
 
 #[derive(Clone, Eq, PartialEq)]
 struct Evidence {
@@ -21,18 +36,25 @@ struct Evidence {
 }
 
 impl Evidence {
-    fn new(raw: Vec<u8>, accepted_at: u64) -> Result<Self, Error> {
-        let (tbs, _, _) = split(&raw)?;
+    fn new(raw: Vec<u8>, accepted_at: u64, identity: bool) -> Result<Self, Error> {
+        let (tbs, _, _) = split(&raw, magic(identity))?;
         let object = AuthorityRevocation::decode_tbs(tbs).map_err(|_| Error::Corrupt)?;
+        if (object.class == RevocationClass::Identity) != identity {
+            return Err(Error::RevocationPermission);
+        }
         Ok(Self { raw, accepted_at, object })
     }
 
     fn key(&self) -> Key<'_> {
         (
+            self.object.class,
             &self.object.issuer_key_id,
             self.object.issuer_generation,
             self.object.subject_node_id,
             self.object.identity_generation,
+            &self.object.scope.prefix,
+            self.object.scope.prefix_len,
+            self.object.scope.core_id,
         )
     }
 }
@@ -54,10 +76,10 @@ impl Decisions {
         Ok(())
     }
 
-    pub(super) fn decode(reader: &mut Reader<'_>, utc_floor: u64) -> Result<Self, Error> {
+    pub(super) fn decode(reader: &mut Reader<'_>, utc_floor: u64, identity: bool) -> Result<Self, Error> {
         let root = reader.take(32)?.try_into().map_err(|_| Error::Corrupt)?;
         let count = usize::from(reader.u8()?);
-        if count == 0 || count > MAX_IDENTITY_REVOCATIONS {
+        if count == 0 || count > if identity { MAX_IDENTITY_REVOCATIONS } else { MAX_SCOPED_REVOCATIONS } {
             return Err(Error::Corrupt);
         }
         let mut evidence: Vec<Evidence> = Vec::with_capacity(count);
@@ -67,7 +89,7 @@ impl Decisions {
                 return Err(Error::Corrupt);
             }
             let raw = reader.blob_u32(MAX_IDENTITY_REVOCATION_BYTES)?.to_vec();
-            let record = Evidence::new(raw, accepted_at)?;
+            let record = Evidence::new(raw, accepted_at, identity)?;
             if evidence.last().is_some_and(|previous| previous.key() >= record.key()) {
                 return Err(Error::Corrupt);
             }
@@ -80,6 +102,7 @@ impl Decisions {
         &self,
         root: [u8; 32],
         trust: &AuthorityRevocationTrust,
+        identity: bool,
     ) -> Result<(), Error> {
         if self.root != root {
             return Err(Error::RevocationPermission);
@@ -87,7 +110,7 @@ impl Decisions {
         for record in &self.evidence {
             // Authenticate historical evidence at the persisted acceptance time.
             // This does not authorize any new submission after expiry.
-            verify(trust, &record.raw, record.accepted_at)?;
+            verify(trust, &record.raw, record.accepted_at, identity)?;
         }
         Ok(())
     }
@@ -95,25 +118,30 @@ impl Decisions {
 
 type SignedParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
 
-fn split(raw: &[u8]) -> Result<SignedParts<'_>, Error> {
-    let ed_end = IDENTITY_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN;
+fn split<'a>(raw: &'a [u8], header: &[u8; 8]) -> Result<SignedParts<'a>, Error> {
+    let ed_end = header.len() + ED25519_SIGNATURE_LEN;
     let pq_end = ed_end + MLDSA65_SIGNATURE_LEN;
     if raw.len() <= pq_end
         || raw.len() > MAX_IDENTITY_REVOCATION_BYTES
-        || !raw.starts_with(IDENTITY_REVOCATION_MAGIC)
+        || !raw.starts_with(header)
     {
         return Err(Error::RevocationPermission);
     }
-    Ok((&raw[pq_end..], &raw[IDENTITY_REVOCATION_MAGIC.len()..ed_end], &raw[ed_end..pq_end]))
+    Ok((&raw[pq_end..], &raw[header.len()..ed_end], &raw[ed_end..pq_end]))
 }
 
 fn verify(
     trust: &AuthorityRevocationTrust,
     raw: &[u8],
     now: u64,
+    identity: bool,
 ) -> Result<VerifiedAuthorityRevocation, Error> {
-    let (tbs, ed, pq) = split(raw)?;
-    trust.verify(tbs, ed, pq, now).map_err(Error::AuthorityRevocation)
+    let (tbs, ed, pq) = split(raw, magic(identity))?;
+    let verified = trust.verify(tbs, ed, pq, now).map_err(Error::AuthorityRevocation)?;
+    if (verified.class() == RevocationClass::Identity) != identity {
+        return Err(Error::RevocationPermission);
+    }
+    Ok(verified)
 }
 
 impl StatusStore {
@@ -149,60 +177,191 @@ impl StatusStore {
     /// A signed object is terminal for its exact identity generation once accepted;
     /// expiry limits admission, not the lifetime of a committed denial.
     pub fn accept_identity_revocation(&mut self, raw: &[u8], utc_us: u64) -> Result<(), Error> {
+        self.accept_authority_revocation(raw, utc_us, RevocationClass::Identity)
+    }
+
+    /// Commit a scoped decision only for the class assigned to the input.
+    /// The class is also signed; a mailbox filename supplies no trust.
+    pub fn accept_scoped_revocation(
+        &mut self,
+        class: RevocationClass,
+        raw: &[u8],
+        utc_us: u64,
+    ) -> Result<(), Error> {
+        if class == RevocationClass::Identity {
+            return Err(Error::RevocationPermission);
+        }
+        self.accept_authority_revocation(raw, utc_us, class)
+    }
+
+    fn accept_authority_revocation(
+        &mut self,
+        raw: &[u8],
+        utc_us: u64,
+        class: RevocationClass,
+    ) -> Result<(), Error> {
         if self.is_frozen() {
             return Err(Error::Frozen);
         }
+        let identity = class == RevocationClass::Identity;
         let now = self.observe_trusted_utc(utc_us)?;
         let (root, trust) = self.identity_trust.as_ref().ok_or(Error::RevocationPermission)?;
-        if self.state.identity.as_ref().is_some_and(|decisions| {
-            decisions.evidence.iter().any(|r| r.raw == raw)
+        let slot = if identity { &mut self.state.identity } else { &mut self.state.scoped };
+        if slot.as_ref().is_some_and(|decisions| {
+            decisions.evidence.iter().any(|r| r.object.class == class && r.raw == raw)
         }) {
-            // Already authenticated and committed (also re-verified on reopen).
-            // No renewal or acceptance at the current time occurs here.
+            // Already authenticated and committed, including after reopen.
             return Ok(());
         }
-        let verified = verify(trust, raw, now)?;
+        let verified = verify(trust, raw, now, identity)?;
+        if verified.class() != class {
+            return Err(Error::RevocationPermission);
+        }
         let key = (
+            class,
             verified.issuer_key_id(),
             verified.issuer_generation(),
             verified.subject_node_id(),
             verified.identity_generation(),
+            verified.scope().prefix.as_slice(),
+            verified.scope().prefix_len,
+            verified.scope().core_id,
         );
-        let decisions = self.state.identity.get_or_insert_with(|| Decisions {
+        let decisions = slot.get_or_insert_with(|| Decisions {
             root: *root,
             evidence: Vec::new(),
         });
-        let index = match decisions.evidence.binary_search_by(|r| r.key().cmp(&key)) {
+        let limit = if identity { MAX_IDENTITY_REVOCATIONS } else { MAX_SCOPED_REVOCATIONS };
+        match decisions.evidence.binary_search_by(|r| r.key().cmp(&key)) {
             Ok(index) => {
                 let old = &decisions.evidence[index];
                 match verified.sequence().cmp(&old.object.seq) {
                     std::cmp::Ordering::Less => return Err(Error::RevocationStale),
                     std::cmp::Ordering::Equal => {
                         // Compare exact canonical TBS, not randomized signatures.
-                        if split(raw)?.0 == split(&old.raw)?.0 {
+                        if split(raw, magic(identity))?.0 == split(&old.raw, magic(identity))?.0 {
                             return Ok(());
                         }
-                        return Err(Error::IdentityRevocationConflict);
+                        return Err(if identity { Error::IdentityRevocationConflict }
+                                   else { Error::ScopedRevocationConflict });
                     }
                     std::cmp::Ordering::Greater => (),
                 }
-                index
+                decisions.evidence[index] = Evidence::new(raw.to_vec(), now, identity)?;
             }
             Err(index) => {
-                if decisions.evidence.len() >= MAX_IDENTITY_REVOCATIONS {
+                if decisions.evidence.len() >= limit {
                     return Err(Error::RevocationTooLarge);
                 }
-                decisions.evidence.insert(index, Evidence::new(raw.to_vec(), now)?);
-                return self.commit_or_poison();
+                decisions.evidence.insert(index, Evidence::new(raw.to_vec(), now, identity)?);
             }
-        };
-        decisions.evidence[index] = Evidence::new(raw.to_vec(), now)?;
+        }
         self.commit_or_poison()
     }
 
     /// Query a previously committed IdentityAuthority denial for an authenticated
     /// endpoint. Unusable state is an error, never an empty decision set.
     pub fn identity_revoked(&self, peer: &super::AuthenticatedPeer) -> Result<bool, Error> {
+        self.decision_matches(peer, RevocationClass::Identity, |_| true)
+    }
+
+    /// Independently root-issued denial for this authenticated Core generation.
+    pub fn core_revoked(&self, peer: &super::AuthenticatedPeer) -> Result<bool, Error> {
+        self.decision_matches(peer, RevocationClass::Core, |_| true)
+    }
+
+    /// Invalidate only a verified grant's own issuer/subject/prefix binding.
+    /// The grant format does not carry an identity generation: callers must
+    /// supply the authenticated beneficiary bound to this grant at admission,
+    /// not a successor or a generation copied from the revocation object.
+    /// A negative answer does not verify grant freshness or authorize use.
+    pub fn route_grant_revoked(
+        &self,
+        subject: &super::AuthenticatedPeer,
+        grant: &VerifiedObject,
+    ) -> Result<bool, Error> {
+        let object = grant.object();
+        let ObjectBody::RouteGrant(route) = &object.body else {
+            return Err(Error::RevocationPermission);
+        };
+        self.check_grant_subject(subject, object, route.subject_node_id)?;
+        Ok(self.identity_revoked(subject)? || self.core_revoked(subject)?
+            || self.decision_matches(subject, RevocationClass::Route, |r| {
+                r.issuer_key_id == object.issuer_key_id
+                    && r.issuer_generation == object.issuer_generation
+                    && r.scope.prefix == route.prefix && r.scope.prefix_len == route.prefix_len
+            })?)
+    }
+
+    /// A Direct denial matches the verified grant's Core, issuer key ID and
+    /// issuer generation, and the authenticated beneficiary's generation.
+    /// It does not affect CDN sessions or another operational key's grants.
+    /// As with [`Self::route_grant_revoked`], use the original admission binding
+    /// and check grant freshness separately.
+    pub fn direct_grant_revoked(
+        &self,
+        subject: &super::AuthenticatedPeer,
+        grant: &VerifiedObject,
+    ) -> Result<bool, Error> {
+        let object = grant.object();
+        let ObjectBody::DirectGrant(direct) = &object.body else {
+            return Err(Error::RevocationPermission);
+        };
+        self.check_grant_subject(subject, object, direct.subject_node_id)?;
+        let crate::Authority::CoreOperationalKey { core_id } = grant.issuer_authority() else {
+            return Err(Error::RevocationPermission);
+        };
+        Ok(self.identity_revoked(subject)? || self.core_revoked(subject)?
+            || self.decision_matches(subject, RevocationClass::Direct, |r| {
+                r.scope.core_id == core_id
+                    && r.issuer_key_id == object.issuer_key_id
+                    && r.issuer_generation == object.issuer_generation
+            })?)
+    }
+
+    /// An attachment lease depends on both its owner and its authenticated
+    /// target Core generation. Route and Direct denials never revoke a lease.
+    /// Use the target generation captured when the owner admitted the lease;
+    /// attaching an old lease to a successor identity is not recovery.
+    pub fn attachment_lease_revoked(
+        &self,
+        target: &super::AuthenticatedPeer,
+        lease: &VerifiedObject,
+    ) -> Result<bool, Error> {
+        let object = lease.object();
+        let ObjectBody::AttachmentLease(lease) = &object.body else {
+            return Err(Error::RevocationPermission);
+        };
+        let subject = super::AuthenticatedPeer::new(
+            object.net_id, lease.node_id, lease.identity_generation,
+        ).ok_or(Error::RevocationPermission)?;
+        let target_node = (u16::from(lease.target_core_id) - 1) * 256 + 1;
+        self.check_grant_subject(target, object, target_node)?;
+        Ok(self.identity_revoked(&subject)? || self.core_revoked(&subject)?
+            || self.identity_revoked(target)? || self.core_revoked(target)?)
+    }
+
+    fn check_grant_subject(
+        &self,
+        peer: &super::AuthenticatedPeer,
+        object: &boreas_proto::objects::ManagementObject,
+        node_id: u16,
+    ) -> Result<(), Error> {
+        if object.net_id != self.net_id() || peer.net_id() != self.net_id() {
+            return Err(Error::WrongNetwork);
+        }
+        if peer.node_id() != node_id {
+            return Err(Error::RevocationPermission);
+        }
+        Ok(())
+    }
+
+    fn decision_matches(
+        &self,
+        peer: &super::AuthenticatedPeer,
+        class: RevocationClass,
+        scope: impl Fn(&AuthorityRevocation) -> bool,
+    ) -> Result<bool, Error> {
         self.healthy()?;
         if self.identity_trust.is_none() {
             return Err(Error::RevocationPermission);
@@ -216,10 +375,15 @@ impl StatusStore {
         if self.is_clock_latched() {
             return Err(Error::ClockRollback);
         }
-        Ok(self.state.identity.as_ref().is_some_and(|decisions| {
+        let decisions = if class == RevocationClass::Identity {
+            &self.state.identity
+        } else {
+            &self.state.scoped
+        };
+        Ok(decisions.as_ref().is_some_and(|decisions| {
             decisions.evidence.iter().any(|r| {
-                r.object.subject_node_id == peer.node_id()
-                    && r.object.identity_generation == peer.identity_generation()
+                r.object.class == class && r.object.subject_node_id == peer.node_id()
+                    && r.object.identity_generation == peer.identity_generation() && scope(&r.object)
             })
         }))
     }
@@ -234,7 +398,7 @@ mod tests {
         status_store::AuthenticatedPeer,
     };
     use boreas_proto::{
-        authority_revocation::{RevocationClass, RevocationScope},
+        authority_revocation::RevocationScope,
         objects::MldsaParameterSet,
     };
     use openssl::{pkey::{KeyType, PKey}, sign::Signer};

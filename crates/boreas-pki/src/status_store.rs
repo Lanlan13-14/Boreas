@@ -35,8 +35,9 @@
 //!   handle. [`crate::revoke_cleanup`] applies class-limited drops to an in-memory
 //!   id registry only.
 //!
-//! Independent IdentityAuthority objects use a separate, Linux-only v2 image
-//! extension. The legacy status-relay behavior above is unchanged.
+//! Independently signed decisions use separate Linux-only extensions: v2 for
+//! Identity alone and v3 when Core, Route or Direct evidence is present. The
+//! production rejection of revocation entries inside snapshots is unchanged.
 //!
 //! Linux is the only durable target in this slice. Other targets expose the
 //! same API but every operation fails closed with [`Error::Unsupported`].
@@ -98,7 +99,10 @@ use openssl::hash::{MessageDigest, hash};
 #[cfg(target_os = "linux")]
 mod identity;
 #[cfg(target_os = "linux")]
-pub use identity::{IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES};
+pub use identity::{
+    IDENTITY_REVOCATION_MAGIC, MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES,
+    SCOPED_REVOCATION_MAGIC,
+};
 #[cfg(target_os = "linux")]
 use crate::authority_revocation::AuthorityRevocationTrust;
 
@@ -121,7 +125,10 @@ const MAGIC: &[u8; 8] = b"BRSS\0\0\0\x01";
 #[cfg(target_os = "linux")]
 const IDENTITY_MAGIC: &[u8; 8] = b"BRSS\0\0\0\x02";
 #[cfg(target_os = "linux")]
-const MAX_STATE_WITH_IDENTITY_BYTES: usize = MAX_STATUS_STATE_BYTES + identity::MAX_EXTENSION_BYTES;
+const SCOPED_MAGIC: &[u8; 8] = b"BRSS\0\0\0\x03";
+#[cfg(target_os = "linux")]
+const MAX_STATE_BYTES: usize = MAX_STATUS_STATE_BYTES + 1
+    + identity::MAX_EXTENSION_BYTES + identity::MAX_SCOPED_EXTENSION_BYTES;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const LINUX_O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
@@ -191,6 +198,9 @@ pub enum Error {
     /// A different TBS claims the same identity-scope sequence. The prior denial remains.
     #[cfg(target_os = "linux")]
     IdentityRevocationConflict,
+    /// A different TBS claims the same scoped sequence. The prior denial remains.
+    #[cfg(target_os = "linux")]
+    ScopedRevocationConflict,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -320,6 +330,8 @@ struct State {
     revocation: RevocationState,
     #[cfg(target_os = "linux")]
     identity: Option<identity::Decisions>,
+    #[cfg(target_os = "linux")]
+    scoped: Option<identity::Decisions>,
 }
 #[cfg(target_os = "linux")]
 impl State {
@@ -332,6 +344,7 @@ impl State {
             equivocation: None,
             revocation: RevocationState::default(),
             identity: None,
+            scoped: None,
         }
     }
 }
@@ -446,7 +459,7 @@ pub struct PeerRevocationState {
     pub sequence: u64,
     /// An authority-issued identity decision covers this node and generation.
     pub identity: bool,
-    /// A decision from this node's own home Core covers it.
+    /// A root-issued Core denial or a model-only same-home-Core decision.
     pub core: bool,
     /// An authority-issued route decision covers this node and generation.
     pub route: bool,
@@ -587,8 +600,8 @@ impl StatusStore {
         )
     }
 
-    /// Open with independent IdentityAuthority trust. The caller must bind both
-    /// verifiers to the exact same verified NetworkRoot before calling this API.
+    /// Open with independent authority revocation trust. The caller must bind
+    /// both verifiers to the exact same verified NetworkRoot before calling.
     /// This does not authorize any entries carried inside a status snapshot.
     #[cfg(target_os = "linux")]
     pub fn open_with_identity_revocations(
@@ -601,6 +614,9 @@ impl StatusStore {
     ) -> Result<Self, Error> {
         if identity_trust.net_id() != net_id {
             return Err(Error::WrongNetwork);
+        }
+        if !identity_trust.is_bound_to(root_fingerprint) {
+            return Err(Error::RevocationPermission);
         }
         Self::open_inner(
             path,
@@ -687,7 +703,11 @@ impl StatusStore {
             store.verify_loaded()?;
             if let Some(decisions) = &store.state.identity {
                 let (root, trust) = store.identity_trust.as_ref().ok_or(Error::RevocationPermission)?;
-                decisions.verify_loaded(*root, trust)?;
+                decisions.verify_loaded(*root, trust, true)?;
+            }
+            if let Some(decisions) = &store.state.scoped {
+                let (root, trust) = store.identity_trust.as_ref().ok_or(Error::RevocationPermission)?;
+                decisions.verify_loaded(*root, trust, false)?;
             }
             Ok(store)
         }
@@ -826,9 +846,12 @@ impl StatusStore {
         };
         #[cfg(target_os = "linux")]
         if self.identity_trust.is_some() {
-            match self.identity_revoked(peer) {
-                Ok(revoked) => state.identity = revoked,
-                Err(_) => return PeerRevocation::Unknown(RevocationUnknown::Poisoned),
+            match (self.identity_revoked(peer), self.core_revoked(peer)) {
+                (Ok(identity), Ok(core)) => {
+                    state.identity = identity;
+                    state.core = core;
+                }
+                _ => return PeerRevocation::Unknown(RevocationUnknown::Poisoned),
             }
         }
         for scope in &self.state.revocation.scopes {
@@ -1266,14 +1289,15 @@ impl StatusStore {
         };
         validate_file(&self.path, &file, self.owner)?;
         let len = usize::try_from(file.metadata()?.len()).map_err(|_| Error::TooLarge)?;
-        if len > MAX_STATE_WITH_IDENTITY_BYTES {
+        if len > MAX_STATE_BYTES {
             return Err(Error::TooLarge);
         }
         let mut bytes = Vec::with_capacity(len);
-        file.take(MAX_STATE_WITH_IDENTITY_BYTES as u64 + 1)
+        file.take(MAX_STATE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_STATE_WITH_IDENTITY_BYTES
-            || (bytes.len() > MAX_STATUS_STATE_BYTES && !bytes.starts_with(IDENTITY_MAGIC))
+        if bytes.len() > MAX_STATE_BYTES
+            || (bytes.len() > MAX_STATUS_STATE_BYTES
+                && !bytes.starts_with(IDENTITY_MAGIC) && !bytes.starts_with(SCOPED_MAGIC))
         {
             return Err(Error::TooLarge);
         }
@@ -1491,6 +1515,12 @@ impl FreshStatus<'_> {
     pub fn identity_revoked(&self, peer: &AuthenticatedPeer) -> Result<bool, Error> {
         self.store.identity_revoked(peer)
     }
+
+    /// Independently verified Core denial; separate from snapshot entries.
+    #[cfg(target_os = "linux")]
+    pub fn core_revoked(&self, peer: &AuthenticatedPeer) -> Result<bool, Error> {
+        self.store.core_revoked(peer)
+    }
 }
 
 fn snapshot_from_verified(verified: &VerifiedObject, net: [u8; 16]) -> Result<Snapshot, Error> {
@@ -1664,7 +1694,8 @@ fn sha256(data: &[u8]) -> Result<[u8; 32], Error> {
 #[cfg(target_os = "linux")]
 fn encode(state: &State) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(if state.identity.is_some() { IDENTITY_MAGIC } else { MAGIC });
+    bytes.extend_from_slice(if state.scoped.is_some() { SCOPED_MAGIC }
+        else if state.identity.is_some() { IDENTITY_MAGIC } else { MAGIC });
     bytes.extend_from_slice(&state.net);
     bytes.extend_from_slice(&state.utc_floor.to_be_bytes());
     let mut flags = 0u8;
@@ -1697,8 +1728,14 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     if bytes.len() > MAX_STATUS_STATE_BYTES {
         return Err(Error::TooLarge);
     }
+    if state.scoped.is_some() {
+        bytes.push(u8::from(state.identity.is_some()));
+    }
     if let Some(identity) = &state.identity {
         identity.encode(&mut bytes)?;
+    }
+    if let Some(scoped) = &state.scoped {
+        scoped.encode(&mut bytes)?;
     }
     Ok(bytes)
 }
@@ -1707,8 +1744,8 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
 fn decode(bytes: &[u8]) -> Result<State, Error> {
     let mut reader = Reader { bytes, position: 0 };
     let magic = reader.take(8)?;
-    let has_identity = magic == IDENTITY_MAGIC;
-    if magic != MAGIC && !has_identity {
+    let has_scoped = magic == SCOPED_MAGIC;
+    if magic != MAGIC && magic != IDENTITY_MAGIC && !has_scoped {
         return Err(Error::Corrupt);
     }
     let net: [u8; 16] = reader.take(16)?.try_into().map_err(|_| Error::Corrupt)?;
@@ -1767,11 +1804,19 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
     if reader.position > MAX_STATUS_STATE_BYTES {
         return Err(Error::TooLarge);
     }
-    let identity = if has_identity {
-        Some(identity::Decisions::decode(&mut reader, utc_floor)?)
+    let has_identity = if has_scoped {
+        match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Corrupt),
+        }
     } else {
-        None
+        magic == IDENTITY_MAGIC
     };
+    let identity = has_identity
+        .then(|| identity::Decisions::decode(&mut reader, utc_floor, true)).transpose()?;
+    let scoped = has_scoped
+        .then(|| identity::Decisions::decode(&mut reader, utc_floor, false)).transpose()?;
     if reader.position != bytes.len() {
         return Err(Error::Corrupt);
     }
@@ -1789,6 +1834,7 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
         // Model relay entries still come only from the re-verified snapshot.
         revocation: RevocationState::default(),
         identity,
+        scoped,
     })
 }
 

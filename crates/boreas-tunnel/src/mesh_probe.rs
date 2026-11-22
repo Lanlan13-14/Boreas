@@ -71,6 +71,8 @@ pub enum Error {
     /// Local mailbox input or a live authority worker failed; stop business.
     RevocationState,
     IdentityRevoked,
+    /// The pinned NetworkRoot denied this Core generation.
+    CoreRevoked,
     Clock,
     NoRoute,
     /// A configured Core has no seed and no learned directory head yet.
@@ -83,6 +85,13 @@ pub enum Error {
     /// At least one confirmed business circuit lost transport, with no replay.
     ConfirmedPathLost(TunnelError),
     Transport(TunnelError),
+}
+
+impl Error {
+    /// A committed member denial is an authority event, not a transport loss.
+    pub const fn member_denial(&self) -> bool {
+        matches!(self, Self::IdentityRevoked | Self::CoreRevoked)
+    }
 }
 
 impl From<TunnelError> for Error {
@@ -115,17 +124,21 @@ pub fn mesh_trust(
     }
     let mut trust = ManagementTrust::new(net);
     let mut identity = AuthorityRevocationTrust::new(net);
+    identity.add_network_root(&roots.network_root_pin().map_err(|_| Error::Trust)?, fingerprint)
+        .map_err(|_| Error::Trust)?;
+    let (mut has_status, mut has_identity) = (false, false);
     for grant in grants {
-        trust
-            .add_verified_issuer(&grant)
-            .map_err(|_| Error::Trust)?;
-        if grant.issuer_record().authority == Authority::IdentityAuthority {
-            identity
-                .add_verified_issuer(grant)
-                .map_err(|_| Error::Trust)?;
+        trust.add_verified_issuer(&grant).map_err(|_| Error::Trust)?;
+        let authority = grant.issuer_record().authority;
+        has_status |= authority == Authority::StatusSigner;
+        has_identity |= authority == Authority::IdentityAuthority;
+        if matches!(authority, Authority::IdentityAuthority | Authority::RouteAuthority
+            | Authority::CoreOperationalKey { .. })
+        {
+            identity.add_verified_issuer(grant).map_err(|_| Error::Trust)?;
         }
     }
-    if identity.issuer_count() == 0 {
+    if !has_status || !has_identity {
         return Err(Error::Trust);
     }
     Ok((trust, identity))
@@ -176,6 +189,11 @@ impl Core {
             Ok(true) => return Err(Error::IdentityRevoked),
             Err(_) => return Err(Error::Status),
         }
+        match fresh.core_revoked(&peer) {
+            Ok(false) => (),
+            Ok(true) => return Err(Error::CoreRevoked),
+            Err(_) => return Err(Error::Status),
+        }
         match fresh.peer_revocation(&peer) {
             PeerRevocation::Verified(state) if !state.sessions_revoked() => Ok(()),
             _ => Err(Error::Status),
@@ -192,9 +210,15 @@ impl Core {
     }
 
     fn check_identity_denial(&self, status: &StatusStore) -> Result<(), Error> {
-        match status.identity_revoked(&self.authenticated_slot()?) {
+        let peer = self.authenticated_slot()?;
+        match status.identity_revoked(&peer) {
+            Ok(false) => (),
+            Ok(true) => return Err(Error::IdentityRevoked),
+            Err(_) => return Err(Error::Status),
+        }
+        match status.core_revoked(&peer) {
             Ok(false) => Ok(()),
-            Ok(true) => Err(Error::IdentityRevoked),
+            Ok(true) => Err(Error::CoreRevoked),
             Err(_) => Err(Error::Status),
         }
     }
@@ -524,6 +548,8 @@ impl<'a> MeshProbe<'a> {
             {
                 Ok(tcp) => tcp,
                 Err(error) if path_loss(error.kind()) => {
+                    self.poll_identity_mailbox()?;
+                    self.check(&peer)?;
                     last_dial = Error::PathUnavailable(error.into());
                     continue;
                 }

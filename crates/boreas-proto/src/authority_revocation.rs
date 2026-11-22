@@ -11,12 +11,6 @@
 //! * `Direct` — the `CoreOperationalKey` of the Core that issued the grant; the
 //!   subject's home Core is not used to infer the DirectGrant issuer.
 //!
-//! The pki verifier is intentionally narrower than this schema: v1 fully enables
-//! only `Identity`. `Core`, `Route` and `Direct` are parsed and structurally
-//! validated so future authority-specific work cannot drift the wire shape, but
-//! `boreas_pki::authority_revocation::AuthorityRevocationTrust::verify` returns
-//! `UnsupportedClass` for them until their exact scope evidence is implemented.
-//!
 //! Wire shape (canonical deterministic CBOR, unsigned integer keys, ascending):
 //!
 //! ```text
@@ -59,6 +53,17 @@ pub const SIGNED_CARRIER_HEADER_LEN: usize =
     IDENTITY_REVOCATION_MAGIC.len() + ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
 pub const MAX_IDENTITY_REVOCATION_BYTES: usize = SIGNED_CARRIER_HEADER_LEN + MAX_TBS_LEN;
 pub const MAX_IDENTITY_REVOCATIONS: usize = 16;
+/// Local publication carrier for Core, Route and Direct (never Identity).
+pub const SCOPED_REVOCATION_MAGIC: &[u8; 8] = b"BRSR\0\0\0\x01";
+pub const MAX_SCOPED_REVOCATION_BYTES: usize = MAX_IDENTITY_REVOCATION_BYTES;
+pub const MAX_SCOPED_REVOCATIONS: usize = 64;
+
+/// Class-specific local mailboxes. These names are not evidence of authority.
+pub const SCOPED_REVOCATION_MAILBOXES: [(RevocationClass, &str); 3] = [
+    (RevocationClass::Core, "core-revocation.signed"),
+    (RevocationClass::Route, "route-revocation.signed"),
+    (RevocationClass::Direct, "direct-revocation.signed"),
+];
 /// Schema version carried in field 0.
 pub const SCHEMA_VERSION: u64 = 1;
 /// Object type inside the independent signature domain. This is deliberately not
@@ -78,7 +83,7 @@ pub enum Error {
 }
 
 /// Authority class named by one revocation object.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum RevocationClass {
     Identity = 1,

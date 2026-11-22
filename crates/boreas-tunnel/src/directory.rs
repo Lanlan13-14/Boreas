@@ -1681,6 +1681,57 @@ pub mod pki_verifier {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    impl super::DirectoryIngest<PkiObjectVerifier> {
+        /// Return only a usable cached lease for the authenticated subject and
+        /// the target Core generation captured at admission. A revocation
+        /// invalidates the lookup but does not remove signed convergence or
+        /// replay evidence; duplicate and out-of-order ingest cannot undo it.
+        /// `directory()`/`snapshot()` remain evidence views, not authorization.
+        pub fn usable_attachment_lease(
+            &self,
+            status: &boreas_pki::status_store::StatusStore,
+            subject: &boreas_pki::status_store::AuthenticatedPeer,
+            target: &boreas_pki::status_store::AuthenticatedPeer,
+            utc: u64,
+            mono: std::time::Instant,
+        ) -> Result<Option<&super::RecordEnvelope>, boreas_pki::status_store::Error> {
+            use boreas_pki::status_store::Error;
+            if status.net_id() != self.verifier.trust.net_id()
+                || subject.net_id() != status.net_id() || target.net_id() != status.net_id()
+            {
+                return Err(Error::WrongNetwork);
+            }
+            status.check_active_snapshot(utc, mono)?;
+            let now = utc.max(status.last_trusted_utc());
+            let Some(record) = self.convergence.get(super::DirectoryKey {
+                kind: DirectoryObjectKind::AttachmentLease,
+                subject: subject.node_id(),
+            }) else {
+                return Ok(None);
+            };
+            let VersionKey::AttachmentLease { identity_generation, .. } = record.version else {
+                return Err(Error::RevocationPermission);
+            };
+            if identity_generation != subject.identity_generation() {
+                return Ok(None);
+            }
+            let Some(identity) = self.convergence.get(super::DirectoryKey {
+                kind: DirectoryObjectKind::NodeIdentity,
+                subject: subject.node_id(),
+            }) else {
+                return Ok(None);
+            };
+            let lease = self.verifier.trust.revalidate_attachment_lease(
+                &record.payload, &identity.payload, now,
+            ).map_err(|_| Error::RevocationPermission)?;
+            if status.attachment_lease_revoked(target, &lease)? {
+                return Ok(None);
+            }
+            Ok(Some(record))
+        }
+    }
+
     /// Decode the envelope this replica was handed, without trusting it. Only
     /// reachable after the trust layer reported an authenticated conflict.
     /// Returns the object and SHA-256 of its exact canonical TBS bytes

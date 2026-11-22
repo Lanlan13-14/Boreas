@@ -219,7 +219,7 @@ impl MeshProbe<'_> {
             seen |= bit;
             let now = match self.check(origin) {
                 Ok(now) => now,
-                Err(Error::IdentityRevoked) => {
+                Err(error) if error.member_denial() => {
                     self.check_local_identity_denial()?;
                     self.check_directory_link(link)?;
                     // A healthy peer may not yet know a committed denial

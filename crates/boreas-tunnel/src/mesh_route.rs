@@ -55,7 +55,7 @@ struct Vertex<'a> {
 pub struct VerifiedGraph<'a> {
     local: crate::PeerIdentity,
     vertices: BTreeMap<u8, Vertex<'a>>,
-    denied: u32,
+    denied: BTreeMap<u8, Error>,
 }
 
 impl MeshProbe<'_> {
@@ -112,7 +112,7 @@ impl MeshProbe<'_> {
             lsa: self.local_lsa().clone(),
         })]);
         let mut pending = false;
-        let mut denied = 0;
+        let mut denied = BTreeMap::new();
         for (identity, seed) in others {
             let core = self.verified_core(identity)?;
             // Verify before rejecting duplicate IDs so a signed fork poisons
@@ -135,12 +135,12 @@ impl MeshProbe<'_> {
                 // In the runtime directory profile, a committed remote denial
                 // removes usable edges, not configured membership. Preserve
                 // healthy control links so signed denials can cross the mesh.
-                Err(Error::IdentityRevoked) if use_directory => {
+                Err(reason) if use_directory && reason.member_denial() => {
                     self.check_local_identity_denial()?;
                     match self.check_identity_denial(&core) {
-                        Err(Error::IdentityRevoked) => denied |= bit,
+                        Err(error) if error.member_denial() => { denied.insert(core.id, error); }
                         Err(e) => return Err(e),
-                        Ok(()) => return Err(Error::IdentityRevoked),
+                        Ok(()) => return Err(reason),
                     }
                 }
                 Err(e) => return Err(e),
@@ -164,7 +164,7 @@ impl VerifiedGraph<'_> {
     /// Verified slots, independent of untrusted material filenames.
     pub fn core_ids(&self) -> impl Iterator<Item = u8> + '_ {
         (1..=MAX_CORES as u8)
-            .filter(|&id| self.vertices.contains_key(&id) || self.denied & (1u32 << id) != 0)
+            .filter(|&id| self.vertices.contains_key(&id) || self.denied.contains_key(&id))
     }
 
     /// Original envelope captured by this snapshot, for inspection only.
@@ -174,8 +174,11 @@ impl VerifiedGraph<'_> {
     }
 
     fn vertex(&self, id: u8) -> Result<&Vertex<'_>, Error> {
-        if id <= MAX_CORES as u8 && self.denied & (1u32 << id) != 0 {
-            return Err(Error::IdentityRevoked);
+        if let Some(denial) = self.denied.get(&id) {
+            return Err(match denial {
+                Error::CoreRevoked => Error::CoreRevoked,
+                _ => Error::IdentityRevoked,
+            });
         }
         self.vertices.get(&id).ok_or(Error::NoRoute)
     }
@@ -353,7 +356,7 @@ impl VerifiedGraph<'_> {
             for &id in path {
                 match self.vertex(id).and_then(|v| self.check_vertex(probe, v)) {
                     Ok(()) => (),
-                    Err(Error::IdentityRevoked) => denied = true,
+                    Err(error) if error.member_denial() => denied = true,
                     Err(e) => return Err(e),
                 }
             }
@@ -542,7 +545,7 @@ impl VerifiedGraph<'_> {
         }
         for id in [src, dst] {
             match self.vertex(id) {
-                Err(Error::IdentityRevoked) => return Err(Error::NoRoute),
+                Err(error) if error.member_denial() => return Err(Error::NoRoute),
                 result => {
                     result?;
                 }
@@ -573,10 +576,10 @@ impl VerifiedGraph<'_> {
             match probe.check_identity_denial(&vertex.core) {
                 Ok(()) if id != src && id != dst => transit.push(id),
                 Ok(()) => (),
-                Err(Error::IdentityRevoked) if id == src || id == dst => {
+                Err(error) if error.member_denial() && (id == src || id == dst) => {
                     return Err(Error::NoRoute);
                 }
-                Err(Error::IdentityRevoked) => (),
+                Err(error) if error.member_denial() => (),
                 Err(e) => return Err(e),
             }
         }
