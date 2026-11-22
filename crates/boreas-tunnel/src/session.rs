@@ -16,7 +16,6 @@
 //! Wire schemas are the candidate `boreas-proto` definitions; they are not a
 //! frozen protocol. `SessionHello` is the only accepted first frame.
 
-use std::collections::VecDeque;
 
 use boreas_crypto::{NodeRole, Policy};
 use boreas_proto::messages::{
@@ -205,9 +204,8 @@ struct FrameIo {
     decoder: FrameDecoder,
     buffer: Vec<u8>,
     write_buf: Vec<u8>,
-    pending: VecDeque<Frame>,
-    decoded: Vec<Frame>,
-    pending_bytes: usize,
+    // Store each decoded batch in reverse so pop() delivers it in wire order.
+    pending: Vec<Frame>,
     failed: bool,
 }
 
@@ -218,18 +216,14 @@ impl FrameIo {
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
-            pending: VecDeque::new(),
-            decoded: Vec::new(),
-            pending_bytes: 0,
+            pending: Vec::new(),
             failed: false,
         }
     }
 
     fn poison(&mut self) {
         self.failed = true;
-        self.pending = VecDeque::new();
-        self.decoded = Vec::new();
-        self.pending_bytes = 0;
+        self.pending = Vec::new();
     }
 
     fn has_buffered_input(&self) -> bool {
@@ -301,8 +295,7 @@ impl FrameIo {
             return Err(TunnelError::Poisoned);
         }
         loop {
-            if let Some(frame) = self.pending.pop_front() {
-                self.pending_bytes = self.pending_bytes.saturating_sub(frame.body.len());
+            if let Some(frame) = self.pending.pop() {
                 return Ok(frame);
             }
             let read = match self.stream.read(&mut self.buffer) {
@@ -316,20 +309,19 @@ impl FrameIo {
                 self.poison();
                 return Err(TunnelError::Closed);
             }
-            if let Err(error) = self.decoder.feed_into(&self.buffer[..read], &mut self.decoded) {
+            if let Err(error) = self.decoder.feed_into(&self.buffer[..read], &mut self.pending) {
                 self.poison();
                 return Err(error.into());
             }
-            for frame in &self.decoded {
-                self.pending_bytes = self.pending_bytes.saturating_add(frame.body.len());
-            }
-            self.pending.extend(self.decoded.drain(..));
-            // An 8 KiB read can contain over a thousand minimal headers; the
-            // decoder byte limit alone does not bound queued frame metadata.
-            if self.pending.len() > MAX_PENDING_FRAMES || self.pending_bytes > MAX_PENDING_BYTES {
+            // Check the full batch before publishing any frame. The decoder's
+            // byte limit alone does not bound queued frame metadata.
+            if self.pending.len() > MAX_PENDING_FRAMES
+                || self.pending.iter().map(|frame| frame.body.len()).sum::<usize>() > MAX_PENDING_BYTES
+            {
                 self.poison();
                 return Err(TunnelError::FrameQuota);
             }
+            self.pending.reverse();
         }
     }
 }
@@ -721,6 +713,27 @@ mod tests {
             },
             record,
         )
+    }
+
+    #[test]
+    fn receive_reuses_one_batch_and_preserves_fifo() {
+        let mut batch = Vec::new();
+        for value in [1, 2, 3] {
+            let header = AppHeader {
+                proto_major: PROTO_MAJOR, kind: Kind::Control, flags: 0, body_len: 1,
+            };
+            batch.extend_from_slice(&header.encode().unwrap());
+            batch.push(value);
+        }
+        let mut io = FrameIo::new(Box::new(std::io::Cursor::new(batch.clone())));
+        for value in [1, 2, 3] {
+            assert_eq!(io.recv().unwrap().body, [value]);
+        }
+        assert!(!io.has_buffered_input());
+        let mut io = FrameIo::new(Box::new(std::io::Cursor::new(batch.repeat(MAX_PENDING_FRAMES))));
+        assert!(matches!(io.recv(), Err(TunnelError::FrameQuota)));
+        assert!(!io.has_buffered_input());
+        assert!(matches!(io.recv(), Err(TunnelError::Poisoned)));
     }
 
     #[test]
