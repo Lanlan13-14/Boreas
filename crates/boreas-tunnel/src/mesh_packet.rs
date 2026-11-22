@@ -15,7 +15,7 @@ use crate::{
     e2e::E2eCircuit,
     mesh_probe::{Error, MeshProbe},
     mesh_relay::EndpointIo,
-    mesh_route::{RouteLocator, VerifiedGraph},
+    mesh_route::{RouteLocator, RoutedPair, VerifiedGraph},
     packet_path::{MAX_MTU, PointToPoint},
     resource::Admission,
 };
@@ -74,6 +74,44 @@ impl VerifiedGraph<'_> {
             .map_err(TunnelError::from)?;
         self.respond_io(probe, path, incoming, outer, admission, |c, io| {
             epoch(c, io, tun, false, confirmed)
+        })
+    }
+
+    /// Same packet profile and no-replay semantics as `connect_tun`, with
+    /// candidates derived from the verified graph and adjacent locators.
+    pub fn connect_routed_tun(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        pair: &RoutedPair<'_>,
+        outer: &dyn Fn() -> Result<OpenSslOuterTlsConnector, TunnelError>,
+        admission: &Admission,
+        endpoint: (&LinuxTunQueue, Option<u8>),
+        mut confirmed: impl FnMut(&[u8], [u8; 16]),
+    ) -> Result<PacketEpoch, Error> {
+        let _buffer = admission
+            .reserve_bytes(PACKET_BUFFER_BYTES)
+            .map_err(TunnelError::from)?;
+        let (tun, preferred) = endpoint;
+        self.connect_routed_io(probe, pair, outer, (admission, preferred), |path, c, io| {
+            epoch(c, io, tun, true, |id| confirmed(path, id))
+        })
+    }
+
+    pub fn respond_routed_tun(
+        &self,
+        probe: &mut MeshProbe<'_>,
+        pair: &RoutedPair<'_>,
+        incoming: TcpStream,
+        outer: &OpenSslOuterTlsAcceptor,
+        endpoint: (&Admission, &LinuxTunQueue),
+        confirmed: impl FnOnce(&[u8], [u8; 16]),
+    ) -> Result<PacketEpoch, Error> {
+        let (admission, tun) = endpoint;
+        let _buffer = admission
+            .reserve_bytes(PACKET_BUFFER_BYTES)
+            .map_err(TunnelError::from)?;
+        self.respond_routed_io(probe, pair, incoming, outer, admission, |path, c, io| {
+            epoch(c, io, tun, false, |id| confirmed(path, id))
         })
     }
 }

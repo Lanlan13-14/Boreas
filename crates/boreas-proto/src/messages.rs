@@ -266,6 +266,8 @@ pub enum PayloadSchema {
     Probe,
     /// Typed Drain notice.
     Drain,
+    /// Proposed Core slots on a dedicated routed business hop.
+    MeshPath,
     /// Typed CircuitOpen.
     CircuitOpen,
     /// Typed CircuitAccept.
@@ -289,7 +291,7 @@ pub struct ControlSchema {
 
 /// Candidate control registry in the order documented in
 /// `docs/protocol/control-messages-v1.md`.
-pub const CONTROL_SCHEMAS: [ControlSchema; 15] = [
+pub const CONTROL_SCHEMAS: [ControlSchema; 16] = [
     ControlSchema {
         subtype: ControlType::SessionHello,
         name: "SessionHello",
@@ -380,6 +382,12 @@ pub const CONTROL_SCHEMAS: [ControlSchema; 15] = [
         body_cap: ControlType::CircuitClose.body_cap(),
         payload: PayloadSchema::CircuitClose,
     },
+    ControlSchema {
+        subtype: ControlType::MeshPath,
+        name: "MeshPath",
+        body_cap: ControlType::MeshPath.body_cap(),
+        payload: PayloadSchema::MeshPath,
+    },
 ];
 
 const fn schema_index(subtype: ControlType) -> usize {
@@ -399,6 +407,7 @@ const fn schema_index(subtype: ControlType) -> usize {
         ControlType::CircuitAccept => 12,
         ControlType::CircuitReset => 13,
         ControlType::CircuitClose => 14,
+        ControlType::MeshPath => 15,
     }
 }
 
@@ -1214,6 +1223,7 @@ pub enum ControlBody {
     Probe(Probe),
     Drain(Drain),
     IdentityRevocation(Option<Vec<u8>>),
+    MeshPath(Vec<u8>),
     CircuitOpen(CircuitOpen),
     CircuitAccept(CircuitAccept),
     CircuitReset(CircuitReset),
@@ -1234,6 +1244,7 @@ impl ControlBody {
             Self::Probe(_) => ControlType::Probe,
             Self::Drain(_) => ControlType::Drain,
             Self::IdentityRevocation(_) => ControlType::IdentityRevocation,
+            Self::MeshPath(_) => ControlType::MeshPath,
             Self::CircuitOpen(_) => ControlType::CircuitOpen,
             Self::CircuitAccept(_) => ControlType::CircuitAccept,
             Self::CircuitReset(_) => ControlType::CircuitReset,
@@ -1256,34 +1267,30 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
         ControlType::Enrollment => Ok(ControlBody::Enrollment(Enrollment::decode(body)?)),
         ControlType::DirectoryPage => Ok(ControlBody::DirectoryPage(DirectoryPage::decode(body)?)),
         ControlType::Lease => Ok(ControlBody::Lease(Lease {
-            object: decode_signed_control(
-                body,
-                ControlType::Lease,
-                &[ObjectType::AttachmentLease],
-            )?,
+            object: decode_signed_control(body, ControlType::Lease, &[
+                ObjectType::AttachmentLease,
+            ])?,
         })),
         ControlType::Lsa => Ok(ControlBody::Lsa(Lsa {
             object: decode_signed_control(body, ControlType::Lsa, &[ObjectType::CoreLsa])?,
         })),
         ControlType::Grant => Ok(ControlBody::Grant(Grant {
-            object: decode_signed_control(
-                body,
-                ControlType::Grant,
-                &[ObjectType::RouteGrant, ObjectType::DirectGrant],
-            )?,
+            object: decode_signed_control(body, ControlType::Grant, &[
+                ObjectType::RouteGrant,
+                ObjectType::DirectGrant,
+            ])?,
         })),
         ControlType::Revoke => Ok(ControlBody::Revoke(Revoke {
-            object: decode_signed_control(
-                body,
-                ControlType::Revoke,
-                &[ObjectType::StatusSnapshot],
-            )?,
+            object: decode_signed_control(body, ControlType::Revoke, &[
+                ObjectType::StatusSnapshot,
+            ])?,
         })),
         ControlType::Probe => Ok(ControlBody::Probe(Probe::decode(body)?)),
         ControlType::Drain => Ok(ControlBody::Drain(Drain::decode(body)?)),
         ControlType::IdentityRevocation => Ok(ControlBody::IdentityRevocation(
             decode_identity_revocation(body)?.map(|raw| raw.to_vec()),
         )),
+        ControlType::MeshPath => Ok(ControlBody::MeshPath(decode_mesh_path(body)?.to_vec())),
         ControlType::CircuitOpen => Ok(ControlBody::CircuitOpen(CircuitOpen::decode(body)?)),
         ControlType::CircuitAccept => Ok(ControlBody::CircuitAccept(CircuitAccept::decode(body)?)),
         ControlType::CircuitReset => Ok(ControlBody::CircuitReset(CircuitReset::decode(body)?)),
@@ -1291,10 +1298,54 @@ pub fn parse_control_body(body: &[u8]) -> Result<ControlBody, MessageError> {
     }
 }
 
+/// Dedicated mesh profile keeps at most two transit Cores per circuit.
+pub const MAX_MESH_PATH_CORES: usize = 4;
+
+/// Encode a path proposal. Slots are hints, not authentication or routing authority.
+pub fn encode_mesh_path(path: &[u8]) -> Result<Vec<u8>, MessageError> {
+    validate_mesh_path(path)?;
+    let mut body = vec![ControlType::MeshPath as u8, path.len() as u8];
+    body.extend_from_slice(path);
+    Ok(body)
+}
+
+/// Decode the exact, bounded path proposal without allocating.
+pub fn decode_mesh_path(body: &[u8]) -> Result<&[u8], MessageError> {
+    let [subtype, count, path @ ..] = body else {
+        return Err(MessageError::WrongLength);
+    };
+    if *subtype != ControlType::MeshPath as u8 {
+        return Err(MessageError::BadSubtype(*subtype));
+    }
+    if usize::from(*count) != path.len() {
+        return Err(MessageError::WrongLength);
+    }
+    validate_mesh_path(path)?;
+    Ok(path)
+}
+
+fn validate_mesh_path(path: &[u8]) -> Result<(), MessageError> {
+    if !(2..=MAX_MESH_PATH_CORES).contains(&path.len()) {
+        return Err(MessageError::WrongLength);
+    }
+    if path.first() >= path.last()
+        || path
+            .iter()
+            .enumerate()
+            .any(|(i, id)| !(1..=16).contains(id) || path[..i].contains(id))
+    {
+        return Err(MessageError::InvalidField("mesh path"));
+    }
+    Ok(())
+}
+
 /// Frame exactly one signed carrier, or end a bounded exchange. This checks
 /// shape only; the independent authority verifier owns admission.
 pub fn encode_identity_revocation(evidence: Option<&[u8]>) -> Result<Vec<u8>, MessageError> {
-    let mut out = vec![ControlType::IdentityRevocation as u8, u8::from(evidence.is_some())];
+    let mut out = vec![
+        ControlType::IdentityRevocation as u8,
+        u8::from(evidence.is_some()),
+    ];
     if let Some(raw) = evidence {
         check_identity_revocation_carrier(raw)?;
         out.extend_from_slice(raw);
@@ -1336,20 +1387,16 @@ fn check_identity_revocation_carrier(raw: &[u8]) -> Result<(), MessageError> {
 
 impl Lease {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        encode_signed_control(
-            ControlType::Lease,
-            &self.object,
-            &[ObjectType::AttachmentLease],
-        )
+        encode_signed_control(ControlType::Lease, &self.object, &[
+            ObjectType::AttachmentLease,
+        ])
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         Ok(Self {
-            object: decode_signed_control(
-                body,
-                ControlType::Lease,
-                &[ObjectType::AttachmentLease],
-            )?,
+            object: decode_signed_control(body, ControlType::Lease, &[
+                ObjectType::AttachmentLease,
+            ])?,
         })
     }
 }
@@ -1368,40 +1415,34 @@ impl Lsa {
 
 impl Grant {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        encode_signed_control(
-            ControlType::Grant,
-            &self.object,
-            &[ObjectType::RouteGrant, ObjectType::DirectGrant],
-        )
+        encode_signed_control(ControlType::Grant, &self.object, &[
+            ObjectType::RouteGrant,
+            ObjectType::DirectGrant,
+        ])
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         Ok(Self {
-            object: decode_signed_control(
-                body,
-                ControlType::Grant,
-                &[ObjectType::RouteGrant, ObjectType::DirectGrant],
-            )?,
+            object: decode_signed_control(body, ControlType::Grant, &[
+                ObjectType::RouteGrant,
+                ObjectType::DirectGrant,
+            ])?,
         })
     }
 }
 
 impl Revoke {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        encode_signed_control(
-            ControlType::Revoke,
-            &self.object,
-            &[ObjectType::StatusSnapshot],
-        )
+        encode_signed_control(ControlType::Revoke, &self.object, &[
+            ObjectType::StatusSnapshot,
+        ])
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         Ok(Self {
-            object: decode_signed_control(
-                body,
-                ControlType::Revoke,
-                &[ObjectType::StatusSnapshot],
-            )?,
+            object: decode_signed_control(body, ControlType::Revoke, &[
+                ObjectType::StatusSnapshot,
+            ])?,
         })
     }
 }
@@ -2238,20 +2279,17 @@ mod tests {
     }
 
     fn single_signed(object: &ManagementObject) -> SignedObject {
-        signed(
-            object,
-            vec![signer(SignerRole::Primary, MldsaParameterSet::Mldsa65)],
-        )
+        signed(object, vec![signer(
+            SignerRole::Primary,
+            MldsaParameterSet::Mldsa65,
+        )])
     }
 
     fn lease_signed(object: &ManagementObject) -> SignedObject {
-        signed(
-            object,
-            vec![
-                signer(SignerRole::Primary, MldsaParameterSet::Mldsa87),
-                signer(SignerRole::CoSign, MldsaParameterSet::Mldsa87),
-            ],
-        )
+        signed(object, vec![
+            signer(SignerRole::Primary, MldsaParameterSet::Mldsa87),
+            signer(SignerRole::CoSign, MldsaParameterSet::Mldsa87),
+        ])
     }
 
     #[test]
@@ -2349,13 +2387,10 @@ mod tests {
             Err(MessageError::SessionMismatch)
         );
         assert_eq!(
-            SessionParams::accept_for(
-                &hello,
-                LocalIdentity {
-                    node_id: 0x0303,
-                    ..sample_local_identity()
-                }
-            ),
+            SessionParams::accept_for(&hello, LocalIdentity {
+                node_id: 0x0303,
+                ..sample_local_identity()
+            }),
             Err(MessageError::SessionMismatch)
         );
     }
@@ -2417,18 +2452,27 @@ mod tests {
         use crate::authority_revocation::{IDENTITY_REVOCATION_MAGIC, SIGNED_CARRIER_HEADER_LEN};
         assert_eq!(decode_identity_revocation(&[20, 0]), Ok(None));
         for bad in [&[20, 0, 0][..], &[20, 2], &[20, 1], &[20]] {
-            assert_eq!(decode_identity_revocation(bad), Err(MessageError::WrongLength));
+            assert_eq!(
+                decode_identity_revocation(bad),
+                Err(MessageError::WrongLength)
+            );
         }
         let mut raw = vec![0; SIGNED_CARRIER_HEADER_LEN + 1];
         raw[..IDENTITY_REVOCATION_MAGIC.len()].copy_from_slice(IDENTITY_REVOCATION_MAGIC);
         let encoded = encode_identity_revocation(Some(&raw)).unwrap();
-        assert_eq!(decode_identity_revocation(&encoded), Ok(Some(raw.as_slice())));
-        assert_eq!(parse_control_body(&encoded), Ok(ControlBody::IdentityRevocation(Some(raw))));
+        assert_eq!(
+            decode_identity_revocation(&encoded),
+            Ok(Some(raw.as_slice()))
+        );
+        assert_eq!(
+            parse_control_body(&encoded),
+            Ok(ControlBody::IdentityRevocation(Some(raw)))
+        );
     }
 
     #[test]
     fn registry_caps_and_all_subtype_bytes() {
-        let caps: [(ControlType, usize); 15] = [
+        let caps: [(ControlType, usize); 16] = [
             (ControlType::SessionHello, 4096),
             (ControlType::SessionAccept, 4096),
             (ControlType::Enrollment, 16384),
@@ -2444,6 +2488,7 @@ mod tests {
             (ControlType::CircuitAccept, 4096),
             (ControlType::CircuitReset, 256),
             (ControlType::CircuitClose, 256),
+            (ControlType::MeshPath, 6),
         ];
         assert_eq!(CONTROL_SCHEMAS.len(), caps.len());
         for (schema, (subtype, cap)) in CONTROL_SCHEMAS.iter().zip(caps) {
@@ -2471,6 +2516,29 @@ mod tests {
             }
         }
         assert_eq!(parse_control_body(&[]), Err(MessageError::EmptyBody));
+    }
+
+    #[test]
+    fn mesh_path_control_has_exact_ordered_slots_and_length() {
+        let bytes = [21, 4, 1, 3, 2, 4];
+        assert_eq!(encode_mesh_path(&[1, 3, 2, 4]).unwrap(), bytes);
+        assert_eq!(decode_mesh_path(&bytes), Ok([1, 3, 2, 4].as_slice()));
+        assert_eq!(
+            parse_control_body(&bytes),
+            Ok(ControlBody::MeshPath(vec![1, 3, 2, 4]))
+        );
+        assert!(encode_mesh_path(&[1, 4]).is_ok());
+        for bad in [
+            &[21, 2, 1, 4, 2][..],
+            &[21, 1, 1],
+            &[21, 3, 1, 1, 4],
+            &[21, 3, 1, 0, 4],
+            &[21, 2, 5, 4],
+            &[21, 2, 1, 17],
+            &[21, 5, 1, 2, 3, 4, 5],
+        ] {
+            assert!(parse_control_body(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -2851,6 +2919,7 @@ mod tests {
             17 => Some("CircuitAccept"),
             18 => Some("CircuitReset"),
             19 => Some("CircuitClose"),
+            21 => Some("MeshPath"),
             _ => None,
         }
     }
@@ -2897,7 +2966,7 @@ mod tests {
             "SignedObject" => {
                 SignedObject::decode(data)?;
             }
-            "ControlBody" => {
+            "ControlBody" | "MeshPath" => {
                 parse_control_body(data)?;
             }
             "RelayFragment" => {
@@ -2942,6 +3011,7 @@ mod tests {
             "CircuitAccept" => Ok(CircuitAccept::decode(data)?.encode()?),
             "CircuitReset" => Ok(CircuitReset::decode(data)?.encode()?),
             "CircuitClose" => Ok(CircuitClose::decode(data)?.encode()?),
+            "MeshPath" => encode_mesh_path(decode_mesh_path(data)?),
             "ControlBody" => panic!("ControlBody vectors are not re-encodable"),
             other => panic!("unknown vector message {other}"),
         }
@@ -2952,7 +3022,7 @@ mod tests {
         let document = vector_document();
         assert_eq!(
             vector_array(&document).len(),
-            48,
+            54,
             "control vector count changed; update this assertion"
         );
         assert_eq!(
@@ -3000,8 +3070,8 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&document).unwrap();
         for text in [&compact, &pretty] {
             let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-            assert_eq!(vector_array(&parsed).len(), 48);
-            assert_eq!(vector_ids(&parsed).len(), 48);
+            assert_eq!(vector_array(&parsed).len(), 54);
+            assert_eq!(vector_ids(&parsed).len(), 54);
         }
 
         // Same Probe vector with fields in a different textual order. This
@@ -3123,7 +3193,7 @@ mod tests {
             "CircuitClose" => {
                 CircuitClose::decode(data)?;
             }
-            "ControlBody" => {
+            "ControlBody" | "MeshPath" => {
                 parse_control_body(data)?;
             }
             other => panic!("mutation corpus has an unknown message {other}"),

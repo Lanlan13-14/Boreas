@@ -1110,6 +1110,212 @@ fn original_identity_revocation_is_relayed_between_distinct_cores_and_invalidate
 }
 
 #[test]
+fn live_relay_denial_interrupts_idle_e2e_and_releases_both_hops() {
+    use boreas_tunnel::mesh_route::RouteLocator;
+    use std::{io::Read, sync::mpsc};
+
+    let f = &Fixture::new();
+    let (relay_listener, relay_target) = listener();
+    let (destination_listener, destination_target) = listener();
+    let outer = &|| OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let path = &[1, 2, 4];
+    let mailbox = f.node(2).path.join("identity-revocation.signed");
+    let subject = AuthenticatedPeer::new(NET, 0x0301, 1).unwrap();
+    let evidence = identity_evidence(f, subject, true);
+    // The owner under test is Core 2. A revoked participant need not cooperate
+    // in closing the sockets: Core 1 and Core 4 both block on a real TLS read.
+    let relay_credits = route_admission();
+    let (src_ready, src_confirmed) = mpsc::channel();
+    let (dst_ready, dst_confirmed) = mpsc::channel();
+    thread::scope(|scope| {
+        let relay = scope.spawn(|| {
+            let mut store = f.status(2);
+            let mut probe = f.probe(2, &mut store);
+            probe.set_identity_revocation_mailbox(|| match fs::read(&mailbox) {
+                Ok(raw) => Ok(Some(raw)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            });
+            let graph = probe.verify_route_graph(&f.node(2).identity, &graph_inputs(f, 2))?;
+            graph.relay(
+                &mut probe,
+                path,
+                accept_socket(relay_listener),
+                &destination_target,
+                (&outer_for(f, 2), outer),
+                &relay_credits,
+            )
+        });
+        let destination = scope.spawn(|| {
+            let mut store = f.status(4);
+            let mut probe = f.probe(4, &mut store);
+            let graph = probe.verify_route_graph(&f.node(4).identity, &graph_inputs(f, 4))?;
+            graph.respond(
+                &mut probe,
+                path,
+                accept_socket(destination_listener),
+                &outer_for(f, 4),
+                &route_admission(),
+                |c| {
+                    dst_ready.send(c.circuit_id()).unwrap();
+                    c.read_exact(&mut [0; 1]).map_err(TunnelError::from)
+                },
+            )
+        });
+        let source = scope.spawn(|| {
+            let mut store = f.status(1);
+            let mut probe = f.probe(1, &mut store);
+            let graph = probe.verify_route_graph(&f.node(1).identity, &graph_inputs(f, 1))?;
+            graph.connect(
+                &mut probe,
+                &[RouteLocator {
+                    path,
+                    target: &relay_target,
+                }],
+                outer,
+                &route_admission(),
+                |_, c| {
+                    src_ready.send(c.circuit_id()).unwrap();
+                    c.read_exact(&mut [0; 1]).map_err(TunnelError::from)
+                },
+            )
+        });
+        let wait = Duration::from_secs(5);
+        let id = src_confirmed.recv_timeout(wait).unwrap();
+        assert_eq!(id, dst_confirmed.recv_timeout(wait).unwrap());
+        assert_eq!(relay_credits.snapshot().unwrap().authenticated, 2);
+        let published = Instant::now();
+        let stage = mailbox.with_extension("staging");
+        fs::write(&stage, &evidence).unwrap();
+        fs::rename(stage, &mailbox).unwrap();
+        assert!(matches!(relay.join().unwrap(), Err(Error::IdentityRevoked)));
+        assert!(source.join().unwrap().is_err());
+        assert!(destination.join().unwrap().is_err());
+        assert!(published.elapsed() < Duration::from_secs(2));
+    });
+    let snap = relay_credits.snapshot().unwrap();
+    assert_eq!((snap.handshakes, snap.authenticated, snap.bytes), (0, 0, 0));
+    fs::remove_file(&mailbox).unwrap();
+    let reopened = f.status(2);
+    assert!(reopened.identity_revoked(&subject).unwrap());
+    assert!(
+        !reopened
+            .identity_revoked(&AuthenticatedPeer::new(NET, 0x0301, 2).unwrap())
+            .unwrap()
+    );
+}
+
+#[test]
+fn live_directory_propagates_remote_denial_after_graph_isolation() {
+    use boreas_tunnel::mesh_route::DirectoryCore;
+
+    let f = &Fixture::new();
+    let subject = AuthenticatedPeer::new(NET, 0x0301, 1).unwrap();
+    let evidence = identity_evidence(f, subject, true);
+    let wrong_authority = identity_evidence(f, subject, false);
+    let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
+    let members = |id| {
+        [1, 2, 3, 4]
+            .into_iter()
+            .filter(|&other| other != id)
+            .map(|other| f.node(other).identity.as_slice())
+            .collect::<Vec<_>>()
+    };
+    let mut a_status = f.status(1);
+    let mut b_status = f.status(2);
+    let mut c_status = f.status(3);
+    assert!(!a_status.identity_revoked(&subject).unwrap());
+    assert!(!b_status.identity_revoked(&subject).unwrap());
+    assert!(!c_status.identity_revoked(&subject).unwrap());
+    let mut a = f.probe(1, &mut a_status);
+    let mut b = f.probe(2, &mut b_status);
+    let mut c = f.probe(3, &mut c_status);
+    let graph = |probe: &mut MeshProbe<'_>, id| {
+        let others = [1, 2, 3, 4]
+            .into_iter()
+            .filter(|&other| other != id)
+            .map(|other| DirectoryCore {
+                identity: &f.node(other).identity,
+                seed_lsa: Some(&f.node(other).lsa),
+            })
+            .collect::<Vec<_>>();
+        probe
+            .verify_directory_graph(&f.node(id).identity, &others)
+            .unwrap()
+    };
+    let a_before = graph(&mut a, 1);
+    assert!(a_before.authorize_path(&mut a, &[1, 4, 3]).is_ok());
+    graph(&mut b, 2);
+    graph(&mut c, 3);
+    assert_eq!(
+        a.refresh_runtime_authority(&f.status, Some(&wrong_authority), &f.node(1).lsa),
+        Err(Error::Status)
+    );
+    assert!(a_before.authorize_path(&mut a, &[1, 4, 3]).is_ok());
+    a.refresh_runtime_authority(&f.status, Some(&evidence), &f.node(1).lsa)
+        .unwrap();
+    let a_after = graph(&mut a, 1);
+    assert!(a_after.core_ids().eq(1..=4));
+    assert_eq!(a_after.signed_lsa(4), None);
+    assert!(matches!(
+        a_before.authorize_path(&mut a, &[1, 4, 3]),
+        Err(Error::IdentityRevoked)
+    ));
+    assert!(matches!(
+        a_after.authorize_path(&mut a, &[1, 4, 3]),
+        Err(Error::IdentityRevoked)
+    ));
+    assert!(a_after.authorize_path(&mut a, &[1, 2, 3]).is_ok());
+
+    let sync = |from: &mut MeshProbe<'_>, to: &mut MeshProbe<'_>, src, dst| {
+        let (socket, target) = listener();
+        let (dial_credits, listen_credits) = (route_admission(), route_admission());
+        thread::scope(|scope| {
+            let received = scope.spawn(|| {
+                to.accept_directory_member(
+                    accept_socket(socket),
+                    &members(dst),
+                    &outer_for(f, dst),
+                    &listen_credits,
+                )
+            });
+            assert_eq!(
+                from.sync_directory(
+                    Candidate {
+                        target: &target,
+                        signed_identity: &f.node(dst).identity,
+                    },
+                    &members(src),
+                    &outer,
+                    &dial_credits
+                ),
+                Ok(())
+            );
+            assert_eq!(received.join().unwrap(), Ok(src as u8));
+        });
+        for credits in [&dial_credits, &listen_credits] {
+            let snap = credits.snapshot().unwrap();
+            assert_eq!((snap.handshakes, snap.authenticated, snap.bytes), (0, 0, 0));
+        }
+    };
+    sync(&mut a, &mut b, 1, 2);
+    assert_eq!(graph(&mut b, 2).signed_lsa(4), None);
+    // The intermediate Core has already isolated the subject, yet it must
+    // keep its control profiles running so the exact signed evidence moves on.
+    sync(&mut b, &mut c, 2, 3);
+    assert_eq!(graph(&mut c, 3).signed_lsa(4), None);
+    drop(c);
+    drop(c_status);
+    let mut reopened = f.status(3);
+    assert_eq!(
+        reopened
+            .relayable_identity_revocations(utc_now().unwrap())
+            .unwrap(),
+        vec![evidence.as_slice()]
+    );
+}
+
+#[test]
 fn directory_converges_over_two_authenticated_hops_and_gates_business() {
     use boreas_tunnel::mesh_route::DirectoryCore;
 

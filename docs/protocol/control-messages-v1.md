@@ -1,6 +1,6 @@
 # Candidate Control message payloads v1
 
-**Status: candidate / not frozen. Revision 4.** This document and `boreas-proto::messages` define the candidate typed wire formats for TLS session negotiation, enrollment, directory/management distribution, probes, drain notices and circuit control. They do **not** define TLS, certificate policy, signature verification, identity authorization, circuit TLS, or production route policy. Fixed raw vectors live in `vectors/control-messages-candidate-v1.json` and are decoded by Rust tests; the independent Python checker is authoritative evidence only after it is wired into CI.
+**Status: candidate / not frozen. Revision 5.** This document and `boreas-proto::messages` define the candidate typed wire formats for TLS session negotiation, enrollment, directory/management distribution, probes, drain notices and circuit control. They do **not** define TLS, certificate policy, signature verification, identity authorization, circuit TLS, or production route policy. Fixed raw vectors live in `vectors/control-messages-candidate-v1.json` and are decoded by Rust tests; the independent Python checker is authoritative evidence only after it is wired into CI.
 
 ## Encoding conventions
 
@@ -27,10 +27,15 @@ Every registered control subtype has a typed schema. There is no opaque fallback
 | `0x12` | CircuitReset | circuit opening or established | 256 | CircuitReset |
 | `0x13` | CircuitClose | circuit established | 256 | CircuitClose |
 | `0x14` | IdentityRevocation | accepted Core–Core, e2e-required, neither opening nor established circuit | 19767 | independent signed carrier or end marker |
+| `0x15` | MeshPath | accepted Core–Core, e2e-required, neither opening nor established circuit | 6 | ordered slot proposal |
 
-`0x00`, `0x0B..=0x0F` and `0x15..=0xFF` are unregistered and reject with `unknown_subtype`. The mesh `0x14` extension is a candidate deviation from the base plan's reserved range, not available in the generic daemon. See [authority-specific revocation](authority-revocation-v1.md#explicit-core-adjacency-distribution-and-route-denial) for the bounded exchange and the distinction from legacy `0x08`.
+`0x00`, `0x0B..=0x0F` and `0x16..=0xFF` are unregistered and reject with `unknown_subtype`. Mesh `0x14` and `0x15` are candidate extensions to the base registry, not used by the generic daemon. See [authority-specific revocation](authority-revocation-v1.md#explicit-core-adjacency-distribution-and-route-denial) for the bounded exchange and the distinction from legacy `0x08`.
 
 **Lease cap deviation (reported conflict).** Master plan §5.4 lists Lease at 4 KiB. A single Ed25519+ML-DSA-87 signature pair is 64+4627 bytes; an AttachmentLease requires Primary + Core co-signature, so two pairs (9382 B) plus TBS and envelope headers cannot fit 4 KiB. The candidate registry therefore uses 16 KiB for Lease. This is a plan/registry conflict requiring review before freeze; it is not a silent protocol change. The same arithmetic means signed envelopes must be budgeted before the per-subtype cap is applied.
+
+## MeshPath (0x15)
+
+The body is `0x15 | count:u8 | core_slot:u8[count]`, exactly 4 to 6 bytes. Require 2–4 distinct slots in `1..=16`, with the source slot less than the destination slot; an intermediate slot need not be in ascending order. On the opt-in routed business profile this is one hop-local transaction message, following the authenticated adjacency and authority exchanges and preceding `CircuitOpen`. It does not change `CircuitOpen`, `SessionHello`, or the fixed-route profile. No locator, new credential, or key crosses in this body. Each receiver checks the configured endpoint pair and the authenticated peer against the claimed predecessor, the entire path against its own current signed graph, and its local outgoing permission before using it. Endpoint E2E still binds the exact ordered identities and signed LSA digests; the proposal is not an attestation of the physical route. See the [Linux mesh runtime](../deployment/linux-core-mesh-runtime.md#configure-signed-topology-routing-and-tun).
 
 ## SessionHello / SessionAccept (0x01 / 0x02)
 

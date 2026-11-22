@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeMap,
     net::TcpStream,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +36,8 @@ use crate::{
 };
 
 mod directory_sync;
+mod live_identity;
+mod routed_business;
 
 pub const ATTEMPT_LIMIT: Duration = Duration::from_secs(5);
 const MAX_ATTEMPTS: usize = 3;
@@ -66,6 +68,8 @@ pub enum Error {
     /// The durable CoreLSA authority state is unavailable or inconsistent.
     LsaState,
     Status,
+    /// Local mailbox input or a live authority worker failed; stop business.
+    RevocationState,
     IdentityRevoked,
     Clock,
     NoRoute,
@@ -256,7 +260,8 @@ pub struct MeshProbe<'a> {
     // seeds and authenticated hop sessions update this same replay-backed view.
     remote_lsas: BTreeMap<u8, VerifiedObject>,
     durable: bool,
-    status: &'a mut StatusStore,
+    status: Mutex<&'a mut StatusStore>,
+    live_identity: live_identity::Mailbox<'a>,
     pem: &'a PemIdentity,
 }
 
@@ -352,13 +357,34 @@ impl<'a> MeshProbe<'a> {
             local_lsa,
             remote_lsas,
             durable: state.is_some(),
-            status,
+            status: Mutex::new(status),
+            live_identity: live_identity::Mailbox::default(),
             pem,
         })
     }
 
     pub fn local(&self) -> PeerIdentity {
         self.local.peer()
+    }
+
+    fn status(&self) -> Result<MutexGuard<'_, &'a mut StatusStore>, Error> {
+        self.status.lock().map_err(|_| Error::RevocationState)
+    }
+
+    fn effective_utc(&self) -> Result<u64, Error> {
+        let mut status = self.status()?;
+        effective_utc(&mut status)
+    }
+
+    /// Check only the independent durable denial for a verified slot. A
+    /// directory can isolate a remote denial without weakening local authority.
+    pub(crate) fn check_identity_denial(&self, core: &Core) -> Result<(), Error> {
+        let status = self.status()?;
+        core.check_identity_denial(&status)
+    }
+
+    pub(crate) fn check_local_identity_denial(&self) -> Result<(), Error> {
+        self.check_identity_denial(&self.local)
     }
 
     /// Import operator-published updates between bounded circuits. The owner,
@@ -371,15 +397,16 @@ impl<'a> MeshProbe<'a> {
     ) -> Result<(), Error> {
         let observed = utc_now()?;
         let mono = Instant::now();
-        self.status
+        self.status()?
             .accept_signed_snapshot(snapshot, observed, mono)
             .map_err(|_| Error::Status)?;
+        self.poll_identity_mailbox()?;
         if let Some(raw) = identity_revocation {
-            self.status
+            self.status()?
                 .accept_identity_revocation(raw, utc_now()?)
                 .map_err(|_| Error::Status)?;
         }
-        let now = effective_utc(self.status)?;
+        let now = self.effective_utc()?;
         let verified = self
             .trust
             .verify_core_lsa(local_lsa, self.local.id, now)
@@ -441,11 +468,12 @@ impl<'a> MeshProbe<'a> {
         admission: &Admission,
         purpose: HopPurpose,
     ) -> Result<Adjacency, Error> {
+        self.poll_identity_mailbox()?;
         let route = purpose.route();
         if candidates.is_empty() || candidates.len() > MAX_ATTEMPTS {
             return Err(Error::NoRoute);
         }
-        let now = effective_utc(self.status)?;
+        let now = self.effective_utc()?;
         let mut ordered = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let peer = Core::from_object(
@@ -621,8 +649,9 @@ impl<'a> MeshProbe<'a> {
         admission: &Admission,
         purpose: HopPurpose,
     ) -> Result<Adjacency, Error> {
+        self.poll_identity_mailbox()?;
         let route = purpose.route();
-        let now = effective_utc(self.status)?;
+        let now = self.effective_utc()?;
         let peer = Core::from_object(
             &self
                 .trust
@@ -668,6 +697,7 @@ impl<'a> MeshProbe<'a> {
         purpose: HopPurpose,
         deadline: Instant,
     ) -> Result<Adjacency, Error> {
+        self.poll_identity_mailbox()?;
         let deadline = deadline.min(self.deadline(&peer)?);
         let received = bounded_link_operation(&socket, deadline, || {
             let session = &mut accepted.session;
@@ -756,12 +786,16 @@ impl<'a> MeshProbe<'a> {
                         .into());
                     }
                     self.check_route_utc(std::slice::from_ref(peer), remote_lsa_expiry)?;
-                    match self.status.accept_identity_revocation(raw, utc_now()?) {
+                    match self.status()?.accept_identity_revocation(raw, utc_now()?) {
                         // The store returns Stale only after verifying both
                         // signatures, exact scope and current validity. It
                         // already holds a newer denial of the same generation.
                         Ok(()) | Err(boreas_pki::status_store::Error::RevocationStale) => (),
-                        Err(_) => return Err(Error::Status),
+                        Err(
+                            boreas_pki::status_store::Error::AuthorityRevocation(_)
+                            | boreas_pki::status_store::Error::RevocationPermission,
+                        ) => return Err(Error::Status),
+                        Err(_) => return Err(Error::RevocationState),
                     }
                     // Stop promptly if the object names either endpoint, or if
                     // the independent status/LSA/policy deadline expired.
@@ -791,8 +825,10 @@ impl<'a> MeshProbe<'a> {
     }
 
     fn send_revocations(&mut self, session: &mut EstablishedSession) -> Result<(), Error> {
-        let evidence = self
-            .status
+        // Control exchange is serial with business: no live mailbox worker
+        // exists in this phase. Borrow rather than copying the whole batch.
+        let mut status = self.status()?;
+        let evidence = status
             .relayable_identity_revocations(utc_now()?)
             .map_err(|_| Error::Status)?;
         for raw in evidence {
@@ -805,7 +841,7 @@ impl<'a> MeshProbe<'a> {
     }
 
     pub(crate) fn verified_core(&mut self, signed: &[u8]) -> Result<Core, Error> {
-        let now = effective_utc(self.status)?;
+        let now = self.effective_utc()?;
         Core::from_object(
             &self
                 .trust
@@ -892,20 +928,22 @@ impl<'a> MeshProbe<'a> {
         self.authority_deadline(core, expires)
     }
 
-    // The status store is single-owner while a bounded transaction runs. An
-    // already-issued monotonic cutoff is never extended; this fast check also
+    // The status ledger is serialized with the scoped mailbox watcher. An
+    // already-issued monotonic cutoff is never extended; this quick check
     // rejects UTC jumps without fsync per fragment. Rollback is durably latched.
     pub(crate) fn check_route_utc(
-        &mut self,
+        &self,
         route: &[Core],
         remote_lsa_expiry: u64,
     ) -> Result<(), Error> {
         let observed = utc_now()?;
-        let floor = self.status.last_trusted_utc();
-        match self.status.check_active_snapshot(observed, Instant::now()) {
+        self.live_identity.check_fault()?;
+        let mut status = self.status()?;
+        let floor = status.last_trusted_utc();
+        match status.check_active_snapshot(observed, Instant::now()) {
             Ok(()) => (),
             Err(boreas_pki::status_store::Error::ClockRollback) => {
-                let _ = self.status.observe_trusted_utc(observed);
+                let _ = status.observe_trusted_utc(observed);
                 return Err(Error::Status);
             }
             Err(_) => return Err(Error::Status),
@@ -915,9 +953,9 @@ impl<'a> MeshProbe<'a> {
         let cutoff = policy_expiry
             .min(self.local_lsa.valid_until())
             .min(remote_lsa_expiry);
-        self.local.check_identity_denial(self.status)?;
+        self.local.check_identity_denial(&status)?;
         for node in route {
-            node.check_identity_denial(self.status)?;
+            node.check_identity_denial(&status)?;
         }
         if now < start
             || now >= cutoff
@@ -937,7 +975,7 @@ impl<'a> MeshProbe<'a> {
             )
             .ok_or(Error::Identity)?;
             if now >= node.until
-                || !matches!(self.status.peer_revocation(&peer),
+                || !matches!(status.peer_revocation(&peer),
                 PeerRevocation::Verified(state) if !state.sessions_revoked())
             {
                 return Err(Error::Status);
@@ -958,6 +996,7 @@ impl<'a> MeshProbe<'a> {
         route: &[Core],
         links: &[&Adjacency],
     ) -> Result<Instant, Error> {
+        self.poll_identity_mailbox()?;
         let mut deadline = Instant::now() + ATTEMPT_LIMIT;
         for link in links {
             if link.session.local() != self.local() {
@@ -982,7 +1021,7 @@ impl<'a> MeshProbe<'a> {
         Ok(deadline)
     }
 
-    fn check(&mut self, peer: &Core) -> Result<u64, Error> {
+    pub(crate) fn check(&mut self, peer: &Core) -> Result<u64, Error> {
         self.with_fresh(peer, |_, now| now)
     }
 
@@ -1038,9 +1077,10 @@ impl<'a> MeshProbe<'a> {
         {
             return Err(Error::Lsa);
         }
-        let now = observed.max(self.status.last_trusted_utc());
-        let fresh = self
-            .status
+        self.live_identity.check_fault()?;
+        let mut status = self.status()?;
+        let now = observed.max(status.last_trusted_utc());
+        let fresh = status
             .current_fresh(observed, Instant::now())
             .map_err(|_| Error::Status)?;
         let (start, end) = self.policy.validity();

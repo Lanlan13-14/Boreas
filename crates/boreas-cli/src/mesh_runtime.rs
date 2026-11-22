@@ -19,7 +19,7 @@ pub fn run(args: &[String]) -> (u8, String, String) {
 #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
 mod linux {
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         fs,
         io::ErrorKind,
         net::{SocketAddr, TcpListener, TcpStream},
@@ -41,7 +41,7 @@ mod linux {
     use boreas_tunnel::{
         ClientTarget, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
         mesh_probe::{Candidate, Error, MeshProbe, utc_now},
-        mesh_route::{DirectoryCore, RouteLocator},
+        mesh_route::{DirectoryCore, RouteLocator, RoutedPair},
         packet_path::{MAX_MTU, MIN_MTU},
         resource::{Admission, Limits},
     };
@@ -60,7 +60,7 @@ mod linux {
     const DIRECTORY_POLL: Duration = Duration::from_secs(5);
     const MAX_PEM: usize = 64 * 1024;
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "lowercase")]
     enum Mode {
         Source,
@@ -75,7 +75,9 @@ mod linux {
         peers: Vec<u8>,
         tun: Option<String>,
         mtu: Option<usize>,
+        #[serde(default)]
         routes: Vec<Route>,
+        routing: Option<Routing>,
         #[serde(default)]
         directory: Vec<DirectoryLink>,
         directory_discovery: Option<DirectoryDiscovery>,
@@ -114,6 +116,89 @@ mod linux {
         tls_name: Option<String>,
     }
 
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Routing {
+        source: u8,
+        destination: u8,
+        listen: Option<SocketAddr>,
+        #[serde(default)]
+        incoming: Vec<u8>,
+        #[serde(default)]
+        outgoing: Vec<NeighborTarget>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NeighborTarget {
+        peer: u8,
+        next: SocketAddr,
+        tls_name: String,
+    }
+
+    impl Routing {
+        fn validate(
+            &self,
+            local: u8,
+            mode: &Mode,
+            peers: &BTreeSet<u8>,
+            listens: &mut BTreeSet<SocketAddr>,
+            targets: &mut BTreeSet<SocketAddr>,
+        ) -> Result<(), String> {
+            if self.source >= self.destination
+                || !peers.contains(&self.source)
+                || !peers.contains(&self.destination)
+            {
+                return Err("invalid routed mesh endpoint pair".into());
+            }
+            let expected = if local == self.source {
+                Mode::Source
+            } else if local == self.destination {
+                Mode::Destination
+            } else {
+                Mode::Relay
+            };
+            let ingress = expected != Mode::Source;
+            let egress = expected != Mode::Destination;
+            if *mode != expected
+                || self.listen.is_some() != ingress
+                || self.incoming.is_empty() == ingress
+                || self.outgoing.is_empty() == egress
+                || self.incoming.len() >= usize::from(MAX_CORES)
+                || self.outgoing.len() >= usize::from(MAX_CORES)
+                || self
+                    .listen
+                    .is_some_and(|a| a.port() == 0 || !listens.insert(a))
+            {
+                return Err(
+                    "routed mesh role, ingress or egress does not match endpoint pair".into(),
+                );
+            }
+            let mut seen = BTreeSet::new();
+            for &id in &self.incoming {
+                if id == local || id == self.destination || !peers.contains(&id) || !seen.insert(id)
+                {
+                    return Err("invalid or duplicate routed mesh ingress peer".into());
+                }
+            }
+            seen.clear();
+            for hop in &self.outgoing {
+                if hop.peer == local
+                    || hop.peer == self.source
+                    || !peers.contains(&hop.peer)
+                    || !seen.insert(hop.peer)
+                    || hop.next.port() == 0
+                    || hop.next.ip().is_unspecified()
+                    || !targets.insert(hop.next)
+                    || !valid_tls_name(&hop.tls_name)
+                {
+                    return Err("invalid or duplicate routed mesh egress peer/locator".into());
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl Spec {
         fn directory_enabled(&self) -> bool {
             self.directory_discovery.is_some() || !self.directory.is_empty()
@@ -126,9 +211,10 @@ mod linux {
                     .peers
                     .iter()
                     .any(|&id| !(1..=MAX_CORES).contains(&id) || !peers.insert(id))
-                || !(1..=MAX_ROUTES).contains(&self.routes.len())
+                || self.routes.len() > MAX_ROUTES
+                || self.routes.is_empty() != self.routing.is_some()
             {
-                return Err("invalid mesh peer/route count or slot".into());
+                return Err("invalid mesh peer/route count or slot; configure exactly one of routes or routing".into());
             }
             let endpoints = (
                 !matches!(self.mode, Mode::Relay),
@@ -143,6 +229,9 @@ mod linux {
             }
             let mut listens = BTreeSet::new();
             let mut targets = BTreeSet::new();
+            if let Some(routing) = &self.routing {
+                routing.validate(local, &self.mode, &peers, &mut listens, &mut targets)?;
+            }
             let mut paths = BTreeSet::new();
             let mut first_hops = BTreeSet::new();
             let mut pair = None;
@@ -226,8 +315,20 @@ mod linux {
                     || d.listen.is_some() == outgoing
                     || d.next.is_some() != outgoing
                     || d.tls_name.is_some() != outgoing
-                    || d.listen
-                        .is_some_and(|a| a.port() == 0 || !listens.insert(a))
+                    || d.listen.is_some_and(|a| {
+                        a.port() == 0
+                            || self
+                                .routing
+                                .as_ref()
+                                .and_then(|r| r.listen)
+                                .is_some_and(|b| {
+                                    a.port() == b.port()
+                                        && (a.ip() == b.ip()
+                                            || a.ip().is_unspecified()
+                                            || b.ip().is_unspecified())
+                                })
+                            || !listens.insert(a)
+                    })
                     || d.next.is_some_and(|a| {
                         a.port() == 0 || a.ip().is_unspecified() || !targets.insert(a)
                     })
@@ -436,11 +537,7 @@ mod linux {
             probe
                 .refresh_runtime_authority(
                     &read(&self.dir.join("status.signed"), MAX_SIGNED_OBJECT_BYTES)?,
-                    optional(
-                        &self.dir.join("identity-revocation.signed"),
-                        MAX_IDENTITY_REVOCATION_BYTES,
-                    )?
-                    .as_deref(),
+                    None,
                     &self.lsa()?,
                 )
                 .map_err(|e| format!("mesh runtime authority: {e:?}"))?;
@@ -515,6 +612,10 @@ mod linux {
         {
             return Err("local signed Core does not match configured identity".into());
         }
+        let mailbox = dir.join("identity-revocation.signed");
+        probe.set_identity_revocation_mailbox(move || {
+            optional(&mailbox, MAX_IDENTITY_REVOCATION_BYTES).map_err(std::io::Error::other)
+        });
         let outer_roots = optional(&dir.join("outer-ca.pem"), MAX_PEM)?;
         let outer = || match &outer_roots {
             Some(pem) => OpenSslOuterTlsConnector::with_root_certificates(pem),
@@ -587,6 +688,21 @@ mod linux {
                 })
             })
             .collect();
+        let routed_targets = spec.routing.as_ref().map(|r| {
+            r.outgoing
+                .iter()
+                .map(|hop| (hop.peer, client_target(hop.next, &hop.tls_name)))
+                .collect::<BTreeMap<_, _>>()
+        });
+        let routed = spec
+            .routing
+            .as_ref()
+            .zip(routed_targets.as_ref())
+            .map(|(r, outgoing)| RoutedPair {
+                endpoints: (r.source, r.destination),
+                incoming: &r.incoming,
+                outgoing,
+            });
         let admission = Admission::new(Limits {
             handshakes_global: 1,
             authenticated_global: 2,
@@ -676,7 +792,10 @@ mod linux {
                     probe.accept_directory(socket, members[i], &members, outer, &admission)
                 };
                 if let Err(e) = result {
-                    if matches!(e, Error::LsaConflict | Error::LsaState) {
+                    if matches!(
+                        e,
+                        Error::LsaConflict | Error::LsaState | Error::RevocationState
+                    ) {
                         return Err(format!("mesh directory authority stopped: {e:?}"));
                     }
                     eprintln!("mesh directory listener refused/closed exchange: {e:?}");
@@ -696,7 +815,10 @@ mod linux {
                 );
                 dir_poll[poll] = Instant::now() + DIRECTORY_POLL;
                 if let Err(e) = result {
-                    if matches!(e, Error::LsaConflict | Error::LsaState) {
+                    if matches!(
+                        e,
+                        Error::LsaConflict | Error::LsaState | Error::RevocationState
+                    ) {
                         return Err(format!("mesh directory authority stopped: {e:?}"));
                     }
                     eprintln!("mesh directory dial refused/closed exchange: {e:?}");
@@ -722,11 +844,19 @@ mod linux {
             if !ready {
                 // Require at least one authorized path before activating the real TUN or listeners.
                 let mut usable = false;
-                for route in &spec.routes {
-                    match graph.authorize_path(&mut probe, &route.path) {
-                        Ok(_) => usable = true,
-                        Err(Error::NoRoute) => (),
+                if let Some(pair) = &routed {
+                    match graph.authorize_routed_pair(&mut probe, pair) {
+                        Ok(()) => usable = true,
+                        Err(Error::NoRoute | Error::IdentityRevoked) => (),
                         Err(e) => return Err(format!("mesh route authorization: {e:?}")),
+                    }
+                } else {
+                    for route in &spec.routes {
+                        match graph.authorize_path(&mut probe, &route.path) {
+                            Ok(_) => usable = true,
+                            Err(Error::NoRoute | Error::IdentityRevoked) => (),
+                            Err(e) => return Err(format!("mesh route authorization: {e:?}")),
+                        }
                     }
                 }
                 if !usable {
@@ -738,8 +868,13 @@ mod linux {
                 }
                 tun = open_tun(&spec)?;
                 if !matches!(spec.mode, Mode::Source) {
-                    for (i, route) in spec.routes.iter().enumerate() {
-                        let addr = route.listen.ok_or("mesh listener missing")?;
+                    let addresses = spec
+                        .routes
+                        .iter()
+                        .map(|r| r.listen)
+                        .chain(spec.routing.iter().map(|r| r.listen));
+                    for (i, addr) in addresses.enumerate() {
+                        let addr = addr.ok_or("mesh listener missing")?;
                         let listener = TcpListener::bind(addr)
                             .map_err(|e| format!("mesh bind {addr}: {}", e.kind()))?;
                         listener
@@ -754,17 +889,30 @@ mod linux {
             match spec.mode {
                 Mode::Source => {
                     let previous = preferred;
-                    let result = graph.connect_tun(
-                        &mut probe,
-                        &locators,
-                        &outer,
-                        &admission,
-                        (tun.as_ref().ok_or("mesh source TUN missing")?, previous),
-                        |path, id| {
-                            preferred = Some(path[1]);
-                            confirmed("source", path, id);
-                        },
-                    );
+                    let endpoint = (tun.as_ref().ok_or("mesh source TUN missing")?, previous);
+                    let on_confirmed = |path: &[u8], id| {
+                        preferred = Some(path[1]);
+                        confirmed("source", path, id);
+                    };
+                    let result = if let Some(pair) = &routed {
+                        graph.connect_routed_tun(
+                            &mut probe,
+                            pair,
+                            &outer,
+                            &admission,
+                            endpoint,
+                            on_confirmed,
+                        )
+                    } else {
+                        graph.connect_tun(
+                            &mut probe,
+                            &locators,
+                            &outer,
+                            &admission,
+                            endpoint,
+                            on_confirmed,
+                        )
+                    };
                     match result {
                         Ok(e) => {
                             last_loss = None;
@@ -774,6 +922,13 @@ mod linux {
                                 e.tx,
                                 e.rx
                             );
+                        }
+                        Err(Error::IdentityRevoked) => {
+                            // This is an authority transition, not a transport
+                            // retry. Rebuild and rank only still-authorized routes.
+                            eprintln!("mesh source route closed: IdentityRevoked");
+                            preferred = None;
+                            last_loss = None;
                         }
                         Err(Error::TopologyChanged) => {
                             eprintln!("mesh authenticated topology changed; rebuilding graph");
@@ -798,39 +953,57 @@ mod linux {
                     let Some((i, socket)) = incoming else {
                         continue;
                     };
-                    let path = &spec.routes[i].path;
                     let acceptor = acceptor
                         .as_ref()
                         .ok_or("mesh listener credential missing")?;
                     let result = match spec.mode {
-                        Mode::Relay => graph
-                            .relay(
-                                &mut probe,
-                                path,
-                                socket,
-                                targets[i].as_ref().ok_or("mesh relay target missing")?,
-                                (acceptor, &outer),
-                                &admission,
-                            )
+                        Mode::Relay => {
+                            let outer = (acceptor, &outer as &dyn Fn() -> _);
+                            if let Some(pair) = &routed {
+                                graph.relay_routed(&mut probe, pair, socket, outer, &admission)
+                            } else {
+                                graph.relay(
+                                    &mut probe,
+                                    &spec.routes[i].path,
+                                    socket,
+                                    targets[i].as_ref().ok_or("mesh relay target missing")?,
+                                    outer,
+                                    &admission,
+                                )
+                            }
                             .map(|e| {
                                 eprintln!(
                                     "mesh epoch role=relay circuit={:032x} ciphertext={:?}",
                                     u128::from_be_bytes(e.circuit_id),
                                     e.ciphertext_bytes
                                 )
-                            }),
-                        Mode::Destination => graph
-                            .respond_tun(
-                                &mut probe,
-                                path,
-                                socket,
-                                acceptor,
-                                (
-                                    &admission,
-                                    tun.as_ref().ok_or("mesh destination TUN missing")?,
-                                ),
-                                |id| confirmed("destination", path, id),
-                            )
+                            })
+                        }
+                        Mode::Destination => {
+                            let endpoint = (
+                                &admission,
+                                tun.as_ref().ok_or("mesh destination TUN missing")?,
+                            );
+                            if let Some(pair) = &routed {
+                                graph.respond_routed_tun(
+                                    &mut probe,
+                                    pair,
+                                    socket,
+                                    acceptor,
+                                    endpoint,
+                                    |path, id| confirmed("destination", path, id),
+                                )
+                            } else {
+                                let path = &spec.routes[i].path;
+                                graph.respond_tun(
+                                    &mut probe,
+                                    path,
+                                    socket,
+                                    acceptor,
+                                    endpoint,
+                                    |id| confirmed("destination", path, id),
+                                )
+                            }
                             .map(|e| {
                                 eprintln!(
                                     "mesh epoch role=destination circuit={:032x} tx={} rx={}",
@@ -838,11 +1011,15 @@ mod linux {
                                     e.tx,
                                     e.rx
                                 )
-                            }),
+                            })
+                        }
                         Mode::Source => unreachable!(),
                     };
                     if let Err(e) = result {
-                        if matches!(e, Error::LsaConflict | Error::LsaState) {
+                        if matches!(
+                            e,
+                            Error::LsaConflict | Error::LsaState | Error::RevocationState
+                        ) {
                             return Err(format!("mesh business authority stopped: {e:?}"));
                         }
                         // One unauthenticated connection must not kill the service.
@@ -874,6 +1051,47 @@ path = [1, 3, 4]
 next = "192.0.2.3:18083"
 tls_name = "core3.example.com"
 "#;
+
+        const ROUTED: &str = r#"
+mode = "relay"
+peers = [1, 2, 4]
+
+[routing]
+source = 1
+destination = 4
+incoming = [1, 2]
+listen = "192.0.2.3:18082"
+
+[[routing.outgoing]]
+peer = 4
+next = "192.0.2.4:18082"
+tls_name = "core4.example.com"
+"#;
+
+        #[test]
+        fn routed_mesh_config_binds_pair_and_local_ingress_egress() {
+            let good: Spec = toml::from_str(ROUTED).unwrap();
+            assert!(good.validate(3).is_ok());
+            for bad in [
+                ROUTED.replace("destination = 4", "destination = 1"),
+                ROUTED.replace("destination = 4", "destination = 5"),
+                ROUTED.replace("[1, 2]", "[1, 1]"),
+                ROUTED.replace("[1, 2]", "[3]"),
+                ROUTED.replace("[1, 2]", "[4]"),
+                ROUTED.replace("[1, 2]", "[]"),
+                ROUTED.replace("peer = 4", "peer = 1"),
+                ROUTED.replace("peer = 4", "peer = 3"),
+                ROUTED.replace("192.0.2.4:18082", "0.0.0.0:18082"),
+                ROUTED.replace("core4.example.com", "https://core4.example.com"),
+                format!("{ROUTED}\n[[routes]]\npath = [1, 3, 4]\n"),
+                format!(
+                    "{ROUTED}\n[directory_discovery]\ncoordinator = 3\nlisten = \"0.0.0.0:18082\"\n"
+                ),
+            ] {
+                let parsed: Spec = toml::from_str(&bad).unwrap();
+                assert!(parsed.validate(3).is_err(), "{bad}");
+            }
+        }
 
         #[test]
         fn source_routes_bind_ordered_pair_with_distinct_first_hops() {

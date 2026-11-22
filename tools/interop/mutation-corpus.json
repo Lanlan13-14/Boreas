@@ -1,7 +1,7 @@
 {
   "schema": "boreas-mutation-corpus-v1",
   "source": "docs/protocol/vectors/control-messages-candidate-v1.json",
-  "sha256": "933cd540b02466d7ca998e3ee15ab06f12f55fc2bc5434ce3667277f961c95f9",
+  "sha256": "05e54a45ebdcc0738c611d051931f7e1d89bfe930d7527045166791c2690a0aa",
   "cases": [
     {
       "id": "session-hello-minimal::truncate_one",
@@ -590,6 +590,84 @@
       "message": "DirectoryPage",
       "input_hex": "",
       "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-direct::truncate_one",
+      "message": "MeshPath",
+      "input_hex": "150201",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-direct::truncate_half",
+      "message": "MeshPath",
+      "input_hex": "1502",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-direct::append_zero",
+      "message": "MeshPath",
+      "input_hex": "1502011000",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-direct::append_ff",
+      "message": "MeshPath",
+      "input_hex": "15020110ff",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-direct::flip_high_bit",
+      "message": "MeshPath",
+      "input_hex": "95020110",
+      "python_verdict": "unknown_subtype"
+    },
+    {
+      "id": "mesh-path-direct::empty",
+      "message": "MeshPath",
+      "input_hex": "",
+      "python_verdict": "empty_body"
+    },
+    {
+      "id": "mesh-path-four-cores::truncate_one",
+      "message": "MeshPath",
+      "input_hex": "1504010302",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-four-cores::truncate_half",
+      "message": "MeshPath",
+      "input_hex": "150401",
+      "python_verdict": "wrong_length"
+    },
+    {
+      "id": "mesh-path-four-cores::append_zero",
+      "message": "MeshPath",
+      "input_hex": "15040103021000",
+      "python_verdict": "body_too_large"
+    },
+    {
+      "id": "mesh-path-four-cores::append_ff",
+      "message": "MeshPath",
+      "input_hex": "150401030210ff",
+      "python_verdict": "body_too_large"
+    },
+    {
+      "id": "mesh-path-four-cores::flip_high_bit",
+      "message": "MeshPath",
+      "input_hex": "950401030210",
+      "python_verdict": "unknown_subtype"
+    },
+    {
+      "id": "mesh-path-four-cores::swap_len_bytes",
+      "message": "MeshPath",
+      "input_hex": "150403010210",
+      "python_verdict": "accept"
+    },
+    {
+      "id": "mesh-path-four-cores::empty",
+      "message": "MeshPath",
+      "input_hex": "",
+      "python_verdict": "empty_body"
     }
   ]
 }

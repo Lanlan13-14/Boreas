@@ -57,10 +57,12 @@ SUBTYPE_NAMES = {
     5: "Lease", 6: "Lsa", 7: "Grant", 8: "Revoke", 9: "Probe", 10: "Drain",
     16: "CircuitOpen", 17: "CircuitAccept", 18: "CircuitReset", 19: "CircuitClose",
     20: "IdentityRevocation",
+    21: "MeshPath",
 }
 SUBTYPE_CAPS = {
     1: 4096, 2: 4096, 16: 4096, 17: 4096, 3: 16384, 4: 16384, 5: 16384,
     8: 16384, 6: 8192, 7: 8192, 9: 256, 10: 256, 18: 256, 19: 256, 20: 19767,
+    21: 6,
 }
 OBJECT_TYPE_NAMES = {
     1: "NodeIdentity", 2: "AttachmentLease", 3: "CoreLsa", 4: "RouteGrant",
@@ -539,6 +541,13 @@ def parse_control(data: bytes) -> dict:
         return parse_circuit_close(data, "CircuitReset")
     if subtype == 19:
         return parse_circuit_close(data, "CircuitClose")
+    if subtype == 21:
+        slots = data[2:]
+        if not 2 <= len(slots) <= 4 or data[1] != len(slots):
+            raise Reject("wrong_length")
+        if slots[0] >= slots[-1] or any(slot < 1 or slot > 16 for slot in slots) or len(set(slots)) != len(slots):
+            raise Reject("invalid_field")
+        return {"message": "MeshPath", "slots": list(slots)}
     if subtype == 20:
         if data == b"\x14\x00":
             return {"message": "IdentityRevocation", "evidence_hex": None}

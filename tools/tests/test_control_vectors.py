@@ -287,8 +287,24 @@ class RegistryTests(unittest.TestCase):
         parsed = control.parse_control(b"\x14\x01" + carrier)
         self.assertEqual(parsed["evidence_hex"], carrier.hex())
 
+    def test_mesh_path_registry_and_strict_body(self):
+        self.assertEqual(control.SUBTYPE_CAPS[0x15], 6)
+        self.assertEqual(control.parse_control(bytes.fromhex("150401030210")),
+                         {"message": "MeshPath", "slots": [1, 3, 2, 16]})
+        for raw, category in (
+            ("15", "wrong_length"),
+            ("15030110", "wrong_length"),
+            ("1503010110", "invalid_field"),
+            ("15020010", "invalid_field"),
+            ("15021001", "invalid_field"),
+            ("15050102030410", "body_too_large"),
+        ):
+            with self.subTest(raw=raw), self.assertRaises(control.Reject) as caught:
+                control.parse_control(bytes.fromhex(raw))
+            self.assertEqual(caught.exception.category, category)
+
     def test_unregistered_subtypes_are_rejected(self):
-        for subtype in (0, 0x0B, 0x0F, 0x15, 0x1F, 0xFF):
+        for subtype in (0, 0x0B, 0x0F, 0x16, 0x1F, 0xFF):
             with self.subTest(subtype=subtype):
                 with self.assertRaises(control.Reject) as caught:
                     control.parse_control(bytes([subtype]))
@@ -997,22 +1013,22 @@ class DirectoryPageLayoutTests(unittest.TestCase):
 
 
 class ControlFixtureLayoutTests(unittest.TestCase):
-    """Guard the fixed candidate layout: 48 vectors plus 4 session pairs.
+    """Guard the fixed candidate layout: 54 vectors plus 4 session pairs.
 
     Negative vectors are evidence and must not be deleted or relabelled to make a
     gate pass; this test fails loudly if the fixture shrinks.
     """
 
-    def test_fixture_keeps_all_48_vectors_and_4_pairs(self):
+    def test_fixture_keeps_all_54_vectors_and_4_pairs(self):
         fixture = json.loads(
             (ROOT / "docs/protocol/vectors/control-messages-candidate-v1.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(len(fixture["vectors"]), 48)
+        self.assertEqual(len(fixture["vectors"]), 54)
         self.assertEqual(len(fixture["session_pairs"]), 4)
         ids = [vector["id"] for vector in fixture["vectors"]]
-        self.assertEqual(len(set(ids)), 48)
-        self.assertEqual(sum(1 for vector in fixture["vectors"] if vector["valid"]), 14)
-        self.assertEqual(sum(1 for vector in fixture["vectors"] if not vector["valid"]), 34)
+        self.assertEqual(len(set(ids)), 54)
+        self.assertEqual(sum(1 for vector in fixture["vectors"] if vector["valid"]), 16)
+        self.assertEqual(sum(1 for vector in fixture["vectors"] if not vector["valid"]), 38)
         self.assertEqual(sum(1 for pair in fixture["session_pairs"] if pair["valid"]), 1)
         self.assertEqual(sum(1 for pair in fixture["session_pairs"] if not pair["valid"]), 3)
 

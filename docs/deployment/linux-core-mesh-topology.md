@@ -1,6 +1,6 @@
 # 四 Core 互通：业务路径、目录发现与故障切换
 
-这是一条独立的 Linux 实验路线：`boreas node mesh-run <node.toml> <material-dir> <runtime.toml>`。不使用普通 Core/Edge 的 `daemon`、`boreas-run` 或离线签名 daemon 单元。它只服务**一对 Core 永久 IPv4 VIP**；Source 发起电路，确认后两个端点都可收发。每实例最多三条显式路径，每条经过三或四个不重复的 Core，Source 槽位小于 Destination。它不做任意子网、Edge、默认路由、IPv6 或 DNS 转发。
+这是一条独立的 Linux 实验路线：`boreas node mesh-run <node.toml> <material-dir> <runtime.toml>`。不使用普通 Core/Edge 的 `daemon`、`boreas-run` 或离线签名 daemon 单元。它只服务**一对 Core 永久 IPv4 VIP**；Source 发起电路，确认后两个端点都可收发。下面的 `[[routes]]` 配方每实例最多三条显式路径，每条经过三或四个不重复的 Core。也可以用[签名拓扑 `[routing]` 配方](linux-core-mesh-runtime.md#configure-signed-topology-routing-and-tun)：只配置端点对和相邻传输，不列端到端路径，支持直达或最多两个中继；两种配方均要求 Source 槽位小于 Destination。它不做任意子网、Edge、默认路由、IPv6 或 DNS 转发。
 
 **先选实现版本：** 三种目录方式在[第 4 节](#directory)区分。本页完整示例使用含 `4363e0e` 的 Linux `openssl-inner-tls` 开发构建；不适用于公开 `v0.1.0-pre.3`。如果只有不含发现改动的 `43b744a` 构建，删除协调器配置并选择手工种子或静态控制邻接。下文的持久 CoreLSA 防重放与冲突处置也只适用于包含发现改动的构建。判断制品是否具备这些能力，要看实际构建的源码提交；文档存在或其他提交的 CI 通过都不是证据。
 
@@ -277,7 +277,7 @@ ping -c 4 -I 10.20.4.1 10.20.1.1
 
 1. 在 Source 和 Destination 核对相同的已确认 `circuit` ID 及 `path=[1, 2, 3, 4]`。两端日志应看到 `tx`/`rx`，Relay 报密文计数，不记录业务内容。
 2. **仅在可销毁的环境**，确认主路径在承载流量时，停止 Core 2 进程（不是停协调器 Core 3）。等待双方确认 `path=[1, 3, 4]`，新 ID 应相同且不同于旧 ID；再发新的 `ping`。运行只在有合格的失链证据、另一路径仍获授权时尝试新跳链和新 E2E TLS，不重放旧包或密文。确认前的 EOF/reset、认证/协议错误、过期或撤权不是自动改走备路的依据。没有无损切换承诺，测试 TCP 时由上层自行恢复。
-3. 进一步的撤权测试由[仓库验收](#acceptance)完成。独立身份撤权材料使用 `identity-revocation.signed` 入口；StatusSigner 的日常快照不替代 IdentityAuthority 撤权。已提交撤权不会因删除邮箱文件或重启而消失。
+3. 进一步的撤权测试由[仓库验收](#acceptance)完成。独立身份撤权材料使用 `identity-revocation.signed` 入口；StatusSigner 的日常快照不替代 IdentityAuthority 撤权。已提交撤权不会因删除邮箱文件或重启而消失。业务电路存续时也轮询邮箱；撤权涉及路径成员时，先持久化决定再关闭电路。被撤的是远端时，仍可通过健康的目录邻接传播原始签名证据；若被撤的是本机代次，进程停止。
 
 | 现象 | 检查顺序 |
 | --- | --- |
@@ -311,4 +311,4 @@ sudo --preserve-env=OPENSSL_CONF,BOREAS_OPENSSL_BIN \
   /path/printed/mesh_run_netns-HASH --ignored --nocapture --test-threads=1
 ```
 
-含发现改动的测试启动四个非 root 进程、两个真实持久 TUN；只有协调器预置 Source LSA，通过共享目录收敛，主备路径分别传真实包，核对新 ID 和密文计数，并用独立签名撤权验证 Source 退出码 `2`。活体 TLS 用例还覆盖未预配成员拒绝和跨重启分叉证据。这里描述的是测试断言；是否通过要读目标提交的实际日志。测试不经过真实 CDN，不验证公网长稳、通用路由或生产就绪。
+固定路径用例启动四个非 root 进程、两个真实持久 TUN；只有协调器预置 Source LSA，通过共享目录收敛，主备路径分别传真实包，核对新 ID 和密文计数。撤销活跃远端后应取消电路、报告无可用路径但不退出；撤销本机代次才要求 Source 退出码 `2`。另外两个用例不配置固定路径，分别验证单边通告不能授权直达、失链后复用入口，以及运行中撤权后经双边签名的直达路径重新建环。活体 TLS 用例还覆盖空闲电路撤权、跨跳传播、未预配成员拒绝和跨重启分叉证据。这里描述的是测试断言；是否通过要读目标提交的实际日志。测试不经过真实 CDN，不验证公网长稳、通用路由或生产就绪。

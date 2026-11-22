@@ -59,8 +59,19 @@ fn sign(key: &PKey<Private>, msg: &[u8]) -> Vec<u8> {
         .unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum Topology {
+    Legacy,
+    OneSidedDirect,
+    SignedDirectBackup,
+}
+
 impl Fixture {
     fn new() -> Self {
+        Self::with_topology(Topology::Legacy)
+    }
+
+    fn with_topology(topology: Topology) -> Self {
         let now = utc_now().unwrap();
         use std::{
             os::unix::fs::DirBuilderExt,
@@ -114,9 +125,17 @@ impl Fixture {
             .unwrap();
             roots_path = new_roots;
             let neighbors: Vec<_> = (1..=4)
-                .filter(|other| *other != id)
+                .filter(|other| {
+                    *other != id
+                        && !(matches!(topology, Topology::OneSidedDirect) && id == 4 && *other == 1)
+                })
                 .map(|other| {
                     let rtt = match (id.min(other), id.max(other)) {
+                        (1, 4) => match topology {
+                            Topology::OneSidedDirect => 1,
+                            Topology::SignedDirectBackup => 12,
+                            Topology::Legacy => u16::from(other),
+                        },
                         (1, 3) => 20,
                         (2, 4) => 30,
                         _ => u16::from(other),
@@ -267,7 +286,7 @@ fn private(path: &Path, contents: impl AsRef<[u8]>) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-fn install(f: &Fixture) -> [PathBuf; 4] {
+fn install(f: &Fixture, routed: bool) -> [PathBuf; 4] {
     let base = &f._temp.0;
     // Allow traversal to each node, without exposing the offline signing keys.
     fs::set_permissions(base, fs::Permissions::from_mode(0o711)).unwrap();
@@ -305,7 +324,10 @@ fn install(f: &Fixture) -> [PathBuf; 4] {
             if j != i + 1 {
                 peers.push(j);
                 private(&dir.join(format!("core-{j}.signed")), &f.node(j).identity);
-                // Most remote LSAs must be learned through the directory.
+                if routed {
+                    private(&dir.join(format!("core-{j}-lsa.signed")), &f.node(j).lsa);
+                }
+                // The legacy case instead learns almost all heads through discovery.
             }
         }
         let role = ["source", "relay", "relay", "destination"][i];
@@ -313,26 +335,56 @@ fn install(f: &Fixture) -> [PathBuf; 4] {
         if i == 0 || i == 3 {
             runtime += "tun = \"bmesh0\"\nmtu = 1400\n";
         }
-        const MAIN: &str = "1, 2, 3, 4";
-        const BACKUP: &str = "1, 3, 4";
-        runtime += &match i {
-            0 => route(BACKUP, None, Some((2, 18083))) + &route(MAIN, None, Some((1, 18082))),
-            1 => route(MAIN, Some((1, 18082)), Some((2, 18082))),
-            2 => {
-                route(MAIN, Some((2, 18082)), Some((3, 18082)))
-                    + &route(BACKUP, Some((2, 18083)), Some((3, 18083)))
+        if routed {
+            runtime += "[routing]\nsource = 1\ndestination = 4\n";
+            let incoming: &[usize] = match i {
+                0 => &[],
+                1 => &[1],
+                2 => &[1, 2],
+                3 => &[1, 2, 3],
+                _ => unreachable!(),
+            };
+            let outgoing: &[usize] = match i {
+                0 => &[2, 3, 4],
+                1 => &[3, 4],
+                2 => &[4],
+                3 => &[],
+                _ => unreachable!(),
+            };
+            if !incoming.is_empty() {
+                runtime += &format!(
+                    "incoming = {incoming:?}\nlisten = \"{}:18082\"\n",
+                    SERVICE_IP[i]
+                );
             }
-            3 => route(MAIN, Some((3, 18082)), None) + &route(BACKUP, Some((3, 18083)), None),
-            _ => unreachable!(),
-        };
-        runtime += "[directory_discovery]\ncoordinator = 3\n";
-        if i == 2 {
-            runtime += &format!("listen = \"{}:18183\"\n", SERVICE_IP[2]);
+            for &peer in outgoing {
+                runtime += &format!(
+                    "[[routing.outgoing]]\npeer = {peer}\nnext = \"{}:18082\"\ntls_name = \"{NAME}\"\n",
+                    SERVICE_IP[peer - 1]
+                );
+            }
         } else {
-            runtime += &format!(
-                "next = \"{}:18183\"\ntls_name = \"{NAME}\"\n",
-                SERVICE_IP[2]
-            );
+            const MAIN: &str = "1, 2, 3, 4";
+            const BACKUP: &str = "1, 3, 4";
+            runtime += &match i {
+                0 => route(BACKUP, None, Some((2, 18083))) + &route(MAIN, None, Some((1, 18082))),
+                1 => route(MAIN, Some((1, 18082)), Some((2, 18082))),
+                2 => {
+                    route(MAIN, Some((2, 18082)), Some((3, 18082)))
+                        + &route(BACKUP, Some((2, 18083)), Some((3, 18083)))
+                }
+                3 => route(MAIN, Some((3, 18082)), None) + &route(BACKUP, Some((3, 18083)), None),
+                _ => unreachable!(),
+            };
+            runtime += "[directory_discovery]\ncoordinator = 3\n";
+            if i == 2 {
+                runtime += &format!("listen = \"{}:18183\"\n", SERVICE_IP[2]);
+            } else {
+                runtime += &format!(
+                    "next = \"{}:18183\"\ntls_name = \"{NAME}\"\n",
+                    SERVICE_IP[2]
+                );
+            }
         }
         private(&dir.join("runtime.toml"), runtime);
         let config = format!(
@@ -393,10 +445,21 @@ impl Process {
     }
 
     fn wait_for(&mut self, match_log: &str) -> String {
+        self.wait_for_line(match_log, |_| true)
+    }
+
+    fn wait_for_new_path(&mut self, match_log: &str, previous_circuit: &str) -> String {
+        self.wait_for_line(match_log, |line| circuit(line) != previous_circuit)
+    }
+
+    fn wait_for_line(&mut self, match_log: &str, accept: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
             let text = self.text();
-            if let Some(line) = text.lines().find(|line| line.contains(match_log)) {
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains(match_log) && accept(line))
+            {
                 return line.to_owned();
             }
             assert!(
@@ -427,6 +490,42 @@ fn circuit(line: &str) -> &str {
         .unwrap()
 }
 
+fn publish_denial(f: &Fixture, dir: &Path, subject_node_id: u16) {
+    use boreas_pki::status_store::IDENTITY_REVOCATION_MAGIC;
+    use boreas_proto::authority_revocation::{
+        AuthorityRevocation, RevocationClass, RevocationScope,
+    };
+    let now = utc_now().unwrap();
+    let tbs = AuthorityRevocation {
+        net_id: NET,
+        class: RevocationClass::Identity,
+        subject_node_id,
+        identity_generation: 1,
+        issuer_key_id: b"identity-authority-v1".to_vec(),
+        issuer_generation: 1,
+        scope: RevocationScope::default(),
+        seq: 1,
+        issued_at: now,
+        next_update: now + 15_000_000,
+    }
+    .encode_tbs()
+    .unwrap();
+    let msg = AuthorityRevocation::signature_input(&tbs).unwrap();
+    let ca = f._temp.0.join("ca");
+    let mut raw = IDENTITY_REVOCATION_MAGIC.to_vec();
+    for name in ["ia.ed25519.key", "ia.mldsa65.key"] {
+        raw.extend(sign(
+            &PKey::private_key_from_der(&read(&ca, name)).unwrap(),
+            &msg,
+        ));
+    }
+    raw.extend(tbs);
+    let stage = dir.join("revocation.tmp");
+    fs::write(&stage, raw).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::rename(stage, dir.join("identity-revocation.signed")).unwrap();
+}
+
 fn ping(n: &Network, i: usize, destination: &str) {
     checked(Command::new("ip").args([
         "netns",
@@ -449,7 +548,7 @@ fn ping(n: &Network, i: usize, destination: &str) {
 fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
     let n = Network::setup();
     let f = Fixture::new();
-    let dirs = install(&f);
+    let dirs = install(&f, false);
     // Run discovery on real processes and on one dedicated socket. The hub
     // cannot finish its graph until it sees Core 1, whose business process
     // must start last: EOF before route confirmation is deliberately not
@@ -483,52 +582,95 @@ fn mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss() {
     let relay_epoch = second.wait_for(&format!("role=relay circuit={}", circuit(&backup)));
     assert!(relay_epoch.contains("ciphertext=["), "{relay_epoch}");
 
-    // Publish an independently signed denial for the still-active backup relay.
-    // The next local authority boundary must stop source admission, not select
-    // another path past the revocation or treat it as ordinary socket failure.
-    use boreas_pki::status_store::IDENTITY_REVOCATION_MAGIC;
-    use boreas_proto::authority_revocation::{
-        AuthorityRevocation, RevocationClass, RevocationScope,
-    };
-    let now = utc_now().unwrap();
-    let tbs = AuthorityRevocation {
-        net_id: NET,
-        class: RevocationClass::Identity,
-        subject_node_id: 513,
-        identity_generation: 1,
-        issuer_key_id: b"identity-authority-v1".to_vec(),
-        issuer_generation: 1,
-        scope: RevocationScope::default(),
-        seq: 1,
-        issued_at: now,
-        next_update: now + 15_000_000,
-    }
-    .encode_tbs()
-    .unwrap();
-    let msg = AuthorityRevocation::signature_input(&tbs).unwrap();
-    let ca = f._temp.0.join("ca");
-    let mut raw = IDENTITY_REVOCATION_MAGIC.to_vec();
-    for name in ["ia.ed25519.key", "ia.mldsa65.key"] {
-        raw.extend(sign(
-            &PKey::private_key_from_der(&read(&ca, name)).unwrap(),
-            &msg,
-        ));
-    }
-    raw.extend(tbs);
-    let stage = dirs[0].join("revocation.tmp");
-    fs::write(&stage, raw).unwrap();
-    fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::rename(stage, dirs[0].join("identity-revocation.signed")).unwrap();
-    source.wait_for("mesh signed graph: IdentityRevoked");
+    // Wait for a new, idle backup circuit before publishing. A remote denial
+    // closes that circuit, not the node or its dedicated directory service.
+    let next = source.wait_for_new_path("role=source path=[1, 3, 4]", circuit(&backup));
+    assert_ne!(circuit(&backup), circuit(&next));
+    publish_denial(&f, &dirs[0], 513);
+    source.wait_for("mesh source route closed: IdentityRevoked");
+    source.wait_for("mesh routes temporarily unavailable: NoRoute");
+    assert!(source.child.try_wait().unwrap().is_none());
+
+    // In contrast, the source's own denied generation cannot serve business
+    // or directory traffic. Require the process to fail closed.
+    publish_denial(&f, &dirs[0], 1);
+    source.wait_for("mesh runtime authority: IdentityRevoked");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Some(status) = source.child.try_wait().unwrap() {
             assert_eq!(status.code(), Some(2));
             break;
         }
-        assert!(Instant::now() < deadline);
+        assert!(Instant::now() < deadline, "{}", source.text());
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+#[ignore = "requires root, CAP_NET_ADMIN/CAP_SYS_ADMIN, real TUN, and iproute2/ping/setpriv"]
+fn mesh_routed_tun_derives_paths_and_reuses_ingress_after_relay_loss() {
+    let n = Network::setup();
+    let f = Fixture::with_topology(Topology::OneSidedDirect);
+    let dirs = install(&f, true);
+    let mut destination = Process::spawn(&f, &n, 3, &dirs[3]);
+    let mut shared_relay = Process::spawn(&f, &n, 2, &dirs[2]);
+    let mut first_relay = Process::spawn(&f, &n, 1, &dirs[1]);
+    for process in [&mut destination, &mut shared_relay, &mut first_relay] {
+        process.wait_for("mesh ready");
+    }
+    // A cheap one-sided direct advertisement is not an edge. Also verify
+    // complete rank selection (1-2-3-4 is cheaper than 1-2-4).
+    let mut source = Process::spawn(&f, &n, 0, &dirs[0]);
+    let primary = source.wait_for("role=source path=[1, 2, 3, 4]");
+    assert_eq!(
+        circuit(&primary),
+        circuit(&destination.wait_for("role=destination path=[1, 2, 3, 4]"))
+    );
+    ping(&n, 0, "10.20.4.1");
+    first_relay.stop();
+    // Core 3 uses the *same port* here, but the authenticated predecessor
+    // changes from 2 to 1. Core 4 reuses its listener on both paths as well.
+    let backup = source.wait_for("role=source path=[1, 3, 4]");
+    assert_ne!(circuit(&primary), circuit(&backup));
+    assert_eq!(
+        circuit(&backup),
+        circuit(&destination.wait_for("role=destination path=[1, 3, 4]"))
+    );
+    ping(&n, 3, "10.20.1.1");
+    let observed = shared_relay.wait_for(&format!("role=relay circuit={}", circuit(&backup)));
+    assert!(observed.contains("ciphertext=["), "{observed}");
+}
+
+#[test]
+#[ignore = "requires root, CAP_NET_ADMIN/CAP_SYS_ADMIN, real TUN, and iproute2/ping/setpriv"]
+fn mesh_routed_tun_live_revocation_excludes_relay_and_preserves_healthy_path() {
+    let n = Network::setup();
+    let f = Fixture::with_topology(Topology::SignedDirectBackup);
+    let dirs = install(&f, true);
+    let mut destination = Process::spawn(&f, &n, 3, &dirs[3]);
+    let mut shared_relay = Process::spawn(&f, &n, 2, &dirs[2]);
+    let mut first_relay = Process::spawn(&f, &n, 1, &dirs[1]);
+    for process in [&mut destination, &mut shared_relay, &mut first_relay] {
+        process.wait_for("mesh ready");
+    }
+    let mut source = Process::spawn(&f, &n, 0, &dirs[0]);
+    let primary = source.wait_for("role=source path=[1, 2, 3, 4]");
+    assert_eq!(
+        circuit(&primary),
+        circuit(&destination.wait_for("role=destination path=[1, 2, 3, 4]"))
+    );
+    publish_denial(&f, &dirs[0], 257);
+    source.wait_for("mesh source route closed: IdentityRevoked");
+    assert!(first_relay.child.try_wait().unwrap().is_none());
+    // Unlike the one-sided direct fixture, this reciprocal edge is usable;
+    // it outranks the surviving transit alternative after Core 2 is denied.
+    let backup = source.wait_for("role=source path=[1, 4]");
+    assert_ne!(circuit(&primary), circuit(&backup));
+    assert_eq!(
+        circuit(&backup),
+        circuit(&destination.wait_for("role=destination path=[1, 4]"))
+    );
+    ping(&n, 0, "10.20.4.1");
 }
 
 #[test]

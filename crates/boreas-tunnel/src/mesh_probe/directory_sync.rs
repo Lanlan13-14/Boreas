@@ -59,6 +59,7 @@ impl MeshProbe<'_> {
         outer: &OpenSslOuterTlsAcceptor,
         admission: &Admission,
     ) -> Result<u8, Error> {
+        self.poll_identity_mailbox()?;
         let deadline = self.deadline(&self.local.clone())?;
         let members = self.directory_members(members)?;
         let extractor = Arc::new(PkiIdentityExtractor::new(
@@ -216,7 +217,19 @@ impl MeshProbe<'_> {
                 return Err(Error::Lsa);
             }
             seen |= bit;
-            let now = self.check(origin)?;
+            let now = match self.check(origin) {
+                Ok(now) => now,
+                Err(Error::IdentityRevoked) => {
+                    self.check_local_identity_denial()?;
+                    self.check_directory_link(link)?;
+                    // A healthy peer may not yet know a committed denial
+                    // (for example, its signed carrier is no longer fresh).
+                    // Never install a denied origin's LSA, but keep exchanging
+                    // other heads over this still-authorized adjacency.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match self.trust.verify_core_lsa(raw, id, now) {
                 Ok(object) if !object.is_duplicate() => {
                     self.remote_lsas.insert(id, object);

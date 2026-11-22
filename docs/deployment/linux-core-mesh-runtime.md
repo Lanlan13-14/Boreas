@@ -1,6 +1,6 @@
 # Dedicated Linux Core mesh runtime
 
-`boreas node mesh-run /absolute/node.toml /absolute/material /absolute/runtime.toml` (Linux binary with `openssl-inner-tls`). This is separate from `daemon` and `mesh-probe`. A source opens the circuit; either endpoint can send IPv4 traffic once it is up. One instance serves a single permanent Core VIP pair over up to three preprovisioned paths (three or four distinct Cores per path). Source must be the lower Core slot. This does not enable general/Edge subnet routing, discovery of unprovisioned identities, unrestricted LSA flooding, generic listener multiplexing, IPv6, DNS, DIR, or hitless migration.
+`boreas node mesh-run /absolute/node.toml /absolute/material /absolute/runtime.toml` (Linux binary with `openssl-inner-tls`). This is separate from `daemon` and `mesh-probe`. A source opens the circuit; either endpoint can send IPv4 traffic once it is up. One instance serves a single permanent Core VIP pair. The opt-in `[routing]` profile derives paths of two to four distinct Cores from signed topology and local adjacent transports; the original `[[routes]]` profile still uses up to three preprovisioned paths of three or four Cores. Source must be the lower Core slot. This does not enable general/Edge subnet routing, discovery of unprovisioned identities, unrestricted LSA flooding, generic listener multiplexing, IPv6, DNS, DIR, or hitless migration.
 
 ## Supply trust and topology
 
@@ -23,7 +23,7 @@ The final command takes Core generation, sequence, TTL in seconds, then zero to 
 
 Material filenames: `identity.pem`, `identity-ca.pem`, `local.signed`, `local-lsa.signed`, `status.signed`, plus `core-N.signed` for every `peers` slot and `core-N-lsa.signed` for each peer seeded locally. Relay/destination need `outer.pem` (leaf first then intermediates) and `outer.key`. Source/relay use platform Web PKI, or an explicit `outer-ca.pem` whose roots replace platform roots; TLS 1.3 and hostname verification stay enabled in either case. A name/IP locator never confers identity. Hop and E2E pq768 mTLS remain bound to the signed node SPKIs. A status snapshot cannot carry independent identity denials. Publish such a decision as `identity-revocation.signed` (existing IdentityAuthority mailbox format), not through StatusSigner; committed denials survive mailbox deletion and process restart.
 
-Publish updates via atomic rename. Active attempts are capped at five seconds and are further constrained by policy/identity/LSA/status cutoffs. Status, identity revocation mailbox, and signed topology are reloaded before each admission/epoch and polled when idle; a mailbox arriving mid-attempt applies locally at the next authority boundary (at most three five-second attempts in one source selection). Without directory sync, `core-N-lsa.signed` files seed the LSA directory and are required for a fresh deployment with no durable heads. When an authenticated direct hop advertises a newer valid LSA for its own Core, the runtime retains the exact signed bytes, aborts the old route before business bytes, and rebuilds the graph at the next admission. A missing file or a still-valid, authenticated older seed may use the newer durable head; an invalid, expired or equivocating file is not silently ignored. An expired or poisoned head is never replaced by an older version. Use `(core_generation, seq)` for LSA versions, with nonregressing issuance times and operator-controlled generation changes.
+Publish updates via atomic rename. Active attempts are capped at five seconds and are further constrained by policy/identity/LSA/status cutoffs. Status and topology are refreshed at authority boundaries, not installed into an active circuit. During dedicated business I/O a scoped watcher polls the optional identity-revocation mailbox about every 100 ms, independent of traffic. It verifies and durably commits the signed decision before shutting down that circuit’s local sockets when any route member is denied; the interval is not a delivery SLA. Mailbox or ledger failures fail closed. A denied remote generation remains in provisioned membership but is excluded from business routing; healthy directory adjacencies can forward the original signed evidence. A denied local generation stops the process. Revocation is not a transport retry: the source may build a fresh graph and open a new circuit only across still-authorized Cores, without replaying data. Without directory sync, `core-N-lsa.signed` files seed the LSA directory and are required for a fresh deployment with no durable heads. When an authenticated direct hop advertises a newer valid LSA for its own Core, the runtime retains the exact signed bytes, aborts the old route before business bytes, and rebuilds the graph at the next admission. A missing file or a still-valid, authenticated older seed may use the newer durable head; an invalid, expired or equivocating file is not silently ignored. An expired or poisoned head is never replaced by an older version. Use `(core_generation, seq)` for LSA versions, with nonregressing issuance times and operator-controlled generation changes.
 
 ### Optional cross-hop CoreLSA directory
 
@@ -56,7 +56,42 @@ Both profiles use the same strict pq768 mutual authentication, probe, direct sig
 
 Do not remove the state, lock or staging files to clear an error. Preserve protected copies for incident response; recover the underlying filesystem or provision a new reviewed trust deployment after investigating key compromise. Rotation must retain the authorizations needed to reverify the ledger; replacing them without a supported migration fails closed. This is not protection against a trusted UID/root rolling back or removing the entire state directory, nor is there automatic quarantine reset. The on-disk layout is a versioned local diagnostic format: `BRLS\0\0\0\x01`, 16-byte network ID, 32-byte root fingerprint, one local slot byte, ascending slot records (one slot byte, two consecutive `u16` big-endian length + original-envelope fields; a zero second length means no fork), and a trailing SHA-256 checksum over all preceding bytes. The checksum detects damage, not malicious substitution; signatures are verified independently.
 
-## Configure dedicated listeners and TUN
+## Configure signed-topology routing and TUN
+
+Choose exactly one profile: `[routing]` for local neighbor configuration, or `[[routes]]` for the original route-specific listeners. All participants for one pair must use the same profile. `[routing]` does not discover underlay locators and is not a generic daemon switch.
+
+Example Core 1 (`mode = "source"`, `peers = [2, 3, 4]`, `tun = "btun0"`, `mtu = 1400`):
+
+```toml
+[routing]
+source = 1
+destination = 4
+
+[[routing.outgoing]]
+peer = 2
+next = "192.0.2.2:18082"
+tls_name = "core2.example.com"
+
+[[routing.outgoing]]
+peer = 3
+next = "192.0.2.3:18082"
+tls_name = "core3.example.com"
+```
+
+The example permits `1 → 2 → 3 → 4` and `1 → 3 → 4` when their edges are signed from both sides. Use the same pair fields on every node, with its own `mode` and other peer slots:
+
+| Core | Role | `[routing].listen` | `[routing].incoming` | `[[routing.outgoing]]` peers and locators |
+|---|---|---|---|---|
+| 1 | `source` | omit | omit | 2 and 3 as above |
+| 2 | `relay` | `192.0.2.2:18082` | `[1]` | 3 at `192.0.2.3:18082`, `core3.example.com` |
+| 3 | `relay` | `192.0.2.3:18082` | `[1, 2]` | 4 at `192.0.2.4:18082`, `core4.example.com` |
+| 4 | `destination` | `192.0.2.4:18082` | `[3]` | omit |
+
+`listen` is one dedicated business socket per relay/destination. Different paths and authenticated predecessors can share it, but it is still single-owner/serial and cannot share a socket with directory, fixed routes, or ordinary daemon traffic. A relay has no TUN. To permit a direct path add Core 4 as an outbound neighbor at Core 1, Core 1 as an incoming peer at Core 4, and the reciprocal signed CDN edge. Any proposal with the wrong endpoint pair, a repeated slot, a mismatched authenticated predecessor, a missing reciprocal edge, or an unconfigured next hop is refused. Names and addresses only locate transports; hop and end-to-end identities still come from independently verified signed material. `MeshPath` follows hop authentication, LSA and revocation exchange and precedes `CircuitOpen`; it does not replace existing endpoint E2E confirmation of the exact signed graph path.
+
+The opener enumerates simple paths, compares the sum of per-edge worst-direction loss, then RTT, path length and ordered slot numbers. An edge advertised by only one side or reporting 100% loss on either side is excluded. Selection uses at most the best route per locally configured first hop, at most three attempts, and prefers the last confirmed first hop after initial selection. Signed neighbor metrics express topology, not readiness or remote transport configuration. Provision incoming and outgoing locators consistently along every signed path that may win; a downstream missing locator or preconfirmation EOF does not authorize fallback. Use signed LSA updates to change topology at the normal authority boundary, not to bypass transport configuration. Start downstream relays and destination first.
+
+### Original `[[routes]]` profile
 
 Example source (`peers = [2, 3, 4]`):
 
@@ -79,6 +114,8 @@ tls_name = "core3.example.com"
 
 At Core 2 use `mode = "relay"`, `peers = [1, 3, 4]`, no `tun` or `mtu`, and only the primary path with `listen = "192.0.2.2:18082"`, `next = "192.0.2.3:18082"`, `tls_name = "core3.example.com"`. At Core 3 use `mode = "relay"`, `peers = [1, 2, 4]`, a listener for each path (`192.0.2.3:18082` and `:18083`) and corresponding distinct destinations (`192.0.2.4:18082` and `:18083`) under `core4.example.com`. At Core 4 use `mode = "destination"`, `peers = [1, 2, 3]`, the same TUN settings as the source, and both paths with `listen` only. Start destination and downstream relays before source. Every path is explicitly authorized at every participant.
 
+### TUN setup for either profile
+
 An administrator must provision one persistent `IFF_TUN|IFF_NO_PI` queue belonging to the unprivileged service UID at each endpoint, bring it up, match the MTU and configure the two /32 routes. For example, at Core 1:
 
 ```sh
@@ -96,7 +133,7 @@ First selection ranks eligible signed paths. After a confirmed transport loss it
 
 Existing signed graph + genuine TLS coverage: `cargo test --locked -p boreas-tunnel --features openssl-inner-tls --test mesh_probe_live`.
 
-In a controlled Linux runner with reviewed OpenSSL (the same backend as `rust-tls.yml`), build the acceptance target as a regular test invocation, then run its binary as root in the disposable runner. The test requires CAP_NET_ADMIN/CAP_SYS_ADMIN, `/dev/net/tun`, `ip`, `ping`, `unshare`, `mount`, and `setpriv`. It creates four network namespaces, starts four actual unprivileged Boreas subprocesses, discovers remote LSAs via one shared coordinator listener with just the source LSA seeded at the coordinator, attaches two real persistent TUNs, pings in both directions across distinct confirmed circuits, kills the active first relay, confirms the backup circuit has a fresh ID at both endpoints, inspects packet/ciphertext counters, then publishes an independently signed Core revocation and requires source to exit with status 2. No real CDN or external address is used.
+In a controlled Linux runner with reviewed OpenSSL (the same backend as `rust-tls.yml`), build the acceptance target as a regular test invocation, then run its binary as root in the disposable runner. The test requires CAP_NET_ADMIN/CAP_SYS_ADMIN, `/dev/net/tun`, `ip`, `ping`, `unshare`, `mount`, and `setpriv`. It creates four network namespaces, starts four actual unprivileged Boreas subprocesses, discovers remote LSAs via one shared coordinator listener with just the source LSA seeded at the coordinator, attaches two real persistent TUNs, pings in both directions across distinct confirmed circuits, kills the active first relay, confirms the backup circuit has a fresh ID at both endpoints, inspects packet/ciphertext counters, then publishes an independently signed Core revocation during a new idle backup circuit and requires typed cancellation and no authorized route without terminating the healthy source process. A second decision, denying the source’s own generation, must stop it. No real CDN or external address is used.
 
 ```sh
 cargo test --locked -p boreas-cli --features openssl-inner-tls --test mesh_run_netns --no-run
@@ -104,4 +141,4 @@ cargo test --locked -p boreas-cli --features openssl-inner-tls --test mesh_run_n
 sudo --preserve-env=OPENSSL_CONF /path/printed/mesh_run_netns-HASH --ignored --nocapture --test-threads=1
 ```
 
-A normal unprivileged test run leaves this integration test ignored. Only output from the explicit privileged invocation is real TUN/process acceptance evidence.
+The second privileged case exercises `[routing]` with no static route rows: it gives a cheaper one-sided direct advertisement, requires the signed four-Core path, kills its first relay, and verifies a new circuit and bidirectional TUN traffic using the same ingress socket on Core 3 with a different authenticated predecessor. The third publishes a signed denial during a routed circuit, leaves the first relay process running, and requires typed cancellation followed by bidirectional TUN traffic over a fresh, reciprocally signed direct route. All three privileged tests are ignored on normal unprivileged runs; only the explicit invocation is real TUN/process acceptance evidence.

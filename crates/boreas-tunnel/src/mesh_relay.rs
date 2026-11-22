@@ -56,7 +56,7 @@ impl FixedRoute {
         Ok(deadline)
     }
 
-    fn expiry(&self, adjacent_expiry: u64) -> u64 {
+    pub(crate) fn expiry(&self, adjacent_expiry: u64) -> u64 {
         self.advertisements
             .iter()
             .fold(adjacent_expiry, |expiry, ad| expiry.min(ad.1))
@@ -152,42 +152,49 @@ pub fn forward_fixed(
             .check_route_utc(&route.members, remote_expiry)
             .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
     };
-    bounded_link_operation(left_socket, deadline, || {
-        bounded_link_operation(right_socket, deadline, || {
-            let frame = control(&mut left.session, ControlType::CircuitOpen)?;
-            let open = CircuitOpen::decode(&frame.body)?;
-            let dst = destination(&route.members);
-            if open.destination_node_id != dst.node_id
-                || open.destination_identity_generation != dst.identity_generation
-            {
-                return Err(CircuitReject::WrongDestination.into());
-            }
-            if open.path_hops != route.hops() {
-                return Err(CircuitReject::HopsMismatch.into());
-            }
-            check()?;
-            right
-                .session
-                .send_control(ControlType::CircuitOpen, &frame.body)?;
-            let frame = control(&mut right.session, ControlType::CircuitAccept)?;
-            let accept = CircuitAccept::decode(&frame.body)?;
-            if accept.circuit_id != open.circuit_id || accept.path_hops != open.path_hops {
-                return Err(CircuitReject::BadBody.into());
-            }
-            check()?;
-            left.session
-                .send_control(ControlType::CircuitAccept, &frame.body)?;
-            pump(
-                [left_socket, right_socket],
-                [&mut left.session, &mut right.session],
-                open,
-                pos,
-                deadline,
-                check,
-            )
-        })
-    })
-    .map_err(Error::from)
+    probe.with_live_identity(
+        &route.members,
+        remote_expiry,
+        &[left_socket, right_socket],
+        || {
+            bounded_link_operation(left_socket, deadline, || {
+                bounded_link_operation(right_socket, deadline, || {
+                    let frame = control(&mut left.session, ControlType::CircuitOpen)?;
+                    let open = CircuitOpen::decode(&frame.body)?;
+                    let dst = destination(&route.members);
+                    if open.destination_node_id != dst.node_id
+                        || open.destination_identity_generation != dst.identity_generation
+                    {
+                        return Err(CircuitReject::WrongDestination.into());
+                    }
+                    if open.path_hops != route.hops() {
+                        return Err(CircuitReject::HopsMismatch.into());
+                    }
+                    check()?;
+                    right
+                        .session
+                        .send_control(ControlType::CircuitOpen, &frame.body)?;
+                    let frame = control(&mut right.session, ControlType::CircuitAccept)?;
+                    let accept = CircuitAccept::decode(&frame.body)?;
+                    if accept.circuit_id != open.circuit_id || accept.path_hops != open.path_hops {
+                        return Err(CircuitReject::BadBody.into());
+                    }
+                    check()?;
+                    left.session
+                        .send_control(ControlType::CircuitAccept, &frame.body)?;
+                    pump(
+                        [left_socket, right_socket],
+                        [&mut left.session, &mut right.session],
+                        open,
+                        pos,
+                        deadline,
+                        check,
+                    )
+                })
+            })
+            .map_err(Error::from)
+        },
+    )
 }
 
 /// Nonsecret observation of a completed relay lifetime, not an E2E proof.
@@ -403,53 +410,55 @@ pub(crate) fn with_fixed_endpoint_io<T>(
         Arc::new(acceptor),
         Arc::new(PkiIdentityExtractor::new(vec![peer.identity.clone()])?),
     );
-    bounded_link_operation(&hop.socket, deadline, || {
-        let mut circuit = if initiator {
-            open_e2e(&mut hop.session, &backend, identity(peer), route.hops())?
-        } else {
-            accept_e2e(&mut hop.session, &backend, identity(peer))?
-        };
-        if circuit.info().path_hops != route.hops() {
-            return Err(CircuitReject::HopsMismatch.into());
-        }
-        // Private to this fixed-path profile; does not change the ordinary
-        // circuit wire layouts/version. Not an attestation of physical route.
-        use std::io::{Read, Write};
-        let mut remote = [0u8; 32];
-        if initiator {
-            circuit.write_all(&binding)?;
-        }
-        circuit.read_exact(&mut remote)?;
-        if remote != binding {
-            return Err(crate::SessionReject::PeerIdentityMismatch.into());
-        }
-        if !initiator {
-            circuit.write_all(&binding)?;
-        }
-        let mut check = || {
-            if Instant::now() >= deadline {
-                return Err(TunnelError::Timeout);
+    probe.with_live_identity(&route.members, remote_expiry, &[&hop.socket], || {
+        bounded_link_operation(&hop.socket, deadline, || {
+            let mut circuit = if initiator {
+                open_e2e(&mut hop.session, &backend, identity(peer), route.hops())?
+            } else {
+                accept_e2e(&mut hop.session, &backend, identity(peer))?
+            };
+            if circuit.info().path_hops != route.hops() {
+                return Err(CircuitReject::HopsMismatch.into());
+            }
+            // Private to this fixed-path profile; does not change the ordinary
+            // circuit wire layouts/version. Not an attestation of physical route.
+            use std::io::{Read, Write};
+            let mut remote = [0u8; 32];
+            if initiator {
+                circuit.write_all(&binding)?;
+            }
+            circuit.read_exact(&mut remote)?;
+            if remote != binding {
+                return Err(crate::SessionReject::PeerIdentityMismatch.into());
+            }
+            if !initiator {
+                circuit.write_all(&binding)?;
+            }
+            let mut check = || {
+                if Instant::now() >= deadline {
+                    return Err(TunnelError::Timeout);
+                }
+                probe
+                    .check_route_utc(&route.members, remote_expiry)
+                    .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
+            };
+            check()?;
+            let result = exchange(&mut circuit, EndpointIo {
+                socket: &hop.socket,
+                deadline,
+                check: &mut check,
+            })?;
+            check()?;
+            if initiator {
+                circuit.finish_dedicated()?;
+            } else {
+                circuit.wait_dedicated_close()?;
             }
             probe
                 .check_route_utc(&route.members, remote_expiry)
-                .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
-        };
-        check()?;
-        let result = exchange(&mut circuit, EndpointIo {
-            socket: &hop.socket,
-            deadline,
-            check: &mut check,
-        })?;
-        check()?;
-        if initiator {
-            circuit.finish_dedicated()?;
-        } else {
-            circuit.wait_dedicated_close()?;
-        }
-        probe
-            .check_route_utc(&route.members, remote_expiry)
-            .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))?;
-        Ok(result)
+                .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))?;
+            Ok(result)
+        })
+        .map_err(Error::from)
     })
-    .map_err(Error::from)
 }

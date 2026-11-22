@@ -277,6 +277,7 @@ pub enum ControlType {
     CircuitReset = 18,
     CircuitClose = 19,
     IdentityRevocation = 20,
+    MeshPath = 21,
 }
 impl TryFrom<u8> for ControlType {
     type Error = Error;
@@ -297,6 +298,7 @@ impl TryFrom<u8> for ControlType {
             18 => Ok(Self::CircuitReset),
             19 => Ok(Self::CircuitClose),
             20 => Ok(Self::IdentityRevocation),
+            21 => Ok(Self::MeshPath),
             _ => Err(Error::UnknownControl(v)),
         }
     }
@@ -316,6 +318,7 @@ impl ControlType {
             Self::Enrollment | Self::DirectoryPage | Self::Lease | Self::Revoke => 16384,
             Self::Lsa | Self::Grant => 8192,
             Self::IdentityRevocation => 2 + authority_revocation::MAX_IDENTITY_REVOCATION_BYTES,
+            Self::MeshPath => 2 + messages::MAX_MESH_PATH_CORES,
             Self::Probe | Self::Drain | Self::CircuitReset | Self::CircuitClose => 256,
         }
     }
@@ -370,7 +373,7 @@ pub fn validate_frame_policy_parts(
                     if ctx.accepted => {}
                 ControlType::Lease if ctx.accepted && ctx.identity_registered => (),
                 ControlType::Lsa if ctx.accepted && ctx.peer_role == PeerRole::Core => (),
-                ControlType::IdentityRevocation
+                ControlType::IdentityRevocation | ControlType::MeshPath
                     if ctx.accepted
                         && ctx.peer_role == PeerRole::Core
                         && ctx.mode == SecurityMode::E2eRequired
@@ -865,8 +868,8 @@ mod tests {
 
     #[test]
     fn control_subtype_classifies_all_256() {
-        // Candidate registry including the mesh extension: 15 subtypes. Reserved
-        // ranges 0x00, 0x0B..=0x0F and 0x15..=0xFF -> UnknownControl(v).
+        // Candidate registry including the mesh extensions: 16 subtypes. Reserved
+        // ranges 0x00, 0x0B..=0x0F and 0x16..=0xFF -> UnknownControl(v).
         for (v, expected) in [
             (1u8, Ok(ControlType::SessionHello)),
             (2, Ok(ControlType::SessionAccept)),
@@ -883,12 +886,13 @@ mod tests {
             (18, Ok(ControlType::CircuitReset)),
             (19, Ok(ControlType::CircuitClose)),
             (20, Ok(ControlType::IdentityRevocation)),
+            (21, Ok(ControlType::MeshPath)),
         ] {
             assert_eq!(ControlType::try_from(v), expected);
         }
         for v in 0u16..=255 {
             let v = v as u8;
-            if matches!(v, 1..=10 | 16..=20) {
+            if matches!(v, 1..=10 | 16..=21) {
                 continue;
             }
             assert_eq!(
@@ -897,15 +901,15 @@ mod tests {
                 "control byte {v:#04x} must reject deterministically"
             );
         }
-        // Discrimination: 0x0B and 0x15 are the first reserved bytes after
+        // Discrimination: 0x0B and 0x16 are the first reserved bytes after
         // the two allocated runs; 0x00 is never allocated.
         assert_eq!(
             ControlType::try_from(0x0B),
             Err(Error::UnknownControl(0x0B))
         );
         assert_eq!(
-            ControlType::try_from(0x15),
-            Err(Error::UnknownControl(0x15))
+            ControlType::try_from(0x16),
+            Err(Error::UnknownControl(0x16))
         );
         assert_eq!(
             ControlType::try_from(0x00),
@@ -2032,9 +2036,7 @@ mod tests {
         ctx.peer_role = PeerRole::Core;
         // Reserved bytes must reject with UnknownControl, not IllegalState:
         // they are not "a known message at the wrong time".
-        for subtype in [
-            0x00u8, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x15, 0x7F, 0x80, 0xFF,
-        ] {
+        for subtype in [0x00u8, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x16, 0x7F, 0x80, 0xFF] {
             assert_eq!(
                 validate_frame_policy(&frame(Kind::Control, control_body(subtype, 1)), &mut ctx),
                 Err(Error::UnknownControl(subtype)),
@@ -2068,12 +2070,13 @@ mod tests {
             (ControlType::Probe, 256),
             (ControlType::Drain, 256),
             (ControlType::IdentityRevocation, 19767),
+            (ControlType::MeshPath, 6),
             (ControlType::CircuitOpen, 4096),
             (ControlType::CircuitAccept, 4096),
             (ControlType::CircuitReset, 256),
             (ControlType::CircuitClose, 256),
         ];
-        assert_eq!(table.len(), 15);
+        assert_eq!(table.len(), 16);
         for (t, cap) in table {
             assert_eq!(t.body_cap(), cap, "{t:?}");
         }
@@ -2095,7 +2098,7 @@ mod tests {
                 ctx.accepted = true;
                 ctx.identity_registered = true;
             }
-            6 | 20 => {
+            6 | 20 | 21 => {
                 ctx.accepted = true;
                 ctx.peer_role = PeerRole::Core;
             }
@@ -2115,23 +2118,74 @@ mod tests {
 
     #[test]
     fn identity_revocation_requires_accepted_core_control_phase() {
-        let frame = frame(Kind::Control, vec![ControlType::IdentityRevocation as u8, 0]);
+        let frame = frame(Kind::Control, vec![
+            ControlType::IdentityRevocation as u8,
+            0,
+        ]);
         let mut ctx = test_ctx();
-        assert_eq!(validate_frame_policy(&frame, &mut ctx), Err(Error::IllegalState));
+        assert_eq!(
+            validate_frame_policy(&frame, &mut ctx),
+            Err(Error::IllegalState)
+        );
         ctx.accepted = true;
-        assert_eq!(validate_frame_policy(&frame, &mut ctx), Err(Error::IllegalState));
+        assert_eq!(
+            validate_frame_policy(&frame, &mut ctx),
+            Err(Error::IllegalState)
+        );
         ctx.peer_role = PeerRole::Core;
         assert_eq!(validate_frame_policy(&frame, &mut ctx), Ok(()));
         ctx.circuit_opening = true;
-        assert_eq!(validate_frame_policy(&frame, &mut ctx), Err(Error::IllegalState));
+        assert_eq!(
+            validate_frame_policy(&frame, &mut ctx),
+            Err(Error::IllegalState)
+        );
         ctx.circuit_opening = false;
         ctx.circuit_established = true;
-        assert_eq!(validate_frame_policy(&frame, &mut ctx), Err(Error::IllegalState));
+        assert_eq!(
+            validate_frame_policy(&frame, &mut ctx),
+            Err(Error::IllegalState)
+        );
+    }
+
+    #[test]
+    fn mesh_path_requires_accepted_core_e2e_before_circuit() {
+        let proposal = frame(Kind::Control, vec![ControlType::MeshPath as u8, 2, 1, 4]);
+        let mut ctx = test_ctx();
+        assert_eq!(
+            validate_frame_policy(&proposal, &mut ctx),
+            Err(Error::IllegalState)
+        );
+        ctx.accepted = true;
+        assert_eq!(
+            validate_frame_policy(&proposal, &mut ctx),
+            Err(Error::IllegalState)
+        );
+        ctx.peer_role = PeerRole::Core;
+        ctx.mode = SecurityMode::HopOnly;
+        assert_eq!(
+            validate_frame_policy(&proposal, &mut ctx),
+            Err(Error::IllegalState)
+        );
+        ctx.mode = SecurityMode::E2eRequired;
+        let before = ctx;
+        assert_eq!(validate_frame_policy(&proposal, &mut ctx), Ok(()));
+        assert_eq!(ctx, before); // Proposal never opens a circuit.
+        ctx.circuit_opening = true;
+        assert_eq!(
+            validate_frame_policy(&proposal, &mut ctx),
+            Err(Error::IllegalState)
+        );
+        ctx.circuit_opening = false;
+        ctx.circuit_established = true;
+        assert_eq!(
+            validate_frame_policy(&proposal, &mut ctx),
+            Err(Error::IllegalState)
+        );
     }
 
     #[test]
     fn policy_control_cap_boundary_exact_and_one_over() {
-        let caps: [(u8, usize); 15] = [
+        let caps: [(u8, usize); 16] = [
             (1, 4096),
             (2, 4096),
             (3, 16384),
@@ -2147,6 +2201,7 @@ mod tests {
             (18, 256),
             (19, 256),
             (20, 19767),
+            (21, 6),
         ];
         for (subtype, cap) in caps {
             // Minimal legal body (subtype byte only).

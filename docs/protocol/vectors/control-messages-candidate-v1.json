@@ -1,7 +1,7 @@
 {
     "status":  "candidate-not-frozen",
     "format":  "boreas-control-messages-v1",
-    "revision":  3,
+    "revision":  4,
     "warning":  "candidate wire only; session auth comes from TLS/policy; signed-object verification belongs to pki; no crypto implied",
     "vectors":  [
                     {
@@ -424,6 +424,68 @@
                         "valid":  false,
                         "input_hex":  "100505050505050505050505050505050501020000000000000004",
                         "expected_error":  "wrong_length"
+                    },
+                    {
+                        "id":  "mesh-path-direct",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  true,
+                        "expected_hex":  "15020110",
+                        "expected":  {
+                            "message":  "MeshPath",
+                            "slots":  [
+                                1,
+                                16
+                            ]
+                        }
+                    },
+                    {
+                        "id":  "mesh-path-four-cores",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  true,
+                        "expected_hex":  "150401030210",
+                        "expected":  {
+                            "message":  "MeshPath",
+                            "slots":  [
+                                1,
+                                3,
+                                2,
+                                16
+                            ]
+                        }
+                    },
+                    {
+                        "id":  "mesh-path-count-mismatch",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  false,
+                        "input_hex":  "15030110",
+                        "expected_error":  "wrong_length"
+                    },
+                    {
+                        "id":  "mesh-path-duplicate-slot",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  false,
+                        "input_hex":  "1503010110",
+                        "expected_error":  "invalid_field"
+                    },
+                    {
+                        "id":  "mesh-path-reversed-endpoints",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  false,
+                        "input_hex":  "15021001",
+                        "expected_error":  "invalid_field"
+                    },
+                    {
+                        "id":  "mesh-path-over-cap",
+                        "kind":  "control",
+                        "message":  "MeshPath",
+                        "valid":  false,
+                        "input_hex":  "15050102030410",
+                        "expected_error":  "body_too_large"
                     }
                 ],
     "session_pairs":  [

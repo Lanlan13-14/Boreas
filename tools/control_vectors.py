@@ -66,6 +66,7 @@ SUBTYPE_CAPS = {
     18: 256,
     19: 256,
     20: 19767,
+    21: 6,
 }
 
 SUBTYPE_NAMES = {
@@ -84,6 +85,7 @@ SUBTYPE_NAMES = {
     18: "CircuitReset",
     19: "CircuitClose",
     20: "IdentityRevocation",
+    21: "MeshPath",
 }
 
 # PeerRole wire values, in the same order as the Rust enum.
@@ -716,6 +718,13 @@ def parse_control(data: bytes, tbs_decoder: Callable[[bytes], dict[str, Any]] | 
         return parse_circuit_close(data, "CircuitReset")
     if subtype == SUBTYPE_CIRCUIT_CLOSE:
         return parse_circuit_close(data, "CircuitClose")
+    if subtype == 21:
+        slots = data[2:]
+        if not 2 <= len(slots) <= 4 or data[1] != len(slots):
+            raise Reject("wrong_length")
+        if slots[0] >= slots[-1] or any(slot < 1 or slot > 16 for slot in slots) or len(set(slots)) != len(slots):
+            raise Reject("invalid_field")
+        return {"message": "MeshPath", "slots": list(slots)}
     if subtype == 20:
         if data == b"\x14\x00":
             return {"message": "IdentityRevocation", "evidence_hex": None}
