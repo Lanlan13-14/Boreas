@@ -1,0 +1,622 @@
+name: '[Release] Build and publish (stable or prerelease)'
+
+# Manual publication of either a stable tag or a development prerelease.
+# The build is the existing five-platform bundle plus the Linux pq768 daemon
+# (glibc and fully static musl). Real-device throughput stays in the test
+# workflows. Publishing a stable tag does not close a production gate and does
+# not set production_approved.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag: vX.Y.Z or vX.Y.Z-pre.N'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  validate-tag:
+    name: Validate stable or prerelease tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      channel: ${{ steps.check.outputs.channel }}
+    steps:
+      - name: Require a stable or prerelease tag
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag }}'
+          if printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            channel=stable
+          elif printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$'; then
+            channel=prerelease
+          else
+            echo "tag must match vX.Y.Z or vX.Y.Z-pre.N, got: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+  build-test:
+    name: ${{ matrix.label }}
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64 musl (static)
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux
+            expected_arch: x86_64
+          - label: Linux aarch64 musl (static, native)
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux
+            expected_arch: aarch64
+          - label: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            expected_arch: AMD64
+          - label: macOS Intel x86_64 (native)
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            expected_arch: x86_64
+          - label: macOS Apple Silicon aarch64 (native)
+            runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            expected_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Verify native runner architecture (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          actual="$(uname -m)"
+          test "$actual" = "${{ matrix.expected_arch }}" || {
+            echo "Expected native ${{ matrix.expected_arch }} runner, got $actual" >&2
+            exit 1
+          }
+
+      - name: Verify native runner architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne '${{ matrix.expected_arch }}') {
+            throw "Expected native ${{ matrix.expected_arch }} runner, got $env:PROCESSOR_ARCHITECTURE"
+          }
+
+      - name: Install musl toolchain and ELF inspection tools (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools binutils file
+
+      - name: Configure native musl linker (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -eu
+          case '${{ matrix.target }}' in
+            x86_64-unknown-linux-musl) echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
+            aarch64-unknown-linux-musl) echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV" ;;
+            *) echo "unexpected Linux target ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Record Rust toolchain and lock hash
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv | tee toolchain.txt
+          cargo -V | tee -a toolchain.txt
+          rustup target list --installed | tee -a toolchain.txt
+          echo "rustc_summary=$(rustc -Vv | tr -d '\r' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+
+      - name: Run workspace tests on the target
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p boreas-cli --target ${{ matrix.target }}
+
+      - name: Verify full static linkage (Linux only)
+        if: matrix.platform == 'linux'
+        run: |
+          python tools/release/verify_static_linux.py \
+            --binary "target/${{ matrix.target }}/release/boreas" \
+            --target "${{ matrix.target }}" \
+            --out dist/static-linkage.json
+
+      - name: Execute packaged-binary functional smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/boreas${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          python tools/release/functional_smoke.py \
+            --binary "$binary" \
+            --target "${{ matrix.target }}" \
+            --out functional-smoke.json
+
+      - name: Package development artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/boreas${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          args=(
+            --binary "$binary"
+            --target "${{ matrix.target }}"
+            --source-sha "$GITHUB_SHA"
+            --repository "$GITHUB_REPOSITORY"
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            --runner "$RUNNER_NAME"
+            --runner-os "$RUNNER_OS"
+            --rustc "${{ steps.toolchain.outputs.rustc_summary }}"
+            --smoke-report functional-smoke.json
+            --cargo-lock Cargo.lock
+            --out-dir dist
+          )
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            args+=(--static-report dist/static-linkage.json)
+          fi
+          python tools/release/package.py "${args[@]}"
+
+      - name: Upload development artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            dist
+            functional-smoke.json
+            toolchain.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-runtime-compat:
+    name: Static CLI runtime in ${{ matrix.distro }} (${{ matrix.arch }})
+    needs: build-test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Ubuntu 24.04
+            distro_slug: ubuntu-24.04
+            image: ubuntu:24.04
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Debian Bookworm
+            distro_slug: debian-bookworm
+            image: debian:bookworm-slim
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Fedora 42
+            distro_slug: fedora-42
+            image: fedora:42
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            distro: Alpine 3.22
+            distro_slug: alpine-3.22
+            image: alpine:3.22
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Ubuntu 24.04
+            distro_slug: ubuntu-24.04
+            image: ubuntu:24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Debian Bookworm
+            distro_slug: debian-bookworm
+            image: debian:bookworm-slim
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Fedora 42
+            distro_slug: fedora-42
+            image: fedora:42
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            distro: Alpine 3.22
+            distro_slug: alpine-3.22
+            image: alpine:3.22
+    steps:
+      - name: Download Linux development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
+          path: artifact
+
+      - name: Extract package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg
+          archive=(artifact/dist/boreas-*-${{ matrix.target }}.tar.gz)
+          if [ "${#archive[@]}" -ne 1 ] || [ ! -f "${archive[0]}" ]; then
+            printf 'expected one development archive, found: %s\n' "${archive[*]}" >&2
+            exit 1
+          fi
+          tar -xzf "${archive[0]}" -C pkg
+          test -x pkg/boreas
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: Run doctor in the target distribution (not a VPN test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas doctor | tee doctor.json
+          grep -F '"status":"foundation_only"' doctor.json
+          grep -F '"daemon":false' doctor.json
+          grep -F '"tls_backend":false' doctor.json
+          grep -F '"networking":false' doctor.json
+          grep -F '"phase0_complete":false' doctor.json
+
+      - name: Run self-check in the target distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas self-check | tee self-check.json
+          grep -F '"daemon":false' self-check.json
+          grep -F '"phase0_complete":false' self-check.json
+
+      - name: Unknown command must fail in the target distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/pkg:/pkg:ro" \
+            "${{ matrix.image }}" /pkg/boreas definitely-not-a-command \
+            > unknown.out 2> unknown.err
+          code=$?
+          set -e
+          test "$code" -ne 0
+          test ! -s unknown.out
+          grep -F 'no daemon was started' unknown.err
+
+      - name: Record container runtime evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '{"schema":"boreas.development.container-runtime.v1","distro":"%s","arch":"%s","image":"%s","target":"%s","result":"passed","vpn_data_plane_tested":false,"production_release":false}\n' \
+            "${{ matrix.distro }}" "${{ matrix.arch }}" "${{ matrix.image }}" \
+            "${{ matrix.target }}" > container-runtime.json
+          cat container-runtime.json
+
+      - name: Upload container runtime evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: container-runtime-${{ matrix.target }}-${{ matrix.distro_slug }}-${{ github.run_id }}
+          path: |
+            doctor.json
+            self-check.json
+            unknown.out
+            unknown.err
+            container-runtime.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  pq768-linux:
+    name: Linux pq768 daemon (glibc and static musl)
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: 4.1.1
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
+      OPENSSL_PREFIX: ${{ github.workspace }}/.rust-tls-openssl
+      OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
+      OPENSSL_NO_VENDOR: '1'
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential perl curl ca-certificates pkg-config binutils \
+            musl-tools linux-libc-dev file zip
+      - name: Build pinned static OpenSSL
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/dependencies/fetch-openssl.sh openssl-src
+          cd openssl-src
+          ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests \
+            --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          make -j"$(nproc)"
+          make install_sw
+          mkdir -p "${OPENSSL_PREFIX}/ssl"
+          printf '%s\n' \
+            'openssl_conf = openssl_init' \
+            '' \
+            '[openssl_init]' \
+            'providers = provider_sect' \
+            '' \
+            '[provider_sect]' \
+            'default = default_sect' \
+            '' \
+            '[default_sect]' \
+            'activate = 1' \
+            > "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          test -s "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          cd "${GITHUB_WORKSPACE}"
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-src "${OPENSSL_PREFIX}" \
+            "${GITHUB_WORKSPACE}/openssl-runtime.txt" \
+            "${GITHUB_WORKSPACE}/openssl-build.txt"
+          readelf -d "${OPENSSL_PREFIX}/bin/openssl" \
+            | tee "${GITHUB_WORKSPACE}/openssl-linkage.txt"
+          if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' \
+              "${GITHUB_WORKSPACE}/openssl-linkage.txt"; then
+            echo 'OpenSSL CLI unexpectedly links shared libssl/libcrypto' >&2
+            exit 1
+          fi
+      - name: Build Linux pq768 daemon binaries
+        timeout-minutes: 25
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p boreas-cli --features openssl-inner-tls
+
+          mkdir -p hop-node-linux
+          cp target/release/boreas hop-node-linux/boreas
+
+          rustup target add x86_64-unknown-linux-musl
+          OPENSSL_MUSL_PREFIX="${GITHUB_WORKSPACE}/.rust-tls-openssl-musl"
+          mkdir -p openssl-musl-src
+          tar -xzf openssl.tar.gz --strip-components=1 -C openssl-musl-src
+          MUSL_UAPI="${GITHUB_WORKSPACE}/.musl-kernel-headers"
+          mkdir -p "$MUSL_UAPI"
+          ln -s /usr/include/linux "$MUSL_UAPI/linux"
+          ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
+          ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm"
+          pushd openssl-musl-src
+          CC=musl-gcc ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests no-async \
+            -isystem "$MUSL_UAPI" \
+            --prefix="${OPENSSL_MUSL_PREFIX}" --openssldir="${OPENSSL_MUSL_PREFIX}/ssl"
+          make -j"$(nproc)"
+          make install_sw
+          popd
+          mkdir -p "${OPENSSL_MUSL_PREFIX}/ssl"
+          cp "${OPENSSL_PREFIX}/ssl/openssl.cnf" "${OPENSSL_MUSL_PREFIX}/ssl/openssl.cnf"
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-musl-src "${OPENSSL_MUSL_PREFIX}" \
+            "${GITHUB_WORKSPACE}/openssl-musl-runtime.txt" \
+            "${GITHUB_WORKSPACE}/openssl-musl-build.txt"
+          OPENSSL_DIR="${OPENSSL_MUSL_PREFIX}" OPENSSL_STATIC=1 \
+            cargo build --locked --release --target x86_64-unknown-linux-musl \
+              -p boreas-cli --features openssl-inner-tls
+          cp target/x86_64-unknown-linux-musl/release/boreas hop-node-linux/boreas-linux-x86_64-musl-pq768
+          python tools/release/verify_static_linux.py \
+            --binary hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            --target x86_64-unknown-linux-musl \
+            --out hop-node-linux/static-linkage-pq768.json
+
+          printf '%s\n' \
+            'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
+            'Source commit: '"$GITHUB_SHA" \
+            'Feature: openssl-inner-tls (OpenSSL 4.1.1-dev snapshot 941390af2ac3, no-quic/no-cms/no-siv; X25519MLKEM768 + ML-DSA-65)' \
+            'Included binaries:' \
+            '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
+            '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
+            'Built by the development publication workflow. Real-device throughput and netns acceptance stay in the test workflows and were not run here.' \
+            'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
+            > hop-node-linux/README-DEVELOPMENT.txt
+          (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
+          (cd hop-node-linux && zip -9 -X ../boreas-pq768-linux-x86_64.zip \
+            boreas boreas-linux-x86_64-musl-pq768 SHA256SUMS \
+            static-linkage-pq768.json README-DEVELOPMENT.txt)
+      - name: Upload pq768 development binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: boreas-pq768-${{ github.run_id }}
+          path: |
+            hop-node-linux/boreas
+            hop-node-linux/boreas-linux-x86_64-musl-pq768
+            hop-node-linux/SHA256SUMS
+            hop-node-linux/static-linkage-pq768.json
+            hop-node-linux/README-DEVELOPMENT.txt
+            boreas-pq768-linux-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Assemble, verify, and publish the release
+    needs:
+      - validate-tag
+      - build-test
+      - linux-runtime-compat
+      - pq768-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+
+      - name: Download Linux x86_64 development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-x86_64-unknown-linux-musl-${{ github.run_id }}
+          path: downloaded/x86_64-unknown-linux-musl
+
+      - name: Download Linux aarch64 development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-aarch64-unknown-linux-musl-${{ github.run_id }}
+          path: downloaded/aarch64-unknown-linux-musl
+
+      - name: Download Windows x86_64 development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-x86_64-pc-windows-msvc-${{ github.run_id }}
+          path: downloaded/x86_64-pc-windows-msvc
+
+      - name: Download macOS Intel development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-x86_64-apple-darwin-${{ github.run_id }}
+          path: downloaded/x86_64-apple-darwin
+
+      - name: Download macOS Apple Silicon development artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-development-aarch64-apple-darwin-${{ github.run_id }}
+          path: downloaded/aarch64-apple-darwin
+
+      - name: Download pq768 development binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        with:
+          name: boreas-pq768-${{ github.run_id }}
+          path: downloaded/pq768
+
+      - name: Assemble and verify the five-target bundle
+        run: |
+          python tools/release/make_index.py \
+            --dist downloaded \
+            --out release-bundle \
+            --source-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Independently re-verify the assembled bundle
+        run: python tools/release/verify_bundle.py --bundle release-bundle
+
+      - name: Add source archive, pq768 binaries, and the release checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ needs.validate-tag.outputs.tag }}'
+          version="${tag#v}"
+          git archive --format=tar.gz --prefix="boreas-${version}/" \
+            -o "release-bundle/boreas-${version}-source.tar.gz" HEAD
+          install -m 0644 downloaded/pq768/boreas-linux-x86_64-musl-pq768 release-bundle/
+          install -m 0644 downloaded/pq768/boreas-pq768-linux-x86_64.zip release-bundle/
+          install -m 0644 downloaded/pq768/static-linkage-pq768.json release-bundle/
+          (cd downloaded/pq768 && sha256sum --check --strict SHA256SUMS)
+          (
+            cd release-bundle
+            sha256sum \
+              boreas-*.tar.gz boreas-*.zip \
+              boreas-linux-x86_64-musl-pq768 \
+              boreas-pq768-linux-x86_64.zip \
+              > "SHA256SUMS-${version}"
+          )
+
+      - name: Publish the stable release or prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ needs.validate-tag.outputs.tag }}'
+          channel='${{ needs.validate-tag.outputs.channel }}'
+          version="${tag#v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; refusing to replace it" >&2
+            exit 1
+          fi
+          notes="$(mktemp)"
+          if [ "$channel" = prerelease ]; then
+            title="Boreas ${version} - Development prerelease"
+            channel_line='Channel: development prerelease.'
+          else
+            title="Boreas ${version}"
+            channel_line='Channel: stable tag. This publication does not set production_approved and does not close any production gate.'
+          fi
+          printf '%s\n' \
+            "Boreas ${version} was built by GitHub Actions from \`${GITHUB_SHA}\`." \
+            '' \
+            "$channel_line" \
+            '' \
+            'This run compiled and tested all five targets, checked both static Linux executables in Ubuntu, Debian, Fedora and Alpine containers, and built the Linux pq768 daemon (glibc and fully static musl) against the reviewed OpenSSL 4.1.1-dev snapshot `941390af2ac35f41d2f95bb0bac823dbf0700845`. Real-device throughput and network-namespace acceptance were not run by this publication workflow.' \
+            '' \
+            "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > "$notes"
+          if [ "$channel" = prerelease ]; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --prerelease \
+              --verify-tag \
+              release-bundle/*
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --verify-tag \
+              release-bundle/*
+          fi
