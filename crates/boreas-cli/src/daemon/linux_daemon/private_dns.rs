@@ -118,7 +118,7 @@ const PIN_POLL: Duration = Duration::from_millis(100);
 
 pub(super) struct PinnedDns {
     pin_file: PathBuf,
-    pin: Vec<u8>,
+    pin: [u8; 96],
     network: VerifiedNetworkPolicy,
     service: VerifiedDnsServicePolicy,
     authority: VerifiedDnsAuthority,
@@ -189,12 +189,14 @@ impl PinnedDns {
                 .file_name()
                 .ok_or("daemon: missing DNS pin filename")?,
         );
-        let pin = read(&pin_file, 96)?;
+        let pin: [u8; 96] = read(&pin_file, 96)?
+            .try_into()
+            .map_err(|_| "daemon: invalid private DNS pin length")?;
         let s = Object::load(&dir, "service", dns_service_policy::MAX_TBS_LEN)?;
         let g = Object::load(&dir, "signer", dns_authority::MAX_TBS_LEN)?;
         let a = Object::load(&dir, "authority", dns_authority::MAX_TBS_LEN)?;
         let selected = [&s, &g, &a].map(|o| openssl::sha::sha256(&o.tbs)).concat();
-        if selected != pin {
+        if selected.as_slice() != pin.as_slice() {
             return Err("daemon: private DNS version pin mismatch".into());
         }
         let context = network
@@ -211,18 +213,7 @@ impl PinnedDns {
         if authority.zone() != zone {
             return Err("daemon: configured quarantine suffix differs from signed DNS zone".into());
         }
-        if !service.has_grant_at(
-            &network,
-            core.net_id,
-            DnsSubject {
-                node_id: core.node_id,
-                identity_generation: core.identity_generation,
-            },
-            Capability::Replica,
-            now,
-        ) {
-            return Err("daemon: this Core generation lacks a current DNS Replica grant".into());
-        }
+        require_replica(&service, &network, core, now)?;
         if public && !service.has_grant_at(
             &network,
             core.net_id,
@@ -259,6 +250,26 @@ impl PinnedDns {
         })
     }
 
+    pub(super) fn check_source(&self, core: PeerIdentity) -> Result<(), String> {
+        let now = super::now_utc_us()?;
+        if now < self.loaded_utc || now >= self.until_utc || Instant::now() >= self.deadline {
+            return Err("daemon: private DNS version or identity window no longer current".into());
+        }
+        require_replica(&self.service, &self.network, core, now)?;
+        if read(&self.pin_file, 96)?.as_slice() != self.pin.as_slice() {
+            return Err("daemon: private DNS version pin changed".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(super) fn pin(&self) -> &[u8; 96] {
+        &self.pin
+    }
+
     pub(super) fn material(&self) -> Material<'_> {
         Material {
             network: &self.network,
@@ -275,6 +286,29 @@ impl PinnedDns {
             retired: AtomicBool::new(false),
         })
     }
+}
+
+fn require_replica(
+    service: &VerifiedDnsServicePolicy,
+    network: &VerifiedNetworkPolicy,
+    core: PeerIdentity,
+    now: u64,
+) -> Result<(), String> {
+    if core.role != boreas_crypto::NodeRole::Core
+        || !service.has_grant_at(
+            network,
+            core.net_id,
+            DnsSubject {
+                node_id: core.node_id,
+                identity_generation: core.identity_generation,
+            },
+            Capability::Replica,
+            now,
+        )
+    {
+        return Err("daemon: this Core generation lacks a current DNS Replica grant".into());
+    }
+    Ok(())
 }
 
 /// Each lease has one packet-loop owner. The watchdog observes UTC separately
@@ -319,8 +353,8 @@ impl Interrupt {
         status_current: impl Fn() -> bool + Send + 'static,
     ) -> Result<Self, String> {
         let path = dns.pin_file.clone();
-        let pin = dns.pin.clone();
-        if read(&path, 96)? != pin || !lease.current() {
+        let pin = dns.pin;
+        if read(&path, 96)?.as_slice() != pin.as_slice() || !lease.current() {
             return Err("daemon: private DNS lease or version pin lost before business".into());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -335,7 +369,7 @@ impl Interrupt {
                         && !lease.retired.load(Ordering::Acquire)
                         && status_current()
                         && Instant::now() < lease.deadline
-                        && read(&path, 96).is_ok_and(|current| current == pin)
+                        && read(&path, 96).is_ok_and(|current| current.as_slice() == pin.as_slice())
                     {
                         last_utc = now;
                         thread::park_timeout(

@@ -24,6 +24,7 @@ on:
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_public_dns_fixture.py'
+      - 'tools/release/netns_dns_replica.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -47,6 +48,7 @@ on:
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_public_dns_fixture.py'
+      - 'tools/release/netns_dns_replica.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -919,6 +921,29 @@ jobs:
           grep -Fx 'private_dns_tcp_pin_withdrawal=no_later_dns_data_on_open_stream' rust-tls-private-dns.log
           grep -Fx 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed' rust-tls-private-dns.log
           grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
+      - name: Verify private DNS replica selection on three real Linux TUNs
+        id: acceptance_dns_replicas
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')
+        timeout-minutes: 4
+        env:
+          BOREAS_NETNS_PRIVATE_DNS: '1'
+          BOREAS_NETNS_DNS_REPLICAS: '1'
+        run: |
+          set -euo pipefail
+          sudo -E timeout --kill-after=5s 180s bash tools/release/netns_daemon_smoke.sh \
+            hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+            2>&1 | tee rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_grant=ungranted_backup_rejected_before_dial' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_startup=refused_primary_selected_distinct_authenticated_backup' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_tls=wrong_server_name_terminal_no_fallback' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_identity=wrong_pq_peer_terminal_no_fallback' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_pin_match=different_valid_remote_pin_terminal_no_fallback' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_packet_scope=ordinary_overlay_denied_in_both_directions' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_live=authenticated_close_promoted_once_with_fresh_udp_and_tcp_only' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_exhausted=withdrawn_backup_did_not_reopen_primary' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_withdrawal=abrupt_primary_pin_loss_terminal_while_backup_available' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_status=valid_new_sequence_retired_pinned_lease_without_fallback' rust-tls-dns-replicas.log
+          grep -Fx 'dns_replica_revocation=revoked_backup_denied_before_dial_and_after_mailbox_removal' rust-tls-dns-replicas.log
       - name: Verify four-process Core routing, failover, and revocation on real TUN
         id: acceptance_mesh
         if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
@@ -1087,6 +1112,7 @@ jobs:
         env:
           DNS_RESULT: ${{ steps.acceptance_private_dns.outcome }}
           PUBLIC_DNS_RESULT: ${{ steps.acceptance_public_dns.outcome }}
+          DNS_REPLICAS_RESULT: ${{ steps.acceptance_dns_replicas.outcome }}
           MESH_RESULT: ${{ steps.acceptance_mesh.outcome }}
           MULTI_ACTIVE_RESULT: ${{ steps.acceptance_multi_active.outcome }}
           DELAYED_RESULT: ${{ steps.candidate_delayed.outcome }}
@@ -1097,7 +1123,7 @@ jobs:
           failed=0
           {
             printf '\n### Mandatory real-device acceptance\n\n'
-            for check in DNS PUBLIC_DNS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
+            for check in DNS PUBLIC_DNS DNS_REPLICAS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
               var="${check}_RESULT"
               outcome="${!var}"
               printf -- '- %s: `%s`\n' "$check" "${outcome:-not-run}"
@@ -1127,6 +1153,7 @@ jobs:
             rust-tls-dns-tests.log
             rust-tls-private-dns.log
             rust-tls-public-dns-*.log
+            rust-tls-dns-replicas.log
             rust-tls-mesh-runtime.log
             rust-tls-multi-active-*.log
             rust-tls-cli-tests.log

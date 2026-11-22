@@ -59,6 +59,17 @@ if [[ "$PUBLIC_DNS" != 0 ]]; then
   fi
   PRIVATE_DNS=1 # Reuse signed private DNS, TCP, and the same Edge VIP route.
 fi
+DNS_REPLICAS="${BOREAS_NETNS_DNS_REPLICAS:-0}"
+case "$DNS_REPLICAS" in
+  0) ;;
+  1) [[ "$PRIVATE_DNS" == 1 && -z "${BOREAS_NETNS_HOOK:-}" ]] || {
+       echo 'ERROR: DNS replica fixture requires private DNS without routing hooks' >&2; exit 1;
+     } ;;
+  *) echo 'ERROR: BOREAS_NETNS_DNS_REPLICAS must be 0 or 1' >&2; exit 1 ;;
+esac
+if [[ "$PUBLIC_DNS" != 0 && "$DNS_REPLICAS" != 0 ]]; then
+  echo "ERROR: public forwarding and DNS replicas are separate fixtures" >&2; exit 1
+fi
 if [[ "$ACTIVE_LANES" != 0 && ( "$PRIVATE_DNS" != 0 || ${#TUN_GSO_ARGS[@]} != 0 ||
     "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ||
     -n "${BOREAS_NETNS_HOOK:-}" ) ]]; then
@@ -677,6 +688,7 @@ cleanup() {
   fi
   if (( CORE_NS_CREATED )); then ip netns del "$CORE_NS" 2>/dev/null || true; fi
   if (( EDGE_NS_CREATED )); then ip netns del "$EDGE_NS" 2>/dev/null || true; fi
+  if [[ -n "${REPLICA_NS:-}" ]]; then ip netns del "$REPLICA_NS" 2>/dev/null || true; fi
   # Safety net for exits before the explicit reports below: the guarded filter
   # never duplicates lines and reads the daemon logs only while WORK still exists.
   report_diagnostic_timing
@@ -922,6 +934,13 @@ ip netns exec "$CORE_NS" ip link set veth-core up
 ip netns exec "$EDGE_NS" ip link set lo up
 ip netns exec "$EDGE_NS" ip addr add 192.0.2.2/24 dev veth-edge
 ip netns exec "$EDGE_NS" ip link set veth-edge up
+
+if [[ "$DNS_REPLICAS" == 1 ]]; then
+  # Sources the dedicated cases after ordinary PKI, policy and netns setup.
+  source "$(dirname "$PERF_SCRIPT")/netns_dns_replica.sh"
+  dns_replica_matrix
+  exit 0
+fi
 
 run_hook setup
 

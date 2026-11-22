@@ -627,6 +627,7 @@ pub struct E2eCircuit<'a> {
     local: PeerIdentity,
     mtu_cap: u16,
     l3_profile: E2eL3Profile,
+    private_dns_only: bool,
 }
 
 // Application confirmation inside E2E TLS, not a cryptographic handshake.
@@ -912,11 +913,21 @@ impl<'a> E2eCircuit<'a> {
     pub fn close_gracefully(&mut self) {
         let _ = self.stream.close_stream();
     }
+
+    #[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+    pub(crate) fn mark_private_dns_only(&mut self) {
+        self.private_dns_only = true;
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn is_private_dns_only(&self) -> bool {
+        self.private_dns_only
+    }
 }
 
 impl Read for E2eCircuit<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.l3_profile == E2eL3Profile::SINGLE_LANE {
+        if self.l3_profile == E2eL3Profile::SINGLE_LANE && !self.private_dns_only {
             self.stream.read(out)
         } else {
             self.stream.read_with_authenticated_eof(out)
@@ -1013,6 +1024,7 @@ fn finish_e2e<'a>(
         local,
         mtu_cap,
         l3_profile,
+        private_dns_only: false,
     })
 }
 

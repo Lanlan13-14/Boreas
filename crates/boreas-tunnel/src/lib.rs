@@ -43,6 +43,9 @@ pub mod dataplane;
 pub mod directory;
 #[cfg(feature = "openssl-inner-tls")]
 pub mod dns_packet_service;
+/// Dedicated profile confirmation inside authenticated E2E TLS.
+#[cfg(all(feature = "openssl-inner-tls", target_os = "linux"))]
+pub mod dns_replica;
 /// Authoritative UDP DNS service over a real `PacketIo` endpoint, bound to a
 /// verified signed zone authority and the authenticated local identity. TCP is
 /// refused; it is not a DNS-over-TCP implementation.

@@ -133,6 +133,8 @@ pub enum PacketDeny {
     SourceNotPeer,
     /// Inbound packet destination is not the local permanent VIP.
     DestinationNotLocal,
+    /// An ordinary IP packet on a dedicated private DNS circuit.
+    NotDnsTraffic,
 }
 
 impl fmt::Display for PacketDeny {
@@ -152,6 +154,7 @@ impl fmt::Display for PacketDeny {
             Self::DestinationNotPeer => "destination-not-peer-vip",
             Self::SourceNotPeer => "source-not-peer-vip",
             Self::DestinationNotLocal => "destination-not-local-vip",
+            Self::NotDnsTraffic => "not-private-dns-traffic",
         })
     }
 }
@@ -163,7 +166,7 @@ impl PacketDeny {
     pub const fn is_local_discard(self) -> bool {
         matches!(
             self,
-            Self::Ipv6NotNegotiated | Self::SourceNotLocal | Self::DestinationNotPeer
+            Self::Ipv6NotNegotiated | Self::SourceNotLocal | Self::DestinationNotPeer | Self::NotDnsTraffic
         )
     }
 }
@@ -837,6 +840,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     private_dns: Option<PrivateDns<'a>>,
     #[cfg(feature = "openssl-inner-tls")]
     edge_dns: Option<EdgeDns<'a>>,
+    #[cfg(feature = "openssl-inner-tls")]
+    dns_replica_only: bool,
 }
 
 #[cfg(feature = "openssl-inner-tls")]
@@ -1035,7 +1040,12 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         mtu: usize,
     ) -> Result<Self, PacketPathError> {
         let endpoints = AuthorizedEndpoints::from_e2e_circuit(&circuit)?;
-        Self::try_new(io, circuit, endpoints, mtu)
+        #[cfg(feature = "openssl-inner-tls")]
+        let only_dns = circuit.is_private_dns_only();
+        let path = Self::try_new(io, circuit, endpoints, mtu)?;
+        #[cfg(feature = "openssl-inner-tls")]
+        let path = Self { dns_replica_only: only_dns, ..path };
+        Ok(path)
     }
 
     /// Bind private DNS to this exact authenticated Core–Edge circuit, using
@@ -1178,6 +1188,8 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             private_dns: None,
             #[cfg(feature = "openssl-inner-tls")]
             edge_dns: None,
+            #[cfg(feature = "openssl-inner-tls")]
+            dns_replica_only: false,
         })
     }
 
@@ -1268,6 +1280,8 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             &mut self.outbound_scratch,
             #[cfg(feature = "openssl-inner-tls")]
             self.edge_dns.as_mut(),
+            #[cfg(feature = "openssl-inner-tls")]
+            self.dns_replica_only,
         ) {
             Ok(Some(length)) => {
                 self.stats.outbound_packets = self.stats.outbound_packets.saturating_add(1);
@@ -1333,6 +1347,8 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                 &packet,
                 #[cfg(feature = "openssl-inner-tls")]
                 self.edge_dns.as_mut(),
+                #[cfg(feature = "openssl-inner-tls")]
+                self.dns_replica_only,
             );
             match authorized {
                 Ok(info) => {
@@ -1416,6 +1432,8 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             self.private_dns.as_mut(),
             #[cfg(feature = "openssl-inner-tls")]
             self.edge_dns.as_mut(),
+            #[cfg(feature = "openssl-inner-tls")]
+            self.dns_replica_only,
         ) {
             Ok(Some(InboundDelivery { length, reply_len })) => {
                 if let Some(reply_len) = reply_len {
@@ -1486,6 +1504,7 @@ fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     policy: &PointToPoint,
     scratch: &mut [u8],
     #[cfg(feature = "openssl-inner-tls")] mut edge_dns: Option<&mut EdgeDns<'_>>,
+    #[cfg(feature = "openssl-inner-tls")] dns_replica_only: bool,
 ) -> Result<Option<usize>, PacketPathError> {
     let packet = match io.read_for_forwarding(scratch) {
         Ok(Some(packet)) => packet,
@@ -1498,6 +1517,8 @@ fn outbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         &packet,
         #[cfg(feature = "openssl-inner-tls")]
         edge_dns.as_deref_mut(),
+        #[cfg(feature = "openssl-inner-tls")]
+        dns_replica_only,
     )
     .map_err(PacketPathError::Denied)?;
     // Copy the packet directly into a contiguous, bounded frame for the stream.
@@ -1518,6 +1539,7 @@ fn authorize_outbound_read(
     policy: &PointToPoint,
     packet: &PacketRead<'_>,
     #[cfg(feature = "openssl-inner-tls")] edge_dns: Option<&mut EdgeDns<'_>>,
+    #[cfg(feature = "openssl-inner-tls")] dns_replica_only: bool,
 ) -> Result<PacketInfo, PacketDeny> {
     let ordinary = policy.authorize_host_read(packet);
     #[cfg(feature = "openssl-inner-tls")]
@@ -1544,6 +1566,10 @@ fn authorize_outbound_read(
                 return Ok(info);
             }
         }
+    }
+    #[cfg(feature = "openssl-inner-tls")]
+    if dns_replica_only && ordinary.is_ok() {
+        return Err(PacketDeny::NotDnsTraffic);
     }
     ordinary
 }
@@ -1647,6 +1673,7 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     packet: &mut Vec<u8>,
     #[cfg(feature = "openssl-inner-tls")] dns: Option<&mut PrivateDns<'_>>,
     #[cfg(feature = "openssl-inner-tls")] edge_dns: Option<&mut EdgeDns<'_>>,
+    #[cfg(feature = "openssl-inner-tls")] dns_replica_only: bool,
 ) -> Result<Option<InboundDelivery>, PacketPathError> {
     if !read_packet_frame_into(circuit, policy.mtu(), packet)? {
         return Ok(None);
@@ -1708,6 +1735,10 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
             length: info.packet_len,
             reply_len: None,
         }));
+    }
+    #[cfg(feature = "openssl-inner-tls")]
+    if dns_replica_only {
+        return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
     }
     let packet = policy
         .authorize_inspected(packet, Direction::PeerToHost)
@@ -2266,16 +2297,28 @@ mod tests {
             let bytes = udp_datagram(source, destination, 40_001, port, &body, true);
             let packet = InspectedPacket::new(&bytes).unwrap();
             assert!(
-                authorize_outbound_read(&policy, &PacketRead::Inspected(packet), None).is_err()
+                authorize_outbound_read(&policy, &PacketRead::Inspected(packet), None, false).is_err()
             );
             assert_eq!(
-                authorize_outbound_read(&policy, &PacketRead::Inspected(packet), Some(&mut dns))
+                authorize_outbound_read(&policy, &PacketRead::Inspected(packet), Some(&mut dns), true)
                     .is_ok(),
                 allow
             );
         }
         let mut response = question;
         response[2] |= 0x84; // QR + AA, echo RD.
+        // The same structurally valid ordinary L3 packet is allowed by the
+        // normal point-to-point policy but must not cross a DNS-only circuit.
+        let ordinary_out = udp_datagram(edge, core, 40_001, 1234, b"not DNS", true);
+        let ordinary_out = PacketRead::Inspected(policy.inspect_bytes(&ordinary_out).unwrap());
+        assert!(authorize_outbound_read(&policy, &ordinary_out, Some(&mut dns), false).is_ok());
+        assert_eq!(authorize_outbound_read(&policy, &ordinary_out, Some(&mut dns), true),
+            Err(PacketDeny::NotDnsTraffic));
+        let ordinary_in = udp_datagram(core, edge, 1234, 40_001, b"not DNS", true);
+        let mut ordinary_stream = InboundSource::new(encode_packet_frame(&ordinary_in, DEFAULT_MTU).unwrap());
+        assert!(matches!(inbound_once(&device, &mut ordinary_stream, &policy, &mut scratch,
+            None, Some(&mut dns), true), Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic))));
+        assert!(host.read_packet().unwrap().is_none());
         let answer = udp_datagram(vip, edge, 53, 40_001, &response, true);
         let wrong_port = udp_datagram(vip, edge, 53, 40_002, &response, true);
         let wrong_destination = udp_datagram(vip, core, 53, 40_001, &response, true);
@@ -2296,7 +2339,8 @@ mod tests {
                     &policy,
                     &mut scratch,
                     None,
-                    Some(&mut dns)
+                    Some(&mut dns),
+                    true,
                 )
                 .is_err(),
                 reject
@@ -2343,7 +2387,7 @@ mod tests {
         };
         let authorize = |bytes: &[u8], dns: &mut EdgeDns<'_>| {
             let packet = InspectedPacket::new(bytes).unwrap();
-            authorize_outbound_read(&policy, &PacketRead::Inspected(packet), Some(dns)).is_ok()
+            authorize_outbound_read(&policy, &PacketRead::Inspected(packet), Some(dns), false).is_ok()
         };
         let syn = segment(edge, vip, 40_000, 53, TCP_SYN);
         assert!(!authorize(&syn, &mut dns));
@@ -2366,7 +2410,7 @@ mod tests {
         ] {
             let frame = encode_packet_frame(&bytes, DEFAULT_MTU).unwrap();
             let mut stream = InboundSource::new(frame);
-            let result = inbound_once(&device, &mut stream, &policy, &mut scratch, None, Some(&mut dns));
+            let result = inbound_once(&device, &mut stream, &policy, &mut scratch, None, Some(&mut dns), false);
             assert_eq!(result.is_err(), reject);
             assert_eq!(host.read_packet().unwrap(), deliver.then_some(bytes));
         }
@@ -3102,6 +3146,8 @@ mod tests {
                 None,
                 #[cfg(feature = "openssl-inner-tls")]
                 None,
+                #[cfg(feature = "openssl-inner-tls")]
+                false,
             );
             let length = delivery.map(|item| {
                 item.map(|delivery| {

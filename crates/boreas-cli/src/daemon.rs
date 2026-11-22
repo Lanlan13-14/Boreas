@@ -50,6 +50,9 @@ pub fn daemon_usage() -> &'static str {
   Direct multi-active IPv4/TCP (either role, real TUN only): add --e2e-active-lanes <2|3|4>
   with the same value and MTU on both ends. Connect requires explicit --connect; no standby,
   private DNS, GSO, virtual TUN or --max-packets in this profile.
+  Private DNS replica profile: --private-dns-only (both roles). Edge also requires
+  --connect <IPv4:port> --tls-name <NAME> --private-dns-backup <IPv4:port>
+  --private-dns-backup-identity <ABS>. No general overlay forwarding in this profile.
   Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
   and set [dns].zone to the signed private suffix. Set [dns].tcp = true on both ends
   for bounded DNS-over-TCP without TUN GSO. Public DNS also requires a signed PublicForward
@@ -286,6 +289,7 @@ mod linux_daemon {
 
     mod multi_active;
     mod private_dns;
+    mod private_dns_replica;
 
     const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(10);
     const VIRTUAL_IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -1913,6 +1917,9 @@ mod linux_daemon {
         let mut dns_pin: Option<PathBuf> = None;
         let mut public_dns_upstream: Option<PathBuf> = None;
         let mut public_dns_client = false;
+        let mut dns_only = false;
+        let mut dns_backup = None;
+        let mut dns_backup_identity: Option<PathBuf> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -1922,6 +1929,11 @@ mod linux_daemon {
                     i += 1;
                 }
                 "--public-dns-client" => return Err("daemon: duplicate --public-dns-client".into()),
+                "--private-dns-only" if !dns_only => {
+                    dns_only = true;
+                    i += 1;
+                }
+                "--private-dns-only" => return Err("daemon: duplicate --private-dns-only".into()),
                 "--virtual-tun" => {
                     virtual_tun = true;
                     i += 1;
@@ -1970,6 +1982,10 @@ mod linux_daemon {
                         "--private-dns-dir" if dns_dir.is_none() => dns_dir = Some(val.into()),
                         "--private-dns-pin" if dns_pin.is_none() => dns_pin = Some(val.into()),
                         "--public-dns-upstream" if public_dns_upstream.is_none() => public_dns_upstream = Some(val.into()),
+                        "--private-dns-backup" if dns_backup.is_none() => dns_backup = Some(val.clone()),
+                        "--private-dns-backup-identity" if dns_backup_identity.is_none() => {
+                            dns_backup_identity = Some(val.into());
+                        }
                         "--listen" => listen_spec = Some(val.clone()),
                         "--connect" => connect_spec = Some(val.clone()),
                         "--tls-name" => tls_name = Some(val.clone()),
@@ -2018,6 +2034,26 @@ mod linux_daemon {
             || (mode == Mode::Connect && public_dns_upstream.is_some()))
         {
             return Err("daemon: public DNS requires pinned DNS, real TUN without GSO, Core-only upstream configuration and Edge-only client opt-in".into());
+        }
+        if dns_only && public_dns {
+            return Err("daemon: DNS replica mode cannot enable public DNS forwarding".into());
+        }
+        if (dns_backup.is_some() || dns_backup_identity.is_some())
+            && (!dns_only || mode != Mode::Connect)
+        {
+            return Err("daemon: DNS backup options require connect --private-dns-only".into());
+        }
+        if dns_only
+            && (dns_dir.is_none() || dns_pin.is_none() || virtual_tun || tun_tcpv4_gso
+                || multi_active_profile.is_some() || provisioned)
+        {
+            return Err("daemon: --private-dns-only requires pinned DNS and a standalone real TUN without GSO or multi-active lanes".into());
+        }
+        if dns_only && mode == Mode::Connect
+            && (connect_spec.is_none() || tls_name.is_none() || dns_backup.is_none()
+                || dns_backup_identity.is_none())
+        {
+            return Err("daemon: DNS replica selection requires explicit primary, TLS name, backup endpoint and signed backup identity".into());
         }
         if multi_active_profile.is_some() {
             if virtual_tun
@@ -2103,7 +2139,7 @@ mod linux_daemon {
         let verified =
             verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
                 .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
-        let (status_trust, identity_trust) = bound_runtime_trust(
+        let (mut status_trust, identity_trust) = bound_runtime_trust(
             &roots_path,
             cfg_net_id,
             verified.root_fingerprint,
@@ -2195,6 +2231,30 @@ mod linux_daemon {
         let local_peer = local_vn.peer_identity();
         let remote_peer = peer_vn.peer_identity();
 
+        if dns_only && config.uplinks.backup.is_some() {
+            return Err("daemon: --private-dns-only excludes ordinary uplink standby".into());
+        }
+        let dns_sources = if let (Some(backup), Some(backup_identity)) =
+            (dns_backup.as_deref(), dns_backup_identity.as_deref())
+        {
+            Some(private_dns_replica::Sources::load(
+                connect_spec.as_deref().ok_or("daemon: missing DNS primary")?,
+                backup,
+                backup_identity,
+                tls_name.as_deref().ok_or("daemon: missing DNS TLS name")?,
+                ws_host.as_deref(),
+                &ws_path,
+                &mut status_trust,
+                &network_context,
+                remote_peer,
+            )?)
+        } else {
+            None
+        };
+        let identities_until = verified.local.valid_until().min(peer_obj.valid_until());
+        let identities_until = dns_sources.as_ref().map_or(identities_until, |sources| {
+            identities_until.min(sources.backup.valid_until)
+        });
         let private_dns = match (dns_dir, dns_pin) {
             (None, None) => None,
             (Some(dir), Some(pin)) if !virtual_tun => {
@@ -2221,7 +2281,7 @@ mod linux_daemon {
                     dns.tcp,
                     public_dns,
                     public_dns_upstream.as_deref().map(PublicUpstream::load).transpose()?,
-                    verified.local.valid_until().min(peer_obj.valid_until()),
+                    identities_until,
                 )?;
                 if dns
                     .listen_vip
@@ -2249,8 +2309,14 @@ mod linux_daemon {
             }
         };
 
+        let mut identities = vec![local_vn, peer_vn];
+        if let Some(sources) = &dns_sources {
+            private_dns.as_ref().ok_or("daemon: missing pinned DNS")?
+                .check_source(sources.backup.identity.peer_identity())?;
+            identities.push(sources.backup.identity.clone());
+        }
         let extractor = Arc::new(
-            PkiIdentityExtractor::new(vec![local_vn, peer_vn])
+            PkiIdentityExtractor::new(identities)
                 .map_err(|_| "daemon: duplicate or invalid SPKIs".to_string())?,
         );
 
@@ -2471,6 +2537,25 @@ mod linux_daemon {
             });
         }
 
+        if let Some(sources) = &dns_sources {
+            return private_dns_replica::run(private_dns_replica::Run {
+                sources,
+                mat_dir: &mat_dir,
+                status_path: &status_path,
+                policy_window,
+                store: status_store,
+                extractor,
+                connector: inner_conn,
+                backend: e2e_backend,
+                policy: session_policy,
+                tun: &tun_endpoint,
+                mtu,
+                max_packets,
+                max_seconds,
+                counters: &counters,
+                dns: private_dns.as_ref().ok_or("daemon: missing pinned DNS")?,
+            });
+        }
         match mode {
             Mode::Serve => run_serve_loop(
                 listen_spec.ok_or_else(|| "daemon serve: `--listen` is required".to_string())?,
@@ -2489,6 +2574,7 @@ mod linux_daemon {
                 max_seconds,
                 &counters,
                 private_dns.as_ref(),
+                dns_only,
             ),
             Mode::Connect => {
                 let explicit_connect = connect_spec.is_some();
@@ -2912,9 +2998,14 @@ mod linux_daemon {
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
+        dns_only: bool,
     ) -> Result<(), String> {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
-        let listen_addr = resolve_addr(&listen_spec)?;
+        let listen_addr = if dns_only {
+            private_dns_replica::numeric_endpoint(&listen_spec)?
+        } else {
+            resolve_addr(&listen_spec)?
+        };
         let outer_acc = OpenSslOuterTlsAcceptor::from_pem_files(
             mat_dir.join("outer.pem"),
             mat_dir.join("outer.key"),
@@ -2943,7 +3034,8 @@ mod linux_daemon {
         let accept_deadline = max_seconds
             .map(Duration::from_secs)
             .or_else(|| (!supervised).then_some(ACCEPT_WAIT))
-            .map(|wait| Instant::now() + wait);
+            .map(|wait| Instant::now().checked_add(wait).ok_or("daemon: accept deadline overflow"))
+            .transpose()?;
         let mut next_status_check = Instant::now() + STATUS_RECHECK_INTERVAL;
         let tcp = loop {
             match listener.accept() {
@@ -2979,6 +3071,33 @@ mod linux_daemon {
             .check()
             .map_err(|e| format!("daemon serve: policy window failed after accept: {e}"))?;
 
+        let replica_admission = if dns_only {
+            let dns = private_dns.ok_or("daemon: missing pinned DNS")?;
+            dns.check_source(session_policy.local)?;
+            let slots = revocation_slots(session_policy.local, remote_peer)?;
+            let mut store = lock_mutex(&status_store);
+            let (sequence, deadline, _) = status_gate(&mut store, status_path, now_utc_us()?, Instant::now())?;
+            check_identity_revocations(&mut store, status_path, slots)?;
+            Some((sequence, deadline.min(policy_window.deadline()).min(dns.deadline()), slots))
+        } else {
+            None
+        };
+        let replica_gate = || -> Result<(), String> {
+            if let Some((sequence, _, slots)) = replica_admission {
+                policy_window.check()?;
+                let mut store = lock_mutex(&status_store);
+                let (current, _, _) = status_gate(&mut store, status_path, now_utc_us()?, Instant::now())?;
+                if current != sequence {
+                    return Err("daemon: private DNS replica selection status sequence changed".into());
+                }
+                check_identity_revocations(&mut store, status_path, slots)?;
+            }
+            Ok(())
+        };
+        let phase_deadline = || {
+            let handshake = Instant::now() + HANDSHAKE_TIMEOUT;
+            replica_admission.map_or(handshake, |(_, until, _)| handshake.min(until))
+        };
         let admission = Admission::new(Limits {
             handshakes_global: 8,
             authenticated_global: 8,
@@ -2989,13 +3108,7 @@ mod linux_daemon {
             LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
         // The transport's hop deadline is disarmed before the E2E phase.
         let mut accepted = link_server
-            .accept_tls_stream(
-                tcp,
-                &outer_acc,
-                session_policy,
-                HANDSHAKE_TIMEOUT,
-                &admission,
-            )
+            .accept_tls_stream_until(tcp, &outer_acc, session_policy, phase_deadline(), &admission)
             .map_err(|e| format!("daemon serve: WSS + pq768 hop session rejected: {e}"))?;
 
         // The peer authenticated, but status or the signed policy may have
@@ -3008,7 +3121,8 @@ mod linux_daemon {
             format!("daemon serve: durable status gate failed after hop handshake: {e}")
         })?;
 
-        let e2e = {
+        replica_gate()?;
+        let mut e2e = {
             let socket = duplicate_e2e_socket(sock_fd)
                 .map_err(|e| format!("daemon serve: cannot arm E2E circuit deadline: {e}"))?;
             accept_e2e_until(
@@ -3016,7 +3130,7 @@ mod linux_daemon {
                 &e2e_backend,
                 remote_peer,
                 &socket,
-                Instant::now() + HANDSHAKE_TIMEOUT,
+                phase_deadline(),
             )
             .map_err(|e| format!("daemon serve: pq768 E2E circuit rejected: {e}"))?
         };
@@ -3030,6 +3144,15 @@ mod linux_daemon {
             format!("daemon serve: durable status gate failed before business: {e}")
         })?;
 
+        let replica_epoch = if let Some((sequence, _, _)) = replica_admission {
+            replica_gate()?;
+            let dns = private_dns.ok_or("daemon: missing pinned DNS")?;
+            private_dns_replica::accept_confirmation(&mut e2e, sock_fd, dns, phase_deadline())?;
+            replica_gate()?;
+            Some(private_dns_replica::Epoch { ordinal: 1, active_path: PATH_PRIMARY, sequence, promotions: 0 })
+        } else {
+            None
+        };
         bound_path_io(sock_fd)?;
 
         counters.inbound_connections.store(1, Ordering::SeqCst);
@@ -3049,11 +3172,13 @@ mod linux_daemon {
             Arc::clone(&status_store),
             max_packets,
             0,
-            max_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds)),
+            max_seconds.map(|seconds| Instant::now().checked_add(Duration::from_secs(seconds))
+                .ok_or("daemon: business deadline overflow")).transpose()?,
             None,
             None,
             counters,
             private_dns,
+            replica_epoch,
         );
 
         counters.connected.store(false, Ordering::SeqCst);
@@ -3324,6 +3449,7 @@ mod linux_daemon {
                     standby.as_mut(),
                     counters,
                     private_dns,
+                    None,
                 );
                 counters.connected.store(false, Ordering::SeqCst);
                 counters.outbound_upstreams.store(0, Ordering::SeqCst);
@@ -3599,6 +3725,7 @@ mod linux_daemon {
         mut standby: Option<&mut StandbyManager>,
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
+        replica_epoch: Option<private_dns_replica::Epoch>,
     ) -> Result<PathReport, String> {
         let local_e2e = e2e.local();
         let peer_e2e = e2e.info().peer;
@@ -3628,10 +3755,20 @@ mod linux_daemon {
                 .valid_until()
                 .ok_or("daemon: DNS status UTC cutoff unavailable")?;
             let sequence = fresh.sequence();
+            if replica_epoch.is_some_and(|epoch| epoch.sequence != sequence) {
+                return Err("daemon: private DNS replica selection status sequence changed before bind".into());
+            }
             let dns_deadline = fresh
                 .deadline()
                 .min(policy_window.deadline())
-                .min(deadline.unwrap_or_else(|| policy_window.deadline()));
+                .min(if replica_epoch.is_some() {
+                    // Give a planned CLI budget stop a short chance to send
+                    // close_notify, without unbounding blocked packet I/O.
+                    deadline.and_then(|cutoff| cutoff.checked_add(Duration::from_secs(2)))
+                        .unwrap_or_else(|| policy_window.deadline())
+                } else {
+                    deadline.unwrap_or_else(|| policy_window.deadline())
+                });
             let last_trusted_utc = guard.last_trusted_utc();
             counters.status_sequence.store(sequence, Ordering::Relaxed);
             Some((dns.bind(until, dns_deadline, last_trusted_utc), sequence))
@@ -3729,7 +3866,7 @@ mod linux_daemon {
             }
         }
         let watchdog = StatusWatchdog::start(
-            status_store,
+            Arc::clone(&status_store),
             status_path.to_path_buf(),
             policy_window,
             sock_fd,
@@ -3747,7 +3884,8 @@ mod linux_daemon {
         if !dns_current() {
             return Err("daemon: private DNS authorization lost before business".into());
         }
-        if mode_name == "connect" && packets_before == 0 && expected.is_none() {
+        let first_binding = replica_epoch.map_or(packets_before == 0, |epoch| epoch.ordinal == 1);
+        if mode_name == "connect" && first_binding && expected.is_none() {
             // The initial Edge circuit is authenticated and has a bound packet
             // path. Future promotions must never answer the one-shot challenge.
             policy_window.check()?;
@@ -3760,6 +3898,14 @@ mod linux_daemon {
         if dns_lease.is_some() {
             if !dns_current() || watchdog.fault().is_some() {
                 return Err("daemon: private DNS authorization lost before business".into());
+            }
+            if let Some(epoch) = replica_epoch {
+                counters.path_epoch.store(epoch.ordinal, Ordering::SeqCst);
+                counters.active_path.store(epoch.active_path, Ordering::SeqCst);
+                counters.failover_events.store(epoch.promotions, Ordering::SeqCst);
+                if mode_name == "connect" {
+                    counters.outbound_upstreams.store(1, Ordering::SeqCst);
+                }
             }
             // Generic circuit connectivity, not DNS readiness. A successful
             // Edge query is the only confirmation of the remote DNS service.
@@ -3776,6 +3922,22 @@ mod linux_daemon {
         let mut send_deferred_since = None;
         let dns_deferred_core = mode_name == "serve"
             && private_dns.is_some_and(|dns| dns.tcp || dns.public);
+        // Only emit a promotable authenticated close while authorization
+        // is still current. Re-read durable status/revocation and the pin
+        // in the branch that actually sends close_notify.
+        let check_replica_close = || -> Result<(), String> {
+            if let (Some(epoch), Some(dns)) = (replica_epoch, private_dns) {
+                let mut store = lock_mutex(&status_store);
+                let (sequence, _, _) = status_gate(&mut store, status_path, now_utc_us()?, Instant::now())?;
+                if sequence != epoch.sequence || !dns_current() {
+                    return Err("daemon: private DNS authorization lost before planned close".into());
+                }
+                check_identity_revocations(&mut store, status_path, endpoints)?;
+                dns.check_source(if mode_name == "serve" { local_e2e } else { peer_e2e })?;
+                policy_window.check()?;
+            }
+            Ok(())
+        };
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -3795,6 +3957,7 @@ mod linux_daemon {
             if let Some(deadline) = deadline
                 && Instant::now() >= deadline
             {
+                check_replica_close()?;
                 path.close_gracefully();
                 break PathStop::Budget("max_seconds_reached");
             }
@@ -3804,6 +3967,7 @@ mod linux_daemon {
                     .saturating_add(stats.outbound_packets)
                     .saturating_add(stats.inbound_packets);
                 if total >= limit {
+                    check_replica_close()?;
                     path.close_gracefully();
                     break PathStop::Budget("max_packets_reached");
                 }
@@ -4004,6 +4168,7 @@ mod linux_daemon {
                     if private_dns.is_some() && mode_name == "serve" && !dns_deferred_core
                         && limit - total < 2
                     {
+                        check_replica_close()?;
                         path.close_gracefully();
                         break 'outer PathStop::Budget("max_packets_dns_pair_reserve");
                     }

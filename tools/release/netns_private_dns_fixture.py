@@ -29,7 +29,7 @@ def mapping(*items):
     return _head(5, len(items)) + b"".join(_uint(i) + val for i, val in enumerate(items))
 
 
-def generate(ca, policy, directory, pin, net_id, public_forward=False):
+def generate(ca, policy, directory, pin, net_id, *, replica=False, public_forward=False):
     openssl = os.environ.get("BOREAS_OPENSSL_BIN") or "openssl"
     net = _bytes(bytes.fromhex(net_id))
     digest = _bytes(hashlib.sha256(policy.read_bytes()).digest())
@@ -48,10 +48,11 @@ def generate(ca, policy, directory, pin, net_id, public_forward=False):
         for key, name in zip(keys, ("ED25519", "ML-DSA-65")):
             _run(openssl, "genpkey", "-algorithm", name, "-out", str(key))
             public.append(_bytes(_run(openssl, "pkey", "-in", str(key), "-pubout", "-outform", "DER")))
-        # Exact Core slot/generation: Replica (4), optionally PublicForward (2).
         capabilities = 4 | (2 if public_forward else 0)
-        service = mapping(version, net, digest, _uint(3), issued, expires,
-                          array(array(_uint(1), _uint(1), _uint(capabilities))))
+        replicas = [array(_uint(1), _uint(1), _uint(capabilities))]
+        if replica:
+            replicas.append(array(_uint(257), _uint(1), _uint(4)))
+        service = mapping(version, net, digest, _uint(3), issued, expires, array(*replicas))
         grant = mapping(net, digest, version, _uint(1), key_id, version, _uint(2), issued, expires,
                         mapping(public[0], _uint(65), public[1]))
         claims = array(*(mapping(_uint(ip[3]), _bytes(ip), _bytes(bytes(16))) for ip in TCP_MAX_RRSET))
@@ -77,6 +78,26 @@ def generate(ca, policy, directory, pin, net_id, public_forward=False):
                     raise ValueError("invalid signature size")
                 (directory / f"{stem}.{alg}.sig").write_bytes(sig)
         pin.write_bytes(b"".join(hashlib.sha256(tbs).digest() for tbs in (service, grant, authority)))
+
+
+def sign_replica_revocation(ca, net_id, output):
+    """Fixture authority—not a production signing CLI."""
+    openssl = os.environ.get("BOREAS_OPENSSL_BIN") or "openssl"
+    now = time.time_ns() // 1000
+    tbs = mapping(_uint(1), _bytes(bytes.fromhex(net_id)), _uint(1), _uint(257),
+                  _uint(1), _bytes(b"identity-authority-v1"), _uint(1),
+                  mapping(_bytes(b""), _uint(0), _uint(0)), _uint(1),
+                  _uint(now), _uint(now + 120_000_000))
+    message = b"BOREAS-AUTHORITY-REVOCATION\0\x00\x01\x01" + len(tbs).to_bytes(8, "big") + tbs
+    with tempfile.TemporaryDirectory(dir=ca.parent) as scratch:
+        source = Path(scratch) / "revocation-message"
+        source.write_bytes(message)
+        signatures = tuple(_run(openssl, "pkeyutl", "-sign", "-rawin", "-keyform", "DER",
+                                "-inkey", str(ca / f"ia.{alg}.key"), "-in", str(source))
+                           for alg in ("ed25519", "mldsa65"))
+    if tuple(map(len, signatures)) != (64, 3309):
+        raise ValueError("invalid identity revocation signature size")
+    output.write_bytes(b"BRIR\0\0\0\x01" + b"".join(signatures) + tbs)
 
 
 def opt(payload_size):
@@ -136,6 +157,35 @@ def probe():
     query(vip, 53, wide, flags=0x8300, edns=512)
     query(vip, 53, wide, flags=0x8500, addresses=WIDE_RRSET, edns=1232)
     print("private_dns_rrset=verified_complete_a_and_tc_without_partial_answers", flush=True)
+
+
+def replica_tcp_probe():
+    request, expected = messages(b"pair." + ZONE, addresses=(CORE_VIP, EDGE_VIP))
+    with tcp_connect() as client:
+        client.sendall(framed(request))
+        receive_frame(client, expected)
+
+
+def replica_old_tcp_probe(ready, promoted):
+    request, expected = messages(b"pair." + ZONE, addresses=(CORE_VIP, EDGE_VIP))
+    with tcp_connect() as client:
+        client.sendall(framed(request))
+        receive_frame(client, expected)
+        ready.touch()
+        until = time.monotonic() + 30
+        while not promoted.exists():
+            if time.monotonic() >= until:
+                raise TimeoutError("backup promotion was not signaled")
+            time.sleep(0.025)
+        client.settimeout(1)
+        another, _ = messages(b"pair." + ZONE)
+        try:
+            client.sendall(framed(another))
+            result = client.recv(4096)
+        except (TimeoutError, ConnectionResetError, BrokenPipeError):
+            return
+        if result:
+            raise AssertionError("pre-promotion DNS TCP flow received bytes on the new replica")
 
 
 def tcp_connect(timeout=3):
@@ -240,8 +290,17 @@ if __name__ == "__main__":
         tcp_probe()
     elif len(sys.argv) == 4 and sys.argv[1] == "withdrawal":
         withdrawal_probe(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "replica-revoke":
+        sign_replica_revocation(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
+    elif sys.argv[1:] == ["replica-udp"]:
+        probe()
+    elif sys.argv[1:] == ["replica-tcp"]:
+        replica_tcp_probe()
+    elif len(sys.argv) == 4 and sys.argv[1] == "replica-old-tcp":
+        replica_old_tcp_probe(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
-        ca, policy, directory, pin, net, *options = sys.argv[1:]
-        if options not in ([], ["--public-forward"]):
-            raise ValueError("unexpected DNS fixture option")
-        generate(Path(ca), Path(policy), Path(directory), Path(pin), net, bool(options))
+        ca, policy, directory, pin, net, *flags = sys.argv[1:]
+        if flags not in ([], ["--replica"], ["--public-forward"]):
+            raise SystemExit("unsupported DNS fixture flags")
+        generate(Path(ca), Path(policy), Path(directory), Path(pin), net,
+                 replica="--replica" in flags, public_forward="--public-forward" in flags)
