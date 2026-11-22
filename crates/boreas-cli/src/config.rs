@@ -570,6 +570,7 @@ impl Config {
     /// The size bound is enforced here, not only in [`Config::read_file`], so
     /// every caller is bounded — including a future control-socket path that
     /// hands over an in-memory string.
+    #[cfg(test)]
     pub fn parse_toml(input: &str, capabilities: RuntimeCapabilities) -> Result<Self, ConfigError> {
         Self::parse_toml_inner(input, capabilities, false)
     }

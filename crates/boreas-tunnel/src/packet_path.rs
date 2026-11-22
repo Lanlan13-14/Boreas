@@ -2314,6 +2314,8 @@ mod tests {
         assert!(authorize_outbound_read(&policy, &ordinary_out, Some(&mut dns), false).is_ok());
         assert_eq!(authorize_outbound_read(&policy, &ordinary_out, Some(&mut dns), true),
             Err(PacketDeny::NotDnsTraffic));
+        let (device, host) = VirtualTun::try_pair(4, 4, DEFAULT_MTU).unwrap();
+        let mut scratch = Vec::new();
         let ordinary_in = udp_datagram(core, edge, 1234, 40_001, b"not DNS", true);
         let mut ordinary_stream = InboundSource::new(encode_packet_frame(&ordinary_in, DEFAULT_MTU).unwrap());
         assert!(matches!(inbound_once(&device, &mut ordinary_stream, &policy, &mut scratch,
@@ -2322,8 +2324,6 @@ mod tests {
         let answer = udp_datagram(vip, edge, 53, 40_001, &response, true);
         let wrong_port = udp_datagram(vip, edge, 53, 40_002, &response, true);
         let wrong_destination = udp_datagram(vip, core, 53, 40_001, &response, true);
-        let (device, host) = VirtualTun::try_pair(4, 4, DEFAULT_MTU).unwrap();
-        let mut scratch = Vec::new();
         for (bytes, reject, deliver) in [
             (&wrong_port, false, false),
             (&wrong_destination, true, false),

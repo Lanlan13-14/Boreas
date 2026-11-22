@@ -753,7 +753,7 @@ impl StatusStore {
             match (pool_cutover, state.pool_cutover) {
                 (None, None) => (),
                 (Some((_, floor, CutoverAction::Check | CutoverAction::Commit)), None)
-                    if state.snapshot.is_some() && original_hash == Some(floor) => (),
+                    if state.snapshot.is_some() && original_hash == Some(floor) => {}
                 (Some((expected, _, _)), Some(actual)) if expected == actual => (),
                 _ => return Err(Error::PoolCutoverMismatch),
             }
@@ -1390,7 +1390,7 @@ impl StatusStore {
         file.take(MAX_STATE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_STATE_BYTES
-            || (bytes.len() > MAX_STATUS_STATE_BYTES + 32
+            || (bytes.len() > MAX_STATUS_STATE_BYTES
                 && !bytes.starts_with(IDENTITY_MAGIC) && !bytes.starts_with(SCOPED_MAGIC))
         {
             return Err(Error::TooLarge);

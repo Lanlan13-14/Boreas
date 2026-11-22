@@ -52,7 +52,7 @@ impl Sources {
         }
         let raw = crate::network_policy_runtime::read_bounded_regular(
             identity, MAX_IDENTITY_BYTES, "private DNS backup identity",
-        )?;
+        ).map_err(|e| format!("daemon: {e}"))?;
         let signed = trust.verify_and_authorize(&raw, now_utc_us()?)
             .map_err(|e| format!("daemon: DNS backup signed identity rejected: {e}"))?;
         let identity = VerifiedNodeIdentity::from_verified_object(&signed, context)

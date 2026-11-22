@@ -2329,7 +2329,7 @@ mod linux_daemon {
                 let pinned = PinnedDns::load(
                     &dir,
                     pin,
-                    network_policy,
+                    network_policy.clone(),
                     &network_root,
                     core,
                     zone,
