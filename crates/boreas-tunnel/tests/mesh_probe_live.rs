@@ -1412,12 +1412,14 @@ fn shared_directory_listener_discovers_provisioned_spkis_and_rejects_unlisted_co
     let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
     let acceptor = outer_for(&f, 2);
     let admission = route_admission();
-    for (client, provisioned, expected) in [
-        (&mut stranger, &[b_raw][..], None),
-        (&mut c, &c_members[..], Some(3)),
-        (&mut a, &a_members[..], Some(1)),
-        (&mut c, &c_members[..], Some(3)),
-    ] {
+    let stranger_members = [b_raw];
+    for client_id in [4, 3, 1, 3] {
+        let (client, provisioned, expected) = match client_id {
+            1 => (&mut a, &a_members[..], Some(1)),
+            3 => (&mut c, &c_members[..], Some(3)),
+            4 => (&mut stranger, &stranger_members[..], None),
+            _ => unreachable!("unexpected directory fixture client"),
+        };
         let socket = listen.try_clone().unwrap();
         thread::scope(|scope| {
             let incoming = scope.spawn(|| {
