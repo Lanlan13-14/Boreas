@@ -147,7 +147,7 @@ pub fn forward_fixed(
     let deadline = route.deadline(probe, &[&left, &right])?;
     let (left_socket, right_socket) = (&left.socket, &right.socket);
     let remote_expiry = route.expiry(left.remote_lsa_expiry.min(right.remote_lsa_expiry));
-    let mut check = || {
+    let check = || {
         probe
             .check_route_utc(&route.members, remote_expiry)
             .map_err(|_| TunnelError::Unsupported("fixed-route authority expired"))
