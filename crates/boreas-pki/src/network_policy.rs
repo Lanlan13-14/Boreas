@@ -1,6 +1,6 @@
 //! Verification of NetworkPolicy candidates against a separately provisioned pin.
-//! Runtime conversion remains restricted to the default overlay pending complete
-//! custom-prefix integration. A static context is not a live
+//! Ordinary runtime conversion remains restricted to the default overlay.
+//! Custom conversion is internal to explicitly verified migration material. A static context is not a live
 //! freshness proof: renewal, trusted time and revocation remain separate gates.
 #![cfg(feature = "openssl-backend")]
 
@@ -56,7 +56,11 @@ impl VerifiedNetworkPolicy {
         if self.overlay_base != crate::OverlayPrefix::DEFAULT.base() {
             return Err(NetworkPolicyError::UnsupportedRuntimePrefix);
         }
-        Ok(VerifiedNetworkContext {
+        Ok(self.context())
+    }
+
+    pub(crate) fn context(&self) -> VerifiedNetworkContext {
+        VerifiedNetworkContext {
             net_id: self.net_id,
             root_key_fingerprint: self.root_key_fingerprint,
             overlay_base: self.overlay_base,
@@ -65,7 +69,7 @@ impl VerifiedNetworkPolicy {
             seq: self.seq,
             issued_at: self.issued_at,
             expires: self.expires,
-        })
+        }
     }
 
     #[cfg(target_os = "linux")]

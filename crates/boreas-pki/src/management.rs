@@ -49,6 +49,7 @@ use crate::{Authority, NodeRole, root_authorization::VerifiedIssuerAuthorization
 
 mod pool_migration;
 pub use pool_migration::verify_ipv4_pool_migration;
+pub(crate) use pool_migration::verify_migration_objects;
 
 /// Candidate management-object schema version used by `boreas-proto`.
 pub const MANAGEMENT_SCHEMA_VERSION: u16 = 1;

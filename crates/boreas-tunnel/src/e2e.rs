@@ -582,17 +582,25 @@ pub trait E2eTlsBackend: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct E2eL3Profile {
     active_lanes: u8,
+    pool_approval: Option<[u8; 32]>,
 }
 
 impl E2eL3Profile {
-    pub const SINGLE_LANE: Self = Self { active_lanes: 1 };
+    pub const SINGLE_LANE: Self = Self { active_lanes: 1, pool_approval: None };
 
     /// Explicitly enable two, three, or four active lanes.
     pub const fn multi_active(active_lanes: u8) -> Option<Self> {
         match active_lanes {
-            2..=4 => Some(Self { active_lanes }),
+            2..=4 => Some(Self { active_lanes, pool_approval: None }),
             _ => None,
         }
+    }
+
+    /// A single direct lane requiring reciprocal operator approval and exact
+    /// agreement on the signed target policy inside the E2E TLS channel.
+    #[cfg(feature = "openssl-inner-tls")]
+    pub const fn direct_pool_cutover(approval: [u8; 32]) -> Self {
+        Self { active_lanes: 1, pool_approval: Some(approval) }
     }
 
     pub const fn active_lanes(self) -> u8 {
@@ -642,6 +650,7 @@ const E2E_CONFIRM_BODY_LEN: usize = E2E_CONFIRM_CAPABILITIES_OFFSET + 8;
 const POLICY_DIGEST_LEN: usize = 32;
 const E2E_CONFIRM_MULTI_BODY_LEN: usize = E2E_CONFIRM_BODY_LEN + POLICY_DIGEST_LEN;
 const E2E_CONFIRM_MULTI_ACTIVE: u64 = 1 << 8;
+const E2E_CONFIRM_POOL_CUTOVER: u64 = 1 << 9;
 
 type ConfirmationBody = [u8; E2E_CONFIRM_BODY_LEN];
 type PolicyDigest = [u8; POLICY_DIGEST_LEN];
@@ -713,7 +722,11 @@ impl MultiActiveConfirmation {
         let mut bytes = [0u8; E2E_CONFIRM_MULTI_BODY_LEN];
         bytes[..E2E_CONFIRM_BODY_LEN].copy_from_slice(&base);
         bytes[4] = E2E_CONFIRM_MULTI_VERSION;
-        let capability = E2E_CONFIRM_MULTI_ACTIVE | u64::from(self.profile.active_lanes());
+        let capability = if self.profile.pool_approval.is_some() {
+            E2E_CONFIRM_POOL_CUTOVER
+        } else {
+            E2E_CONFIRM_MULTI_ACTIVE
+        } | u64::from(self.profile.active_lanes());
         bytes[E2E_CONFIRM_CAPABILITIES_OFFSET..E2E_CONFIRM_BODY_LEN]
             .copy_from_slice(&capability.to_be_bytes());
         bytes[E2E_CONFIRM_BODY_LEN..].copy_from_slice(&self.policy_digest);
@@ -927,7 +940,7 @@ impl<'a> E2eCircuit<'a> {
 
 impl Read for E2eCircuit<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.l3_profile == E2eL3Profile::SINGLE_LANE && !self.private_dns_only {
+        if self.l3_profile.active_lanes() == 1 && !self.private_dns_only {
             self.stream.read(out)
         } else {
             self.stream.read_with_authenticated_eof(out)
@@ -965,10 +978,22 @@ fn multi_active_confirmation(
     mtu_cap: u16,
 ) -> Result<Option<MultiActiveConfirmation>, TunnelError> {
     if profile == E2eL3Profile::SINGLE_LANE {
+        // Never silently use the legacy confirmation with custom-pool identities.
+        #[cfg(feature = "openssl-inner-tls")]
+        if [local, info.peer].iter().any(|endpoint| endpoint.policy_base()
+            .is_some_and(|base| base != boreas_pki::OverlayPrefix::DEFAULT.base()))
+        {
+            return Err(SessionReject::PeerIdentityMismatch.into());
+        }
         return Ok(None);
     }
     #[cfg(feature = "openssl-inner-tls")]
     {
+        let custom = local.policy_base()
+            .is_some_and(|base| base != boreas_pki::OverlayPrefix::DEFAULT.base());
+        if custom != profile.pool_approval.is_some() || (custom && info.path_hops != 1) {
+            return Err(SessionReject::PeerIdentityMismatch.into());
+        }
         let policy_digest = crate::packet_path::AuthorizedEndpoints::confirmation_policy_digest(
             info.circuit_id,
             info.path_hops,
@@ -977,10 +1002,16 @@ fn multi_active_confirmation(
             mtu_cap,
         )
         .map_err(|_| SessionReject::PeerIdentityMismatch)?;
-        Ok(Some(MultiActiveConfirmation {
-            profile,
-            policy_digest,
-        }))
+        let policy_digest = if let Some(approval) = profile.pool_approval {
+            let mut digest = openssl::sha::Sha256::new();
+            digest.update(b"Boreas direct pool confirmation v1\0");
+            digest.update(&approval);
+            digest.update(&policy_digest);
+            digest.finish()
+        } else {
+            policy_digest
+        };
+        Ok(Some(MultiActiveConfirmation { profile, policy_digest }))
     }
     #[cfg(not(feature = "openssl-inner-tls"))]
     {

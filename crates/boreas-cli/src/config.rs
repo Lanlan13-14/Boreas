@@ -571,6 +571,14 @@ impl Config {
     /// every caller is bounded — including a future control-socket path that
     /// hands over an in-memory string.
     pub fn parse_toml(input: &str, capabilities: RuntimeCapabilities) -> Result<Self, ConfigError> {
+        Self::parse_toml_inner(input, capabilities, false)
+    }
+
+    fn parse_toml_inner(
+        input: &str,
+        capabilities: RuntimeCapabilities,
+        pool_cutover: bool,
+    ) -> Result<Self, ConfigError> {
         if input.len() > MAX_CONFIG_BYTES {
             return Err(ConfigError::TooLarge);
         }
@@ -599,7 +607,7 @@ impl Config {
             }
             _ => return Err(ConfigError::UnsupportedSchemaVersion),
         };
-        config.validate(capabilities)?;
+        config.validate_inner(capabilities, pool_cutover)?;
         Ok(config)
     }
 
@@ -756,6 +764,19 @@ impl Config {
     /// reparse point is refused. NTFS ACLs are not inspected; that is stated
     /// rather than implied.
     pub fn read_file(path: &Path, capabilities: RuntimeCapabilities) -> Result<Self, ConfigError> {
+        Self::read_file_inner(path, capabilities, false)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
+    pub(crate) fn read_pool_cutover_file(path: &Path) -> Result<Self, ConfigError> {
+        Self::read_file_inner(path, RuntimeCapabilities::NO_RUNTIME, true)
+    }
+
+    fn read_file_inner(
+        path: &Path,
+        capabilities: RuntimeCapabilities,
+        pool_cutover: bool,
+    ) -> Result<Self, ConfigError> {
         let file = open_no_follow(path)?;
         let metadata = file.metadata().map_err(|_| ConfigError::ReadFailed)?;
         // A symlink or reparse point is refused on every platform. On Unix the
@@ -793,7 +814,7 @@ impl Config {
             return Err(ConfigError::TooLarge);
         }
         let input = std::str::from_utf8(&bytes).map_err(|_| ConfigError::ParseFailed)?;
-        Self::parse_toml(input, capabilities)
+        Self::parse_toml_inner(input, capabilities, pool_cutover)
     }
 
     /// Machine-readable summary. Secret-bearing values are replaced; `net_id` is
@@ -932,6 +953,14 @@ impl Config {
     /// Validate required security-critical identifiers and policy. Existence,
     /// permissions, key encoding and trust-chain validity are later runtime jobs.
     pub fn validate(&self, capabilities: RuntimeCapabilities) -> Result<(), ConfigError> {
+        self.validate_inner(capabilities, false)
+    }
+
+    fn validate_inner(
+        &self,
+        capabilities: RuntimeCapabilities,
+        pool_cutover: bool,
+    ) -> Result<(), ConfigError> {
         if self.network.net_id.len() != 32
             || !self.network.net_id.bytes().all(|b| b.is_ascii_hexdigit())
         {
@@ -940,7 +969,7 @@ impl Config {
         // Fail closed even for manually constructed Config values and callers
         // reporting FULL capabilities: none of today's capability bits proves
         // end-to-end prefix binding. Never accept intent that the daemon ignores.
-        if self.network.overlay_prefix != OverlayPrefix::DEFAULT {
+        if !pool_cutover && self.network.overlay_prefix != OverlayPrefix::DEFAULT {
             return Err(ConfigError::CustomOverlayPrefixUnavailable);
         }
         let identity = &self.identity;

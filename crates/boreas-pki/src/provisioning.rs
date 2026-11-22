@@ -966,6 +966,48 @@ pub fn verify_material_dir_with_roots(
     now_us: u64,
     require_peer: bool,
 ) -> Result<VerifiedBundle, ProvisionError> {
+    verify_material_dir_inner(material_dir, roots_path, expected_net_id, now_us, require_peer, None)
+        .map(|(bundle, _)| bundle)
+}
+
+/// Exact signed endpoint material for a direct one-Core/one-Edge cutover.
+/// Does not accept a policy floor or grant freshness/revocation permission.
+#[cfg(target_os = "linux")]
+pub struct VerifiedPoolMigrationBundle {
+    pub bundle: VerifiedBundle,
+    pub local_source: VerifiedObject,
+    pub peer_source: VerifiedObject,
+    pub context: crate::VerifiedNetworkContext,
+}
+
+#[cfg(target_os = "linux")]
+pub fn verify_pool_migration_bundle(
+    material_dir: &Path,
+    roots_path: &Path,
+    policy: &crate::VerifiedNetworkPolicy,
+    now_us: u64,
+) -> Result<VerifiedPoolMigrationBundle, ProvisionError> {
+    let (bundle, (local_source, peer_source)) = verify_material_dir_inner(
+        material_dir, roots_path, Some(policy.net_id()), now_us, true, Some(policy),
+    )?;
+    Ok(VerifiedPoolMigrationBundle {
+        bundle,
+        local_source: local_source.ok_or(ProvisionError::InvalidParameter("missing legacy local"))?,
+        peer_source: peer_source.ok_or(ProvisionError::InvalidParameter("missing legacy peer"))?,
+        context: policy.context(),
+    })
+}
+
+type VerifiedMaterial = (VerifiedBundle, (Option<VerifiedObject>, Option<VerifiedObject>));
+
+fn verify_material_dir_inner(
+    material_dir: &Path,
+    roots_path: &Path,
+    expected_net_id: Option<[u8; 16]>,
+    now_us: u64,
+    require_peer: bool,
+    policy: Option<&crate::VerifiedNetworkPolicy>,
+) -> Result<VerifiedMaterial, ProvisionError> {
     let roots_raw = read_bounded(roots_path)?;
     let roots_bundle = RootsBundle::decode(&roots_raw)?;
     let net_id = match expected_net_id {
@@ -976,18 +1018,40 @@ pub fn verify_material_dir_with_roots(
         None => roots_bundle.net_id,
     };
     let (root_fingerprint, authorizations) = roots_bundle.verify_all(net_id, now_us)?;
+    if policy.is_some_and(|policy| policy.root_key_fingerprint() != root_fingerprint) {
+        return Err(ProvisionError::InvalidParameter("migration policy and material root mismatch"));
+    }
 
     let mut has_ia = false;
     let mut has_status = false;
     let mut trust = ManagementTrust::new(net_id);
-    for auth in authorizations {
+    for auth in &authorizations {
         match auth.authority() {
             Authority::IdentityAuthority => has_ia = true,
             Authority::StatusSigner => has_status = true,
             _ => {}
         }
-        trust.add_verified_issuer(&auth)?;
+        trust.add_verified_issuer(auth)?;
     }
+    let mut verify_identity = |raw: &[u8], legacy_filename: &str| {
+        let Some(policy) = policy else {
+            return Ok((None, trust.verify_and_authorize(raw, now_us)?));
+        };
+        let legacy = read_bounded(&material_dir.join(legacy_filename))?;
+        let signed = boreas_proto::messages::SignedObject::decode(&legacy)
+            .map_err(|_| ProvisionError::InvalidParameter("invalid legacy signed envelope"))?;
+        let source = boreas_proto::objects::decode_tbs(&signed.raw_tbs)
+            .map_err(|_| ProvisionError::InvalidParameter("invalid legacy signed identity"))?;
+        let issuer = authorizations.iter().find(|grant| {
+            grant.authority() == Authority::IdentityAuthority
+                && grant.issuer_record().issuer_key_id == source.issuer_key_id
+                && grant.issuer_record().issuer_generation == source.issuer_generation
+        }).ok_or(ProvisionError::MissingAuthority("migration source issuer"))?;
+        let (legacy, migrated) = crate::management::verify_migration_objects(
+            &legacy, raw, policy, issuer, now_us,
+        )?;
+        Ok::<_, ProvisionError>((Some(legacy), migrated))
+    };
     if !has_ia {
         return Err(ProvisionError::MissingAuthority("IdentityAuthority"));
     }
@@ -1011,7 +1075,7 @@ pub fn verify_material_dir_with_roots(
         .map_err(|_| ProvisionError::CryptoIdentity)?;
 
     let local_raw = read_bounded(&material_dir.join("local.signed"))?;
-    let local = trust.verify_and_authorize(&local_raw, now_us)?;
+    let (local_source, local) = verify_identity(&local_raw, "legacy-local.signed")?;
     let ObjectBody::NodeIdentity(local_body) = &local.object().body else {
         return Err(ProvisionError::InvalidParameter(
             "local.signed is not a NodeIdentity",
@@ -1022,9 +1086,9 @@ pub fn verify_material_dir_with_roots(
     }
 
     let peer_path = material_dir.join("peer.signed");
-    let peer = if peer_path.exists() || require_peer {
+    let (peer_source, peer) = if peer_path.exists() || require_peer {
         let peer_raw = read_bounded(&peer_path)?;
-        let verified_peer = trust.verify_and_authorize(&peer_raw, now_us)?;
+        let (source, verified_peer) = verify_identity(&peer_raw, "legacy-peer.signed")?;
         let ObjectBody::NodeIdentity(peer_body) = &verified_peer.object().body else {
             return Err(ProvisionError::InvalidParameter(
                 "peer.signed is not a NodeIdentity",
@@ -1035,15 +1099,22 @@ pub fn verify_material_dir_with_roots(
                 "peer.signed has the same node_id as local.signed",
             ));
         }
-        Some(verified_peer)
+        if policy.is_some() && (peer_body.home_core_id != local_body.home_core_id
+            || !matches!((local_body.role, peer_body.role),
+                (boreas_proto::objects::NodeRole::Core, boreas_proto::objects::NodeRole::Edge)
+                | (boreas_proto::objects::NodeRole::Edge, boreas_proto::objects::NodeRole::Core)))
+        {
+            return Err(ProvisionError::InvalidParameter("migration requires the Edge and its home Core"));
+        }
+        (source, Some(verified_peer))
     } else {
-        None
+        (None, None)
     };
 
     let status =
         verify_status_file_against_trust(&mut trust, &material_dir.join("status.signed"), now_us)?;
 
-    Ok(VerifiedBundle {
+    Ok((VerifiedBundle {
         net_id,
         root_fingerprint,
         local,
@@ -1052,7 +1123,7 @@ pub fn verify_material_dir_with_roots(
         status_issued_at_us: status.issued_at,
         status_next_update_us: status.next_update,
         status_valid_until_us: status.valid_until,
-    })
+    }, (local_source, peer_source)))
 }
 
 /// Convenience wrapper verifying `material_dir/roots.cbor`.

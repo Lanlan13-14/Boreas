@@ -262,12 +262,12 @@ impl StatusStore {
     /// Query a previously committed IdentityAuthority denial for an authenticated
     /// endpoint. Unusable state is an error, never an empty decision set.
     pub fn identity_revoked(&self, peer: &super::AuthenticatedPeer) -> Result<bool, Error> {
-        self.decision_matches(peer, RevocationClass::Identity, |_| true)
+        self.endpoint_decision_matches(peer, RevocationClass::Identity)
     }
 
     /// Independently root-issued denial for this authenticated Core generation.
     pub fn core_revoked(&self, peer: &super::AuthenticatedPeer) -> Result<bool, Error> {
-        self.decision_matches(peer, RevocationClass::Core, |_| true)
+        self.endpoint_decision_matches(peer, RevocationClass::Core)
     }
 
     /// Invalidate only a verified grant's own issuer/subject/prefix binding.
@@ -354,6 +354,25 @@ impl StatusStore {
             return Err(Error::RevocationPermission);
         }
         Ok(())
+    }
+
+    fn endpoint_decision_matches(
+        &self,
+        peer: &super::AuthenticatedPeer,
+        class: RevocationClass,
+    ) -> Result<bool, Error> {
+        if self.decision_matches(peer, class, |_| true)? {
+            return Ok(true);
+        }
+        // A migration is not a new key or independent authorization. Explicit
+        // denials of a source continue to deny its exact approved successor.
+        if let Some(source) = self.pool_cutover_sources.iter().flatten().find(|source| {
+            source.node_id() == peer.node_id()
+                && source.identity_generation().checked_add(1) == Some(peer.identity_generation())
+        }) {
+            return self.decision_matches(source, class, |_| true);
+        }
+        Ok(false)
     }
 
     fn decision_matches(

@@ -4,7 +4,7 @@
 use std::{net::SocketAddr, os::fd::AsRawFd, path::Path, sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use boreas_pki::{VerifiedNetworkContext, management::ManagementTrust};
-use boreas_tunnel::dns_replica::{self, Side};
+use boreas_tunnel::{dns_replica::{self, Side}, e2e::open_e2e_until};
 
 use super::{
     AuthenticatedPeer, ClientTarget, HANDSHAKE_TIMEOUT, LinkClient, LiveCounters,
@@ -12,7 +12,7 @@ use super::{
     PathStop, PeerIdentity, PinnedDns, PkiIdentityExtractor, PolicyWindow, SessionPolicy,
     StatusStore, TunEndpoint, VerifiedNodeIdentity, bound_path_io, direct_outer_connector,
     drive_business_path, duplicate_e2e_socket, lock_mutex, may_try_backup, now_utc_us,
-    open_e2e_until, print_path_summary, revocation_slots, status_gate,
+    print_path_summary, revocation_slots, status_gate,
     check_identity_revocations,
 };
 

@@ -47,6 +47,8 @@ pub fn daemon_usage() -> &'static str {
     "Usage:
   boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
   boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
+  Direct IPv4 pool cutover (both roles): --pool-cutover <APPROVAL> --pool-cutover-action <check|commit|resume>.
+  See docs/engineering/signed-ipv4-pool-staging.md; check and commit are offline.
   Direct multi-active IPv4/TCP (either role, real TUN only): add --e2e-active-lanes <2|3|4>
   with the same value and MTU on both ends. Connect requires explicit --connect; no standby,
   private DNS, GSO, virtual TUN or --max-packets in this profile.
@@ -255,8 +257,9 @@ mod linux_daemon {
         Authority,
         authority_revocation::AuthorityRevocationTrust,
         management::ManagementTrust,
+        network_policy_store::{CutoverAction, NetworkPolicyStore},
         provisioning::{
-            RootsBundle, parse_net_id_hex, read_status_snapshot_raw, verify_material_dir_with_roots,
+            RootsBundle, parse_net_id_hex, read_status_snapshot_raw, verify_material_dir_with_roots, verify_pool_migration_bundle,
         },
         status_store::{AuthenticatedPeer, MAX_IDENTITY_REVOCATION_BYTES, MAX_SCOPED_REVOCATION_BYTES, StatusStore},
     };
@@ -273,7 +276,7 @@ mod linux_daemon {
         ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
         OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
-        e2e::{E2eCircuit, accept_e2e_until, open_e2e_until},
+        e2e::{E2eCircuit, E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
         failover,
         packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
         resource::{Admission, Limits},
@@ -288,6 +291,7 @@ mod linux_daemon {
     use private_dns::{Interrupt as DnsInterrupt, PinnedDns, PublicUpstream};
 
     mod multi_active;
+    mod pool_cutover;
     mod private_dns;
     mod private_dns_replica;
 
@@ -1920,6 +1924,8 @@ mod linux_daemon {
         let mut dns_only = false;
         let mut dns_backup = None;
         let mut dns_backup_identity: Option<PathBuf> = None;
+        let mut pool_approval = None;
+        let mut pool_action = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -1948,6 +1954,15 @@ mod linux_daemon {
                         .get(i + 1)
                         .ok_or_else(|| format!("daemon: missing value for `{flag}`"))?;
                     match flag {
+                        "--pool-cutover" if pool_approval.is_none() => pool_approval = Some(val.as_str()),
+                        "--pool-cutover-action" if pool_action.is_none() => {
+                            pool_action = Some(match val.as_str() {
+                                "check" => CutoverAction::Check,
+                                "commit" => CutoverAction::Commit,
+                                "resume" => CutoverAction::Resume,
+                                _ => return Err("daemon: invalid pool cutover action".into()),
+                            });
+                        }
                         "--config" => config_path = Some(PathBuf::from(val)),
                         "--material-dir" => material_dir = Some(PathBuf::from(val)),
                         "--status-state-file" => {
@@ -2028,7 +2043,35 @@ mod linux_daemon {
             }
         }
 
+        let plan = match (pool_approval, pool_action) {
+            (None, None) => None,
+            (Some(text), Some(action)) => Some(pool_cutover::Plan::parse(text, action)?),
+            _ => return Err("daemon: --pool-cutover and --pool-cutover-action must be supplied together".into()),
+        };
         let public_dns = public_dns_upstream.is_some() || public_dns_client;
+        if plan.is_some() {
+            if provisioned || virtual_tun || tun_tcpv4_gso || multi_active_profile.is_some()
+                || dns_only || public_dns || dns_dir.is_some() || dns_pin.is_some()
+                || dns_backup.is_some() || dns_backup_identity.is_some()
+            {
+                return Err("daemon: pool cutover supports only standalone real TUN single-lane direct IPv4 without DNS or GSO".into());
+            }
+            let endpoint = match (mode, listen_spec.as_deref(), connect_spec.as_deref()) {
+                (Mode::Serve, Some(addr), None) => addr,
+                (Mode::Connect, None, Some(addr)) if tls_name.as_deref().is_some_and(|s| !s.is_empty()) => addr,
+                _ => return Err("daemon: pool cutover requires explicit Core --listen or Edge --connect and --tls-name".into()),
+            };
+            let addr = endpoint.parse::<std::net::SocketAddrV4>()
+                .map_err(|_| "daemon: pool cutover endpoint must be a literal IPv4 address and port")?;
+            if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() || addr.ip().is_broadcast() {
+                return Err("daemon: pool cutover requires a specific unicast underlay endpoint".into());
+            }
+            // Only canonical numeric addresses reach the existing direct path.
+            match mode {
+                Mode::Serve => listen_spec = Some(addr.to_string()),
+                Mode::Connect => connect_spec = Some(addr.to_string()),
+            }
+        }
         if public_dns && (dns_dir.is_none() || dns_pin.is_none() || virtual_tun || tun_tcpv4_gso
             || (mode == Mode::Serve && public_dns_client)
             || (mode == Mode::Connect && public_dns_upstream.is_some()))
@@ -2104,7 +2147,11 @@ mod linux_daemon {
             && dns_pin.is_some()
             && !virtual_tun
             && !tun_tcpv4_gso;
-        let config = Config::read_file(&cfg_file, daemon_capabilities(dns_tcp_profile))
+        let config = if plan.is_some() {
+            Config::read_pool_cutover_file(&cfg_file)
+        } else {
+            Config::read_file(&cfg_file, daemon_capabilities(dns_tcp_profile))
+        }
             .map_err(|e| format!("daemon config rejected: {e}"))?;
 
         if config.security.mode != CfgMode::E2eRequired {
@@ -2134,22 +2181,6 @@ mod linux_daemon {
             .ok_or_else(|| "daemon: config `[paths].roots` is empty".to_string())?
             .clone();
 
-        // Real mounted roots.cbor verification (§2.2 / §3.4): NO TOFU, NO bypass.
-        let now_us = now_utc_us()?;
-        let verified =
-            verify_material_dir_with_roots(&mat_dir, &roots_path, Some(cfg_net_id), now_us, true)
-                .map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
-        let (mut status_trust, identity_trust) = bound_runtime_trust(
-            &roots_path,
-            cfg_net_id,
-            verified.root_fingerprint,
-            now_utc_us()?,
-        )?;
-
-        // The default overlay now also requires a separately pinned, dual-signed
-        // policy plus durable anti-rollback state. This helper accepts no raw
-        // caller prefix and currently returns only the default runtime prefix.
-        // Missing inputs fail closed rather than selecting legacy/unbound data.
         fn required_policy_input(value: Option<PathBuf>, flag: &str) -> Result<PathBuf, String> {
             value.ok_or_else(|| format!("daemon: `{flag}` is required for policy-bound runtime"))
         }
@@ -2171,22 +2202,41 @@ mod linux_daemon {
             root_ed25519_der: &policy_root_ed_path,
             root_mldsa65_der: &policy_root_pq_path,
         };
-        let (network_policy, network_root) =
-            crate::network_policy_runtime::verify_and_record_policy_material(
-                policy_inputs,
-                &policy_state_path,
-                &config.paths.state_dir,
-                cfg_net_id,
-                verified.root_fingerprint,
-                policy_state_owner_uid.ok_or_else(|| {
-                    "daemon: `--network-policy-state-owner-uid` is required".to_string()
-                })?,
-            )
-            .map_err(|error| format!("daemon network policy rejected: {error}"))?;
-
-        let network_context = network_policy
-            .require_default_runtime()
-            .map_err(|e| format!("daemon network context rejected: {e}"))?;
+        let policy_owner = policy_state_owner_uid.ok_or(
+            "daemon: `--network-policy-state-owner-uid` is required",
+        )?;
+        let now_us = now_utc_us()?;
+        let (verified, network_policy, network_root, network_context, mut policy_store, bound) =
+            if let Some(plan) = &plan {
+                let (policy, root, _) = crate::network_policy_runtime::verify_policy_material(
+                    policy_inputs, &policy_state_path, &config.paths.state_dir, cfg_net_id, plan.root,
+                ).map_err(|error| format!("daemon network policy rejected: {error}"))?;
+                let material = verify_pool_migration_bundle(&mat_dir, &roots_path, &policy, now_us)
+                    .map_err(|e| format!("daemon: migration material rejected: {e}"))?;
+                let bound = plan.bind_material(&material, &policy, &config, mode)?;
+                let store = NetworkPolicyStore::open(&policy_state_path, cfg_net_id, plan.root, policy_owner)
+                    .map_err(|e| format!("daemon: existing pool policy state rejected: {e}"))?;
+                (material.bundle, policy, root, material.context, store, Some(bound))
+            } else {
+                let verified = verify_material_dir_with_roots(
+                    &mat_dir, &roots_path, Some(cfg_net_id), now_us, true,
+                ).map_err(|e| format!("daemon trust/roots verification failed: {e}"))?;
+                let (policy, root, tbs) = crate::network_policy_runtime::verify_policy_material(
+                    policy_inputs, &policy_state_path, &config.paths.state_dir, cfg_net_id,
+                    verified.root_fingerprint,
+                ).map_err(|error| format!("daemon network policy rejected: {error}"))?;
+                let context = policy.require_default_runtime()
+                    .map_err(|e| format!("daemon network context rejected: {e}"))?;
+                // Hold the policy lock as well as the status lock for the daemon's
+                // lifetime. A live direct daemon cannot race the cutover writer.
+                let store = crate::network_policy_runtime::record_default_policy(
+                    &policy_state_path, policy_owner, &policy, &tbs,
+                ).map_err(|e| format!("daemon network policy state rejected: {e}"))?;
+                (verified, policy, root, context, store, None)
+            };
+        let (mut status_trust, identity_trust) = bound_runtime_trust(
+            &roots_path, cfg_net_id, verified.root_fingerprint, now_utc_us()?,
+        )?;
 
         // The signed policy is the sole address authority. A config prefix that
         // does not equal the verified context would let a node derive/use an
@@ -2207,7 +2257,12 @@ mod linux_daemon {
         // Capture the signed window exactly once. It is checked at every dial,
         // handshake, promotion and packet-loop iteration; it is never widened by
         // a later verification or clock observation.
-        let policy_window = PolicyWindow::new(network_context.validity().1)?;
+        let mut signed_until = network_context.validity().1;
+        if plan.is_some() {
+            signed_until = signed_until.min(verified.local.valid_until())
+                .min(verified.peer.as_ref().ok_or("daemon: migration peer missing")?.valid_until());
+        }
+        let policy_window = PolicyWindow::new(signed_until)?;
 
         let local_vn =
             VerifiedNodeIdentity::from_verified_object(&verified.local, &network_context)
@@ -2355,6 +2410,91 @@ mod linux_daemon {
         let e2e_backend =
             OpenSslE2eBackend::new(Arc::new(e2e_conn), Arc::new(e2e_acc), extractor.clone());
 
+        // Offline admission and both durable locks precede any TUN, control
+        // socket, bind or dial. Only Resume may proceed past this boundary.
+        let canonical_state_dir = fs::canonicalize(&config.paths.state_dir)
+            .map_err(|_| "daemon: cannot canonicalize state_dir for status store")?;
+        let canonical_status_parent = fs::canonicalize(
+            status_state_file.parent().ok_or("daemon: status state path has no parent")?,
+        ).map_err(|_| "daemon: status state parent does not exist")?;
+        if canonical_status_parent != canonical_state_dir {
+            return Err("daemon: --status-state-file must be directly under the configured state_dir".into());
+        }
+        let canonical_status_state = canonical_status_parent.join(
+            status_state_file.file_name().ok_or("daemon: invalid status state filename")?,
+        );
+        let status_path = mat_dir.join("status.signed");
+        let cutover = plan.as_ref().zip(bound.as_ref());
+        let mut status_store = if let Some((plan, bound)) = cutover {
+            if mode == Mode::Serve {
+                OpenSslOuterTlsAcceptor::from_pem_files(mat_dir.join("outer.pem"), mat_dir.join("outer.key"))
+                    .map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?;
+            } else {
+                direct_outer_connector(&mat_dir)?;
+            }
+            if plan.action == CutoverAction::Resume {
+                // Reject a partial policy transaction before processing the
+                // status mailbox on Resume; recheck the actual sequence below.
+                policy_store.cutover(&network_policy, plan.anchors(
+                    bound, &canonical_status_state, u64::MAX,
+                ), CutoverAction::Resume)
+                    .map_err(|e| format!("daemon: pool cutover resume denied: {e}"))?;
+            }
+            StatusStore::open_for_pool_cutover(
+                &status_state_file, cfg_net_id, status_state_owner_uid, status_trust,
+                verified.root_fingerprint, identity_trust, plan.status_marker(bound, &canonical_status_state),
+                plan.original_status_state, plan.action,
+            )
+        } else {
+            StatusStore::open_with_identity_revocations(
+                &status_state_file, cfg_net_id, status_state_owner_uid, status_trust,
+                verified.root_fingerprint, identity_trust,
+            )
+        }.map_err(|e| format!("daemon: durable status store open failed: {e:?}"))?;
+        let (gate_seq, _, _) = status_gate(&mut status_store, &status_path, now_utc_us()?, Instant::now())
+            .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
+        let targets = revocation_slots(local_peer, remote_peer)?;
+        check_identity_revocations(&mut status_store, &status_path, targets)?;
+        let l3_profile = if let Some((plan, bound)) = cutover {
+            if gate_seq < plan.minimum_status {
+                return Err("daemon: cutover status sequence below coordinated approval floor".into());
+            }
+            check_committed_identity_revocations(&status_store, bound.sources)?;
+            let now = now_utc_us()?;
+            status_store.current_fresh(now, Instant::now())
+                .map_err(|e| format!("daemon: cutover status not fresh: {e}"))?;
+            policy_window.check()?;
+            let anchors = plan.anchors(bound, &canonical_status_state, gate_seq);
+            match plan.action {
+                CutoverAction::Check | CutoverAction::Commit => {
+                    // Validate policy eligibility before changing either image.
+                    policy_store.cutover(&network_policy, anchors, CutoverAction::Check)
+                        .map_err(|e| format!("daemon: pool cutover policy check failed: {e}"))?;
+                    if plan.action == CutoverAction::Commit {
+                        // Policy marker first: a partial commit blocks ordinary
+                        // startup and cannot resume without the status marker.
+                        policy_store.cutover(&network_policy, anchors, CutoverAction::Commit)
+                            .map_err(|e| format!("daemon: pool cutover policy commit failed: {e}"))?;
+                        status_store.commit_pool_cutover(anchors.approval_digest)
+                            .map_err(|e| format!("daemon: pool cutover status commit failed: {e}"))?;
+                    }
+                    println!("{{\"pool_cutover\":\"{}\",\"network_started\":false}}",
+                        if plan.action == CutoverAction::Commit { "committed" } else { "checked" });
+                    return Ok(());
+                }
+                CutoverAction::Resume => {
+                    policy_store.cutover(&network_policy, anchors, CutoverAction::Resume)
+                        .map_err(|e| format!("daemon: pool cutover resume denied: {e}"))?;
+                    status_store.bind_pool_cutover_sources(bound.sources)
+                        .map_err(|e| format!("daemon: cannot bind cutover revocation continuity: {e}"))?;
+                    E2eL3Profile::direct_pool_cutover(plan.ceremony_digest(bound))
+                }
+            }
+        } else {
+            E2eL3Profile::SINGLE_LANE
+        };
+        let status_store = Arc::new(Mutex::new(status_store));
+
         // Open real Linux TUN (or VirtualTun for unprivileged tests) BEFORE starting traffic.
         let tun_endpoint = if virtual_tun {
             let (device, host) = VirtualTun::try_pair(64, 64, mtu)
@@ -2409,7 +2549,7 @@ mod linux_daemon {
             tx_bytes: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
-            status_sequence: AtomicU64::new(verified.status_sequence),
+            status_sequence: AtomicU64::new(gate_seq),
             status_fresh: AtomicBool::new(true),
             standby_ready: AtomicBool::new(false),
             standby_rejected: AtomicBool::new(false),
@@ -2423,49 +2563,6 @@ mod linux_daemon {
             multi_active_lanes: std::array::from_fn(|_| multi_active::LaneCounters::default()),
         });
         let _ctl_guard = start_control_socket(&config.paths.state_dir, Arc::clone(&counters))?;
-
-        // The durable status store is a process-wide singleton: open it once,
-        // before any accept/connect handshake, and keep it until the watchdog
-        // thread exits. A second StatusStore::open on the same path would
-        // return Busy from the adjacent .lock.
-        let canonical_state_dir = fs::canonicalize(&config.paths.state_dir)
-            .map_err(|_| "daemon: cannot canonicalize state_dir for status store".to_string())?;
-        let status_parent = status_state_file
-            .parent()
-            .ok_or_else(|| "daemon: --status-state-file has no parent".to_string())?;
-        let canonical_status_parent = fs::canonicalize(status_parent)
-            .map_err(|_| "daemon: status state parent does not exist".to_string())?;
-        if canonical_status_parent != canonical_state_dir {
-            return Err(
-                "daemon: --status-state-file must be directly under the configured state_dir"
-                    .to_string(),
-            );
-        }
-        let mut status_store = StatusStore::open_with_identity_revocations(
-            &status_state_file,
-            cfg_net_id,
-            status_state_owner_uid,
-            status_trust,
-            verified.root_fingerprint,
-            identity_trust,
-        )
-        .map_err(|e| format!("daemon: durable status store open failed: {e:?}"))?;
-        let status_path = mat_dir.join("status.signed");
-        let (gate_seq, _, _) = status_gate(
-            &mut status_store,
-            &status_path,
-            now_utc_us()?,
-            Instant::now(),
-        )
-        .map_err(|e| format!("daemon: durable status gate failed before business: {e}"))?;
-        counters.status_sequence.store(gate_seq, Ordering::SeqCst);
-        check_identity_revocations(&mut status_store, &status_path, [
-            auth_slot(local_peer.net_id, local_peer.node_id, local_peer.identity_generation)?,
-            auth_slot(remote_peer.net_id, remote_peer.node_id, remote_peer.identity_generation)?,
-        ])?;
-        // One process-wide store instance for every later boundary, including
-        // each failover epoch: reopening on the same path would return `Busy`.
-        let status_store = Arc::new(Mutex::new(status_store));
 
         let session_policy = SessionPolicy {
             local: local_peer,
@@ -2575,6 +2672,7 @@ mod linux_daemon {
                 &counters,
                 private_dns.as_ref(),
                 dns_only,
+                l3_profile,
             ),
             Mode::Connect => {
                 let explicit_connect = connect_spec.is_some();
@@ -2606,6 +2704,7 @@ mod linux_daemon {
                     max_seconds,
                     &counters,
                     private_dns.as_ref(),
+                    l3_profile,
                 )
             }
         }
@@ -2999,6 +3098,7 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
         dns_only: bool,
+        l3_profile: E2eL3Profile,
     ) -> Result<(), String> {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
         let listen_addr = if dns_only {
@@ -3125,10 +3225,11 @@ mod linux_daemon {
         let mut e2e = {
             let socket = duplicate_e2e_socket(sock_fd)
                 .map_err(|e| format!("daemon serve: cannot arm E2E circuit deadline: {e}"))?;
-            accept_e2e_until(
+            accept_e2e_with_l3_profile_until(
                 &mut accepted.session,
                 &e2e_backend,
                 remote_peer,
+                l3_profile,
                 &socket,
                 phase_deadline(),
             )
@@ -3257,6 +3358,7 @@ mod linux_daemon {
         max_seconds: Option<u64>,
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
+        l3_profile: E2eL3Profile,
     ) -> Result<(), String> {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
         let outer_conn = direct_outer_connector(mat_dir)?;
@@ -3404,11 +3506,12 @@ mod linux_daemon {
                     let socket = duplicate_e2e_socket(link.fd).map_err(|e| {
                         format!("daemon connect: cannot arm E2E circuit deadline: {e}")
                     })?;
-                    open_e2e_until(
+                    open_e2e_with_l3_profile_until(
                         &mut link.session,
                         &e2e_backend,
                         remote_peer,
                         1,
+                        l3_profile,
                         &socket,
                         Instant::now() + HANDSHAKE_TIMEOUT,
                     )

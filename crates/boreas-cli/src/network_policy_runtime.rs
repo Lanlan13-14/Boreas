@@ -144,9 +144,41 @@ pub(crate) fn verify_and_record_policy_material(
     ),
     PolicyRuntimeError,
 > {
-    use boreas_pki::{
-        NetworkRootPin, network_policy_store::NetworkPolicyStore, verify_network_policy,
-    };
+    let (token, pin, tbs) = verify_policy_material(
+        inputs, state_path, configured_state_dir, expected_net_id, expected_root_fingerprint,
+    )?;
+    let _store = record_default_policy(state_path, trusted_owner_uid, &token, &tbs)?;
+    Ok((token, pin))
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) fn record_default_policy(
+    state_path: &Path,
+    trusted_owner_uid: u32,
+    token: &boreas_pki::VerifiedNetworkPolicy,
+    tbs: &[u8],
+) -> Result<boreas_pki::network_policy_store::NetworkPolicyStore, PolicyRuntimeError> {
+    use boreas_pki::network_policy_store::NetworkPolicyStore;
+    token.require_default_runtime().map_err(|_| PolicyRuntimeError::UnsupportedPrefix)?;
+    let mut store = NetworkPolicyStore::open(
+        state_path, token.net_id(), token.root_key_fingerprint(), trusted_owner_uid,
+    ).map_err(|e| PolicyRuntimeError::Store(e.to_string()))?;
+    store.commit(token, tbs).map_err(|e| PolicyRuntimeError::Store(e.to_string()))?;
+    Ok(store)
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+type VerifiedPolicyMaterial = (boreas_pki::VerifiedNetworkPolicy, boreas_pki::NetworkRootPin, Vec<u8>);
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) fn verify_policy_material(
+    inputs: PolicyInputPaths<'_>,
+    state_path: &Path,
+    configured_state_dir: &Path,
+    expected_net_id: [u8; 16],
+    expected_root_fingerprint: [u8; 32],
+) -> Result<VerifiedPolicyMaterial, PolicyRuntimeError> {
+    use boreas_pki::{NetworkRootPin, verify_network_policy};
     use boreas_proto::objects::MldsaParameterSet;
 
     let PolicyInputPaths {
@@ -255,16 +287,7 @@ pub(crate) fn verify_and_record_policy_material(
     let now = u64::try_from(now).map_err(|_| PolicyRuntimeError::Clock)?;
     let token = verify_network_policy(&tbs, &ed_sig, &pq_sig, &pin, expected_net_id, now)
         .map_err(|e| PolicyRuntimeError::Verify(e.to_string()))?;
-    token
-        .require_default_runtime()
-        .map_err(|_| PolicyRuntimeError::UnsupportedPrefix)?;
-    let mut store =
-        NetworkPolicyStore::open(state_path, expected_net_id, fingerprint, trusted_owner_uid)
-            .map_err(|e| PolicyRuntimeError::Store(e.to_string()))?;
-    store
-        .commit(&token, &tbs)
-        .map_err(|e| PolicyRuntimeError::Store(e.to_string()))?;
-    Ok((token, pin))
+    Ok((token, pin, tbs))
 }
 
 #[cfg(all(test, feature = "openssl-inner-tls"))]

@@ -127,7 +127,7 @@ const IDENTITY_MAGIC: &[u8; 8] = b"BRSS\0\0\0\x02";
 #[cfg(target_os = "linux")]
 const SCOPED_MAGIC: &[u8; 8] = b"BRSS\0\0\0\x03";
 #[cfg(target_os = "linux")]
-const MAX_STATE_BYTES: usize = MAX_STATUS_STATE_BYTES + 1
+const MAX_STATE_BYTES: usize = MAX_STATUS_STATE_BYTES + 1 + 32
     + identity::MAX_EXTENSION_BYTES + identity::MAX_SCOPED_EXTENSION_BYTES;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const LINUX_O_NOFOLLOW: i32 = 0o100_000;
@@ -166,7 +166,9 @@ const FLAG_HAS_SNAPSHOT: u8 = 1 << 1;
 #[cfg(target_os = "linux")]
 const FLAG_HAS_EQUIVOCATION: u8 = 1 << 2;
 #[cfg(target_os = "linux")]
-const KNOWN_FLAGS: u8 = FLAG_ROLLBACK_LATCHED | FLAG_HAS_SNAPSHOT | FLAG_HAS_EQUIVOCATION;
+const FLAG_POOL_CUTOVER: u8 = 1 << 3;
+#[cfg(target_os = "linux")]
+const KNOWN_FLAGS: u8 = FLAG_ROLLBACK_LATCHED | FLAG_HAS_SNAPSHOT | FLAG_HAS_EQUIVOCATION | FLAG_POOL_CUTOVER;
 
 #[derive(Debug)]
 pub enum Error {
@@ -183,6 +185,7 @@ pub enum Error {
     Frozen,
     ClockRollback,
     NotFresh,
+    PoolCutoverMismatch,
     /// A revocation entry is refused by the current policy, its class/scope rules,
     /// or the fact that no per-authority issuer evidence exists.
     RevocationPermission,
@@ -332,6 +335,8 @@ struct State {
     identity: Option<identity::Decisions>,
     #[cfg(target_os = "linux")]
     scoped: Option<identity::Decisions>,
+    #[cfg(target_os = "linux")]
+    pool_cutover: Option<[u8; 32]>,
 }
 #[cfg(target_os = "linux")]
 impl State {
@@ -345,6 +350,7 @@ impl State {
             revocation: RevocationState::default(),
             identity: None,
             scoped: None,
+            pool_cutover: None,
         }
     }
 }
@@ -524,6 +530,9 @@ pub struct RevocationConflict {
     pub second_digest: [u8; 32],
 }
 
+#[cfg(target_os = "linux")]
+type PoolCutoverOpen = ([u8; 32], [u8; 32], crate::network_policy_store::CutoverAction);
+
 /// Exclusive, network-bound durable freshness store.
 ///
 /// The store owns the stateful verifier because its process-local replay table
@@ -538,6 +547,10 @@ pub struct StatusStore {
     owner: u32,
     #[cfg(target_os = "linux")]
     identity_trust: Option<([u8; 32], AuthorityRevocationTrust)>,
+    #[cfg(target_os = "linux")]
+    pool_cutover_sources: Option<[AuthenticatedPeer; 2]>,
+    #[cfg(target_os = "linux")]
+    cutover_preflight: bool,
     net: [u8; 16],
     trust: ManagementTrust,
     revocation_relay: RevocationRelayPolicy,
@@ -597,6 +610,8 @@ impl StatusStore {
             RevocationRelayPolicy::none(),
             #[cfg(target_os = "linux")]
             None,
+            #[cfg(target_os = "linux")]
+            None,
         )
     }
 
@@ -612,6 +627,38 @@ impl StatusStore {
         root_fingerprint: [u8; 32],
         identity_trust: AuthorityRevocationTrust,
     ) -> Result<Self, Error> {
+        Self::open_revocation_store(path, net_id, trusted_owner_uid, trust, root_fingerprint, identity_trust, None)
+    }
+
+    /// Reopen the original revocation store with explicit cutover continuity.
+    /// `resume` requires an already durable matching marker; an ordinary open
+    /// cannot use a marked store. This opens state, not a network session.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_for_pool_cutover(
+        path: impl AsRef<Path>,
+        net_id: [u8; 16],
+        trusted_owner_uid: u32,
+        trust: ManagementTrust,
+        root_fingerprint: [u8; 32],
+        identity_trust: AuthorityRevocationTrust,
+        approval: [u8; 32],
+        original_state: [u8; 32],
+        action: crate::network_policy_store::CutoverAction,
+    ) -> Result<Self, Error> {
+        Self::open_revocation_store(path, net_id, trusted_owner_uid, trust, root_fingerprint, identity_trust, Some((approval, original_state, action)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_revocation_store(
+        path: impl AsRef<Path>,
+        net_id: [u8; 16],
+        trusted_owner_uid: u32,
+        trust: ManagementTrust,
+        root_fingerprint: [u8; 32],
+        identity_trust: AuthorityRevocationTrust,
+        pool_cutover: Option<PoolCutoverOpen>,
+    ) -> Result<Self, Error> {
         if identity_trust.net_id() != net_id {
             return Err(Error::WrongNetwork);
         }
@@ -625,6 +672,7 @@ impl StatusStore {
             trust,
             RevocationRelayPolicy::none(),
             Some((root_fingerprint, identity_trust)),
+            pool_cutover,
         )
     }
 
@@ -644,9 +692,10 @@ impl StatusStore {
         trust: ManagementTrust,
         revocation_relay: RevocationRelayPolicy,
     ) -> Result<Self, Error> {
-        Self::open_inner(path, net_id, trusted_owner_uid, trust, revocation_relay, None)
+        Self::open_inner(path, net_id, trusted_owner_uid, trust, revocation_relay, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         path: impl AsRef<Path>,
         net_id: [u8; 16],
@@ -655,6 +704,8 @@ impl StatusStore {
         revocation_relay: RevocationRelayPolicy,
         #[cfg(target_os = "linux")]
         identity_trust: Option<([u8; 32], AuthorityRevocationTrust)>,
+        #[cfg(target_os = "linux")]
+        pool_cutover: Option<PoolCutoverOpen>,
     ) -> Result<Self, Error> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -685,6 +736,8 @@ impl StatusStore {
                 _lock: lock,
                 owner: trusted_owner_uid,
                 identity_trust,
+                pool_cutover_sources: None,
+                cutover_preflight: false,
                 net: net_id,
                 trust,
                 revocation_relay,
@@ -695,7 +748,18 @@ impl StatusStore {
                 #[cfg(all(test, target_os = "linux"))]
                 fail_next_commit: false,
             };
-            let state = store.read_state()?;
+            use crate::network_policy_store::CutoverAction;
+            let (state, original_hash) = store.read_state()?;
+            match (pool_cutover, state.pool_cutover) {
+                (None, None) => (),
+                (Some((_, floor, CutoverAction::Check | CutoverAction::Commit)), None)
+                    if state.snapshot.is_some() && original_hash == Some(floor) => (),
+                (Some((expected, _, _)), Some(actual)) if expected == actual => (),
+                _ => return Err(Error::PoolCutoverMismatch),
+            }
+            // Preview and stage in memory. Commit writes the marker and the
+            // resulting floor in one status transaction, after admission.
+            store.cutover_preflight = pool_cutover.is_some_and(|(_, _, a)| a != CutoverAction::Resume);
             store.state = state;
             if store.state.net != net_id {
                 return Err(Error::WrongNetwork);
@@ -721,6 +785,36 @@ impl StatusStore {
     /// exposing or comparing verifier replay state.
     pub fn has_same_authorities(&self, expected: &ManagementTrust) -> bool {
         self.trust.same_issuers(expected)
+    }
+
+    /// Persist the exact locally approved transition in this same status image.
+    /// The caller holds the policy lock and has checked freshness and revocations.
+    #[cfg(target_os = "linux")]
+    pub fn commit_pool_cutover(&mut self, approval: [u8; 32]) -> Result<(), Error> {
+        self.healthy()?;
+        if self.identity_trust.is_none() || self.state.snapshot.is_none()
+            || self.is_frozen() || self.is_clock_latched()
+        {
+            return Err(Error::PoolCutoverMismatch);
+        }
+        if !self.cutover_preflight || self.state.pool_cutover.is_some_and(|previous| previous != approval) {
+            return Err(Error::PoolCutoverMismatch);
+        }
+        self.state.pool_cutover = Some(approval);
+        self.cutover_preflight = false;
+        self.commit_or_poison()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn bind_pool_cutover_sources(&mut self, sources: [AuthenticatedPeer; 2]) -> Result<(), Error> {
+        if self.state.pool_cutover.is_none() || self.pool_cutover_sources.is_some()
+            || sources.iter().any(|source| source.net_id() != self.net || source.identity_generation() == u64::MAX)
+            || sources[0].node_id() == sources[1].node_id()
+        {
+            return Err(Error::PoolCutoverMismatch);
+        }
+        self.pool_cutover_sources = Some(sources);
+        Ok(())
     }
 
     pub fn sequence(&self) -> Option<u64> {
@@ -1279,11 +1373,11 @@ impl StatusStore {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_state(&self) -> Result<State, Error> {
+    fn read_state(&self) -> Result<(State, Option<[u8; 32]>), Error> {
         let file = match open_existing(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(State::empty(self.net));
+                return Ok((State::empty(self.net), None));
             }
             Err(error) => return Err(error.into()),
         };
@@ -1296,12 +1390,12 @@ impl StatusStore {
         file.take(MAX_STATE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_STATE_BYTES
-            || (bytes.len() > MAX_STATUS_STATE_BYTES
+            || (bytes.len() > MAX_STATUS_STATE_BYTES + 32
                 && !bytes.starts_with(IDENTITY_MAGIC) && !bytes.starts_with(SCOPED_MAGIC))
         {
             return Err(Error::TooLarge);
         }
-        decode(&bytes)
+        Ok((decode(&bytes)?, Some(sha256(&bytes)?)))
     }
 
     #[cfg(target_os = "linux")]
@@ -1394,6 +1488,9 @@ impl StatusStore {
 
     #[cfg(target_os = "linux")]
     fn commit(&self) -> Result<(), Error> {
+        if self.cutover_preflight {
+            return Ok(());
+        }
         #[cfg(test)]
         if self.fail_next_commit {
             return Err(Error::Io(io::Error::other(
@@ -1708,6 +1805,12 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     if state.snapshot.is_some() && state.equivocation.is_some() {
         flags |= FLAG_HAS_EQUIVOCATION;
     }
+    if state.pool_cutover.is_some() {
+        if state.snapshot.is_none() {
+            return Err(Error::Corrupt);
+        }
+        flags |= FLAG_POOL_CUTOVER;
+    }
     bytes.push(flags);
     if let Some(snapshot) = &state.snapshot {
         put_u16_blob(&mut bytes, &snapshot.issuer, MAX_ISSUER_ID_BYTES)?;
@@ -1736,6 +1839,9 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     }
     if let Some(scoped) = &state.scoped {
         scoped.encode(&mut bytes)?;
+    }
+    if let Some(marker) = state.pool_cutover {
+        bytes.extend_from_slice(&marker);
     }
     Ok(bytes)
 }
@@ -1817,6 +1923,14 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
         .then(|| identity::Decisions::decode(&mut reader, utc_floor, true)).transpose()?;
     let scoped = has_scoped
         .then(|| identity::Decisions::decode(&mut reader, utc_floor, false)).transpose()?;
+    let pool_cutover = if flags & FLAG_POOL_CUTOVER != 0 {
+        if !has_snapshot {
+            return Err(Error::Corrupt);
+        }
+        Some(reader.take(32)?.try_into().map_err(|_| Error::Corrupt)?)
+    } else {
+        None
+    };
     if reader.position != bytes.len() {
         return Err(Error::Corrupt);
     }
@@ -1835,6 +1949,7 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
         revocation: RevocationState::default(),
         identity,
         scoped,
+        pool_cutover,
     })
 }
 

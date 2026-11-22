@@ -25,6 +25,7 @@ on:
       - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_public_dns_fixture.py'
       - 'tools/release/netns_dns_replica.sh'
+      - 'tools/release/netns_pool_cutover.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -49,6 +50,7 @@ on:
       - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_public_dns_fixture.py'
       - 'tools/release/netns_dns_replica.sh'
+      - 'tools/release/netns_pool_cutover.sh'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -921,6 +923,19 @@ jobs:
           grep -Fx 'private_dns_tcp_pin_withdrawal=no_later_dns_data_on_open_stream' rust-tls-private-dns.log
           grep -Fx 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed' rust-tls-private-dns.log
           grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
+      - name: Verify signed IPv4 cutover on two real Linux TUNs
+        id: acceptance_pool_cutover
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime')
+        timeout-minutes: 3
+        env:
+          BOREAS_NETNS_POOL_CUTOVER: '1'
+        run: |
+          set -euo pipefail
+          sudo -E timeout --kill-after=5s 120s bash tools/release/netns_daemon_smoke.sh \
+            hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee rust-tls-pool-cutover.log
+          grep -Fx 'pool_cutover_offline=check_and_commit_no_network_legacy_refused' rust-tls-pool-cutover.log
+          grep -Fx 'pool_cutover_data=bidirectional_new_vips_and_old_vips_dropped' rust-tls-pool-cutover.log
+          grep -Fx 'pool_cutover_revocation=source_denial_halted_successor_and_survived_restart' rust-tls-pool-cutover.log
       - name: Verify private DNS replica selection on three real Linux TUNs
         id: acceptance_dns_replicas
         if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')
@@ -1112,6 +1127,7 @@ jobs:
         env:
           DNS_RESULT: ${{ steps.acceptance_private_dns.outcome }}
           PUBLIC_DNS_RESULT: ${{ steps.acceptance_public_dns.outcome }}
+          POOL_CUTOVER_RESULT: ${{ steps.acceptance_pool_cutover.outcome }}
           DNS_REPLICAS_RESULT: ${{ steps.acceptance_dns_replicas.outcome }}
           MESH_RESULT: ${{ steps.acceptance_mesh.outcome }}
           MULTI_ACTIVE_RESULT: ${{ steps.acceptance_multi_active.outcome }}
@@ -1123,7 +1139,7 @@ jobs:
           failed=0
           {
             printf '\n### Mandatory real-device acceptance\n\n'
-            for check in DNS PUBLIC_DNS DNS_REPLICAS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
+            for check in DNS PUBLIC_DNS DNS_REPLICAS POOL_CUTOVER MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
               var="${check}_RESULT"
               outcome="${!var}"
               printf -- '- %s: `%s`\n' "$check" "${outcome:-not-run}"
@@ -1154,6 +1170,7 @@ jobs:
             rust-tls-private-dns.log
             rust-tls-public-dns-*.log
             rust-tls-dns-replicas.log
+            rust-tls-pool-cutover.log
             rust-tls-mesh-runtime.log
             rust-tls-multi-active-*.log
             rust-tls-cli-tests.log

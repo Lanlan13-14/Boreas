@@ -44,16 +44,30 @@ pub fn verify_ipv4_pool_migration(
     issuer: &VerifiedIssuerAuthorization,
     now_us: u64,
 ) -> Result<NodeIdentity, Error> {
+    let (_, staged) = verify_migration_objects(legacy_signed, staged_signed, policy, issuer, now_us)?;
+    let ObjectBody::NodeIdentity(body) = staged.object().body.clone() else {
+        return Err(Error::InvalidPoolMigration);
+    };
+    Ok(body)
+}
+
+pub(crate) fn verify_migration_objects(
+    legacy_signed: &[u8],
+    staged_signed: &[u8],
+    policy: &VerifiedNetworkPolicy,
+    issuer: &VerifiedIssuerAuthorization,
+    now_us: u64,
+) -> Result<(VerifiedObject, VerifiedObject), Error> {
     let (trust, overlay) = migration_trust(policy, issuer, now_us)?;
     let source = trust.authenticate_at(legacy_signed, now_us, now_us, None)?;
     let staged = trust.authenticate_in_overlay(staged_signed, now_us, now_us, None, overlay)?;
     let expected = migrated_identity(&source, policy, issuer, overlay)?;
-    if staged.object().body != ObjectBody::NodeIdentity(expected.clone())
+    if staged.object().body != ObjectBody::NodeIdentity(expected)
         || staged.object().extensions.as_slice() != [evidence(&source, policy)]
     {
         return Err(Error::InvalidPoolMigration);
     }
-    Ok(expected)
+    Ok((source, staged))
 }
 
 fn migration_trust(

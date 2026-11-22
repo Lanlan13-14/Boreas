@@ -390,6 +390,16 @@ fn verified_node_body<'a>(
         ObjectRole::Core => boreas_pki::NodeRole::Core,
         ObjectRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
     };
+    if let Some(policy) = policy
+        && policy.overlay_base() != boreas_pki::OverlayPrefix::DEFAULT.base()
+        && !matches!(management.extensions.as_slice(), [evidence]
+            if evidence.id == boreas_proto::objects::OFFLINE_IPV4_POOL_MIGRATION_EXTENSION
+                && evidence.critical
+                && evidence.value.len() == 64
+                && evidence.value[..32] == policy.policy_digest())
+    {
+        return Err(TunnelError::Unsupported("identity pool migration policy mismatch"));
+    }
     let overlay = match policy {
         Some(policy) => boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16)
             .map_err(|_| TunnelError::Unsupported("invalid verified policy prefix"))?,

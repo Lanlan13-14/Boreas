@@ -57,6 +57,8 @@ pub enum Error {
     WrongRootFingerprint,
     RawTokenMismatch,
     PrefixConflict,
+    CutoverMismatch,
+    CutoverNotCommitted,
     SequenceRollback,
     Equivocation,
     IssuedAtRegression,
@@ -98,6 +100,41 @@ struct State {
     record: Option<Record>,
     frozen: bool,
     conflict_hash: Option<[u8; 32]>,
+    cutover: Option<Cutover>,
+}
+
+/// No implicit first use: check, commit (still offline), and resume are distinct.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CutoverAction {
+    Check,
+    Commit,
+    Resume,
+}
+
+/// Local continuity anchors supplied by the migration admission boundary.
+/// All hashes identify exact signed TBS bytes, except the status path hash.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolCutoverAnchors {
+    pub source_policy: (u64, [u8; 32]),
+    pub target_policy: [u8; 32],
+    pub source_identities: [[u8; 32]; 2], // Core, Edge
+    pub target_identities: [[u8; 32]; 2], // Core, Edge
+    pub status_path_hash: [u8; 32],
+    pub status_sequence: u64,
+    pub approval_digest: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Cutover {
+    target_policy: [u8; 32],
+    source_identities: [[u8; 32]; 2],
+    target_identities: [[u8; 32]; 2],
+    status_path_hash: [u8; 32],
+    status_sequence: u64,
+    approval_digest: [u8; 32],
 }
 
 /// Exclusive Linux durable watermark. It never reconstructs authorization from disk.
@@ -159,6 +196,7 @@ impl NetworkPolicyStore {
                     record: None,
                     frozen: false,
                     conflict_hash: None,
+                    cutover: None,
                 },
                 poisoned: false,
             };
@@ -220,6 +258,9 @@ impl NetworkPolicyStore {
             if self.state.frozen {
                 return Err(Error::Frozen);
             }
+            if self.state.cutover.is_some() {
+                return Err(Error::PrefixConflict);
+            }
             if token.net_id() != self.net_id {
                 return Err(Error::WrongNetwork);
             }
@@ -267,6 +308,64 @@ impl NetworkPolicyStore {
         }
     }
 
+    /// Check or commit a one-time legacy-to-custom cutover, without replacing
+    /// the original policy record. Only an exact, freshly reverified target
+    /// may be resumed; ordinary commits cannot use either prefix afterward.
+    /// This method is a watermark operation, not runtime authorization. The
+    /// caller owns identity, status, revocation, time, and topology admission.
+    #[cfg(target_os = "linux")]
+    pub fn cutover(
+        &mut self,
+        target: &VerifiedNetworkPolicy,
+        anchors: PoolCutoverAnchors,
+        action: CutoverAction,
+    ) -> Result<CommitResult, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        if self.state.frozen {
+            return Err(Error::Frozen);
+        }
+        let source = self.state.record.as_ref().ok_or(Error::CutoverMismatch)?;
+        if source.prefix != crate::OverlayPrefix::DEFAULT.base()
+            || (source.seq, source.object_hash) != anchors.source_policy
+            || target.overlay_base() == source.prefix
+            || target.net_id() != self.net_id
+            || target.root_key_fingerprint() != self.root_fingerprint
+            || target.policy_digest() != anchors.target_policy
+            || target.seq() <= source.seq
+            || target.validity().0 < source.issued
+            || anchors.status_sequence == 0
+        {
+            return Err(Error::CutoverMismatch);
+        }
+        let candidate = Cutover {
+            target_policy: anchors.target_policy,
+            source_identities: anchors.source_identities,
+            target_identities: anchors.target_identities,
+            status_path_hash: anchors.status_path_hash,
+            status_sequence: anchors.status_sequence,
+            approval_digest: anchors.approval_digest,
+        };
+        if let Some(current) = self.state.cutover {
+            if candidate.status_sequence < current.status_sequence
+                || (Cutover { status_sequence: current.status_sequence, ..candidate }) != current
+            {
+                return Err(Error::CutoverMismatch);
+            }
+            return Ok(CommitResult::Duplicate);
+        }
+        match action {
+            CutoverAction::Check => (),
+            CutoverAction::Commit => {
+                self.state.cutover = Some(candidate);
+                self.commit_or_poison()?;
+            }
+            CutoverAction::Resume => return Err(Error::CutoverNotCommitted),
+        }
+        Ok(CommitResult::Committed)
+    }
+
     #[cfg(target_os = "linux")]
     pub fn sequence(&self) -> Option<u64> {
         self.state.record.as_ref().map(|record| record.seq)
@@ -302,6 +401,7 @@ impl NetworkPolicyStore {
                     record: None,
                     frozen: false,
                     conflict_hash: None,
+                    cutover: None,
                 });
             }
             Err(error) => return Err(error.into()),
@@ -380,6 +480,18 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
     if let Some(hash) = state.conflict_hash {
         bytes.extend_from_slice(&hash);
     }
+    if let Some(cutover) = state.cutover {
+        // Older binaries reject this trailing data, rather than treating the
+        // original policy record as authority after cutover.
+        bytes.extend_from_slice(b"BRPM0001");
+        bytes.extend_from_slice(&cutover.target_policy);
+        for identity in cutover.source_identities.into_iter().chain(cutover.target_identities) {
+            bytes.extend_from_slice(&identity);
+        }
+        bytes.extend_from_slice(&cutover.status_path_hash);
+        bytes.extend_from_slice(&cutover.status_sequence.to_be_bytes());
+        bytes.extend_from_slice(&cutover.approval_digest);
+    }
     if bytes.len() > MAX_NETWORK_POLICY_STATE_BYTES {
         return Err(Error::TooLarge);
     }
@@ -452,13 +564,38 @@ fn decode(bytes: &[u8]) -> Result<State, Error> {
     if frozen && record.is_none() {
         return Err(Error::Corrupt);
     }
-    if position != bytes.len() {
-        return Err(Error::Corrupt);
-    }
+    let cutover = if position == bytes.len() {
+        None
+    } else {
+        if frozen
+            || record.as_ref().is_none_or(|r| r.prefix != crate::OverlayPrefix::DEFAULT.base())
+            || &take::<8>(bytes, &mut position)? != b"BRPM0001"
+        {
+            return Err(Error::Corrupt);
+        }
+        let target_policy = take::<32>(bytes, &mut position)?;
+        let source_identities = [take(bytes, &mut position)?, take(bytes, &mut position)?];
+        let target_identities = [take(bytes, &mut position)?, take(bytes, &mut position)?];
+        let status_path_hash = take(bytes, &mut position)?;
+        let status_sequence = u64::from_be_bytes(take(bytes, &mut position)?);
+        let approval_digest = take::<32>(bytes, &mut position)?;
+        if position != bytes.len() || status_sequence == 0 {
+            return Err(Error::Corrupt);
+        }
+        Some(Cutover {
+            target_policy,
+            source_identities,
+            target_identities,
+            status_path_hash,
+            status_sequence,
+            approval_digest,
+        })
+    };
     Ok(State {
         record,
         frozen,
         conflict_hash,
+        cutover,
     })
 }
 #[cfg(target_os = "linux")]
@@ -783,6 +920,7 @@ mod tests {
             }),
             frozen: false,
             conflict_hash: None,
+            cutover: None,
         };
         let bytes = encode(&state).unwrap();
         for length in 0..bytes.len() {
@@ -830,6 +968,7 @@ mod tests {
             }),
             frozen: false,
             conflict_hash: None,
+            cutover: None,
         })
         .unwrap();
         fs::write(&path, &state_bytes).unwrap();

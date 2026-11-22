@@ -80,11 +80,11 @@ def generate(ca, policy, directory, pin, net_id, *, replica=False, public_forwar
         pin.write_bytes(b"".join(hashlib.sha256(tbs).digest() for tbs in (service, grant, authority)))
 
 
-def sign_replica_revocation(ca, net_id, output):
+def sign_replica_revocation(ca, net_id, output, node_id=257):
     """Fixture authority—not a production signing CLI."""
     openssl = os.environ.get("BOREAS_OPENSSL_BIN") or "openssl"
     now = time.time_ns() // 1000
-    tbs = mapping(_uint(1), _bytes(bytes.fromhex(net_id)), _uint(1), _uint(257),
+    tbs = mapping(_uint(1), _bytes(bytes.fromhex(net_id)), _uint(1), _uint(node_id),
                   _uint(1), _bytes(b"identity-authority-v1"), _uint(1),
                   mapping(_bytes(b""), _uint(0), _uint(0)), _uint(1),
                   _uint(now), _uint(now + 120_000_000))
@@ -290,6 +290,8 @@ if __name__ == "__main__":
         tcp_probe()
     elif len(sys.argv) == 4 and sys.argv[1] == "withdrawal":
         withdrawal_probe(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "pool-revoke":
+        sign_replica_revocation(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), node_id=2)
     elif len(sys.argv) == 5 and sys.argv[1] == "replica-revoke":
         sign_replica_revocation(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
     elif sys.argv[1:] == ["replica-udp"]:

@@ -935,6 +935,12 @@ ip netns exec "$EDGE_NS" ip link set lo up
 ip netns exec "$EDGE_NS" ip addr add 192.0.2.2/24 dev veth-edge
 ip netns exec "$EDGE_NS" ip link set veth-edge up
 
+if [[ ${BOREAS_NETNS_POOL_CUTOVER:-0} == 1 ]]; then
+  source "$(dirname "$PERF_SCRIPT")/netns_pool_cutover.sh"
+  pool_cutover_matrix "$POLICY_FIXTURE_DIR"
+  exit 0
+fi
+
 if [[ "$DNS_REPLICAS" == 1 ]]; then
   # Sources the dedicated cases after ordinary PKI, policy and netns setup.
   source "$(dirname "$PERF_SCRIPT")/netns_dns_replica.sh"
