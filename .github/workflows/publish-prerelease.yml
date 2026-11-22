@@ -351,6 +351,116 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  openwrt:
+    name: OpenWrt 24.10.0 ${{ matrix.arch }} static pq768 daemon
+    needs: validate-tag
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            openssl_target: linux-x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            openssl_target: linux-aarch64
+    env:
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: 4.1.1
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
+      OPENSSL_NO_VENDOR: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Verify native architecture and install build tools
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential perl curl ca-certificates pkg-config binutils \
+            musl-tools linux-libc-dev file
+      - name: Build pinned static OpenSSL for native musl
+        timeout-minutes: 35
+        env:
+          OPENSSL_PREFIX: ${{ github.workspace }}/.openwrt-openssl
+        run: |
+          set -euo pipefail
+          bash tools/dependencies/fetch-openssl.sh openssl-src
+          cd openssl-src
+          MUSL_UAPI="${GITHUB_WORKSPACE}/.musl-kernel-headers"
+          mkdir -p "$MUSL_UAPI"
+          ln -s /usr/include/linux "$MUSL_UAPI/linux"
+          ln -s /usr/include/asm-generic "$MUSL_UAPI/asm-generic"
+          extra_cflags=()
+          case '${{ matrix.arch }}' in
+            x86_64) ln -s /usr/include/x86_64-linux-gnu/asm "$MUSL_UAPI/asm" ;;
+            aarch64)
+              ln -s /usr/include/aarch64-linux-gnu/asm "$MUSL_UAPI/asm"
+              extra_cflags+=(-mno-outline-atomics)
+              ;;
+          esac
+          CC=musl-gcc ./Configure '${{ matrix.openssl_target }}' no-quic no-cms no-siv no-shared no-tests no-async no-legacy \
+            "${extra_cflags[@]}" -isystem "$MUSL_UAPI" \
+            --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}/ssl"
+          make -j"$(nproc)"
+          make install_sw
+          mkdir -p "${OPENSSL_PREFIX}/ssl"
+          printf '%s\n' \
+            'openssl_conf = openssl_init' '' '[openssl_init]' \
+            'providers = provider_sect' '' '[provider_sect]' \
+            'default = default_sect' '' '[default_sect]' 'activate = 1' \
+            > "${OPENSSL_PREFIX}/ssl/openssl.cnf"
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p dist
+          bash tools/dependencies/verify-openssl-build.sh \
+            openssl-src "${OPENSSL_PREFIX}" \
+            "${GITHUB_WORKSPACE}/dist/openssl-runtime.txt" \
+            "${GITHUB_WORKSPACE}/dist/openssl-build.txt"
+      - name: Build fully static OpenWrt pq768 daemon
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.openwrt-openssl
+          OPENSSL_STATIC: '1'
+          OPENSSL_CONF: ${{ github.workspace }}/.openwrt-openssl/ssl/openssl.cnf
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          if [[ '${{ matrix.arch }}' = aarch64 ]]; then
+            export CFLAGS_aarch64_unknown_linux_musl='-mno-outline-atomics'
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C link-arg=-mno-outline-atomics'
+          fi
+          cargo build --locked --release -p boreas-cli \
+            --target '${{ matrix.target }}' --features openssl-inner-tls
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/boreas" \
+            "dist/boreas-linux-${{ matrix.arch }}-musl-pq768"
+      - name: Verify static ELF and record checksum
+        run: |
+          set -euo pipefail
+          python tools/release/verify_static_linux.py \
+            --binary "dist/boreas-linux-${{ matrix.arch }}-musl-pq768" \
+            --target '${{ matrix.target }}' --out dist/static-linkage.json
+          (cd dist && sha256sum "boreas-linux-${{ matrix.arch }}-musl-pq768" > SHA256SUMS)
+      - name: Upload OpenWrt development binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: boreas-openwrt-${{ matrix.arch }}-${{ github.run_id }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
   pq768-linux:
     name: Linux pq768 daemon (glibc and static musl)
     needs: validate-tag
@@ -493,6 +603,7 @@ jobs:
       - validate-tag
       - build-test
       - linux-runtime-compat
+      - openwrt
       - pq768-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -531,6 +642,18 @@ jobs:
         with:
           name: boreas-development-aarch64-apple-darwin-${{ github.run_id }}
           path: downloaded/aarch64-apple-darwin
+
+      - name: Download OpenWrt x86_64 development binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: boreas-openwrt-x86_64-${{ github.run_id }}
+          path: downloaded/openwrt-x86_64
+
+      - name: Download OpenWrt aarch64 development binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: boreas-openwrt-aarch64-${{ github.run_id }}
+          path: downloaded/openwrt-aarch64
 
       - name: Download pq768 development binaries
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -572,13 +695,21 @@ jobs:
             cd "$(dirname "$pq768_sums")"
             sha256sum --check --strict SHA256SUMS
           )
+          for arch in x86_64 aarch64; do
+            openwrt_binary="$(find "downloaded/openwrt-${arch}" -type f -name "boreas-linux-${arch}-musl-pq768")"
+            openwrt_sums="$(find "downloaded/openwrt-${arch}" -type f -name SHA256SUMS)"
+            test "$(printf '%s\n' "$openwrt_binary" | grep -c .)" -eq 1
+            test "$(printf '%s\n' "$openwrt_sums" | grep -c .)" -eq 1
+            (cd "$(dirname "$openwrt_sums")" && sha256sum --check --strict SHA256SUMS)
+            install -m 0644 "$openwrt_binary" "release-bundle/boreas-openwrt-linux-${arch}-musl-pq768"
+          done
           install -m 0644 "$pq768_binary" release-bundle/
           install -m 0644 "$pq768_zip" release-bundle/
           install -m 0644 "$pq768_linkage" release-bundle/
           (
             cd release-bundle
             sha256sum \
-              boreas-*.tar.gz boreas-*.zip \
+              boreas-*.tar.gz boreas-*.zip boreas-openwrt-* \
               boreas-linux-x86_64-musl-pq768 \
               boreas-pq768-linux-x86_64.zip \
               > "SHA256SUMS-${version}"
