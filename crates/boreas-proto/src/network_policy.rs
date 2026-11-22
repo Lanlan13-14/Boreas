@@ -22,6 +22,10 @@ pub enum Error {
     Invalid(&'static str),
 }
 
+pub(crate) fn is_private_overlay_base([a, b, c, d]: [u8; 4]) -> bool {
+    c == 0 && d == 0 && (a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168))
+}
+
 impl NetworkPolicyCandidate {
     pub fn validate(&self) -> Result<(), Error> {
         if self.net_id == [0; 16] {
@@ -30,11 +34,7 @@ impl NetworkPolicyCandidate {
         if self.root_key_fingerprint == [0; 32] {
             return Err(Error::Invalid("root fingerprint"));
         }
-        let [a, b, c, d] = self.overlay_base;
-        if c != 0
-            || d != 0
-            || !(a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168))
-        {
+        if !is_private_overlay_base(self.overlay_base) {
             return Err(Error::Invalid("RFC1918 canonical /16"));
         }
         if self.version != 1 {

@@ -47,6 +47,9 @@ use openssl::sign::{Signer, Verifier};
 
 use crate::{Authority, NodeRole, root_authorization::VerifiedIssuerAuthorization};
 
+mod pool_migration;
+pub use pool_migration::verify_ipv4_pool_migration;
+
 /// Candidate management-object schema version used by `boreas-proto`.
 pub const MANAGEMENT_SCHEMA_VERSION: u16 = 1;
 /// Total signed-object container cap from the master plan and the 16 KiB
@@ -110,6 +113,7 @@ pub enum Error {
     InvalidPrefix,
     InvalidTemplate,
     InvalidValidity,
+    InvalidPoolMigration,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -565,14 +569,34 @@ impl ManagementTrust {
         issuer_now_us: u64,
         expected_lsa_core: Option<u8>,
     ) -> Result<VerifiedObject, Error> {
+        self.authenticate_in_overlay(
+            raw_signed_object,
+            object_now_us,
+            issuer_now_us,
+            expected_lsa_core,
+            crate::OverlayPrefix::DEFAULT,
+        )
+    }
+
+    fn authenticate_in_overlay(
+        &self,
+        raw_signed_object: &[u8],
+        object_now_us: u64,
+        issuer_now_us: u64,
+        expected_lsa_core: Option<u8>,
+        overlay: crate::OverlayPrefix,
+    ) -> Result<VerifiedObject, Error> {
         if raw_signed_object.is_empty() || raw_signed_object.len() > MAX_SIGNED_OBJECT_BYTES {
             return Err(Error::ObjectTooLarge);
         }
-        let signed =
-            SignedObject::decode(raw_signed_object).map_err(|_| Error::MalformedSignedObject)?;
+        let base = overlay.base();
+        let signed = SignedObject::decode_for_overlay(raw_signed_object, base)
+            .map_err(|_| Error::MalformedSignedObject)?;
         let raw_tbs = signed.raw_tbs.clone();
-        let object = objects::decode_tbs(&raw_tbs).map_err(|_| Error::MalformedObject)?;
-        let canonical = objects::encode_tbs(&object).map_err(|_| Error::MalformedObject)?;
+        let object =
+            objects::decode_tbs_for_overlay(&raw_tbs, base).map_err(|_| Error::MalformedObject)?;
+        let canonical =
+            objects::encode_tbs_for_overlay(&object, base).map_err(|_| Error::MalformedObject)?;
         if canonical != raw_tbs {
             return Err(Error::NonCanonicalObject);
         }
@@ -986,6 +1010,15 @@ impl IdentityAuthority {
     }
 
     pub fn sign_node_identity(&self, body: NodeIdentity) -> Result<SignedObject, Error> {
+        self.sign_node_identity_in_overlay(body, crate::OverlayPrefix::DEFAULT, Vec::new())
+    }
+
+    fn sign_node_identity_in_overlay(
+        &self,
+        body: NodeIdentity,
+        overlay: crate::OverlayPrefix,
+        extensions: Vec<objects::Extension>,
+    ) -> Result<SignedObject, Error> {
         if body.net_id != self.net_id
             || body.identity_generation == 0
             || body.not_before >= body.expires
@@ -1001,10 +1034,11 @@ impl IdentityAuthority {
             seq: body.identity_generation,
             issued_at: body.not_before,
             expires: body.expires,
-            extensions: Vec::new(),
+            extensions,
             body: ObjectBody::NodeIdentity(body),
         };
-        let raw_tbs = objects::encode_tbs(&envelope).map_err(|_| Error::MalformedObject)?;
+        let raw_tbs = objects::encode_tbs_for_overlay(&envelope, overlay.base())
+            .map_err(|_| Error::MalformedObject)?;
         let message = objects::signature_input(
             &raw_tbs,
             envelope.body.object_type(),
@@ -1022,7 +1056,9 @@ impl IdentityAuthority {
                 mldsa,
             }],
         };
-        signed.encode().map_err(|_| Error::MalformedSignedObject)?;
+        signed
+            .encode_for_overlay(overlay.base())
+            .map_err(|_| Error::MalformedSignedObject)?;
         Ok(signed)
     }
 

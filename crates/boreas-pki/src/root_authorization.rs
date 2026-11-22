@@ -236,6 +236,7 @@ pub(crate) fn verify_network_policy_message(
 pub struct VerifiedIssuerAuthorization {
     record: IssuerRecord,
     net_id: [u8; 16],
+    root_fingerprint: [u8; 32],
     not_before: u64,
     expires: u64,
 }
@@ -245,6 +246,9 @@ impl VerifiedIssuerAuthorization {
     }
     pub fn validity(&self) -> (u64, u64) {
         (self.not_before, self.expires)
+    }
+    pub(crate) fn root_fingerprint(&self) -> [u8; 32] {
+        self.root_fingerprint
     }
     pub(crate) fn authority(&self) -> Authority {
         self.record.authority
@@ -547,6 +551,7 @@ pub fn verify(
             scope,
         },
         net_id: candidate.net_id,
+        root_fingerprint: root.fingerprint()?,
         not_before: candidate.not_before,
         expires: candidate.expires,
     })

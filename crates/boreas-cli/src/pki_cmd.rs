@@ -5,9 +5,12 @@
 //! - `boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--validity-days <N>]`
 //! - `boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role core|edge --home-core <1..16> --vip-octet <1|2..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]`
 //! - `boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]`
-//! - `boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>]`
+//! - `boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>] [--overlay-prefix <RFC1918-/16>]`
 //! - `boreas pki verify-bundle --material-dir <DIR> [--roots <FILE>] [--require-peer]`
 //! - `boreas pki verify-policy --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE> --net-id <32HEX> --root-ed25519-der <FILE> --root-mldsa65-der <FILE>`
+
+#[cfg(feature = "openssl-inner-tls")]
+mod pool_migration;
 
 #[cfg(not(feature = "openssl-inner-tls"))]
 pub fn run_pki_command(args: &[String]) -> Result<(), String> {
@@ -23,7 +26,11 @@ pub fn pki_usage() -> &'static str {
   boreas pki init-ca --ca-dir <DIR> [--net-id <32HEX>] [--generation <N>] [--validity-days <1..3650>]
   boreas pki issue-node --ca-dir <DIR> --out-dir <DIR> --role <core|edge> --home-core <1..16> --vip-octet <1..251> [--generation <N>] [--validity-hours <N>] [--outer-san <DNS>]
   boreas pki sign-status --ca-dir <DIR> --out <FILE> --sequence <N> [--ttl-seconds <1..86400>]
-  boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>]
+  boreas pki sign-policy --ca-dir <DIR> --out-dir <DIR> --sequence <N> [--ttl-seconds <1..315360000>] [--overlay-prefix <RFC1918-/16>]
+  boreas pki stage-pool-migration --ca-dir <DIR> --out <NEW-FILE> <migration inputs>
+  boreas pki verify-pool-migration --staged-identity <FILE> <migration inputs>
+    migration inputs: --legacy-identity <FILE> --roots <FILE> --expected-root-fingerprint <64HEX>
+                      --tbs-file <FILE> --ed25519-signature-file <FILE> --mldsa65-signature-file <FILE>
   boreas pki core-request <new-private-dir> <net-id> <core> <issuer-generation> <validity-days>
   boreas pki core-authorize <offline-ca-dir> <previous-roots> <core.request> <new-roots> <expected-core>
   boreas pki core-sign-lsa <private-dir> <roots> <new-lsa> <core-generation> <seq> <ttl-seconds> [<peer:rtt-ms:loss-ppm>...]
@@ -43,6 +50,9 @@ pub fn run_pki_command(args: &[String]) -> Result<(), String> {
         "issue-node" => cmd_issue_node(&args[1..]),
         "sign-status" => cmd_sign_status(&args[1..]),
         "sign-policy" => cmd_sign_policy(&args[1..]),
+        command @ ("stage-pool-migration" | "verify-pool-migration") => {
+            pool_migration::run(command, &args[1..])
+        }
         #[cfg(target_os = "linux")]
         "core-request" | "core-authorize" | "core-sign-lsa" => core_mesh(args),
         "verify-bundle" => cmd_verify_bundle(&args[1..]),
@@ -358,13 +368,14 @@ fn cmd_sign_status(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "openssl-inner-tls")]
 fn cmd_sign_policy(args: &[String]) -> Result<(), String> {
-    use boreas_pki::provisioning::sign_network_policy_dir;
+    use boreas_pki::{OverlayPrefix, provisioning::sign_network_policy_dir_for_overlay};
     use std::path::PathBuf;
 
     let mut ca_dir: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut sequence: Option<u64> = None;
     let mut ttl_seconds: u64 = 3600;
+    let mut overlay_prefix: Option<OverlayPrefix> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -386,7 +397,12 @@ fn cmd_sign_policy(args: &[String]) -> Result<(), String> {
                     .parse::<u64>()
                     .map_err(|_| "pki sign-policy: invalid --ttl-seconds".to_string())?
             }
-            _ => return Err("pki sign-policy: unknown argument".to_string()),
+            "--overlay-prefix" if overlay_prefix.is_none() => {
+                overlay_prefix = Some(val.parse().map_err(|_| {
+                    "pki sign-policy: --overlay-prefix must be a canonical RFC1918 /16".to_string()
+                })?);
+            }
+            _ => return Err("pki sign-policy: unknown or duplicate argument".to_string()),
         }
         i += 2;
     }
@@ -396,8 +412,15 @@ fn cmd_sign_policy(args: &[String]) -> Result<(), String> {
     let sequence =
         sequence.ok_or_else(|| "pki sign-policy: `--sequence` is required".to_string())?;
 
-    let summary = sign_network_policy_dir(&ca_dir, &out_dir, sequence, now_utc_us()?, ttl_seconds)
-        .map_err(|e| format!("pki sign-policy failed: {e}"))?;
+    let summary = sign_network_policy_dir_for_overlay(
+        &ca_dir,
+        &out_dir,
+        sequence,
+        now_utc_us()?,
+        ttl_seconds,
+        overlay_prefix.unwrap_or_default(),
+    )
+    .map_err(|e| format!("pki sign-policy failed: {e}"))?;
 
     println!(
         "{{\"command\":\"pki.sign-policy\",\"status\":\"ok\",\"net_id\":\"{}\",\"root_fingerprint\":\"{}\",\"sequence\":{},\"issued_at_us\":{},\"expires_us\":{}}}",

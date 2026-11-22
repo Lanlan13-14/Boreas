@@ -924,11 +924,15 @@ pub struct SignedObject {
 
 impl SignedObject {
     pub fn validate(&self) -> Result<(), MessageError> {
+        self.validate_for_overlay(objects::DEFAULT_IDENTITY_OVERLAY)
+    }
+
+    fn validate_for_overlay(&self, overlay_base: [u8; 4]) -> Result<(), MessageError> {
         if self.raw_tbs.is_empty() || self.raw_tbs.len() > objects::MAX_OBJECT_LEN {
             return Err(MessageError::BadSignedObject);
         }
-        let object =
-            objects::decode_tbs(&self.raw_tbs).map_err(|_| MessageError::BadManagementObject)?;
+        let object = objects::decode_tbs_for_overlay(&self.raw_tbs, overlay_base)
+            .map_err(|_| MessageError::BadManagementObject)?;
         if object.body.object_type() != self.object_type {
             return Err(MessageError::BadObjectType);
         }
@@ -953,7 +957,13 @@ impl SignedObject {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        self.validate()?;
+        self.encode_for_overlay(objects::DEFAULT_IDENTITY_OVERLAY)
+    }
+
+    /// Structural encoding for an explicitly selected identity overlay; the
+    /// prefix and signatures must be authenticated by the caller.
+    pub fn encode_for_overlay(&self, overlay_base: [u8; 4]) -> Result<Vec<u8>, MessageError> {
+        self.validate_for_overlay(overlay_base)?;
         let mut writer = VecWriter::new();
         writer.byte(SIGNED_OBJECT_VERSION);
         writer.byte(self.object_type as u8);
@@ -980,6 +990,12 @@ impl SignedObject {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, MessageError> {
+        Self::decode_for_overlay(data, objects::DEFAULT_IDENTITY_OVERLAY)
+    }
+
+    /// Structural decoding for an explicitly selected identity overlay. The
+    /// expected prefix must never be inferred from the untrusted envelope.
+    pub fn decode_for_overlay(data: &[u8], overlay_base: [u8; 4]) -> Result<Self, MessageError> {
         if data.len() > MAX_SIGNED_OBJECT_LEN {
             return Err(MessageError::SignedObjectTooLarge(data.len()));
         }
@@ -1025,7 +1041,7 @@ impl SignedObject {
             raw_tbs,
             signers,
         };
-        object.validate()?;
+        object.validate_for_overlay(overlay_base)?;
         Ok(object)
     }
 }

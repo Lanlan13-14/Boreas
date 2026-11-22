@@ -841,6 +841,26 @@ pub fn sign_network_policy_dir(
     now_us: u64,
     ttl_seconds: u64,
 ) -> Result<NetworkPolicySummary, ProvisionError> {
+    sign_network_policy_dir_for_overlay(
+        ca_dir,
+        out_dir,
+        sequence,
+        now_us,
+        ttl_seconds,
+        crate::OverlayPrefix::DEFAULT,
+    )
+}
+
+/// Sign a policy candidate for an explicit offline overlay. This does not
+/// install it, change an existing policy watermark, or authorize runtime use.
+pub fn sign_network_policy_dir_for_overlay(
+    ca_dir: &Path,
+    out_dir: &Path,
+    sequence: u64,
+    now_us: u64,
+    ttl_seconds: u64,
+    overlay: crate::OverlayPrefix,
+) -> Result<NetworkPolicySummary, ProvisionError> {
     if sequence == 0 {
         return Err(ProvisionError::InvalidParameter(
             "network policy sequence must be non-zero",
@@ -886,7 +906,7 @@ pub fn sign_network_policy_dir(
     let candidate = NetworkPolicyCandidate {
         net_id,
         root_key_fingerprint: root_fp,
-        overlay_base: [10, 20, 0, 0],
+        overlay_base: overlay.base(),
         version: 1,
         seq: sequence,
         issued_at: issued_at_us,
@@ -903,7 +923,18 @@ pub fn sign_network_policy_dir(
     crate::verify_network_policy(&raw_tbs, &ed_sig, &ml_sig, &pin, net_id, now_us)
         .map_err(|_| ProvisionError::OpenSsl("verify generated network policy"))?;
 
-    ensure_private_dir(out_dir)?;
+    if overlay == crate::OverlayPrefix::DEFAULT {
+        ensure_private_dir(out_dir)?;
+    } else {
+        // A migration candidate must never replace installed policy inputs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(out_dir)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(out_dir)?;
+    }
     write_public_atomic(&out_dir.join("tbs.cbor"), &raw_tbs)?;
     write_public_atomic(&out_dir.join("ed25519.sig"), &ed_sig)?;
     write_public_atomic(&out_dir.join("mldsa65.sig"), &ml_sig)?;

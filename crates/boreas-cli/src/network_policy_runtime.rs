@@ -104,8 +104,8 @@ pub(crate) fn read_bounded_regular(
 /// pre-place each candidate/signature/key file directly within `configured_state_dir`;
 /// this is deployment layout, not provenance inferred from the signed candidate. The independently
 /// provisioned DER pair must match the verified identity/status root fingerprint before opening
-/// the watermark. Returns the signed private-prefix context only after fresh verification and
-/// successful anti-replay commit.
+/// the watermark. Returns the signed default-overlay context only after fresh verification and
+/// successful anti-replay commit. A non-default prefix is rejected before opening the watermark.
 #[cfg(feature = "openssl-inner-tls")]
 pub fn verify_and_record_default_policy(
     inputs: PolicyInputPaths<'_>,
@@ -492,19 +492,12 @@ mod tests {
             3,
             (t0, t0 + validity),
         );
-        assert_eq!(
-            invoke(
-                &private,
-                &state_dir.join("private.state"),
-                &state_dir,
-                net,
-                fingerprint,
-                uid
-            )
-            .unwrap()
-            .overlay_base(),
-            [172, 19, 0, 0]
-        );
+        let private_state = state_dir.join("private.state");
+        assert!(matches!(
+            invoke(&private, &private_state, &state_dir, net, fingerprint, uid),
+            Err(PolicyRuntimeError::UnsupportedPrefix)
+        ));
+        assert!(!private_state.exists());
         let _ = fs::remove_dir_all(root);
     }
 

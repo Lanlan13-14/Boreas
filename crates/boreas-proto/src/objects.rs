@@ -603,8 +603,22 @@ fn parse_body(ty: ObjectType, v: &V) -> Result<ObjectBody, Error> {
         }
     })
 }
-fn known_extension(_id: u64) -> bool {
-    false
+/// Offline-only identity migration evidence: SHA-256 of the exact destination
+/// NetworkPolicy TBS followed by SHA-256 of the exact legacy NodeIdentity TBS.
+/// The default codec deliberately does not recognize this critical extension.
+pub const OFFLINE_IPV4_POOL_MIGRATION_EXTENSION: u64 = 0x4252_504d;
+
+fn check_extension(extension: &Extension, overlay_base: [u8; 4]) -> Result<(), Error> {
+    if extension.id == OFFLINE_IPV4_POOL_MIGRATION_EXTENSION
+        && overlay_base != DEFAULT_IDENTITY_OVERLAY
+    {
+        if !extension.critical || extension.value.len() != 64 {
+            return Err(Error::InvalidField("IPv4 pool migration evidence"));
+        }
+    } else if extension.critical {
+        return Err(Error::UnknownCriticalExtension(extension.id));
+    }
+    Ok(())
 }
 fn subject_value(subject: &SubjectIdentity) -> V {
     match subject {
@@ -648,13 +662,22 @@ pub(crate) fn valid_node_id(node_id: u16) -> bool {
     let octet = (node_id & 0xff) as u8;
     (1..=16).contains(&core) && (octet == 1 || (2..=251).contains(&octet))
 }
-fn validate_context(x: &ManagementObject) -> Result<(), Error> {
+pub(crate) const DEFAULT_IDENTITY_OVERLAY: [u8; 4] = [10, 20, 0, 0];
+
+fn validate_context(x: &ManagementObject, overlay_base: [u8; 4]) -> Result<(), Error> {
     if x.issuer_key_id.is_empty()
         || x.issuer_key_id.len() > 64
         || x.issuer_generation == 0
         || x.expires <= x.issued_at
     {
         return Err(Error::InvalidField("common envelope bounds"));
+    }
+    if overlay_base != DEFAULT_IDENTITY_OVERLAY
+        && !matches!(x.extensions.as_slice(), [extension]
+            if extension.id == OFFLINE_IPV4_POOL_MIGRATION_EXTENSION
+                && extension.critical && extension.value.len() == 64)
+    {
+        return Err(Error::InvalidField("IPv4 pool migration evidence"));
     }
     match &x.body {
         ObjectBody::NodeIdentity(body) => {
@@ -666,14 +689,18 @@ fn validate_context(x: &ManagementObject) -> Result<(), Error> {
                 || body.home_core_id == 0
                 || body.home_core_id > 16
                 || body.node_id != ((((body.home_core_id as u16) - 1) << 8) | body.vip[3] as u16)
-                || body.vip[0] != 10
-                || body.vip[1] != 20
+                || body.vip[..2] != overlay_base[..2]
+                || (overlay_base != DEFAULT_IDENTITY_OVERLAY && body.vip6 != [0; 16])
                 || !match body.role {
                     NodeRole::Core => body.vip[2] == body.home_core_id && body.vip[3] == 1,
                     NodeRole::Edge => {
                         body.vip[2] == body.home_core_id && (2..=251).contains(&body.vip[3])
                     }
-                    NodeRole::EnrollmentService => body.vip[2] == 0 && body.vip[3] != 0,
+                    NodeRole::EnrollmentService => {
+                        overlay_base == DEFAULT_IDENTITY_OVERLAY
+                            && body.vip[2] == 0
+                            && body.vip[3] != 0
+                    }
                 }
                 || body.identity_generation == 0
                 || body.expires <= body.not_before
@@ -805,8 +832,8 @@ fn validate_context(x: &ManagementObject) -> Result<(), Error> {
     }
     Ok(())
 }
-fn envelope_value(x: &ManagementObject) -> Result<V, Error> {
-    validate_context(x)?;
+fn envelope_value(x: &ManagementObject, overlay_base: [u8; 4]) -> Result<V, Error> {
+    validate_context(x, overlay_base)?;
     if x.issuer_key_id.is_empty()
         || x.issuer_key_id.len() > 64
         || x.extensions.len() > MAX_EXTENSIONS
@@ -822,9 +849,7 @@ fn envelope_value(x: &ManagementObject) -> Result<V, Error> {
         if e.value.len() > MAX_EXTENSION_VALUE {
             return Err(Error::TooLarge);
         }
-        if e.critical && !known_extension(e.id) {
-            return Err(Error::UnknownCriticalExtension(e.id));
-        }
+        check_extension(e, overlay_base)?;
     }
     Ok(map(vec![
         (0, u(SCHEMA_VERSION)),
@@ -847,8 +872,18 @@ fn envelope_value(x: &ManagementObject) -> Result<V, Error> {
     ]))
 }
 pub fn encode_tbs(x: &ManagementObject) -> Result<Vec<u8>, Error> {
+    encode_tbs_for_overlay(x, DEFAULT_IDENTITY_OVERLAY)
+}
+
+/// Structural encoding for a separately supplied expected IPv4 /16. Does not
+/// authenticate the prefix. Non-default overlays are restricted to NodeIdentity.
+pub fn encode_tbs_for_overlay(
+    x: &ManagementObject,
+    overlay_base: [u8; 4],
+) -> Result<Vec<u8>, Error> {
+    check_overlay(overlay_base, x.body.object_type())?;
     let mut out = Vec::new();
-    encode(&envelope_value(x)?, &mut out);
+    encode(&envelope_value(x, overlay_base)?, &mut out);
     if out.len() > MAX_OBJECT_LEN {
         return Err(Error::TooLarge);
     }
@@ -857,6 +892,25 @@ pub fn encode_tbs(x: &ManagementObject) -> Result<Vec<u8>, Error> {
 /// Parse for typed inspection; caller must keep `data` and pass those exact bytes to signature_input.
 /// This function does not return a re-encoded substitute for the signed input.
 pub fn decode_tbs(data: &[u8]) -> Result<ManagementObject, Error> {
+    decode_tbs_for_overlay(data, DEFAULT_IDENTITY_OVERLAY)
+}
+
+fn check_overlay(overlay_base: [u8; 4], ty: ObjectType) -> Result<(), Error> {
+    if overlay_base != DEFAULT_IDENTITY_OVERLAY
+        && (ty != ObjectType::NodeIdentity
+            || !crate::network_policy::is_private_overlay_base(overlay_base))
+    {
+        return Err(Error::InvalidField("identity overlay"));
+    }
+    Ok(())
+}
+
+/// Structural decoding for a separately supplied expected IPv4 /16. As with
+/// `decode_tbs`, authenticate the original bytes before relying on the result.
+pub fn decode_tbs_for_overlay(
+    data: &[u8],
+    overlay_base: [u8; 4],
+) -> Result<ManagementObject, Error> {
     if data.len() > MAX_OBJECT_LEN {
         return Err(Error::TooLarge);
     }
@@ -869,6 +923,7 @@ pub fn decode_tbs(data: &[u8]) -> Result<ManagementObject, Error> {
         return Err(Error::InvalidField("schema_version"));
     }
     let ty = ObjectType::try_from(num(get(&m, 1)?)?)?;
+    check_overlay(overlay_base, ty)?;
     let mut extensions = Vec::new();
     let V::A(a) = get(&m, 10)? else {
         return Err(Error::InvalidField("extensions"));
@@ -894,14 +949,13 @@ pub fn decode_tbs(data: &[u8]) -> Result<ManagementObject, Error> {
             1 => true,
             _ => return Err(Error::InvalidField("critical bool")),
         };
-        if critical && !known_extension(id) {
-            return Err(Error::UnknownCriticalExtension(id));
-        }
-        extensions.push(Extension {
+        let extension = Extension {
             id,
             critical,
             value: blob(&t[2], MAX_EXTENSION_VALUE)?,
-        })
+        };
+        check_extension(&extension, overlay_base)?;
+        extensions.push(extension);
     }
     let body = parse_body(ty, get(&m, 9)?)?;
     if body.object_type() != ty {
@@ -918,7 +972,7 @@ pub fn decode_tbs(data: &[u8]) -> Result<ManagementObject, Error> {
         extensions,
         body,
     };
-    validate_context(&object)?;
+    validate_context(&object, overlay_base)?;
     Ok(object)
 }
 /// Construct the exact domain-separated message to be signed. Caller retains and verifies original TBS bytes.

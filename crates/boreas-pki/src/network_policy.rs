@@ -1,6 +1,6 @@
 //! Verification of NetworkPolicy candidates against a separately provisioned pin.
-//! Runtime conversion permits any canonical private /16 selected by signed policy.
-//! The policy's verified prefix is the sole source of address derivation. A static context is not a live
+//! Runtime conversion remains restricted to the default overlay pending complete
+//! custom-prefix integration. A static context is not a live
 //! freshness proof: renewal, trusted time and revocation remain separate gates.
 #![cfg(feature = "openssl-backend")]
 
@@ -50,11 +50,12 @@ impl VerifiedNetworkPolicy {
         self.policy_digest
     }
 
-    /// Convert verified policy to the runtime context used for address binding.
-    /// The candidate decoder already enforces a canonical RFC1918 /16. The
-    /// default-prefix name remains as a compatibility alias; it no longer
-    /// discards a different valid signed private prefix.
+    /// Convert verified policy to the currently supported runtime context.
+    /// A valid signature on a non-default prefix is not runtime permission.
     pub fn require_default_runtime(&self) -> Result<VerifiedNetworkContext, NetworkPolicyError> {
+        if self.overlay_base != crate::OverlayPrefix::DEFAULT.base() {
+            return Err(NetworkPolicyError::UnsupportedRuntimePrefix);
+        }
         Ok(VerifiedNetworkContext {
             net_id: self.net_id,
             root_key_fingerprint: self.root_key_fingerprint,
@@ -304,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_private_prefix_is_runtime_bindable() {
+    fn signed_private_prefix_is_verifiable_but_not_runtime_bindable() {
         let (ed, pq) = keys(11);
         let pin = make_pin(&ed, &pq);
         let candidate = NetworkPolicyCandidate {
@@ -319,9 +320,10 @@ mod tests {
         let raw = candidate.encode_tbs().unwrap();
         let (es, ps) = sign(&ed, &pq, &raw);
         let verified = verify_network_policy(&raw, &es, &ps, &pin, [3; 16], 10).unwrap();
+        assert_eq!(verified.overlay_base(), [10, 21, 0, 0]);
         assert_eq!(
-            verified.require_default_runtime().unwrap().overlay_base(),
-            [10, 21, 0, 0]
+            verified.require_default_runtime(),
+            Err(NetworkPolicyError::UnsupportedRuntimePrefix)
         );
     }
 }
