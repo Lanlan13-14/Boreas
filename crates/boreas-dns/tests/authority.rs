@@ -165,6 +165,44 @@ fn aaaa_only_name_is_nodata_for_a_not_nxdomain() {
 }
 
 #[test]
+fn address_rrsets_are_complete_family_specific_and_never_partial() {
+    let mut zone = Zone::new("corp.example").unwrap();
+    let a = [Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 12)];
+    let aaaa: [Ipv6Addr; 2] = ["2001:db8::10".parse().unwrap(), "2001:db8::12".parse().unwrap()];
+    let owner = "dual.corp.example";
+    for ip in [a[0].into(), aaaa[0].into(), a[1].into(), aaaa[1].into(), a[0].into()] {
+        zone.add_address(owner, ip).unwrap();
+    }
+    let name = wire(&[b"DuAl", b"corp", b"example"]);
+    for (qtype, expected) in [(1u16, a.map(|ip| ip.octets().to_vec())), (28, aaaa.map(|ip| ip.octets().to_vec()))] {
+        let request = query(&name, qtype, true);
+        let rdlen = expected[0].len();
+        let exact = request.len() + 2 * (12 + rdlen);
+        let resolver = |limit| {
+            AuthoritativeDns::new(zone.clone(), SourceAuthorization::new([CLIENT]), limit).unwrap()
+        };
+        let dns = resolver(exact);
+        let response = dns.respond_udp(CLIENT, &request).unwrap().unwrap();
+        assert_eq!(dns.respond_tcp(CLIENT, &request).unwrap().unwrap(), response);
+        assert_eq!(flags(&response), 0x8500);
+        assert_eq!(counts(&response), (1, 2, 0, 0));
+        assert_eq!(&response[12..request.len()], &request[12..]);
+        let mut records = response[request.len()..].chunks_exact(12 + rdlen);
+        assert_eq!(records.len(), 2);
+        assert!(records.remainder().is_empty());
+        for (rr, address) in records.by_ref().zip(expected) {
+            assert_eq!(&rr[..2], &[0xc0, 0x0c]);
+            assert_eq!(&rr[2..4], &qtype.to_be_bytes());
+            assert_eq!(&rr[4..10], &[0, 1, 0, 0, 0, 60]);
+            assert_eq!(&rr[10..12], &(rdlen as u16).to_be_bytes());
+            assert_eq!(&rr[12..], address.as_slice());
+        }
+        assert_eq!(resolver(exact - 1).respond_udp(CLIENT, &request), Err(DnsError::TruncatedWouldExceed));
+        assert_eq!(resolver(exact - 1).respond_tcp(CLIENT, &request), Err(DnsError::TruncatedWouldExceed));
+    }
+}
+
+#[test]
 fn recursion_desired_is_echoed_and_does_not_set_ra() {
     let dns = service(512);
     let response = dns

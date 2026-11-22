@@ -19,8 +19,10 @@ on:
       - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'crates/boreas-dns/**'
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
+      - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -39,8 +41,10 @@ on:
       - 'crates/boreas-tun/**'
       - 'crates/boreas-tunnel/**'
       - 'crates/boreas-cli/**'
+      - 'crates/boreas-dns/**'
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
+      - 'tools/release/netns_private_dns_fixture.py'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -191,7 +195,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt -p boreas-crypto -p boreas-pki -p boreas-tunnel -p boreas-supervisor -p boreas-cli
+          cargo fmt -p boreas-crypto -p boreas-pki -p boreas-tunnel -p boreas-supervisor -p boreas-cli -p boreas-dns
           git diff --binary > rust-tls-format.patch || true
           if [ -s rust-tls-format.patch ]; then
             echo '::warning title=Formatting patch produced::Review rust-tls-format.patch; this job did not commit it.'
@@ -270,6 +274,12 @@ jobs:
             --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
+      - name: DNS authority, private dispatch, and packet transport tests
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked -p boreas-dns 2>&1 | tee rust-tls-dns-tests.log
       - name: Test policy fixture encoding helpers
         if: always()
         run: python -m unittest discover -s tools/release -p 'test_network_policy_test_fixture.py'
@@ -862,6 +872,10 @@ jobs:
           sudo -E timeout --kill-after=5s 120s bash tools/release/netns_daemon_smoke.sh \
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-private-dns.log
+          grep -Fx 'private_dns=verified_signed_a_nxdomain_and_out_of_scope_drop' rust-tls-private-dns.log
+          grep -Fx 'private_dns_rrset=verified_complete_a_and_tc_without_partial_answers' rust-tls-private-dns.log
+          grep -Fx 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed' rust-tls-private-dns.log
+          grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
       - name: Verify four-process Core routing and failover on real TUN
         id: acceptance_mesh
         if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
@@ -1059,6 +1073,7 @@ jobs:
             rust-tls-tunnel-tests.log
             rust-tls-supervisor-tests.log
             rust-tls-verified-systemd.log
+            rust-tls-dns-tests.log
             rust-tls-private-dns.log
             rust-tls-mesh-runtime.log
             rust-tls-multi-active-*.log

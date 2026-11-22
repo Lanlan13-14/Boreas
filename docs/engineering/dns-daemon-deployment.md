@@ -18,8 +18,9 @@ applies to the daemon. The host application is separate from that sandbox.
    (NetworkRoot-signed DNS signer grant), and `authority` (DnsSigner-signed
    authority). For each stem install `<stem>.tbs`, `<stem>.ed25519.sig` (64 raw
    bytes) and `<stem>.mldsa65.sig` (3309 raw bytes). Only public artifacts go on
-   either node. Use distinct offline keys for root and DNS signer. The test
-   fixture is not an operator signing utility.
+   either node. Use distinct offline keys for root and DNS signer. An owner can
+   have multiple A records, each pointing to a signed permanent VIP claim.
+   The test fixture is not an operator signing utility.
 3. Independently approve the exact three canonical TBS byte strings. Mount a
    trusted **96-byte raw pin** outside the artifact directory, in this order:
    `SHA256(service.tbs) || SHA256(signer.tbs) || SHA256(authority.tbs)`. Configure
@@ -60,6 +61,21 @@ For the explicit query client in the netns test there is no upstream configurati
 at all. The Edge packet branch drops out-of-suffix and non-UDP/53 traffic to the
 reserved VIP; the Core responder is private-only and never calls a public resolver.
 
+An A query returns the complete signed RRset if it fits. The response ceiling
+is the minimum of the negotiated IPv4 MTU minus 28 bytes, the resolver cap, and
+512 bytes without EDNS (otherwise the advertised EDNS payload, clamped to
+512–4096 bytes). If the complete response does not fit, the Core returns TC
+with the whole question, no answer or authority records, and a minimal OPT
+when the request used EDNS. If even that cannot fit, it sends nothing. A client
+can request an explicitly larger EDNS size **at the same VIP**, if permitted by
+its quarantine policy. Otherwise resolution is incomplete: do not consume a
+partial RRset or retry on TCP, another server, or any public path. For the
+current signed profile there are at most 64 distinct IPv4 claims. The largest
+A response is at most 1306 bytes (12-byte header + up to 259-byte question +
+64 × 16-byte records + 11-byte OPT), so EDNS 1320 with an IPv4 tunnel MTU of at
+least 1334 accommodates any such answer. At a lower MTU, verify that the RRset
+and its owner fit the effective payload ceiling before deploying.
+
 ## Lifetime and observability
 
 The daemon uses the exact durable-accepted NetworkPolicy and original root pin,
@@ -89,23 +105,29 @@ capacity for a reply before consuming a packet and exports actual reply TX count
 There is no DNS-ready bit or DNS readiness claim in the supervisor handshake or
 `ctl status`. A real successful Edge query proves that its DNS path answered.
 
-## Live scenario (not a gate)
+## Automated live acceptance
 
-Use the exact candidate Linux binary and an OpenSSL CLI that supports ML-DSA-65,
-plus root, Linux netns, `/dev/net/tun`, `ip`, and Python 3:
+The DNS-specific step in `.github/workflows/rust-tls.yml` runs this scenario
+on its selected refs, in addition to the default tunnel/performance checks. To
+reproduce it, use the exact candidate Linux binary and an OpenSSL CLI that
+supports ML-DSA-65, plus root, Linux netns, `/dev/net/tun`, `ip`, `ss`, and Python 3:
 
 ```sh
 BOREAS_OPENSSL_BIN=/path/to/openssl-3.6 BOREAS_NETNS_PRIVATE_DNS=1 \
   bash tools/release/netns_daemon_smoke.sh /path/to/candidate/boreas
 ```
 
-This optional scenario builds public DNS fixtures from ephemeral offline test
-keys, installs the kernel Edge `/32`, and probes a byte-checked signed A response,
-authoritative NXDOMAIN, outside-suffix and wrong-port non-delivery, and ordinary
-ICMP on the same E2E circuit. It then withdraws only the Core pin and requires a
-nonzero Core exit with the DNS invalidation reason. It does not replace or alter
-the default performance/gate scenario. No local build/test/netns execution was
-used to claim evidence for this change.
+The scenario builds signed test fixtures with ephemeral offline keys and installs
+only the Edge DNS `/32`. It byte-checks single-A, mixed-case multi-A, AAAA NODATA,
+NXDOMAIN, whole-set truncation with and without EDNS 512, and a complete 32-A
+answer with EDNS 1232. It requires no DNS reply for out-of-suffix (including
+both label-boundary lookalikes) or wrong-port queries, checks both namespaces for
+kernel UDP sockets and TCP/53 listeners after the client exits, and checks ordinary
+ICMP over the same E2E circuit. Finally it withdraws only the Core pin and
+requires a nonzero Core exit with the DNS invalidation reason. This is a bounded
+scenario, not proof that arbitrary client software implements quarantine; the
+DNS socket check is a snapshot, not a replacement for the daemon's NO_UDP sandbox.
+No local build, test, or netns execution is claimed.
 
 Not included: public forwarding/DoH, DNS-over-TCP, registration, discovery,
 replication, signer generation rotation, DNSSEC, IPv6, LAN listening, a host

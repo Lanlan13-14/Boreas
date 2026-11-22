@@ -21,15 +21,15 @@
 //! peer authentication. A response that would exceed the caller byte cap is
 //! [`DnsError::TruncatedWouldExceed`]. [`AuthoritativeDns::respond_udp`] and
 //! [`AuthoritativeDns::respond_tcp`] never set TC and never return a partial
-//! RRset. Only [`AuthoritativeDns::udp_truncate`] emits a header-and-question
-//! message with TC and an empty answer section. RD is echoed and is not
-//! recursion: RA stays clear. QCLASS other than IN is
-//! [`DnsError::InvalidQuestion`] (FORMERR); no REFUSED message is built.
+//! RRset. The private UDP dispatcher can explicitly emit TC with an empty
+//! answer section. RD is echoed and is not recursion: RA stays clear. QCLASS
+//! other than IN is [`DnsError::InvalidQuestion`] (FORMERR); no REFUSED
+//! message is built.
 //! [`Zone::refuse_name`] is an exact-match REFUSED list and wins over addresses.
 //!
-//! Separately, [`dispatch`] composes the authority with an optional blocking
-//! plaintext DNS-over-TCP [`upstream`]. Neither the dispatcher nor forwarding
-//! is wired to the packet path or daemon.
+//! [`dispatch`] composes the authority with an optional blocking plaintext
+//! DNS-over-TCP [`upstream`]. The private packet path uses only the private
+//! branch; it cannot invoke that upstream.
 
 #![forbid(unsafe_code)]
 
@@ -190,10 +190,6 @@ impl AuthoritativeDns {
         })
     }
 
-    /// Handle one DNS-over-UDP message payload from an IPv4/IPv6 source address.
-    /// Unauthorized sources get no response (`Ok(None)`), preventing accidental
-    /// synthetic responses. Exactly one question and at most one EDNS OPT are
-    /// accepted. No recursion, forwarding, or TCP behavior is provided.
     fn name_exists(&self, name: &str) -> bool {
         name == self.zone.origin
             || self.zone.records.contains_key(name)
@@ -212,6 +208,9 @@ impl AuthoritativeDns {
         self.respond(source, query, false)
     }
 
+    /// Handle one DNS-over-UDP payload from an authorized source address.
+    /// Unauthorized sources receive `Ok(None)`. If the whole answer does not
+    /// fit, the response is an error; this method does not insert TC itself.
     pub fn respond_udp(&self, source: IpAddr, query: &[u8]) -> Result<Option<Vec<u8>>, DnsError> {
         self.respond(source, query, true)
     }
@@ -239,44 +238,40 @@ impl AuthoritativeDns {
         ceiling: usize,
     ) -> Result<Vec<u8>, DnsError> {
         let limit = if datagram {
-            if let Some(edns_limit) = question.edns_size {
-                self.max_response_bytes
-                    .min(edns_limit.clamp(512, MAX_RESPONSE_BYTES))
-            } else {
-                self.max_response_bytes.min(512)
-            }
+            self.udp_limit(question, ceiling)
         } else {
-            self.max_response_bytes.min(MAX_RESPONSE_BYTES)
+            self.max_response_bytes.min(ceiling)
         };
-        let limit = limit.min(ceiling);
-        let mut answer = None;
         let authoritative = is_in_zone(&question.name, &self.zone.origin);
         let refused = self.zone.refused.contains(&question.name);
-        let exists = authoritative && self.name_exists(&question.name);
-        let rcode;
-        if !authoritative || refused {
-            rcode = 5; // REFUSED: outside the zone, or an exact refused-name hit.
-        } else if exists {
-            rcode = 0; // Existing owner/empty non-terminal with no requested RRset is NODATA.
-            if let Some(addresses) = self.zone.records.get(&question.name) {
-                answer = addresses.iter().find_map(|ip| match (question.qtype, ip) {
-                    (TYPE_A, IpAddr::V4(v4)) => Some((1u16, v4.octets().to_vec())),
-                    (TYPE_AAAA, IpAddr::V6(v6)) => Some((28u16, v6.octets().to_vec())),
-                    _ => None,
-                });
-            }
+        let (rcode, addresses) = if !authoritative || refused {
+            // REFUSED: outside the zone, or an exact refused-name hit.
+            (5, &[][..])
+        } else if let Some(addresses) = self.zone.records.get(&question.name) {
+            (0, addresses.as_slice())
+        } else if self.name_exists(&question.name) {
+            // Existing apex or empty non-terminal with no RRset: NODATA.
+            (0, &[][..])
         } else {
-            rcode = 3; // NXDOMAIN
-        }
+            (3, &[][..]) // NXDOMAIN
+        };
         build_response(
             query,
             question,
             rcode,
-            answer,
+            addresses,
             limit,
             question.edns_size.is_some(),
             authoritative && !refused,
         )
+    }
+
+    fn udp_limit(&self, question: &Question, ceiling: usize) -> usize {
+        let advertised = question
+            .edns_size
+            .unwrap_or(512)
+            .clamp(512, MAX_RESPONSE_BYTES);
+        self.max_response_bytes.min(ceiling).min(advertised)
     }
 
     /// UDP TC indication only. Copies the query id, echoes RD (never sets RA),
@@ -288,22 +283,34 @@ impl AuthoritativeDns {
         if !(12..=MAX_RESPONSE_BYTES).contains(&max) {
             return Err(DnsError::InvalidConfiguration);
         }
-        let question = parse_query(query)?;
-        if question.end > max {
-            return Err(DnsError::TruncatedWouldExceed);
-        }
-        let mut out = Vec::with_capacity(question.end);
-        out.extend_from_slice(&question.id.to_be_bytes());
-        // QR | TC | echoed RD. AA and RA stay clear: this is not an answer.
-        let flags = 0x8200 | (question.flags & 0x0100);
-        out.extend_from_slice(&flags.to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&query[12..question.end]);
-        Ok(out)
+        truncate_parsed(query, &parse_query(query)?, max, false)
     }
+}
+
+fn truncate_parsed(
+    query: &[u8],
+    question: &Question,
+    max: usize,
+    include_opt: bool,
+) -> Result<Vec<u8>, DnsError> {
+    let required = question.end + if include_opt { OPT_HEADER_BYTES } else { 0 };
+    if required > max {
+        return Err(DnsError::TruncatedWouldExceed);
+    }
+    let mut out = Vec::with_capacity(required);
+    out.extend_from_slice(&question.id.to_be_bytes());
+    // QR | TC | echoed RD. AA and RA stay clear: this is not an answer.
+    let flags = 0x8200 | (question.flags & 0x0100);
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&u16::from(include_opt).to_be_bytes());
+    out.extend_from_slice(&query[12..question.end]);
+    if include_opt {
+        write_opt(&mut out, max);
+    }
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -489,69 +496,61 @@ fn build_response(
     query: &[u8],
     q: &Question,
     rcode: u16,
-    answer: Option<(u16, Vec<u8>)>,
+    addresses: &[IpAddr],
     limit: usize,
     include_opt: bool,
     authoritative: bool,
 ) -> Result<Vec<u8>, DnsError> {
-    let mut out = Vec::with_capacity(q.end + 16);
+    let base_len = q.end + if include_opt { OPT_HEADER_BYTES } else { 0 };
+    let budget = limit
+        .checked_sub(base_len)
+        .ok_or(DnsError::TruncatedWouldExceed)?;
+    let rdata_len: u16 = if q.qtype == TYPE_AAAA { 16 } else { 4 };
+    let rr_len = 12 + usize::from(rdata_len);
+    let max_answers = budget / rr_len;
+    let answers = || {
+        addresses.iter().filter(|ip| match q.qtype {
+            TYPE_A => ip.is_ipv4(),
+            TYPE_AAAA => ip.is_ipv6(),
+            _ => false,
+        })
+    };
+    let count = answers().take(max_answers + 1).count();
+    if count > max_answers {
+        return Err(DnsError::TruncatedWouldExceed);
+    }
+    let mut out = Vec::with_capacity(base_len + count * rr_len);
     out.extend_from_slice(&q.id.to_be_bytes());
-    let mut flags = 0x8000 | (if authoritative { 0x0400 } else { 0 }) | (q.flags & 0x0100) | rcode; // QR, conditional AA, echo RD; RA stays clear.
-    if q.flags & 0x0010 != 0 {
-        flags |= 0x0010;
-    } // CD
+    // QR, optional AA, echo RD/CD; RA stays clear.
+    let flags = 0x8000 | (if authoritative { 0x0400 } else { 0 }) | (q.flags & 0x0110) | rcode;
     out.extend_from_slice(&flags.to_be_bytes());
-    // A question or OPT that cannot fit is not a TC answer. Callers that want
-    // the UDP TC bit use AuthoritativeDns::udp_truncate.
-    if q.end > limit {
-        return Err(DnsError::TruncatedWouldExceed);
-    }
     out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(count as u16).to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&u16::from(include_opt).to_be_bytes());
     out.extend_from_slice(&query[12..q.end]);
-    let opt_size = if include_opt { 11 } else { 0 };
-    if include_opt
-        && out
-            .len()
-            .checked_add(opt_size)
-            .filter(|size| *size <= limit)
-            .is_none()
-    {
-        return Err(DnsError::TruncatedWouldExceed);
-    }
-    if let Some((rrtype, bytes)) = answer {
-        let required = 2 + 2 + 2 + 4 + 2 + bytes.len();
-        if out
-            .len()
-            .checked_add(required)
-            .and_then(|size| size.checked_add(opt_size))
-            .filter(|size| *size <= limit)
-            .is_some()
-        {
-            out.extend_from_slice(&[0xc0, 0x0c]);
-            out.extend_from_slice(&rrtype.to_be_bytes());
-            out.extend_from_slice(&CLASS_IN.to_be_bytes());
-            out.extend_from_slice(&60u32.to_be_bytes());
-            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            out.extend_from_slice(&bytes);
-            out[6..8].copy_from_slice(&1u16.to_be_bytes());
-        } else {
-            return Err(DnsError::TruncatedWouldExceed);
+    for address in answers() {
+        out.extend_from_slice(&[0xc0, 0x0c]);
+        out.extend_from_slice(&q.qtype.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&60u32.to_be_bytes());
+        out.extend_from_slice(&rdata_len.to_be_bytes());
+        match address {
+            IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+            IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
         }
     }
     if include_opt {
-        out.extend_from_slice(&[0, 0, TYPE_OPT.to_be_bytes()[0], TYPE_OPT.to_be_bytes()[1]]);
-        // Advertise the effective response budget; ext-RCODE, version and flags are zero.
-        out.extend_from_slice(&(limit as u16).to_be_bytes());
-        out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        out[10..12].copy_from_slice(&1u16.to_be_bytes());
-    }
-    if out.len() > limit {
-        return Err(DnsError::InvalidConfiguration);
+        write_opt(&mut out, limit);
     }
     Ok(out)
+}
+
+fn write_opt(out: &mut Vec<u8>, limit: usize) {
+    out.extend_from_slice(&[0, 0, TYPE_OPT as u8]);
+    // Advertise the effective response budget; ext-RCODE, version and flags are zero.
+    out.extend_from_slice(&(limit as u16).to_be_bytes());
+    out.extend_from_slice(&[0; 6]);
 }
 
 fn normalize_name(name: &str) -> Option<String> {

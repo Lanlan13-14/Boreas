@@ -1028,7 +1028,22 @@ if [[ "$CONNECTED" -ne 1 ]]; then
 fi
 
 if [[ "$PRIVATE_DNS" == 1 ]]; then
-  ip netns exec "$EDGE_NS" python3 "$DNS_FIXTURE" probe
+  if ! ip netns exec "$EDGE_NS" python3 "$DNS_FIXTURE" probe; then
+    report_failure_evidence
+    exit 1
+  fi
+  # The query client has already closed its UDP socket. Neither daemon needs
+  # a kernel UDP socket or a kernel TCP listener for the reserved DNS VIP.
+  for ns in "$CORE_NS" "$EDGE_NS"; do
+    udp_sockets=$(ip netns exec "$ns" ss -Huan)
+    dns_listeners=$(ip netns exec "$ns" ss -Hltn 'sport = :53')
+    if [[ -n "$udp_sockets" || -n "$dns_listeners" ]]; then
+      echo "ERROR: unexpected kernel UDP socket or TCP/53 listener in $ns" >&2
+      printf '%s\n' "$udp_sockets" "$dns_listeners" >&2
+      exit 1
+    fi
+  done
+  echo 'private_dns_socket_audit=no_udp_socket_or_tcp53_listener_observed'
   ip netns exec "$EDGE_NS" ping -c 2 -W 2 -I 10.20.1.2 10.20.1.1
   # Withdraw the independently mounted pin while the circuit is active.
   # A successful clean exit is wrong; require a real DNS invalidation reason.

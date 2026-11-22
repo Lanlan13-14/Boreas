@@ -13,7 +13,7 @@ use crate::packet::AuthenticatedPeerSource;
 use crate::upstream::{TcpUpstream, UpstreamError};
 use crate::{
     AuthoritativeDns, DnsError, MAX_QUERY_BYTES, MAX_RESPONSE_BYTES, OPT_HEADER_BYTES, is_in_zone,
-    normalize_name, parse_query,
+    normalize_name, parse_query, truncate_parsed,
 };
 
 const MAX_AUTHORITY_ENTRIES: usize = 128;
@@ -229,15 +229,23 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
             if !snapshot.is_fresh(Instant::now()) {
                 return Err(AuthorityNotFresh);
             }
-            let reply = snapshot
-                .resolver
-                .respond_parsed(
+            let resolver = &snapshot.resolver;
+            let reply = resolver.respond_parsed(
+                query,
+                &question,
+                udp_ceiling.is_some(),
+                udp_ceiling.unwrap_or(MAX_RESPONSE_BYTES),
+            );
+            let reply = match (reply, udp_ceiling) {
+                (Err(DnsError::TruncatedWouldExceed), Some(ceiling)) => truncate_parsed(
                     query,
                     &question,
-                    udp_ceiling.is_some(),
-                    udp_ceiling.unwrap_or(MAX_RESPONSE_BYTES),
-                )
-                .map_err(AuthorityResponse)?;
+                    resolver.udp_limit(&question, ceiling),
+                    question.edns_size.is_some(),
+                ),
+                (reply, _) => reply,
+            }
+            .map_err(AuthorityResponse)?;
             (reply, Some(snapshot))
         } else {
             if !allow_public {
@@ -436,6 +444,64 @@ mod tests {
         assert!(matches!(
             dispatcher.dispatch_private_packet(peer, query, None),
             Err(DispatchError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn private_udp_truncates_whole_rrset_under_client_and_link_limits() {
+        let address = "10.20.1.2".parse().unwrap();
+        let peer = AuthenticatedPeerSource::from_authenticated_overlay_peer(address).unwrap();
+        let other = AuthenticatedPeerSource::from_authenticated_overlay_peer(
+            "10.20.1.3".parse().unwrap(),
+        )
+        .unwrap();
+        let mut zone = Zone::new("corp.test").unwrap();
+        for octet in 1..=32 {
+            let ip = std::net::Ipv4Addr::new(10, 20, 1, octet);
+            zone.add_address("corp.test", ip.into()).unwrap();
+        }
+        let resolver = AuthoritativeDns::new(
+            zone,
+            SourceAuthorization::new([address]),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let snapshot = AuthoritySnapshot::new(resolver, now, now + Duration::from_secs(60)).unwrap();
+        let dispatcher =
+            QueryDispatcher::new("corp.test", Some(snapshot), None, TestClient(peer)).unwrap();
+        let query = b"\xab\xcd\x01\0\0\x01\0\0\0\0\0\0\x04corp\x04test\0\0\x01\0\x01";
+        let truncated = dispatcher.dispatch_private_packet(peer, query, Some(1400)).unwrap();
+        assert_eq!(&truncated[..12], b"\xab\xcd\x83\0\0\x01\0\0\0\0\0\0");
+        assert_eq!(&truncated[12..], &query[12..]);
+
+        let mut edns = query.to_vec();
+        edns[11] = 1;
+        edns.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]); // 1232
+        let complete = dispatcher.dispatch_private_packet(peer, &edns, Some(1400)).unwrap();
+        assert_eq!(&complete[2..12], b"\x85\0\0\x01\0\x20\0\0\0\x01");
+        assert_eq!(complete.len(), query.len() + 32 * 16 + OPT_HEADER_BYTES);
+        let link_limit = complete.len() - 1;
+        let truncated = dispatcher.dispatch_private_packet(peer, &edns, Some(link_limit)).unwrap();
+        assert_eq!(&truncated[..12], b"\xab\xcd\x83\0\0\x01\0\0\0\0\0\x01");
+        assert_eq!(&truncated[12..query.len()], &query[12..]);
+        assert_eq!(&truncated[query.len()..query.len() + 3], &[0, 0, 41]);
+        assert_eq!(&truncated[query.len() + 3..query.len() + 5], &(link_limit as u16).to_be_bytes());
+        assert_eq!(&truncated[query.len() + 5..], &[0; 6]);
+
+        assert!(matches!(
+            dispatcher.dispatch_private_packet(peer, &edns, Some(query.len())),
+            Err(DispatchError::AuthorityResponse(DnsError::TruncatedWouldExceed))
+        ));
+        assert!(matches!(
+            dispatcher.dispatch_private_packet(other, query, Some(1400)),
+            Err(DispatchError::Unauthorized)
+        ));
+        let mut outside = *query;
+        outside[13] = b'x';
+        assert!(matches!(
+            dispatcher.dispatch_private_packet(peer, &outside, Some(1400)),
+            Err(DispatchError::PublicForwardingDisabled)
         ));
     }
 
