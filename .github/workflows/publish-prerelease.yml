@@ -559,10 +559,22 @@ jobs:
           version="${tag#v}"
           git archive --format=tar.gz --prefix="boreas-${version}/" \
             -o "release-bundle/boreas-${version}-source.tar.gz" HEAD
-          install -m 0644 downloaded/pq768/boreas-linux-x86_64-musl-pq768 release-bundle/
-          install -m 0644 downloaded/pq768/boreas-pq768-linux-x86_64.zip release-bundle/
-          install -m 0644 downloaded/pq768/static-linkage-pq768.json release-bundle/
-          (cd downloaded/pq768 && sha256sum --check --strict SHA256SUMS)
+          find downloaded/pq768 -type f -print
+          pq768_binary="$(find downloaded/pq768 -type f -name boreas-linux-x86_64-musl-pq768)"
+          pq768_zip="$(find downloaded/pq768 -type f -name boreas-pq768-linux-x86_64.zip)"
+          pq768_linkage="$(find downloaded/pq768 -type f -name static-linkage-pq768.json)"
+          pq768_sums="$(find downloaded/pq768 -type f -name SHA256SUMS)"
+          test "$(printf '%s\n' "$pq768_binary" | grep -c .)" -eq 1
+          test "$(printf '%s\n' "$pq768_zip" | grep -c .)" -eq 1
+          test "$(printf '%s\n' "$pq768_linkage" | grep -c .)" -eq 1
+          test "$(printf '%s\n' "$pq768_sums" | grep -c .)" -eq 1
+          (
+            cd "$(dirname "$pq768_sums")"
+            sha256sum --check --strict SHA256SUMS
+          )
+          install -m 0644 "$pq768_binary" release-bundle/
+          install -m 0644 "$pq768_zip" release-bundle/
+          install -m 0644 "$pq768_linkage" release-bundle/
           (
             cd release-bundle
             sha256sum \
