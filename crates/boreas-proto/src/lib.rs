@@ -154,11 +154,28 @@ impl FrameDecoder {
         self.body.clear();
         Err(e)
     }
-    pub fn feed(&mut self, mut input: &[u8]) -> Result<Vec<Frame>, Error> {
+    pub fn feed(&mut self, input: &[u8]) -> Result<Vec<Frame>, Error> {
+        let mut out = Vec::new();
+        self.feed_into(input, &mut out)?;
+        Ok(out)
+    }
+
+    /// Decode one input chunk, reusing caller-owned frame metadata storage.
+    /// The destination is replaced, and is empty on error (even if a valid
+    /// frame preceded the error in the same chunk).
+    pub fn feed_into(&mut self, input: &[u8], out: &mut Vec<Frame>) -> Result<(), Error> {
+        out.clear();
+        let result = self.decode_chunk(input, out);
+        if result.is_err() {
+            out.clear();
+        }
+        result
+    }
+
+    fn decode_chunk(&mut self, mut input: &[u8], out: &mut Vec<Frame>) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Poisoned);
         }
-        let mut out = Vec::new();
         let mut emitted = 0usize;
         while !input.is_empty() {
             let header = if let Some(header) = self.header {
@@ -220,7 +237,7 @@ impl FrameDecoder {
             emitted += wire_len;
             input = &input[take..];
         }
-        Ok(out)
+        Ok(())
     }
     pub fn finish(&mut self) -> Result<(), Error> {
         if self.failed {
@@ -788,6 +805,26 @@ mod tests {
             d.finish().unwrap();
             assert_eq!(got, reference, "split at {split} diverges");
         }
+    }
+
+    #[test]
+    fn caller_owned_decode_output_reuses_capacity_and_discards_failed_chunk() {
+        let wire = legal_stream();
+        let mut reference = FrameDecoder::new(1024 * 1024);
+        let mut decoder = FrameDecoder::new(1024 * 1024);
+        let mut reuse = Vec::with_capacity(16);
+        let capacity = reuse.capacity();
+        for chunk in wire.chunks(7) {
+            decoder.feed_into(chunk, &mut reuse).unwrap();
+            assert_eq!(reuse, reference.feed(chunk).unwrap());
+            assert_eq!(reuse.capacity(), capacity);
+        }
+        decoder.finish().unwrap();
+        let mut bad = wire;
+        bad.extend_from_slice(&[3, 9, 0, 0, 0, 0, 0, 0]);
+        assert!(decoder.feed_into(&bad, &mut reuse).is_err());
+        assert!(reuse.is_empty());
+        assert_eq!(decoder.feed_into(&[], &mut reuse), Err(Error::Poisoned));
     }
 
     #[test]

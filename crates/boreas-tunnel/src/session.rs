@@ -206,6 +206,7 @@ struct FrameIo {
     buffer: Vec<u8>,
     write_buf: Vec<u8>,
     pending: VecDeque<Frame>,
+    decoded: Vec<Frame>,
     pending_bytes: usize,
     failed: bool,
 }
@@ -218,6 +219,7 @@ impl FrameIo {
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
             pending: VecDeque::new(),
+            decoded: Vec::new(),
             pending_bytes: 0,
             failed: false,
         }
@@ -225,7 +227,8 @@ impl FrameIo {
 
     fn poison(&mut self) {
         self.failed = true;
-        self.pending.clear();
+        self.pending = VecDeque::new();
+        self.decoded = Vec::new();
         self.pending_bytes = 0;
     }
 
@@ -313,17 +316,14 @@ impl FrameIo {
                 self.poison();
                 return Err(TunnelError::Closed);
             }
-            let frames = match self.decoder.feed(&self.buffer[..read]) {
-                Ok(frames) => frames,
-                Err(error) => {
-                    self.poison();
-                    return Err(error.into());
-                }
-            };
-            for frame in &frames {
+            if let Err(error) = self.decoder.feed_into(&self.buffer[..read], &mut self.decoded) {
+                self.poison();
+                return Err(error.into());
+            }
+            for frame in &self.decoded {
                 self.pending_bytes = self.pending_bytes.saturating_add(frame.body.len());
             }
-            self.pending.extend(frames);
+            self.pending.extend(self.decoded.drain(..));
             // An 8 KiB read can contain over a thousand minimal headers; the
             // decoder byte limit alone does not bound queued frame metadata.
             if self.pending.len() > MAX_PENDING_FRAMES || self.pending_bytes > MAX_PENDING_BYTES {
