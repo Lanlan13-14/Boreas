@@ -752,7 +752,6 @@ jobs:
               --title "$title" \
               --notes-file "$notes" \
               --prerelease \
-              --verify-tag \
               release-bundle/*
           else
             gh release create "$tag" \
@@ -760,6 +759,5 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "$title" \
               --notes-file "$notes" \
-              --verify-tag \
               release-bundle/*
           fi
