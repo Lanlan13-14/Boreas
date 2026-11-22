@@ -3,10 +3,10 @@ use openssl::pkey::{Id, KeyType, PKey, Private};
 use openssl::sign::Signer;
 
 const BASE: &str = "https://updates.example.test:8443/candidate";
-const ARCH: &str = "x86_64-unknown-linux-musl";
-const ISSUED: u64 = 1;
-const EXPIRES: u64 = 60;
-const MANIFEST: &str = r#"{
+pub(super) const ARCH: &str = "x86_64-unknown-linux-musl";
+pub(super) const ISSUED: u64 = 1;
+pub(super) const EXPIRES: u64 = 60;
+pub(super) const MANIFEST: &str = r#"{
     "product":"boreas", "manifest_version":1, "sequence":7,
     "published_at":"1970-01-01T00:00:00Z", "issued_at":"1970-01-01T00:00:01Z",
     "expires":"1970-01-01T00:01:00Z", "min_compatible_state":"boreas-node-state-v1",
@@ -17,14 +17,14 @@ const MANIFEST: &str = r#"{
     }]
 }"#;
 
-struct Fixture {
-    feed: Feed,
+pub(super) struct Fixture {
+    pub(super) feed: Feed,
     ed: PKey<Private>,
     pq: PKey<Private>,
 }
 
 impl Fixture {
-    fn new(seed: u8) -> Self {
+    pub(super) fn new(seed: u8) -> Self {
         Self {
             feed: Feed::new(BASE).unwrap(),
             ed: PKey::private_key_from_raw_bytes(&[seed; 32], Id::ED25519).unwrap(),
@@ -32,7 +32,7 @@ impl Fixture {
         }
     }
 
-    fn trust(&self, min_sequence: u64) -> Trust {
+    pub(super) fn trust(&self, min_sequence: u64) -> Trust {
         Trust {
             root: ReleaseRoot::new(
                 "fixture-root",
@@ -43,7 +43,7 @@ impl Fixture {
         }
     }
 
-    fn bodies(&self, manifest: &str) -> [Vec<u8>; 3] {
+    pub(super) fn bodies(&self, manifest: &str) -> [Vec<u8>; 3] {
         let sign = |key: &PKey<Private>| {
             Signer::new_without_digest(key)
                 .unwrap()

@@ -342,7 +342,7 @@ fn run_with_columns(
         Some("menu") => run_menu(&args[1..], lang, stdout_tty, columns),
         Some("console") => run_console(&args[1..], lang, stdout_tty, columns),
         Some("update-check") => update::run(&args[1..], lang),
-        Some("update") => update::offline(&args[1..]),
+        Some("update") => update::apply(&args[1..], lang),
         Some("--version") if args.len() == 1 => {
             (0, format!("Boreas {}", update::local_build()), String::new())
         }
@@ -1514,7 +1514,7 @@ fn help_text() -> String {
      \x20 boreas --version          local CLI build identity\n\
      \x20 boreas update-check [--channel stable|pre]  advisory discovery (default: stable)\n\
      \x20 boreas update-check --help  includes signed metadata discovery (Linux/OpenSSL)\n\
-     \x20 boreas update --help     operator-only verified offline update (Linux/systemd)\n\n\
+     \x20 boreas update --help     operator-only verified update (Linux/systemd)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
      \x20 boreas status --json      JSON snapshot (also the default when not a TTY)\n\

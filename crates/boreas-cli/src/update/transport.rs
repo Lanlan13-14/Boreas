@@ -77,6 +77,46 @@ pub(super) fn fetch_https(
     accept: &'static str,
     deadline: Instant,
 ) -> Result<Vec<u8>, Issue> {
+    fetch_with(url, max_bytes, accept, deadline, |_| {})
+}
+
+#[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
+pub(super) fn fetch_unprivileged(
+    url: &str,
+    max_bytes: usize,
+    accept: &'static str,
+    deadline: Instant,
+    uid: std::num::NonZeroU32,
+    gid: std::num::NonZeroU32,
+) -> Result<Vec<u8>, Issue> {
+    use std::os::unix::process::CommandExt;
+
+    fetch_with(url, max_bytes, accept, deadline, |command| {
+        // SAFETY: the pre-exec hook performs only Linux syscalls (and reads errno).
+        // CLOEXEC preserves the standard library's spawn/error pipe until exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 4_u32) != 0
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(gid.get()) != 0
+                    || libc::setuid(uid.get()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    })
+}
+
+fn fetch_with(
+    url: &str,
+    max_bytes: usize,
+    accept: &'static str,
+    deadline: Instant,
+    configure: impl FnOnce(&mut Command),
+) -> Result<Vec<u8>, Issue> {
     let exe = system_curl().ok_or(Issue::NoCurl)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.as_millis() == 0 {
@@ -123,6 +163,7 @@ pub(super) fn fetch_https(
         }
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    configure(&mut command);
     let mut child = command.spawn().map_err(|error| {
         if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) {
             Issue::NoCurl
@@ -172,8 +213,13 @@ pub(super) fn fetch_https(
 }
 
 fn read_response(reader: impl Read, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let limit = max_bytes + 5;
     let mut bytes = Vec::new();
-    reader.take((max_bytes + 5) as u64).read_to_end(&mut bytes)?;
+    if max_bytes > MAX_BYTES {
+        // Avoid doubling an artifact-sized buffer merely to read the status tail.
+        bytes.try_reserve_exact(limit).map_err(std::io::Error::other)?;
+    }
+    reader.take(limit as u64).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 

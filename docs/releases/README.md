@@ -41,7 +41,7 @@
 - 未显式标注标签的构建显示 Cargo 软件版本和 `dev`（编译时有完整 `BOREAS_BUILD_SHA` / `GITHUB_SHA` 时显示短 SHA），只报告发现的候选，不比较开发提交与发布标签。以后由获准的打包环境按实际标签提供编译期 `BOREAS_BUILD_TAG`；发现结果只能说明远端声称标签较新、SemVer 优先级相同、较旧或无法比较。CLI 退出码：`0` 检查完成（含无匹配），`1` 不可用，`2` 参数错误。
 - 上述默认发现结果不具备发布签名授权；仅显示固定的 Boreas 发布页面，不采用远端任意 URL。
 - 启用 `openssl-inner-tls` 的 Linux x86-64/AArch64 CLI 可显式执行 `boreas update-check --signed-feed HTTPS_BASE_URL --trust-dir ABSOLUTE_PATH`。此模式只读取经独立预配的 ReleaseRoot 双签验证的 [在线发布元数据](../upgrade/README.md#explicit-signed-metadata-discovery)，不采用默认源、GitHub 标签或通道，也不自动回退。没有内置签名 feed 或公钥；签名清单没有可认证的 stable/pre 或 SemVer，结果也不是生产批准。
-- 两种 `update-check` 模式均不下载产物、安装、执行或激活。Linux/systemd 管理员可另行使用[离线验证与显式应用](../deployment/VERIFIED-SERVICE.md)；该入口不读取在线检查结果。自动更新保持禁用，见[升级信任边界](../upgrade/README.md#automatic-update-remains-blocked)。
+- 两种 `update-check` 模式均不下载产物、安装、执行或激活。Linux/systemd 管理员可另行使用[离线验证与显式应用](../deployment/VERIFIED-SERVICE.md)，或核对完整清单摘要后手动发起[签名在线应用](../upgrade/README.md#administrator-approved-online-apply)。在线应用需要兼容的签名 feed，不能用公开发布索引或普通 GitHub Release 下载地址替代；仍由同一个离线 helper 负责验签、准入和回退。自动更新保持禁用。
 
 ## 2. 命名与不可变性
 

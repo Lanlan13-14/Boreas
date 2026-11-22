@@ -1,5 +1,5 @@
-//! Advisory and authenticated metadata discovery; only the separate offline
-//! operator command can ask the installed supervisor to admit a release.
+//! Advisory and signed discovery, plus explicit operator-only updates. The
+//! installed offline helper remains the only CLI path to service admission.
 
 mod json;
 mod offline;
@@ -7,8 +7,8 @@ mod offline;
 mod signed;
 mod transport;
 
-pub(crate) fn offline(args: &[String]) -> (u8, String, String) {
-    offline::run(args)
+pub(crate) fn apply(args: &[String], lang: Lang) -> (u8, String, String) {
+    offline::run(args, lang)
 }
 
 use std::cmp::Ordering;
@@ -359,7 +359,7 @@ pub(crate) fn check(channel: Channel, lang: Lang) -> (bool, Vec<String>) {
 }
 
 pub(crate) fn blocked(lang: Lang) -> &'static str {
-    localized(lang, "Auto-update blocked: installation requires offline operator approval.", "自动更新已禁用：安装必须经管理员离线批准。", "自動更新已停用：安裝必須經管理員離線批准。")
+    localized(lang, "Auto-update blocked: installation requires explicit administrator approval.", "自动更新已禁用：安装必须由管理员明确批准。", "自動更新已停用：安裝必須由管理員明確批准。")
 }
 
 const USAGE: &str = "usage: boreas update-check [--channel stable|pre]\n       boreas update-check --signed-feed HTTPS_BASE_URL --trust-dir ABSOLUTE_PATH";

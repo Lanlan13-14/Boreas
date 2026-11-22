@@ -27,6 +27,18 @@
    已独立信任的管理 CLI 也可使用 `boreas update verify` / `boreas update apply`（同参数、同 helper，要求已获管理员权限，不调用 sudo 或请求密码）。**不得用待验 ELF 运行 `sudo boreas`**。此版本的 helper 与 supervisor 须一起从独立可信来源预配；旧四文件入口已取消，已有 verified 单元无需重建或重置存储，须由管理员显式替换受信工具。此入口不接管旧服务或含 drop-in 的定制单元。
 7. `verify` 不停机、不写升级存储。`apply` 在独占运维锁内先以 `boreas` 复验，成功后才停机；停机后重新验签并检查同一个批准摘要，锁内再次检查持久防回退状态，然后启动真实的 `Type=notify` 单元。清单中的 HTTPS 字段只做语法校验，绝不取回。候选失败且旧版通过就绪时，服务恢复，命令仍非零报告**候选没有确认**。输入在停机后更换或损坏时不能换入新发行版；会尝试重新启动此前运行的服务。首次安装没有旧版时失败会保持停机。核实状态后可用 `sudo systemctl enable boreas.service`；没有自动 enable。
 
+### 可选：管理员签名在线应用
+
+如果已部署[兼容的签名 feed](../upgrade/README.md#administrator-approved-online-apply)，管理员可在独立审查发行版、核对**原始清单**完整 SHA-256 后使用预信任的 Linux/OpenSSL CLI：
+
+```sh
+sudo /absolute/path/to/pretrusted/boreas update apply \
+  --confirm-manifest-sha256 REVIEWED_64_LOWERCASE_HEX \
+  --signed-feed https://updates.example.test/candidate
+```
+
+它用本机已安装的发布根验双签，只为已批准清单下载受大小与 SHA-256 约束的原生静态 ELF，并把四个本地临时文件及同一摘要交给上面的离线 helper；不会跳过准入水位、停机前复验或回退。`update-check` 仍是只读命令，不能自动触发应用。没有兼容 feed 时继续用本地四文件操作；不能使用公开发现索引、普通 GitHub Release 下载地址或生产归档替代签名 feed。
+
 ## 验证 / 恢复
 
 ```sh

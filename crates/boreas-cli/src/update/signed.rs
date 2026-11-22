@@ -1,5 +1,8 @@
-//! Explicit, read-only release discovery. Nothing here reads the upgrade
-//! store or grants permission to download an artifact, stage, or execute it.
+//! Shared signed metadata verification for read-only discovery and the
+//! explicit, digest-approved online handoff to the installed offline helper.
+
+mod online;
+pub(super) use online::apply_online;
 
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -10,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use boreas_supervisor::manifest::{
     MAX_ED25519_PUBLIC_KEY_DER_BYTES, MAX_MANIFEST_BYTES, MAX_METADATA_LIFETIME_SECONDS,
     MAX_ML_DSA_65_PUBLIC_KEY_DER_BYTES, MAX_SIGNING_KEY_ID_BYTES, ML_DSA_65_SIGNATURE_BYTES,
-    ReleasePolicy, ReleaseRoot, SignatureEnvelope, validate_https_url, verify_release,
+    ReleasePolicy, ReleaseRoot, SignatureEnvelope, VerifiedCandidate, validate_https_url, verify_release,
 };
 use boreas_supervisor::preflight::MAX_ELF_BYTES;
 use boreas_supervisor::verified_stage::{DAEMON_STATE_SCHEMA, native_asset};
@@ -186,6 +189,29 @@ fn discover(
     mut get: impl FnMut(&str, usize, &'static str, Instant) -> Result<Vec<u8>, Issue>,
     now: impl FnOnce() -> Result<u64, Error>,
 ) -> Result<Receipt, Error> {
+    let (candidate, _) = authenticate_metadata(feed, trust, arch, deadline, &mut get, now)?;
+    let manifest = candidate.manifest();
+    let receipt = Receipt {
+        sequence: candidate.sequence(),
+        expires: manifest.manifest().expires().to_owned(),
+        arch: arch.to_owned(),
+        asset: candidate.asset().map_err(|_| Error::Policy)?.name().to_owned(),
+        manifest_sha256: manifest_digest(&candidate),
+    };
+    if Instant::now() >= deadline {
+        return Err(Error::Unavailable(Issue::Timeout));
+    }
+    Ok(receipt)
+}
+
+fn authenticate_metadata(
+    feed: &Feed,
+    trust: Trust,
+    arch: &str,
+    deadline: Instant,
+    get: &mut impl FnMut(&str, usize, &'static str, Instant) -> Result<Vec<u8>, Issue>,
+    now: impl FnOnce() -> Result<u64, Error>,
+) -> Result<(VerifiedCandidate, SignatureEnvelope), Error> {
     let mut read = |object, url: &str, max, accept: &'static str| {
         if Instant::now() >= deadline {
             return Err(Error::Request(object, Issue::Timeout));
@@ -216,21 +242,24 @@ fn discover(
     if manifest.manifest().min_compatible_state() != DAEMON_STATE_SCHEMA || asset.size() > MAX_ELF_BYTES {
         return Err(Error::Policy);
     }
-    use std::fmt::Write as _;
-    let mut manifest_sha256 = String::with_capacity(64);
-    for byte in openssl::sha::sha256(manifest.raw_bytes()) {
-        write!(&mut manifest_sha256, "{byte:02x}").expect("writing to String cannot fail");
-    }
     if Instant::now() >= deadline {
         return Err(Error::Unavailable(Issue::Timeout));
     }
-    Ok(Receipt {
-        sequence: candidate.sequence(),
-        expires: manifest.manifest().expires().to_owned(),
-        arch: arch.to_owned(),
-        asset: asset.name().to_owned(),
-        manifest_sha256,
-    })
+    Ok((candidate, envelope))
+}
+
+fn manifest_digest(candidate: &VerifiedCandidate) -> String {
+    use std::fmt::Write as _;
+
+    let mut digest = String::with_capacity(64);
+    for byte in openssl::sha::sha256(candidate.manifest().raw_bytes()) {
+        write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    digest
+}
+
+fn unix_now() -> Result<u64, Error> {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).map_err(|_| Error::Clock)
 }
 
 pub(super) fn run(base: &str, trust_dir: &str, lang: Lang) -> (u8, String, String) {
@@ -255,9 +284,7 @@ pub(super) fn run(base: &str, trust_dir: &str, lang: Lang) -> (u8, String, Strin
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new().spawn(move || {
         let result = Trust::load(Path::new(&path), uid).and_then(|trust| {
-            discover(&feed, trust, arch, deadline, fetch_https, || {
-                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).map_err(|_| Error::Clock)
-            })
+            discover(&feed, trust, arch, deadline, fetch_https, unix_now)
         });
         let _ = sender.send(result);
     }).is_err() {
