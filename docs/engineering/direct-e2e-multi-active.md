@@ -39,21 +39,25 @@ peer SYNs on their observed lane, and keeps both directions on that lane.
 The per-lane FIFO queues hold at most 64 MTU-bounded packets per direction.
 A full queue drops at that lane boundary; no packet is migrated or replayed.
 A stalled frame operation has a 30 s absolute dispatcher-observed limit.
-The policy/status cutoffs and identity-revocation watchdog apply jointly;
-any terminal protocol, transport, TUN or trust failure cancels all sockets
-through owned descriptors and joins the workers. Clean peer close requires
-TLS close on all lanes; a planned `--max-seconds` stop attempts bounded close.
-`ctl status` reports the active connection count and `multi_active_lanes`
-(one-based lane ordinals and sent/TUN-delivered packet totals).
+When an established lane has a recognized transport failure, the dispatcher removes
+that lane and discards its queued packets. Healthy lanes keep serving their own
+flows. The Edge may authenticate a replacement for the vacant slot after the old
+worker exits. The encrypted replacement exchange binds the existing cohort and
+slot, the original circuit ID and a fresh generation; it does not reuse TLS state.
+A failed flow stays failed: use a new TCP connection rather than expecting the
+old one to move to another lane. A silently blackholed idle lane has no separate
+heartbeat deadline. Protocol, trust, revocation and TUN faults remain terminal
+for the whole cohort. A planned `--max-seconds` stop attempts bounded TLS close.
+`ctl status` reports `multi_active_lanes` with each lane's ordinal, generation,
+readiness and packet counts.
 
-Scope: direct permanent-VIP IPv4/TCP only. No ICMP, UDP (including private
-DNS), IPv6, IP fragments, TUN GSO, virtual TUN, `--max-packets`, mesh/CDN
-verification, dynamic lane replacement or standby/failover. The 4,096 tuple
-slots are not automatically retired or evicted in this baseline; long-lived
-instances reaching the limit stop admitting new tuples instead of moving
-existing ones. Simultaneous TCP opens for the same tuple on different lanes
-fail closed. Polling, buffering and lack of retirement have not been tuned
-for deployment or performance.
+Scope: direct permanent-VIP IPv4/TCP only. No ICMP, UDP (including private DNS),
+IPv6, IP fragments, TUN GSO, virtual TUN, `--max-packets`, mesh/CDN verification or
+standby ingress in this profile. The flow pool tracks up to 4,096 tuples. It
+retires a cleanly closed TCP tuple only after observing the handshake and both
+acknowledged FINs, then quarantines it for 120 seconds. A single FIN, reset,
+idleness or loss of the lane is not proof that a tuple can safely be reused.
+Table pressure does not evict or move active flows.
 
 ## Privileged verification on the target Linux runner
 
@@ -70,7 +74,9 @@ Repeat with `2` and `3`; also run the existing smoke without the flag to cover
 unchanged defaults. The opt-in run provisions the usual trusted materials,
 checks distinct established underlay TCP sockets, verifies integrity for four
 application TCP flows in each direction, requires TX and RX progress on every
-admitted lane, then destroys one selected transport inside the disposable
-namespace and requires both daemons to halt nonzero without a promotion.
-No performance or release gate is implied by a passing fixture. The fixture
-was authored but not executed in the implementation container.
+admitted lane, then closes one test socket inside the disposable namespace.
+While replacement is blocked, an existing flow on a healthy lane must continue.
+After replacement is allowed, the test checks a fresh socket and generation on
+both sides and requires the new lane to carry application traffic. The old
+failed flow must not resume on it. This is a functional check, not a throughput
+benchmark.
