@@ -784,6 +784,15 @@ fn read_prefix<C: Read + ?Sized>(
     Ok(true)
 }
 
+/// Distinguish a complete or immediately rejectable frame from a prefix
+/// which would need another blocking read.
+fn prefetched_frame_ready(bytes: &[u8], mtu: usize) -> bool {
+    let [hi, lo, rest @ ..] = bytes else { return false; };
+    let len = usize::from(u16::from_be_bytes([*hi, *lo]));
+    // An invalid length is immediately actionable; never defer its rejection.
+    len == 0 || len > mtu || rest.len() >= len
+}
+
 /// Read one whole frame into caller-provided storage and return whether a
 /// frame was present (`Ok(false)` on clean EOF at a frame boundary).
 fn read_packet_frame_into<C: Read + ?Sized>(
@@ -1128,6 +1137,14 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         self.circuit
             .as_ref()
             .is_some_and(E2eCircuit::has_buffered_input)
+    }
+
+    /// Whether the next packet can be handled without refilling E2E plaintext.
+    /// `None` means this circuit does not use the optional direct prefetcher.
+    pub fn prefetched_frame_ready(&self) -> Option<bool> {
+        self.circuit.as_ref()?.prefetched_plaintext().map(|bytes| {
+            prefetched_frame_ready(bytes, self.policy.mtu())
+        })
     }
 
     /// Close the path after telling the peer: TLS `close_notify`, then the
@@ -1964,6 +1981,17 @@ mod tests {
 
     const NET: [u8; 16] = [0x2a; 16];
     const GENERATION: u64 = 7;
+
+    #[test]
+    fn prefetch_readiness_preserves_partial_and_invalid_lengths() {
+        assert!(!prefetched_frame_ready(&[], 1500));
+        assert!(!prefetched_frame_ready(&[0], 1500));
+        assert!(!prefetched_frame_ready(&[0, 3, 1, 2], 1500));
+        assert!(prefetched_frame_ready(&[0, 3, 1, 2, 3], 1500));
+        assert!(prefetched_frame_ready(&[0, 3, 1, 2, 3, 0], 1500));
+        assert!(prefetched_frame_ready(&[0, 0], 1500));
+        assert!(prefetched_frame_ready(&[0xff, 0xff], 1500));
+    }
 
     #[test]
     fn circuit_io_preserves_transport_and_protocol_distinction() {

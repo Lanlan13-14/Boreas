@@ -4283,6 +4283,20 @@ mod linux_daemon {
                 if step > 0 {
                     buffered = path.has_buffered_input();
                     socket_ready = if buffered {
+                        // Lower TLS layers can have bytes without a complete
+                        // packet above them. On the direct prefetch path, let
+                        // an already-ready send run before a speculative refill.
+                        // The first inbound attempt bypasses this rule; packets
+                        // already complete in plaintext never require a poll.
+                        if path.prefetched_frame_ready() == Some(false)
+                            && !send_deferred
+                            && tun_fd.is_some()
+                        {
+                            let ready = poll_io(sock_fd, tun_fd, PathPoll::Read, Duration::ZERO)?;
+                            if ready.tun_readable && !ready.socket_terminal {
+                                break;
+                            }
+                        }
                         false
                     } else {
                         // A readable TCP fd can hold just part of a TLS record.

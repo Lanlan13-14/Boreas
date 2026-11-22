@@ -906,6 +906,12 @@ impl<'a> E2eCircuit<'a> {
             || self.stream.has_buffered_input()
     }
 
+    /// Plaintext already in the optional read-ahead buffer. Lower-layer
+    /// readiness alone does not guarantee that an entire L3 frame is ready.
+    pub(crate) fn prefetched_plaintext(&self) -> Option<&[u8]> {
+        self.read_ahead.as_ref().map(|buf| &buf.bytes[buf.start..buf.end])
+    }
+
     /// Amortize record reads for the default authenticated direct packet path.
     /// Call only after application confirmation and before forwarding packets.
     pub fn enable_direct_read_ahead(&mut self) {
