@@ -51,6 +51,7 @@ use smoltcp::{
 use crate::{
     AuthoritativeDns, DnsError,
     dispatch::{ClientAuthorizer, DispatchError, QueryDispatcher},
+    forward_reply::Reply,
     packet::{AuthenticatedPeerSource, PacketConfig, inspect_ip_packet, respond_packet_with},
     tcp::{DNS_TCP_PORT, TcpDnsConfig, TcpDnsError, TcpDnsServer, TcpSourceAuthorizer},
 };
@@ -293,6 +294,8 @@ pub struct PacketRuntime<D = AuthoritativeDns> {
     listen: IpAddress,
     listen_ip: IpAddr,
     input: VecDeque<Vec<u8>>,
+    #[cfg(feature = "secure-upstream")]
+    udp_pending: VecDeque<(Vec<u8>, crate::forward_reply::PendingReply)>,
     queue_packets: usize,
     max_packets_per_poll: usize,
 }
@@ -323,12 +326,13 @@ impl PacketRuntime {
             now,
             sources,
             |_, _| true,
-            |dns, peer, query, udp| {
-                if udp.is_some() {
+            |dns, peer, query, udp, _| {
+                let reply = if udp.is_some() {
                     dns.respond_udp(peer.address(), query)
                 } else {
                     dns.respond_tcp(peer.address(), query)
-                }
+                }?;
+                Ok(reply.map_or(Reply::Drop, Reply::Ready))
             },
         )
     }
@@ -336,7 +340,9 @@ impl PacketRuntime {
 
 impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
     /// Own a single dispatcher for both packet transports. Polling this
-    /// runtime never uses the dispatcher's blocking/public upstream path.
+    /// runtime never uses the dispatcher's plaintext library upstream. Only
+    /// an explicitly enabled, separately authorized forwarding worker can
+    /// resolve public names.
     /// This constructor requires an IPv4-only packet configuration. When
     /// `tcp_enabled` is false it allocates no TCP listeners or socket buffers.
     pub fn new_private_dispatcher(
@@ -357,7 +363,7 @@ impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
         )
     }
 
-    /// Drive private UDP and real TCP together. The owner must keep the same
+    /// Drive private UDP/TCP and (when provisioned) nonblocking public dispatch. The owner must keep the same
     /// authenticated binding through queueing, polls, and final delivery;
     /// destroy the runtime (including TCP buffers) on binding invalidation.
     pub fn poll_private<M: AuthenticatedSourceMap>(
@@ -369,16 +375,24 @@ impl<A: ClientAuthorizer> PacketRuntime<QueryDispatcher<A>> {
             Instant::from_millis(elapsed_millis),
             sources,
             QueryDispatcher::permits_private_packet_peer,
-            |dispatcher, peer, query, udp| match dispatcher
-                .dispatch_private_packet(peer, query, udp)
+            |dispatcher, peer, query, udp, allow_pending| match dispatcher
+                .dispatch_packet(peer, query, udp, allow_pending)
             {
-                Ok(response) => Ok(Some(response)),
+                Ok(response) => Ok(response),
                 Err(
                     DispatchError::InvalidQuery(error) | DispatchError::AuthorityResponse(error),
                 ) => Err(error),
-                Err(_) => Ok(None),
+                Err(_) => Ok(Reply::Drop),
             },
         )
+    }
+}
+
+fn queue_udp(device: &QueueDevice, stats: &mut PacketPollStats, response: Vec<u8>) {
+    if device.push_outbound(response) {
+        stats.udp_answered += 1;
+    } else {
+        stats.dropped_queue_full += 1;
     }
 }
 
@@ -447,6 +461,8 @@ impl<D> PacketRuntime<D> {
             listen,
             listen_ip,
             input: VecDeque::with_capacity(queue_packets),
+            #[cfg(feature = "secure-upstream")]
+            udp_pending: VecDeque::new(),
             queue_packets,
             max_packets_per_poll,
         })
@@ -490,7 +506,8 @@ impl<D> PacketRuntime<D> {
             AuthenticatedPeerSource,
             &[u8],
             Option<usize>,
-        ) -> Result<Option<Vec<u8>>, DnsError>,
+            bool,
+        ) -> Result<Reply, DnsError>,
     ) -> PacketPollStats
     where
         M: AuthenticatedSourceMap,
@@ -502,6 +519,24 @@ impl<D> PacketRuntime<D> {
         let dns_v4 = IpAddr::V4(self.packet_config.dns_v4());
         let dns_v6 = self.packet_config.dns_v6().map(IpAddr::V6);
         let mut stats = PacketPollStats::default();
+
+        #[cfg(feature = "secure-upstream")]
+        for _ in 0..self.udp_pending.len() {
+            let Some((packet, pending)) = self.udp_pending.pop_front() else { break };
+            let Some(peer) = inspect_ip_packet(&packet, max_packet_bytes).ok()
+                .and_then(|meta| authorizer.peer(meta.source)) else { continue };
+            match pending.poll() {
+                std::task::Poll::Pending => self.udp_pending.push_back((packet, pending)),
+                std::task::Poll::Ready(None) => {},
+                std::task::Poll::Ready(Some(reply)) => {
+                    if let Ok(Some(response)) = respond_packet_with(
+                        self.packet_config, peer, &packet, |_, _, _| Ok(Some(reply)),
+                    ) {
+                        queue_udp(&self.device, &mut stats, response);
+                    }
+                }
+            }
+        }
 
         for _ in 0..self.max_packets_per_poll {
             let Some(packet) = self.input.pop_front() else {
@@ -524,21 +559,29 @@ impl<D> PacketRuntime<D> {
                 continue;
             }
             match meta.protocol {
-                17 => match respond_packet_with(
-                    self.packet_config,
-                    peer,
-                    &packet,
-                    |_, query, ceiling| answer(&self.dns, peer, query, Some(ceiling)),
-                ) {
-                    Ok(Some(response)) => {
-                        if self.device.push_outbound(response) {
-                            stats.udp_answered += 1;
-                        } else {
-                            stats.dropped_queue_full += 1;
+                17 => {
+                    #[cfg(feature = "secure-upstream")]
+                    let mut pending = None;
+                    #[cfg(feature = "secure-upstream")]
+                    let allow_pending = self.udp_pending.len() < crate::forward::MAX_PENDING;
+                    #[cfg(not(feature = "secure-upstream"))]
+                    let allow_pending = false;
+                    match respond_packet_with(self.packet_config, peer, &packet, |_, query, ceiling| {
+                        match answer(&self.dns, peer, query, Some(ceiling), allow_pending)? {
+                            Reply::Ready(reply) => Ok(Some(reply)),
+                            Reply::Drop => Ok(None),
+                            #[cfg(feature = "secure-upstream")]
+                            Reply::Pending(job) => { pending = Some(job); Ok(None) }
                         }
+                    }) {
+                        Ok(Some(response)) => queue_udp(&self.device, &mut stats, response),
+                        Ok(None) => {},
+                        Err(_) => stats.dropped_malformed += 1,
                     }
-                    Ok(None) => {}
-                    Err(_) => stats.dropped_malformed += 1,
+                    #[cfg(feature = "secure-upstream")]
+                    if let Some(job) = pending {
+                        self.udp_pending.push_back((packet, job));
+                    }
                 },
                 6 => {
                     let is_dns_tcp = self.tcp.is_some()
@@ -568,8 +611,8 @@ impl<D> PacketRuntime<D> {
                 &authorizer,
                 now,
                 |source, query| match authorizer.peer(source) {
-                    Some(peer) => answer(&self.dns, peer, query, None),
-                    None => Ok(None),
+                    Some(peer) => answer(&self.dns, peer, query, None, true),
+                    None => Ok(Reply::Drop),
                 },
             );
             for _ in 0..self.queue_packets {

@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-const MIN_MESSAGE_BYTES: usize = 17; // DNS header + root name + QTYPE + QCLASS.
+pub(crate) const MIN_MESSAGE_BYTES: usize = 17; // DNS header + root name + QTYPE + QCLASS.
 /// Hard ceiling for the configured end-to-end timeout of one exchange.
 pub const MAX_TCP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -44,7 +44,7 @@ impl fmt::Display for UpstreamError {
             Self::InvalidQuery(reason) => write!(f, "invalid upstream DNS query: {reason:?}"),
             Self::UnsupportedQueryType => f.write_str("unsupported upstream DNS query type"),
             Self::DeadlineExceeded => f.write_str("upstream DNS deadline exceeded"),
-            Self::Io(error) => write!(f, "upstream DNS TCP I/O: {error}"),
+            Self::Io(error) => write!(f, "upstream DNS I/O: {error}"),
             Self::InvalidResponse(reason) => write!(f, "invalid upstream DNS response: {reason:?}"),
             Self::ResponseMismatch => f.write_str("upstream DNS response does not match query"),
             Self::TruncatedResponse => f.write_str("upstream DNS response set TC over TCP"),
@@ -176,6 +176,12 @@ impl TcpUpstream {
     }
 }
 
+#[cfg(feature = "secure-upstream")]
+pub(crate) fn forwardable(q: &Question, query: &[u8]) -> bool {
+    !matches!(q.qtype, 0 | TYPE_OPT | 249..=254)
+        && (q.edns_size.is_none() || query.len() == q.end + crate::OPT_HEADER_BYTES)
+}
+
 fn remaining(deadline: Instant) -> Result<Duration, UpstreamError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -226,7 +232,7 @@ fn read_exact_until(
     Ok(())
 }
 
-fn validate_response(msg: &[u8], query: &Question) -> Result<(), UpstreamError> {
+pub(crate) fn validate_response(msg: &[u8], query: &Question) -> Result<(), UpstreamError> {
     use UpstreamError::{InvalidResponse, ResponseMismatch, TruncatedResponse};
 
     let word = |offset| u16_at(msg, offset).map_err(InvalidResponse);

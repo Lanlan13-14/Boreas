@@ -29,7 +29,7 @@ def mapping(*items):
     return _head(5, len(items)) + b"".join(_uint(i) + val for i, val in enumerate(items))
 
 
-def generate(ca, policy, directory, pin, net_id):
+def generate(ca, policy, directory, pin, net_id, public_forward=False):
     openssl = os.environ.get("BOREAS_OPENSSL_BIN") or "openssl"
     net = _bytes(bytes.fromhex(net_id))
     digest = _bytes(hashlib.sha256(policy.read_bytes()).digest())
@@ -48,8 +48,10 @@ def generate(ca, policy, directory, pin, net_id):
         for key, name in zip(keys, ("ED25519", "ML-DSA-65")):
             _run(openssl, "genpkey", "-algorithm", name, "-out", str(key))
             public.append(_bytes(_run(openssl, "pkey", "-in", str(key), "-pubout", "-outform", "DER")))
+        # Exact Core slot/generation: Replica (4), optionally PublicForward (2).
+        capabilities = 4 | (2 if public_forward else 0)
         service = mapping(version, net, digest, _uint(3), issued, expires,
-                          array(array(_uint(1), _uint(1), _uint(4))))
+                          array(array(_uint(1), _uint(1), _uint(capabilities))))
         grant = mapping(net, digest, version, _uint(1), key_id, version, _uint(2), issued, expires,
                         mapping(public[0], _uint(65), public[1]))
         claims = array(*(mapping(_uint(ip[3]), _bytes(ip), _bytes(bytes(16))) for ip in TCP_MAX_RRSET))
@@ -239,5 +241,7 @@ if __name__ == "__main__":
     elif len(sys.argv) == 4 and sys.argv[1] == "withdrawal":
         withdrawal_probe(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
-        ca, policy, directory, pin, net = sys.argv[1:]
-        generate(Path(ca), Path(policy), Path(directory), Path(pin), net)
+        ca, policy, directory, pin, net, *options = sys.argv[1:]
+        if options not in ([], ["--public-forward"]):
+            raise ValueError("unexpected DNS fixture option")
+        generate(Path(ca), Path(policy), Path(directory), Path(pin), net, bool(options))

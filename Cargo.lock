@@ -43,6 +43,7 @@ dependencies = [
 name = "boreas-dns"
 version = "0.1.0"
 dependencies = [
+ "openssl",
  "smoltcp",
 ]
 

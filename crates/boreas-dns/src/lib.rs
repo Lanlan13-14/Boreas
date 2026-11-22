@@ -28,13 +28,19 @@
 //! [`Zone::refuse_name`] is an exact-match REFUSED list and wins over addresses.
 //!
 //! [`dispatch`] composes the authority with an optional blocking plaintext
-//! DNS-over-TCP [`upstream`]. The private packet path uses only the private
-//! branch; it cannot invoke that upstream.
+//! DNS-over-TCP [`upstream`] for library use. The packet runtime cannot invoke
+//! that plaintext upstream. An explicitly provisioned packet owner can enable
+//! the separate authenticated upstream using a bounded worker.
 
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
 pub mod dispatch;
+mod forward_reply;
+#[cfg(feature = "secure-upstream")]
+mod forward;
+#[cfg(feature = "secure-upstream")]
+pub mod secure_upstream;
 pub mod packet;
 pub mod packet_runtime;
 pub mod tcp;
@@ -336,22 +342,38 @@ pub struct PrivateQuestion {
 impl PrivateQuestion {
     /// Apply the responder's query parser and exact label-boundary rule.
     pub fn query(message: &[u8], origin: &str) -> Option<Self> {
+        Self::routed_query(message, origin, false)
+    }
+
+    /// Widen correlation to public questions only on an explicitly opted-in
+    /// Edge. The Core, not this matching key, enforces upstream exclusions.
+    pub fn routed_query(message: &[u8], origin: &str, public: bool) -> Option<Self> {
         let Question {
             id, name, qtype, ..
         } = parse_query(message).ok()?;
-        is_in_zone(&name, origin).then_some(Self { id, name, qtype })
+        (public || is_in_zone(&name, origin)).then_some(Self { id, name, qtype })
     }
 
     /// Require one IN question in a private-only DNS response.
     pub fn response(message: &[u8], origin: &str) -> Option<Self> {
+        Self::routed_response(message, origin, false)
+    }
+
+    /// Correlate a reply to a previously routed question. RA is meaningful
+    /// only for public replies; retain the private authority's stricter check.
+    pub fn routed_response(message: &[u8], origin: &str, public: bool) -> Option<Self> {
         if message.len() > MAX_RESPONSE_BYTES
-            || u16_at(message, 2).map(|flags| flags & 0xf8c0) != Ok(0x8000)
             || u16_at(message, 4) != Ok(1)
         {
             return None;
         }
         let (name, end) = decode_name(message, 12).ok()?;
-        if !is_in_zone(&name, origin) || u16_at(message, end + 2) != Ok(CLASS_IN) {
+        let private = is_in_zone(&name, origin);
+        let flags_mask = if private { 0xf8c0 } else { 0xf840 };
+        if !(public || private)
+            || u16_at(message, 2).map(|flags| flags & flags_mask) != Ok(0x8000)
+            || u16_at(message, end + 2) != Ok(CLASS_IN)
+        {
             return None;
         }
         Some(Self {

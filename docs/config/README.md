@@ -119,6 +119,12 @@ and console paths have no bound daemon profile and do not accept this setting.
 See [private DNS deployment](../engineering/dns-daemon-deployment.md) for route
 and quarantine requirements. Default `false` leaves TCP disabled.
 
+Public forwarding is separately opt-in: a signed `PublicForward` grant for the
+Core's current generation, `--public-dns-upstream <ABS-TOML>` on Core, and
+`--public-dns-client` on Edge. The upstream TOML and CA are Core-only trust inputs,
+not keys in `[dns]`; `config-check` does not validate them. See the
+[upstream configuration contract](../engineering/dns-daemon-deployment.md#optional-forward-public-queries-via-one-authenticated-upstream).
+
 ## Resource limits and safe file handling
 
 | Limit | Value / behavior |

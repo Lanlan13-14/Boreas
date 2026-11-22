@@ -1,4 +1,4 @@
-# Static private DNS on Linux (opt-in)
+# Static private DNS and explicit public forwarding on Linux (opt-in)
 
 The supported slice is one real Linux Core `daemon serve` and one Edge `daemon
 connect`, with the existing authenticated pq768 E2E session. No new handshake,
@@ -70,12 +70,12 @@ quarantine rule independently of tunnel readiness and keep it on failure; use
 an Edge namespace or egress policy that prevents the DNS `/32` going out the
 underlay when the TUN is down. This slice neither edits host DNS configuration
 nor claims to prevent leaks by applications that bypass the operator's resolver.
-For the explicit query client in the netns test there is no upstream configuration
-at all. The Edge drops out-of-suffix UDP queries and non-DNS ports/protocols to
+Without the explicit forwarding configuration below, the Core has no upstream.
+In that default profile, the Edge drops out-of-suffix UDP queries. It always drops non-DNS ports/protocols to
 the reserved VIP. It does **not** parse TCP stream QNAMEs: arbitrary TCP payloads
 to the VIP can reach the authenticated Core, where the signed suffix is checked
-after stream reassembly. A malformed or out-of-suffix TCP message aborts that
-DNS stream without a DNS answer. The Core never calls a public resolver.
+after stream reassembly. A malformed TCP message, or an out-of-suffix TCP
+message in the private-only profile, aborts the stream without a DNS answer.
 
 An A query returns the complete signed RRset if it fits. The response ceiling
 is the minimum of the negotiated IPv4 MTU minus 28 bytes, the resolver cap, and
@@ -93,6 +93,86 @@ A response is at most 1306 bytes (12-byte header + up to 259-byte question +
 64 × 16-byte records + 11-byte OPT), so EDNS 1320 with an IPv4 tunnel MTU of at
 least 1334 accommodates any such UDP answer. At a lower MTU, enable same-VIP
 TCP or ensure each necessary RRset fits the effective UDP ceiling.
+
+## Optional: forward public queries via one authenticated upstream
+
+Keep all the private DNS provisioning above. In `service.tbs`, grant the
+**same Core node ID and current generation** both `Replica` and `PublicForward`
+(bits 4 and 2). Sign the updated service object with both NetworkRoot keys and
+independently approve its new pin on both nodes. Grant alone does not enable
+forwarding. Append these flags to the ordinary launch commands (in addition to
+both private DNS flags):
+
+- Core `daemon serve`: `--public-dns-upstream /etc/boreas/public-dns.toml`
+- Edge `daemon connect`: `--public-dns-client`
+
+Configure both flags for a supported deployment. They require real Linux TUN,
+the pinned private DNS profile, and no TUN GSO, standby, or multi-active.
+`[dns].tcp = true` on both ends enables TCP **between Edge and Core**; it does
+not select the Core's upstream transport. The upstream uses TLS even with
+`[dns].tcp = false`. The Edge flag widens UDP question matching; it is not
+negotiated or a remote veto. If DNS TCP is enabled, the Core classifies TCP
+queries after reassembly even if the Edge flag was omitted. To disable public
+forwarding, remove the Core upstream flag; do not rely on the Edge flag alone.
+
+The Core file is a separate, flat TOML document, **not** part of the versioned
+node config. Example (replace the documentation address, name and CA with those
+of your trusted resolver):
+
+```toml
+transport = "doh"
+endpoint = "192.0.2.53:443"
+tls_name = "resolver.example.net"
+ca_file = "/etc/boreas/public-dns-ca.pem"
+path = "/dns-query"
+exclude_suffixes = ["corp.example.net", "lan"]
+```
+
+For DoT set `transport = "tls-tcp"`, set the explicit numeric endpoint (e.g.
+`"192.0.2.53:853"`), and omit `path`. Supported fields:
+
+| Field | Contract |
+| --- | --- |
+| `transport` | Required: `doh` (HTTPS/1.1 POST) or `tls-tcp` (two-byte DNS length framing inside TLS). No plaintext transport. |
+| `endpoint` | Required numeric IP and nonzero TCP port, brackets for IPv6; use a single unicast destination. The overlay DNS VIP is still IPv4. Core must be able to route to this endpoint (including loopback if deliberately operator-selected). No name bootstrap, proxy discovery, or load balancing. |
+| `tls_name` | Required ASCII dotted DNS hostname, without trailing dot. Used for SNI and DNS SAN verification (not for resolving the endpoint); certificate CN alone is insufficient. TLS 1.2 or later. |
+| `ca_file` | Required absolute path, at most 64 KiB, with 1–16 PEM certificates; only these trust anchors are installed, not the OS trust store. |
+| `path` | Required only for DoH; starts with one `/`, at most 512 ASCII bytes, using letters, digits, `/`, `-`, `_`, `.`, `~`. No URL, query string, fragment, or credentials. Requires HTTP/1.1 `200` with a single `Content-Type: application/dns-message` and `Content-Length` (no transfer/content encoding). Redirects are failures. |
+| `exclude_suffixes` | Optional array, default empty, at most 32 lowercase suffixes without trailing dots; labels use ASCII letters/digits/`-`/`_`, at most 63 bytes per label and 253 per suffix. Exact name and descendants are excluded, not mere string matches. |
+
+Use absolute paths, bounded regular files (upstream TOML at most 8 KiB; unknown
+keys and final symlinks rejected), and operator-controlled, non-writable parent
+directories and files. Mount the public CA read-only, separately from the
+Boreas NetworkRoot and identity keys. Config and trust are read at startup;
+restart both ends as needed to apply a change. Restrict Core egress for this
+service to the selected numeric TCP endpoint in addition to normal Boreas
+transport as appropriate. Forwarding does not modify host DNS or the daemon's
+NO_UDP sandbox. Do not expose the VIP as a LAN resolver.
+
+The Core answers the signed private apex and its descendants locally, including
+negative answers; never retries them upstream after any error. Case-insensitive
+label-boundary matching also excludes single-label names and `local`,
+`localhost`, `internal`, `home.arpa`, `in-addr.arpa`, `ip6.arpa`, `invalid`,
+`test`, `example`, `onion`, and `alt`, plus configured exclusions. Inventory
+**all** other private suffixes and put them in `exclude_suffixes` before
+allowing public queries. Do not send those names to another public resolver
+when refused here; this feature cannot identify undeclared private domains or
+protect clients that bypass the quarantined resolver. Configure the Edge client
+to use only the VIP for the names routed here, with no fallback or search retry.
+
+Only authenticated circuit traffic can use forwarding. It accepts bounded,
+single-question IN messages, not transfers/control queries or opaque EDNS
+options. Each exchange opens one TLS connection with a single three-second
+budget including queue time; one worker per authorized Core binding admits at
+most four queued jobs plus one active exchange. No upstream retry, fallback,
+cache or connection reuse. The Core validates the echoed ID/question and DNS
+framing, but does not validate DNSSEC or vouch for upstream replies. An admitted
+upstream rejection (including CA/SAN failure) normally yields SERVFAIL; dropped,
+expired, invalid or over-budget work may produce no response (and an excluded
+TCP request aborts the stream). Public UDP uses the same path/EDNS ceiling and
+returns question-only TC on overflow; recover only with an explicit TCP request
+to the **same** VIP when enabled. Complete valid upstream replies retain their
+upstream TTLs; the upstream can see forwarded public questions.
 
 ## Lifetime and observability
 
@@ -134,7 +214,8 @@ per-binding dispatch budget. The Core polls timers independently of input on
 the packet owner loop (nominal 10 ms idle wake, coarser under work or blocked
 outer I/O). It emits at most 16 queued DNS packets per turn and counts actual
 TX, including TCP control packets and retransmissions, against `--max-packets`.
-UDP-only retains its one-reply reservation. Saturation can drop packets or
+Private-only UDP retains its synchronous one-reply reservation; public forwarding
+uses the deferred path even without TCP. Saturation can drop packets or
 cause connection failures; this is not a throughput or fairness guarantee.
 Outer TLS/WebSocket I/O is still blocking with existing timeouts; DNS timers
 are not hard real-time and retransmission cannot fix an unusable outer circuit.
@@ -169,8 +250,29 @@ seeing FIN/RST when its TUN disappears. This scenario is not proof that arbitrar
 clients implement quarantine; the socket check is a snapshot, not a replacement
 for the daemon's NO_UDP sandbox. No local build, test, or netns execution is claimed.
 
-Not included: public forwarding/DoH, DNS-over-TLS, registration, discovery,
-replication, signer generation rotation, DNSSEC, IPv6, LAN listening, a host
-resolver manager, a new revocation feed, or live material/status renewal. DNS
-TTL behavior is unchanged (existing 60-second positive TTL, no negative SOA);
-lease invalidation does not flush external caches or revoke already received data.
+The public DNS step uses that same real packet path and ephemeral signed
+material. It adds a Python TLS server bound only to Core namespace loopback;
+neither namespace has a default route. It does not use or validate any live
+Internet resolver. To reproduce one case:
+
+```sh
+BOREAS_OPENSSL_BIN=/path/to/openssl-3.6 BOREAS_NETNS_PUBLIC_DNS=doh \
+  BOREAS_NETNS_PUBLIC_DNS_CASE=good \
+  bash tools/release/netns_daemon_smoke.sh /path/to/candidate/boreas
+```
+
+CI runs `good`, `wrong-ca`, and `wrong-san` (correct CN, wrong DNS SAN) for
+both `doh` and `dot`, plus a signed Replica-only `no-grant` startup refusal.
+The good cases compare byte-exact UDP and pipelined TCP answers through the
+Edge VIP, check whole-question TC, reject invalid upstream framing/redirects,
+and compare every upstream connection and accepted wire question to the expected
+sequence. Private apex, private negative, single-label, special-use and configured
+exclusions must not open an upstream connection. The TLS negatives require a
+client TLS rejection before any query reaches the server, a SERVFAIL at the
+Edge, and continued service of the signed private authority.
+
+Not included: plaintext or UDP upstream, registration, discovery, replication,
+signer generation rotation, DNSSEC, IPv6 overlay DNS, LAN listening, a host
+resolver manager, a new revocation feed, or live material/status renewal. Private
+TTL behavior is unchanged (60-second positive TTL, no negative SOA); lease
+invalidation does not flush external caches or revoke already received data.

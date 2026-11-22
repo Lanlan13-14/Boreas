@@ -42,6 +42,23 @@ case "$ACTIVE_LANES" in
   *) echo 'ERROR: BOREAS_NETNS_E2E_ACTIVE_LANES must be 0, 2, 3 or 4' >&2; exit 1 ;;
 esac
 PRIVATE_DNS="${BOREAS_NETNS_PRIVATE_DNS:-0}"
+PUBLIC_DNS="${BOREAS_NETNS_PUBLIC_DNS:-0}"
+PUBLIC_DNS_CASE="${BOREAS_NETNS_PUBLIC_DNS_CASE:-good}"
+case "$PUBLIC_DNS" in
+  0|doh|dot) ;;
+  *) echo 'ERROR: BOREAS_NETNS_PUBLIC_DNS must be 0, doh, or dot' >&2; exit 1 ;;
+esac
+if [[ "$PUBLIC_DNS" != 0 ]]; then
+  case "$PUBLIC_DNS_CASE" in
+    good|wrong-ca|wrong-san|no-grant) ;;
+    *) echo 'ERROR: invalid public DNS fixture case' >&2; exit 1 ;;
+  esac
+  if [[ -n "${BOREAS_NETNS_HOOK:-}" || -n "${BOREAS_ROOTFS:-}" || -n "${BOREAS_PERF_BYTES:-}" ]]; then
+    echo 'ERROR: public DNS fixture excludes routing hooks, alternate rootfs and performance probes' >&2
+    exit 1
+  fi
+  PRIVATE_DNS=1 # Reuse signed private DNS, TCP, and the same Edge VIP route.
+fi
 if [[ "$ACTIVE_LANES" != 0 && ( "$PRIVATE_DNS" != 0 || ${#TUN_GSO_ARGS[@]} != 0 ||
     "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ||
     -n "${BOREAS_NETNS_HOOK:-}" ) ]]; then
@@ -790,11 +807,23 @@ DNS_FIXTURE="$(dirname "$PERF_SCRIPT")/netns_private_dns_fixture.py"
 if [[ "$PRIVATE_DNS" == 1 ]]; then
   DNS_DIR="$WORK/dns-objects"
   DNS_PIN="$WORK/dns-current.pin"
-  python3 "$DNS_FIXTURE" "$CA_DIR" "$POLICY_FIXTURE_DIR/tbs.cbor" "$DNS_DIR" "$DNS_PIN" "$TEST_NET_ID"
+  PUBLIC_GRANT=()
+  if [[ "$PUBLIC_DNS" != 0 && "$PUBLIC_DNS_CASE" != no-grant ]]; then
+    PUBLIC_GRANT=(--public-forward)
+  fi
+  python3 "$DNS_FIXTURE" "$CA_DIR" "$POLICY_FIXTURE_DIR/tbs.cbor" "$DNS_DIR" "$DNS_PIN" "$TEST_NET_ID" "${PUBLIC_GRANT[@]}"
   cp -- "$DNS_PIN" "$WORK/dns-edge.pin"
   chmod 0400 "$DNS_PIN" "$WORK/dns-edge.pin" "$DNS_DIR"/*
   CORE_DNS_ARGS=(--private-dns-dir "$DNS_DIR" --private-dns-pin "$DNS_PIN")
   EDGE_DNS_ARGS=(--private-dns-dir "$DNS_DIR" --private-dns-pin "$WORK/dns-edge.pin")
+fi
+if [[ "$PUBLIC_DNS" != 0 ]]; then
+  PUBLIC_DNS_FIXTURE="$(dirname "$PERF_SCRIPT")/netns_public_dns_fixture.py"
+  UPSTREAM_DIR="$WORK/dns-upstream"
+  TRUST_CASE="$PUBLIC_DNS_CASE"
+  (umask 077; python3 "$PUBLIC_DNS_FIXTURE" prepare "$PUBLIC_DNS" "$TRUST_CASE" "$UPSTREAM_DIR")
+  CORE_DNS_ARGS+=(--public-dns-upstream "$UPSTREAM_DIR/upstream.toml")
+  EDGE_DNS_ARGS+=(--public-dns-client)
 fi
 
 "$BIN" pki issue-node \
@@ -896,6 +925,31 @@ ip netns exec "$EDGE_NS" ip link set veth-edge up
 
 run_hook setup
 
+if [[ "$PUBLIC_DNS" != 0 ]]; then
+  # Both underlay interfaces join only these disposable namespaces, with no
+  # default route. The upstream binds to Core loopback, never host loopback.
+  for ns in "$CORE_NS" "$EDGE_NS"; do
+    default_routes=$(ip -n "$ns" route show default)
+    if [[ -n "$default_routes" ]]; then
+      echo "ERROR: unexpected default route in $ns" >&2
+      exit 1
+    fi
+  done
+  ip netns exec "$CORE_NS" python3 "$PUBLIC_DNS_FIXTURE" upstream "$PUBLIC_DNS" "$TRUST_CASE" "$UPSTREAM_DIR" \
+    > "$UPSTREAM_DIR/server.log" 2>&1 &
+  upstream_pid=$!
+  for _ in $(seq 1 80); do
+    if [[ -f "$UPSTREAM_DIR/ready" ]]; then break; fi
+    if ! kill -0 "$upstream_pid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  if [[ ! -f "$UPSTREAM_DIR/ready" ]]; then
+    cat "$UPSTREAM_DIR/server.log" >&2
+    echo 'ERROR: public DNS loopback upstream not ready' >&2
+    exit 1
+  fi
+fi
+
 # Optional netem impairment is scoped to the two disposable underlay devices.
 # No host qdisc or global sysctl is touched.
 #
@@ -944,6 +998,26 @@ run_node "$CORE_NS" "$BIN" daemon serve \
   --max-seconds "$CORE_LIFETIME_SECONDS" \
   > "$WORK/core.out" 2> "$WORK/core.err" &
 echo $! > "$WORK/core.pid"
+
+if [[ "$PUBLIC_DNS" != 0 && "$PUBLIC_DNS_CASE" == no-grant ]]; then
+  for _ in $(seq 1 80); do
+    if ! kill -0 "$(<"$WORK/core.pid")" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  if kill -0 "$(<"$WORK/core.pid")" 2>/dev/null || wait "$(<"$WORK/core.pid")"; then
+    echo 'ERROR: Core must refuse public DNS without its signed grant' >&2
+    exit 1
+  fi
+  grep -F 'this Core generation lacks a current DNS PublicForward grant' "$WORK/core.err"
+  touch "$UPSTREAM_DIR/probe-done"
+  if ! wait "$upstream_pid"; then
+    cat "$UPSTREAM_DIR/server.log" >&2
+    exit 1
+  fi
+  [[ ! -e "$UPSTREAM_DIR/wire.log" ]]
+  echo "public_dns[$PUBLIC_DNS/no-grant]=startup_rejected_without_upstream"
+  exit 0
+fi
 
 # Wait for Core `btun0` to appear, then assign permanent VIP 10.20.1.1 and peer route.
 CORE_TUN_STATE=timeout
@@ -1032,6 +1106,29 @@ if [[ "$CONNECTED" -ne 1 ]]; then
   echo "ERROR: Edge daemon never reached connected state" >&2
   report_failure_evidence
   exit 1
+fi
+
+if [[ "$PUBLIC_DNS" != 0 ]]; then
+  if ! ip netns exec "$EDGE_NS" python3 "$PUBLIC_DNS_FIXTURE" probe "$PUBLIC_DNS" "$TRUST_CASE" "$UPSTREAM_DIR" ||
+     ! wait "$upstream_pid"; then
+    cat "$UPSTREAM_DIR/server.log" >&2
+    report_failure_evidence
+    exit 1
+  fi
+  for ns in "$CORE_NS" "$EDGE_NS"; do
+    udp_sockets=$(ip netns exec "$ns" ss -Huan)
+    dns_listeners=$(ip netns exec "$ns" ss -Hltn 'sport = :53')
+    if [[ -n "$udp_sockets" || -n "$dns_listeners" ]]; then
+      printf 'ERROR: unexpected DNS sockets in %s\n%s\n%s\n' "$ns" "$udp_sockets" "$dns_listeners" >&2
+      exit 1
+    fi
+  done
+  if [[ "$TRUST_CASE" == good ]]; then
+    echo "public_dns[$PUBLIC_DNS/$TRUST_CASE]=authenticated_udp_tcp_no_leak_no_fallback"
+  else
+    echo "public_dns[$PUBLIC_DNS/$TRUST_CASE]=tls_rejected_before_query_no_fallback"
+  fi
+  exit 0
 fi
 
 if [[ "$PRIVATE_DNS" == 1 ]]; then

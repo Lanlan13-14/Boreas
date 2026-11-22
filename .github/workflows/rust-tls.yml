@@ -23,6 +23,7 @@ on:
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_private_dns_fixture.py'
+      - 'tools/release/netns_public_dns_fixture.py'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -45,6 +46,7 @@ on:
       - 'tools/deploy/**'
       - 'tools/release/netns_daemon_smoke.sh'
       - 'tools/release/netns_private_dns_fixture.py'
+      - 'tools/release/netns_public_dns_fixture.py'
       - 'tools/release/netns_overlay_perf.py'
       - 'tools/release/netns_multi_active_probe.py'
       - 'tools/dependencies/fetch-openssl.sh'
@@ -283,12 +285,17 @@ jobs:
             grep -Fx "test $test ... ok" rust-tls-cli-tests.log
           done
           grep -E '^test [[:alnum:]_:]+::offline_pool_migration_cli_roundtrip_with_pinned_root_and_no_overwrite \.\.\. ok$' rust-tls-cli-tests.log
-      - name: DNS authority, private dispatch, and packet transport tests
+      - name: DNS authority, dispatch, and packet transport tests
         if: always()
         timeout-minutes: 5
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
         run: |
           set -euo pipefail
           cargo test --locked -p boreas-dns 2>&1 | tee rust-tls-dns-tests.log
+          cargo test --locked -p boreas-dns --features secure-upstream 2>&1 | tee -a rust-tls-dns-tests.log
+          grep -Fx 'test secure_upstream::tests::doh_rejects_noncanonical_framing_without_retry ... ok' rust-tls-dns-tests.log
       - name: Test policy fixture encoding helpers
         if: always()
         run: python -m unittest discover -s tools/release -p 'test_network_policy_test_fixture.py'
@@ -870,6 +877,26 @@ jobs:
           path: hop-node-linux
           if-no-files-found: error
           retention-days: 14
+      - name: Verify opt-in DoH and DoT on isolated real Core and Edge TUNs
+        id: acceptance_public_dns
+        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/test/v111-dns-public-forwarding')
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          fixture() {
+            local mode="$1" trust="$2" expected="$3"
+            local log="rust-tls-public-dns-$1-$2.log"
+            sudo -E env BOREAS_NETNS_PUBLIC_DNS="$mode" BOREAS_NETNS_PUBLIC_DNS_CASE="$trust" \
+              timeout --kill-after=5s 35s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "$log"
+            grep -Fx "public_dns[$mode/$trust]=$expected" "$log"
+          }
+          for mode in doh dot; do
+            fixture "$mode" good authenticated_udp_tcp_no_leak_no_fallback
+            fixture "$mode" wrong-ca tls_rejected_before_query_no_fallback
+            fixture "$mode" wrong-san tls_rejected_before_query_no_fallback
+          done
+          fixture doh no-grant startup_rejected_without_upstream
       - name: Verify opt-in private DNS on real Core and Edge TUNs
         id: acceptance_private_dns
         if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
@@ -1054,6 +1081,7 @@ jobs:
         if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
           DNS_RESULT: ${{ steps.acceptance_private_dns.outcome }}
+          PUBLIC_DNS_RESULT: ${{ steps.acceptance_public_dns.outcome }}
           MESH_RESULT: ${{ steps.acceptance_mesh.outcome }}
           MULTI_ACTIVE_RESULT: ${{ steps.acceptance_multi_active.outcome }}
           DELAYED_RESULT: ${{ steps.candidate_delayed.outcome }}
@@ -1064,7 +1092,7 @@ jobs:
           failed=0
           {
             printf '\n### Mandatory real-device acceptance\n\n'
-            for check in DNS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
+            for check in DNS PUBLIC_DNS MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
               var="${check}_RESULT"
               outcome="${!var}"
               printf -- '- %s: `%s`\n' "$check" "${outcome:-not-run}"
@@ -1093,6 +1121,7 @@ jobs:
             rust-tls-verified-systemd.log
             rust-tls-dns-tests.log
             rust-tls-private-dns.log
+            rust-tls-public-dns-*.log
             rust-tls-mesh-runtime.log
             rust-tls-multi-active-*.log
             rust-tls-cli-tests.log

@@ -139,6 +139,8 @@ pub struct QueryDispatcher<A> {
     upstream: Option<TcpUpstream>,
     authorizer: A,
     budget: Mutex<Budget>,
+    #[cfg(feature = "secure-upstream")]
+    forwarder: Option<crate::forward::Forwarder>,
 }
 
 impl<A: ClientAuthorizer> QueryDispatcher<A> {
@@ -170,6 +172,8 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
             upstream,
             authorizer,
             budget: Mutex::new(Budget::new(Instant::now())),
+            #[cfg(feature = "secure-upstream")]
+            forwarder: None,
         })
     }
 
@@ -198,6 +202,52 @@ impl<A: ClientAuthorizer> QueryDispatcher<A> {
         udp_ceiling: Option<usize>,
     ) -> Result<Vec<u8>, DispatchError> {
         self.dispatch_inner(peer, query, Instant::now() + WINDOW, udp_ceiling, false)
+    }
+
+    /// The authenticated owner must verify its live signed `PublicForward`
+    /// grant and supply an owned status/circuit gate before enabling this.
+    /// This does not enable the unrelated plaintext library upstream.
+    #[cfg(feature = "secure-upstream")]
+    pub fn enable_packet_forwarding(
+        &mut self,
+        upstream: std::sync::Arc<crate::secure_upstream::SecureUpstream>,
+        excluded: Vec<String>,
+        lease_deadline: Instant,
+        current: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), DnsError> {
+        if self.authority.is_none() || self.forwarder.is_some() || excluded.len() > 32
+            || excluded.iter().any(|suffix| {
+                suffix.is_empty() || normalize_name(suffix).as_ref() != Some(suffix)
+            })
+        {
+            return Err(DnsError::InvalidConfiguration);
+        }
+        self.forwarder = Some(crate::forward::Forwarder::new(upstream, excluded, lease_deadline, current)
+            .map_err(|_| DnsError::InvalidConfiguration)?);
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_packet(
+        &self,
+        peer: AuthenticatedPeerSource,
+        query: &[u8],
+        udp: Option<usize>,
+        _allow_pending: bool,
+    ) -> Result<crate::forward_reply::Reply, DispatchError> {
+        use crate::forward_reply::Reply;
+        #[cfg(feature = "secure-upstream")]
+        if let Some(forwarder) = &self.forwarder {
+            let question = parse_query(query).map_err(DispatchError::InvalidQuery)?;
+            if !is_in_zone(&question.name, &self.private_suffix) {
+                if !self.permits_private_packet_peer(peer) {
+                    return Err(DispatchError::Unauthorized);
+                }
+                let node = self.authorizer.authorized_node(peer).ok_or(DispatchError::Unauthorized)?;
+                let _permit = self.admit(node, query.len() + MAX_RESPONSE_BYTES + 4)?;
+                return Ok(if _allow_pending { forwarder.submit(query, question, udp) } else { Reply::Drop });
+            }
+        }
+        self.dispatch_private_packet(peer, query, udp).map(Reply::Ready)
     }
 
     fn dispatch_inner(

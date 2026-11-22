@@ -39,6 +39,18 @@ pub struct Config {
     pub tcp: bool,
 }
 
+/// Explicit Core owner selection; credentials/addresses are never supplied by
+/// the Edge. The worker gate must refer to this same circuit's liveness and
+/// may be called concurrently; it must not update a single-owner UTC floor.
+pub struct PublicForward {
+    pub upstream: Arc<boreas_dns::secure_upstream::SecureUpstream>,
+    pub excluded: Vec<String>,
+    pub deadline: Instant,
+    pub current: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+pub use boreas_dns::secure_upstream::{MAX_CA_BYTES, SecureTransport, SecureUpstream};
+
 /// Current policy and authority tokens selected by the circuit owner.
 #[derive(Clone, Copy)]
 pub struct Material<'a> {
@@ -156,10 +168,12 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
             material,
             started,
             now_utc,
+            None,
             is_current,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new_for_path(
         config: Config,
         circuit: &E2eCircuit<'_>,
@@ -167,6 +181,7 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         material: Material<'_>,
         started: Instant,
         now_utc: u64,
+        public: Option<PublicForward>,
         is_current: F,
     ) -> Result<Option<Self>, Error> {
         if config.enabled && mtu > usize::from(circuit.mtu_cap()) {
@@ -182,6 +197,7 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
             },
             started,
             now_utc,
+            public,
             is_current,
         )
     }
@@ -191,6 +207,7 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         binding: Binding<'_>,
         started: Instant,
         now_utc: u64,
+        public: Option<PublicForward>,
         is_current: F,
     ) -> Result<Option<Self>, Error> {
         if !config.enabled {
@@ -237,8 +254,8 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
         if now_utc < utc_from || now_utc >= utc_until || started > Instant::now() {
             return Err(Error::NotFresh);
         }
-        // Read-only authority requires Replica; this neither advertises nor
-        // exercises PublicForward or Register, even if those grants exist.
+        // The existing authority still requires Replica. Forwarding adds a
+        // distinct PublicForward check and grants no Advertise/Register rights.
         let core_subject = DnsSubject {
             node_id: core.node_id,
             identity_generation: core.identity_generation,
@@ -249,6 +266,8 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
             core_subject,
             Capability::Replica,
             now_utc,
+        ) || public.is_some() && !service.has_grant_at(
+            network, core.net_id, core_subject, Capability::PublicForward, now_utc,
         ) || !is_current()
         {
             return Err(Error::NotAuthorized);
@@ -278,8 +297,13 @@ impl<F: Fn() -> bool + Send + Sync> DnsPacketService<F> {
             source,
             liveness: Arc::clone(&liveness),
         };
-        let dispatcher = QueryDispatcher::new(authority.zone(), Some(snapshot), None, client)
+        let mut dispatcher = QueryDispatcher::new(authority.zone(), Some(snapshot), None, client)
             .map_err(|_| Error::InvalidAuthority)?;
+        if let Some(public) = public {
+            dispatcher.enable_packet_forwarding(
+                public.upstream, public.excluded, expires_at.min(public.deadline), public.current,
+            ).map_err(|_| Error::RuntimeUnavailable)?;
+        }
         let mut seed = [0; 8];
         if config.tcp {
             openssl::rand::rand_bytes(&mut seed).map_err(|_| Error::RuntimeUnavailable)?;
@@ -456,6 +480,7 @@ pub(crate) mod tests {
             bindings,
             Instant::now(),
             NOW,
+            None,
             is_current,
         )
         .unwrap()
@@ -478,6 +503,7 @@ pub(crate) mod tests {
                 binding(&f, &no_replica),
                 Instant::now(),
                 NOW,
+                None,
                 || panic!("disabled service checked liveness"),
             )
             .unwrap()
@@ -490,6 +516,7 @@ pub(crate) mod tests {
                     binding(&f, service),
                     Instant::now(),
                     NOW,
+                    None,
                     || true,
                 ),
                 Err(Error::NotAuthorized)
@@ -508,6 +535,7 @@ pub(crate) mod tests {
                 binding(&f, &policy),
                 Instant::now(),
                 NOW,
+                None,
                 || live.load(Ordering::SeqCst),
             )
             .unwrap()

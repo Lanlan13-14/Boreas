@@ -12,7 +12,7 @@ use smoltcp::{
     wire::{IpAddress, IpListenEndpoint},
 };
 
-use crate::{AuthoritativeDns, MAX_QUERY_BYTES, MAX_RESPONSE_BYTES};
+use crate::{AuthoritativeDns, MAX_QUERY_BYTES, MAX_RESPONSE_BYTES, forward_reply::Reply};
 
 pub const DNS_TCP_PORT: u16 = 53;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 8;
@@ -110,6 +110,8 @@ struct Connection {
     last_activity: smoltcp::time::Instant,
     opened_at: Option<smoltcp::time::Instant>,
     peer_closed: bool,
+    #[cfg(feature = "secure-upstream")]
+    pending: Option<crate::forward_reply::PendingReply>,
 }
 
 /// Fixed TCP socket pool. Every socket is a real smoltcp TCP endpoint, so
@@ -168,6 +170,8 @@ impl TcpDnsServer {
                 last_activity: smoltcp::time::Instant::from_millis(0),
                 opened_at: None,
                 peer_closed: false,
+                #[cfg(feature = "secure-upstream")]
+                pending: None,
             });
         }
         Ok(Self {
@@ -193,7 +197,7 @@ impl TcpDnsServer {
         now: smoltcp::time::Instant,
     ) -> usize {
         self.process_with(sockets, authorizer, now, |source, query| {
-            dns.respond_tcp(source, query)
+            dns.respond_tcp(source, query).map(|reply| reply.map_or(Reply::Drop, Reply::Ready))
         })
     }
 
@@ -202,7 +206,7 @@ impl TcpDnsServer {
         sockets: &mut SocketSet<'static>,
         authorizer: &A,
         now: smoltcp::time::Instant,
-        answer: impl Fn(IpAddr, &[u8]) -> Result<Option<Vec<u8>>, crate::DnsError>,
+        answer: impl Fn(IpAddr, &[u8]) -> Result<Reply, crate::DnsError>,
     ) -> usize {
         let mut completed = 0usize;
         for conn in &mut self.connections {
@@ -271,6 +275,26 @@ impl TcpDnsServer {
                 continue;
             }
 
+            #[cfg(feature = "secure-upstream")]
+            if let Some(pending) = &conn.pending {
+                match pending.poll() {
+                    std::task::Poll::Pending => continue,
+                    std::task::Poll::Ready(None) => {
+                        socket.abort();
+                        reset_connection(conn, now);
+                        continue;
+                    }
+                    std::task::Poll::Ready(Some(response)) => {
+                        conn.pending = None;
+                        if !stage_response(conn, &response, &self.config) {
+                            socket.abort();
+                            reset_connection(conn, now);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Process frames already buffered from an earlier poll before
             // reading more stream data; this is necessary when a response
             // temporarily filled the application TX staging buffer.
@@ -304,11 +328,19 @@ impl TcpDnsServer {
                 if completed >= self.config.max_frames_per_poll {
                     break;
                 }
+                #[cfg(feature = "secure-upstream")]
+                if conn.pending.is_some() {
+                    break;
+                }
             }
             if !flush_transmit(conn, socket, now) {
                 continue;
             }
             if completed >= self.config.max_frames_per_poll {
+                continue;
+            }
+            #[cfg(feature = "secure-upstream")]
+            if conn.pending.is_some() {
                 continue;
             }
             // FIN with an incomplete DNS frame is invalid. FIN after complete
@@ -367,11 +399,15 @@ fn flush_transmit(
 fn extract_frames(
     conn: &mut Connection,
     source: IpAddr,
-    answer: &impl Fn(IpAddr, &[u8]) -> Result<Option<Vec<u8>>, crate::DnsError>,
+    answer: &impl Fn(IpAddr, &[u8]) -> Result<Reply, crate::DnsError>,
     config: &TcpDnsConfig,
     completed: &mut usize,
 ) -> bool {
     loop {
+        #[cfg(feature = "secure-upstream")]
+        if conn.pending.is_some() {
+            return true;
+        }
         if conn.receive.len() < 2 {
             return true;
         }
@@ -388,26 +424,31 @@ fn extract_frames(
         let query = conn.receive[2..2 + frame_len].to_vec();
         conn.receive.drain(..2 + frame_len);
         match answer(source, &query) {
-            Ok(Some(response)) => {
-                if response.len() > u16::MAX as usize
-                    || response.len() + 2 > config.tx_bytes_per_connection
-                {
+            Ok(Reply::Ready(response)) => {
+                if !stage_response(conn, &response, config) {
                     return false;
                 }
-                conn.transmit.clear();
-                conn.transmit
-                    .extend_from_slice(&(response.len() as u16).to_be_bytes());
-                conn.transmit.extend_from_slice(&response);
-                conn.transmit_offset = 0;
             }
-            Ok(None) => return false,
-            Err(_) => return false,
+            #[cfg(feature = "secure-upstream")]
+            Ok(Reply::Pending(pending)) => conn.pending = Some(pending),
+            Ok(Reply::Drop) | Err(_) => return false,
         }
         *completed += 1;
         if *completed >= config.max_frames_per_poll || conn.receive.len() < 2 {
             return true;
         }
     }
+}
+
+fn stage_response(conn: &mut Connection, response: &[u8], config: &TcpDnsConfig) -> bool {
+    if response.len() > MAX_RESPONSE_BYTES || response.len() + 2 > config.tx_bytes_per_connection {
+        return false;
+    }
+    conn.transmit.clear();
+    conn.transmit.extend_from_slice(&(response.len() as u16).to_be_bytes());
+    conn.transmit.extend_from_slice(response);
+    conn.transmit_offset = 0;
+    true
 }
 
 fn remote_ip(endpoint: Option<smoltcp::wire::IpEndpoint>) -> IpAddr {
@@ -425,6 +466,10 @@ fn reset_connection(conn: &mut Connection, now: smoltcp::time::Instant) {
     conn.last_activity = now;
     conn.opened_at = None;
     conn.peer_closed = false;
+    #[cfg(feature = "secure-upstream")]
+    {
+        conn.pending = None;
+    }
 }
 
 fn duration_to_smoltcp(d: Duration) -> smoltcp::time::Duration {

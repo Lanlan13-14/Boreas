@@ -1,7 +1,7 @@
 //! Static, locally pinned private DNS deployment (Linux daemon only).
 
 use std::{
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
@@ -18,9 +18,101 @@ use boreas_pki::{
     dns_service_policy::VerifiedDnsServicePolicy,
 };
 use boreas_proto::dns_service_policy::{Capability, DnsSubject};
-use boreas_tunnel::{dns_packet_service::Material, tls::PeerIdentity};
+use boreas_tunnel::{
+    dns_packet_service::{MAX_CA_BYTES, Material, PublicForward, SecureTransport, SecureUpstream},
+    tls::PeerIdentity,
+};
+use serde::Deserialize;
 
 use crate::network_policy_runtime::read_bounded_regular;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Transport {
+    Doh,
+    TlsTcp,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamFile {
+    transport: Transport,
+    endpoint: SocketAddr,
+    tls_name: String,
+    ca_file: PathBuf,
+    path: Option<String>,
+    #[serde(default)]
+    exclude_suffixes: Vec<String>,
+}
+
+/// Trusted launch input. Not a peer-advertised URL, credentials, or resolver.
+pub(super) struct PublicUpstream {
+    upstream: Arc<SecureUpstream>,
+    excluded: Vec<String>,
+}
+
+impl PublicUpstream {
+    pub(super) fn load(file: &Path) -> Result<Self, String> {
+        if !file.is_absolute() {
+            return Err("daemon: public DNS upstream file requires an absolute path".into());
+        }
+        let bytes = read_bounded_regular(file, 8192, "public DNS upstream config")
+            .map_err(|e| format!("daemon: {e}"))?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| "daemon: public DNS config is not UTF-8")?;
+        let settings: UpstreamFile = toml::from_str(text)
+            .map_err(|_| "daemon: invalid public DNS upstream config")?;
+        let transport = match (settings.transport, settings.path) {
+            (Transport::Doh, Some(path)) => SecureTransport::Https { path },
+            (Transport::TlsTcp, None) => SecureTransport::TlsTcp,
+            _ => return Err("daemon: specify path for DoH only".into()),
+        };
+        if settings.exclude_suffixes.len() > 32 || settings.exclude_suffixes.iter().any(|s| {
+            s.is_empty() || s.len() > 253 || !s.split('.').all(|label| {
+                !label.is_empty() && label.len() <= 63 && label.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                })
+            })
+        }) {
+            return Err("daemon: invalid public DNS exclusion suffix list".into());
+        }
+        if !settings.ca_file.is_absolute() {
+            return Err("daemon: public DNS CA file requires an absolute path".into());
+        }
+        let ca = read_bounded_regular(&settings.ca_file, MAX_CA_BYTES, "public DNS upstream CA")
+            .map_err(|e| format!("daemon: {e}"))?;
+        let upstream = SecureUpstream::new(settings.endpoint, settings.tls_name, &ca, transport)
+            .map_err(|e| format!("daemon: {e}"))?;
+        Ok(Self { upstream: Arc::new(upstream), excluded: settings.exclude_suffixes })
+    }
+
+    pub(super) fn bind(
+        &self,
+        lease: &Arc<Lease>,
+        status_current: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> PublicForward {
+        let lease = Arc::clone(lease);
+        let deadline = lease.deadline;
+        // Only the upstream worker samples this UTC floor. Sampling the
+        // packet loop's floor here would mistake thread scheduling for rollback.
+        let floor = AtomicU64::new(lease.last_utc.load(Ordering::Relaxed));
+        let current = Arc::new(move || {
+            if lease.retired.load(Ordering::Acquire) {
+                return false;
+            }
+            if !status_current()
+                || Instant::now() >= deadline
+                || !super::now_utc_us().is_ok_and(|now| {
+                    now < lease.until_utc && now >= floor.fetch_max(now, Ordering::Relaxed)
+                })
+            {
+                lease.retired.store(true, Ordering::Release);
+                return false;
+            }
+            !lease.retired.load(Ordering::Acquire)
+        });
+        PublicForward { upstream: Arc::clone(&self.upstream), excluded: self.excluded.clone(), deadline, current }
+    }
+}
 
 const PIN_POLL: Duration = Duration::from_millis(100);
 
@@ -32,6 +124,8 @@ pub(super) struct PinnedDns {
     authority: VerifiedDnsAuthority,
     pub(super) vip: Ipv4Addr,
     pub(super) tcp: bool,
+    pub(super) public: bool,
+    pub(super) upstream: Option<PublicUpstream>,
     until_utc: u64,
     deadline: Instant,
     loaded_utc: u64,
@@ -68,6 +162,8 @@ impl PinnedDns {
         core: PeerIdentity,
         zone: &str,
         tcp: bool,
+        public: bool,
+        upstream: Option<PublicUpstream>,
         identities_until: u64,
     ) -> Result<Self, String> {
         use boreas_proto::{dns_authority, dns_service_policy};
@@ -127,6 +223,15 @@ impl PinnedDns {
         ) {
             return Err("daemon: this Core generation lacks a current DNS Replica grant".into());
         }
+        if public && !service.has_grant_at(
+            &network,
+            core.net_id,
+            DnsSubject { node_id: core.node_id, identity_generation: core.identity_generation },
+            Capability::PublicForward,
+            now,
+        ) {
+            return Err("daemon: this Core generation lacks a current DNS PublicForward grant".into());
+        }
         let until_utc = authority
             .freshness()
             .1
@@ -146,6 +251,8 @@ impl PinnedDns {
             authority,
             vip: Ipv4Addr::new(a, b, 0, 53),
             tcp,
+            public,
+            upstream,
             until_utc,
             deadline,
             loaded_utc: now,

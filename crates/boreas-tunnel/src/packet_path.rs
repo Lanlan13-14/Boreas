@@ -848,6 +848,7 @@ type DnsLiveness<'a> = Box<dyn Fn() -> bool + Send + Sync + 'a>;
 pub struct PrivateDnsProvision<'a> {
     pub material: dns_packet_service::Material<'a>,
     pub tcp: bool,
+    pub public: Option<dns_packet_service::PublicForward>,
     /// Fresh UTC Unix microseconds, or `None` on clock failure.
     pub utc: Box<dyn Fn() -> Option<u64> + Send + Sync + 'a>,
     /// Nonblocking gate for this circuit, both identities, and the exact
@@ -862,6 +863,7 @@ pub struct PrivateDnsProvision<'a> {
 struct EdgeDns<'a> {
     vip: Ipv4Addr,
     zone: &'a str,
+    public: bool,
     current: DnsLiveness<'a>,
     pending: std::collections::VecDeque<EdgeQuery>,
     tcp: Option<EdgeTcpFlows>,
@@ -973,6 +975,7 @@ const TCP_ACK: u8 = 0x10;
 struct PrivateDns<'a> {
     service: DnsPacketService<DnsLiveness<'a>>,
     tcp: bool,
+    deferred: bool,
     utc: Box<dyn Fn() -> Option<u64> + Send + Sync + 'a>,
 }
 
@@ -1048,6 +1051,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let mut path = Self::try_new_over_e2e(io, circuit, mtu)?;
         let started = Instant::now();
         let now = (provision.utc)().ok_or(PacketPathError::DnsAuthorizationLost)?;
+        let deferred = provision.tcp || provision.public.is_some();
         let service = DnsPacketService::try_new_for_path(
             dns_packet_service::Config { enabled: true, tcp: provision.tcp },
             path.circuit.as_ref().ok_or(PacketPathError::Closed)?,
@@ -1055,6 +1059,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             provision.material,
             started,
             now,
+            provision.public,
             provision.is_current,
         )
         .map_err(PacketPathError::DnsBind)?
@@ -1062,6 +1067,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         path.private_dns = Some(PrivateDns {
             service,
             tcp: provision.tcp,
+            deferred,
             utc: provision.utc,
         });
         Ok(path)
@@ -1076,6 +1082,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         mtu: usize,
         authority: &'a boreas_pki::dns_authority::VerifiedDnsAuthority,
         tcp: bool,
+        public: bool,
         is_current: Box<dyn Fn() -> bool + Send + Sync + 'a>,
     ) -> Result<Self, PacketPathError> {
         let context = circuit
@@ -1093,6 +1100,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let dns = EdgeDns {
             vip: Ipv4Addr::new(a, b, 0, 53),
             zone: authority.zone(),
+            public,
             current: is_current,
             pending: Default::default(),
             tcp: tcp.then(EdgeTcpFlows::default),
@@ -1438,7 +1446,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     #[cfg(feature = "openssl-inner-tls")]
     pub fn step_private_dns(&mut self, max_packets: usize) -> Result<usize, PacketPathError> {
         self.check_open()?;
-        let Some(dns) = self.private_dns.as_mut().filter(|dns| dns.tcp) else {
+        let Some(dns) = self.private_dns.as_mut().filter(|dns| dns.deferred) else {
             return Ok(0);
         };
         let Some(circuit) = self.circuit.as_mut() else {
@@ -1524,7 +1532,7 @@ fn authorize_outbound_read(
         };
         if info.destination == IpAddr::V4(dns.vip) {
             if let Ok((port, 53, message)) = edge_udp_dns(bytes, info)
-                && let Some(question) = boreas_dns::PrivateQuestion::query(message, dns.zone)
+                && let Some(question) = boreas_dns::PrivateQuestion::routed_query(message, dns.zone, dns.public)
             {
                 dns.remember(port, question);
                 return Ok(info);
@@ -1679,7 +1687,7 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
             let (port, client, message) =
                 edge_udp_dns(packet.bytes(), info).map_err(PacketPathError::Denied)?;
             let Some(question) =
-                boreas_dns::PrivateQuestion::response(message, dns.zone).filter(|_| port == 53)
+                boreas_dns::PrivateQuestion::routed_response(message, dns.zone, dns.public).filter(|_| port == 53)
             else {
                 return Err(PacketPathError::Denied(PacketDeny::BadHeader));
             };
@@ -1805,7 +1813,7 @@ fn dispatch_private_dns<C: Write>(
         dns.live_utc()?;
         return Ok(None);
     }
-    if dns.tcp {
+    if dns.deferred {
         // Both transports share this bounded dispatcher. TCP may emit zero,
         // one, or multiple packets unrelated to the most recent input packet.
         return Ok(None);
@@ -2235,6 +2243,7 @@ mod tests {
         let mut dns = EdgeDns {
             vip: vip.into(),
             zone: "private.example",
+            public: false,
             current: Box::new(|| true),
             pending: Default::default(),
             tcp: None,
@@ -2309,6 +2318,7 @@ mod tests {
         let mut dns = EdgeDns {
             vip: vip.into(),
             zone: "private.example",
+            public: false,
             current: Box::new(|| true),
             pending: Default::default(),
             tcp: None,
@@ -2507,7 +2517,7 @@ mod tests {
             };
             let mut path = PacketPath::try_new(&device, circuit, endpoints, MTU).unwrap();
             if enable {
-                path.private_dns = Some(PrivateDns { service, tcp: false, utc: Box::new(move || utc) });
+                path.private_dns = Some(PrivateDns { service, tcp: false, deferred: false, utc: Box::new(move || utc) });
             }
             // Even on an enabled path, host writes cannot use the DNS VIP.
             host.write_packet(&udp_datagram(vip, edge, 53, 40_000, b"host", true))

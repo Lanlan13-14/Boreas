@@ -6,7 +6,11 @@ rust-version = "1.100"
 license = "GPL-3.0-only"
 description = "Bounded authoritative DNS wire parsing and response construction"
 
+[features]
+secure-upstream = ["dep:openssl"]
+
 [dependencies]
+openssl = { version = "=0.10.82", optional = true }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
 [lib]

@@ -15,7 +15,7 @@ default = []
 # the in-tree outer HTTPS(WSS) adapter, the `boreas-pki` verified-object
 # identity extractor, and the diagnostic inner-TLS seam helpers. The default
 # build keeps policy types but no TLS backend and cannot negotiate a TLS session.
-openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki", "dep:boreas-dns"]
+openssl-inner-tls = ["boreas-crypto/openssl-backend", "boreas-pki/openssl-backend", "dep:openssl", "dep:boreas-pki", "dep:boreas-dns", "boreas-dns/secure-upstream"]
 
 [dependencies]
 # Runtime authorization uses these policy types even without a TLS backend.

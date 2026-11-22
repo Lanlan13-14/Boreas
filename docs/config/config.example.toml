@@ -68,7 +68,7 @@ default_route = false
 # Optional section. listen_vip is a VIP owned by this node, not a bind address.
 listen_vip = "10.20.0.53"
 zone = ".boreas"
-# Requires a runtime that polls the bounded TCP DNS endpoint. This binary
-# integrates no runtime, so `tcp = true` is refused with an explanation naming
-# the missing capability — it is not banned by the schema.
+# `true` requires both Linux daemons to opt in to pinned DNS on real TUNs.
+# Public forwarding has separate launch flags and a separate Core TOML file;
+# see ../engineering/dns-daemon-deployment.md. It is disabled by default.
 tcp = false

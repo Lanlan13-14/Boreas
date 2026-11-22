@@ -52,7 +52,9 @@ pub fn daemon_usage() -> &'static str {
   private DNS, GSO, virtual TUN or --max-packets in this profile.
   Private DNS (either role, real TUN only): add --private-dns-dir <ABS> --private-dns-pin <ABS>
   and set [dns].zone to the signed private suffix. Set [dns].tcp = true on both ends
-  for bounded DNS-over-TCP without TUN GSO; see docs/engineering/dns-daemon-deployment.md."
+  for bounded DNS-over-TCP without TUN GSO. Public DNS also requires a signed PublicForward
+  grant; Core: --public-dns-upstream <ABS-TOML>; Edge: --public-dns-client.
+  See docs/engineering/dns-daemon-deployment.md."
 }
 
 /// Query an active daemon control socket and parse a live [`StatusSnapshot`].
@@ -279,7 +281,7 @@ mod linux_daemon {
         SecurityMode as CfgMode,
     };
 
-    use private_dns::{Interrupt as DnsInterrupt, PinnedDns};
+    use private_dns::{Interrupt as DnsInterrupt, PinnedDns, PublicUpstream};
 
     mod multi_active;
     mod private_dns;
@@ -1909,10 +1911,17 @@ mod linux_daemon {
         let mut policy_state_owner_uid: Option<u32> = None;
         let mut dns_dir: Option<PathBuf> = None;
         let mut dns_pin: Option<PathBuf> = None;
+        let mut public_dns_upstream: Option<PathBuf> = None;
+        let mut public_dns_client = false;
 
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
+                "--public-dns-client" if !public_dns_client => {
+                    public_dns_client = true;
+                    i += 1;
+                }
+                "--public-dns-client" => return Err("daemon: duplicate --public-dns-client".into()),
                 "--virtual-tun" => {
                     virtual_tun = true;
                     i += 1;
@@ -1960,6 +1969,7 @@ mod linux_daemon {
                         }
                         "--private-dns-dir" if dns_dir.is_none() => dns_dir = Some(val.into()),
                         "--private-dns-pin" if dns_pin.is_none() => dns_pin = Some(val.into()),
+                        "--public-dns-upstream" if public_dns_upstream.is_none() => public_dns_upstream = Some(val.into()),
                         "--listen" => listen_spec = Some(val.clone()),
                         "--connect" => connect_spec = Some(val.clone()),
                         "--tls-name" => tls_name = Some(val.clone()),
@@ -2002,6 +2012,13 @@ mod linux_daemon {
             }
         }
 
+        let public_dns = public_dns_upstream.is_some() || public_dns_client;
+        if public_dns && (dns_dir.is_none() || dns_pin.is_none() || virtual_tun || tun_tcpv4_gso
+            || (mode == Mode::Serve && public_dns_client)
+            || (mode == Mode::Connect && public_dns_upstream.is_some()))
+        {
+            return Err("daemon: public DNS requires pinned DNS, real TUN without GSO, Core-only upstream configuration and Edge-only client opt-in".into());
+        }
         if multi_active_profile.is_some() {
             if virtual_tun
                 || tun_tcpv4_gso
@@ -2202,6 +2219,8 @@ mod linux_daemon {
                     core,
                     zone,
                     dns.tcp,
+                    public_dns,
+                    public_dns_upstream.as_deref().map(PublicUpstream::load).transpose()?,
                     verified.local.valid_until().min(peer_obj.valid_until()),
                 )?;
                 if dns
@@ -3624,6 +3643,13 @@ mod linux_daemon {
             let active = Arc::clone(lease);
             let counters = Arc::clone(counters);
             let sequence = *sequence;
+            let public = dns.upstream.as_ref().map(|upstream| {
+                let counters = Arc::clone(&counters);
+                upstream.bind(lease, move || {
+                    counters.status_fresh.load(Ordering::Acquire)
+                        && counters.status_sequence.load(Ordering::Acquire) == sequence
+                })
+            });
             let current = Box::new(move || {
                 counters.status_fresh.load(Ordering::Acquire)
                     && counters.status_sequence.load(Ordering::Acquire) == sequence
@@ -3637,6 +3663,7 @@ mod linux_daemon {
                     PrivateDnsProvision {
                         material: dns.material(),
                         tcp: dns.tcp,
+                        public,
                         utc: Box::new(|| now_utc_us().ok()),
                         is_current: current,
                     },
@@ -3648,6 +3675,7 @@ mod linux_daemon {
                     mtu,
                     dns.material().authority,
                     dns.tcp,
+                    dns.public,
                     current,
                 )
             }
@@ -3745,7 +3773,8 @@ mod linux_daemon {
         // can also write synchronously. Preserve preflight on all GSO paths.
         let protect_send = gso_may_have_pending || (tun_fd.is_some() && private_dns.is_none());
         let mut send_deferred_since = None;
-        let dns_tcp_core = mode_name == "serve" && private_dns.is_some_and(|dns| dns.tcp);
+        let dns_deferred_core = mode_name == "serve"
+            && private_dns.is_some_and(|dns| dns.tcp || dns.public);
         let stop = 'outer: loop {
             // Policy first: an expired signed policy window is a hard stop even
             // when the status snapshot is still fresh.
@@ -3822,7 +3851,7 @@ mod linux_daemon {
             // (on the next turn), independently of which transport fed DNS.
             // Drain a bounded number of generated packets, including timers,
             // and charge each actual transmission to the existing budget.
-            let dns_sent = if dns_tcp_core {
+            let dns_sent = if dns_deferred_core {
                 match path.step_private_dns(remaining_budget) {
                     Ok(sent) => sent,
                     Err(error) => {
@@ -3971,7 +4000,7 @@ mod linux_daemon {
                     }
                     // Only UDP-only Core DNS may synchronously emit a reply
                     // from this step. TCP-profile output is drained separately.
-                    if private_dns.is_some() && mode_name == "serve" && !dns_tcp_core
+                    if private_dns.is_some() && mode_name == "serve" && !dns_deferred_core
                         && limit - total < 2
                     {
                         path.close_gracefully();
