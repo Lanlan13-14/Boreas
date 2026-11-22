@@ -35,8 +35,8 @@ pub(super) fn run(command: &str, args: &[String]) -> Result<(), String> {
         .chain(specific.iter().copied())
         .collect::<Vec<_>>();
     let mut parsed = HashMap::new();
-    let mut pairs = args.chunks_exact(2);
-    for pair in &mut pairs {
+    let (pairs, tail) = args.as_chunks::<2>();
+    for pair in pairs {
         let flag = pair[0].as_str();
         let value = pair[1].as_str();
         if !options.contains(&flag)
@@ -49,7 +49,7 @@ pub(super) fn run(command: &str, args: &[String]) -> Result<(), String> {
             ));
         }
     }
-    if !pairs.remainder().is_empty() {
+    if !tail.is_empty() {
         return Err(format!("pki {command}: missing argument value"));
     }
     for flag in options {
