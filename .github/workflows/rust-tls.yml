@@ -247,7 +247,9 @@ jobs:
             'circuit_pool::retirement_tests::bounded_guard_pressure_never_evicts_and_recovers_on_expiry' \
             'circuit_pool::retirement_tests::incomplete_handshake_and_one_sided_close_have_no_idle_expiry' \
             'shared_directory_listener_discovers_provisioned_spkis_and_rejects_unlisted_core' \
-            'authenticated_forwarded_core_lsa_fork_preserves_both_envelopes_and_blocks_restart'; do
+            'authenticated_forwarded_core_lsa_fork_preserves_both_envelopes_and_blocks_restart' \
+            'live_relay_denial_interrupts_idle_e2e_and_releases_both_hops' \
+            'live_directory_propagates_remote_denial_after_graph_isolation'; do
             grep -Fx "test $test ... ok" rust-tls-tunnel-tests.log
           done
       - name: Supervisor release-manifest dual-signature tests with real OpenSSL
@@ -274,6 +276,13 @@ jobs:
             --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
             -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
+          for test in \
+            'update::signed::tests::authenticates_exact_manifest_and_reports_metadata_only' \
+            'update::signed::tests::requires_both_signatures_exact_bytes_and_local_root' \
+            'update::signed::tests::stops_on_transport_error_or_short_signature_and_never_falls_back'; do
+            grep -Fx "test $test ... ok" rust-tls-cli-tests.log
+          done
+          grep -E '^test [[:alnum:]_:]+::offline_pool_migration_cli_roundtrip_with_pinned_root_and_no_overwrite \.\.\. ok$' rust-tls-cli-tests.log
       - name: DNS authority, private dispatch, and packet transport tests
         if: always()
         timeout-minutes: 5
