@@ -292,7 +292,12 @@ fn install(f: &Fixture, routed: bool) -> [PathBuf; 4] {
     // Allow traversal to each node, without exposing the offline signing keys.
     fs::set_permissions(base, fs::Permissions::from_mode(0o711)).unwrap();
     let binary = base.join("boreas-netns");
-    fs::copy(env!("CARGO_BIN_EXE_boreas"), &binary).unwrap();
+    // The CI acceptance runner restores the daemon built with this test.
+    // Ordinary Cargo invocations still use Cargo's own binary path.
+    let source = std::env::var_os("BOREAS_MESH_TEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_boreas")));
+    fs::copy(source, &binary).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     let root_bytes = f.roots.encode().unwrap();
     std::array::from_fn(|i| {

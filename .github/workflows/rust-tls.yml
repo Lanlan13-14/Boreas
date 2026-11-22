@@ -70,7 +70,11 @@ jobs:
   openssl-rust-mtls:
     name: Real Linux tunnel with the pinned OpenSSL security snapshot
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 60
+    outputs:
+      binary_id: ${{ steps.acceptance_binary.outputs.artifact-id }}
+      runtime_id: ${{ steps.acceptance_runtime.outputs.artifact-id }}
+      mesh_id: ${{ steps.acceptance_mesh_binary.outputs.artifact-id }}
     env:
       # openssl-4.1 @ 941390af2ac3: the first commit that contains all eight
       # advisory fixes and their regression tests. 4.1.1 is not released, so
@@ -885,10 +889,135 @@ jobs:
           name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
           path: hop-node-linux
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
+      - name: Build the mesh netns test and its debug daemon once
+        id: mesh_build
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+        timeout-minutes: 5
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
+          OPENSSL_STATIC: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p boreas-cli --features openssl-inner-tls --test mesh_run_netns \
+            --no-run --message-format=json > mesh-run-build.jsonl
+          test_binary=$(python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads, sys.stdin) if x.get("reason")=="compiler-artifact" and x["target"]["name"]=="mesh_run_netns" and x.get("executable")))' < mesh-run-build.jsonl)
+          test -x "$test_binary"
+          test -x target/debug/boreas
+          mesh_dir="$(mktemp -d)"
+          trap 'rm -rf "$mesh_dir"' EXIT
+          cp "$test_binary" "$mesh_dir/mesh_run_netns"
+          cp target/debug/boreas "$mesh_dir/boreas"
+          mkdir -p acceptance-mesh
+          tar -cf acceptance-mesh/mesh.tar -C "$mesh_dir" mesh_run_netns boreas
+          printf '%s\n' "$GITHUB_SHA" > acceptance-mesh/source-sha
+          (cd acceptance-mesh && sha256sum mesh.tar source-sha > SHA256SUMS)
+      - name: Upload internal mesh executables
+        id: acceptance_mesh_binary
+        if: ${{ !cancelled() && steps.mesh_build.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-mesh-executables-${{ github.run_id }}-${{ github.run_attempt }}
+          path: acceptance-mesh/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Package the verified OpenSSL runtime
+        id: acceptance_package
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-tcpv4-gso' || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime'))) }}
+        run: |
+          set -euo pipefail
+          mkdir -p acceptance-runtime
+          tar -cf acceptance-runtime/runtime.tar .rust-tls-openssl/bin/openssl .rust-tls-openssl/ssl/openssl.cnf
+          printf '%s\n' "$GITHUB_SHA" > acceptance-runtime/source-sha
+          (cd acceptance-runtime && sha256sum runtime.tar source-sha > SHA256SUMS)
+      - name: Upload internal same-run acceptance runtime
+        id: acceptance_runtime
+        if: ${{ !cancelled() && steps.acceptance_package.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: acceptance-runtime/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload non-secret CI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-${{ github.run_id }}
+          path: |
+            openssl-runtime.txt
+            openssl-build.txt
+            openssl-musl-runtime.txt
+            openssl-musl-build.txt
+            openssl-linkage.txt
+            rust-tls-format.patch
+            rust-tls-tests.log
+            rust-tls-pki-tests.log
+            rust-tls-tunnel-tests.log
+            rust-tls-supervisor-tests.log
+            rust-tls-verified-systemd.log
+            rust-tls-dns-tests.log
+            rust-tls-cli-tests.log
+            rust-tls-netns-e2e.log
+            rust-tls-initial-backup.log
+            rust-tls-initial-backup-negative.log
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+  functional-netns:
+    name: Functional netns / ${{ matrix.case }}
+    needs: openssl-rust-mtls
+    # Build failures still fail the workflow, but a failed mesh compile must
+    # not suppress the other fixtures if the verified runtime was uploaded.
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh","multi_active"]' ||
+          (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh"]' ||
+          github.ref == 'refs/heads/test/v111-dns-public-forwarding' && '["public_dns"]' ||
+          github.ref == 'refs/heads/test/v111-mesh-runtime' && '["mesh"]' ||
+          '["private_dns"]') }}
+    env:
+      OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.openssl-rust-mtls.outputs.binary_id }}
+          path: hop-node-linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.openssl-rust-mtls.outputs.runtime_id }}
+          path: acceptance-runtime
+      - name: Verify and prepare the exact build for namespace tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          (cd hop-node-linux && sha256sum --check --strict SHA256SUMS)
+          grep -Fx "Source commit: $GITHUB_SHA" hop-node-linux/README-DEVELOPMENT.txt
+          (cd acceptance-runtime && sha256sum --check --strict SHA256SUMS)
+          test "$(cat acceptance-runtime/source-sha)" = "$GITHUB_SHA"
+          tar -xf acceptance-runtime/runtime.tar
+          test -x "$BOREAS_OPENSSL_BIN"
+          test -s "$OPENSSL_CONF"
+          chmod 0755 hop-node-linux/boreas-linux-x86_64-musl-pq768
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
+          sudo modprobe tun || true
       - name: Verify opt-in DoH and DoT on isolated real Core and Edge TUNs
         id: acceptance_public_dns
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/test/v111-dns-public-forwarding') }}
+        if: matrix.case == 'public_dns'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -908,7 +1037,7 @@ jobs:
           fixture doh no-grant startup_rejected_without_upstream
       - name: Verify opt-in private DNS on real Core and Edge TUNs
         id: acceptance_private_dns
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: matrix.case == 'private_dns'
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -926,7 +1055,7 @@ jobs:
           grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
       - name: Verify signed IPv4 cutover on two real Linux TUNs
         id: acceptance_pool_cutover
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') }}
+        if: matrix.case == 'pool_cutover'
         timeout-minutes: 3
         env:
           BOREAS_NETNS_POOL_CUTOVER: '1'
@@ -939,7 +1068,7 @@ jobs:
           grep -Fx 'pool_cutover_revocation=source_denial_halted_successor_and_survived_restart' rust-tls-pool-cutover.log
       - name: Verify private DNS replica selection on three real Linux TUNs
         id: acceptance_dns_replicas
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff') }}
+        if: matrix.case == 'dns_replicas'
         timeout-minutes: 4
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -960,21 +1089,29 @@ jobs:
           grep -Fx 'dns_replica_withdrawal=abrupt_primary_pin_loss_terminal_while_backup_available' rust-tls-dns-replicas.log
           grep -Fx 'dns_replica_status=valid_new_sequence_retired_pinned_lease_without_fallback' rust-tls-dns-replicas.log
           grep -Fx 'dns_replica_revocation=revoked_backup_denied_before_dial_and_after_mailbox_removal' rust-tls-dns-replicas.log
+      - name: Download the same-build mesh test and daemon
+        if: matrix.case == 'mesh' && needs.openssl-rust-mtls.outputs.mesh_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.openssl-rust-mtls.outputs.mesh_id }}
+          path: acceptance-mesh
       - name: Verify four-process Core routing, failover, and revocation on real TUN
         id: acceptance_mesh
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: matrix.case == 'mesh'
         timeout-minutes: 5
-        env:
-          OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
-          OPENSSL_STATIC: '1'
         run: |
           set -euo pipefail
-          cargo test --locked -p boreas-cli --features openssl-inner-tls --test mesh_run_netns \
-            --no-run --message-format=json > mesh-run-build.jsonl
-          test_binary=$(python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads, sys.stdin) if x.get("reason")=="compiler-artifact" and x["target"]["name"]=="mesh_run_netns" and x.get("executable")))' < mesh-run-build.jsonl)
-          test -x "$test_binary"
-          sudo --preserve-env=OPENSSL_CONF,BOREAS_OPENSSL_BIN timeout --kill-after=5s 120s \
-            "$test_binary" --ignored --nocapture --test-threads=1 2>&1 | tee rust-tls-mesh-runtime.log
+          (
+            cd acceptance-mesh
+            sha256sum --check --strict SHA256SUMS
+            test "$(cat source-sha)" = "$GITHUB_SHA"
+            tar -xf mesh.tar
+            test -x boreas
+            test -x mesh_run_netns
+          )
+          export BOREAS_MESH_TEST_BIN="$PWD/acceptance-mesh/boreas"
+          sudo --preserve-env=OPENSSL_CONF,BOREAS_OPENSSL_BIN,BOREAS_MESH_TEST_BIN timeout --kill-after=5s 120s \
+            acceptance-mesh/mesh_run_netns --ignored --nocapture --test-threads=1 2>&1 | tee rust-tls-mesh-runtime.log
           for test in \
             mesh_run_real_tun_switches_to_fresh_backup_after_confirmed_relay_loss \
             mesh_routed_tun_derives_paths_and_reuses_ingress_after_relay_loss \
@@ -985,7 +1122,7 @@ jobs:
           grep -F 'test result: ok. 4 passed; 0 failed; 0 ignored' rust-tls-mesh-runtime.log
       - name: Verify 2–4 independent encrypted circuits on real Linux devices
         id: acceptance_multi_active
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') }}
+        if: matrix.case == 'multi_active'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -998,8 +1135,76 @@ jobs:
             test "$(grep -Fxc 'multi_active_lane_loss=healthy_circuit_forwarding' "$log")" -eq 1
             test "$(grep -Fxc 'multi_active_lane_replacement=fresh_authenticated_circuit' "$log")" -eq 1
           done
+      - name: Require the selected real-device fixture to have passed
+        if: ${{ !cancelled() }}
+        env:
+          CASE: ${{ matrix.case }}
+          RESULT: ${{ steps[format('acceptance_{0}', matrix.case)].outcome }}
+        run: |
+          printf 'Real-device fixture %s: %s\n' "$CASE" "${RESULT:-not-run}" >> "$GITHUB_STEP_SUMMARY"
+          test "$RESULT" = success
+      - name: Upload functional evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-functional-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            rust-tls-private-dns.log
+            rust-tls-public-dns-*.log
+            rust-tls-dns-replicas.log
+            rust-tls-pool-cutover.log
+            rust-tls-mesh-runtime.log
+            rust-tls-multi-active-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  serial-performance:
+    name: Isolated serial netns performance
+    needs: openssl-rust-mtls
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      delayed: ${{ steps.candidate_delayed.outcome }}
+      gigabit: ${{ steps.candidate_gigabit.outcome }}
+      gso: ${{ steps.acceptance_gso.outcome }}
+    env:
+      OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.openssl-rust-mtls.outputs.binary_id }}
+          path: hop-node-linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.openssl-rust-mtls.outputs.runtime_id }}
+          path: acceptance-runtime
+      - name: Verify and prepare the exact build for namespace tests
+        id: prepare
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          (cd hop-node-linux && sha256sum --check --strict SHA256SUMS)
+          grep -Fx "Source commit: $GITHUB_SHA" hop-node-linux/README-DEVELOPMENT.txt
+          (cd acceptance-runtime && sha256sum --check --strict SHA256SUMS)
+          test "$(cat acceptance-runtime/source-sha)" = "$GITHUB_SHA"
+          tar -xf acceptance-runtime/runtime.tar
+          test -x "$BOREAS_OPENSSL_BIN"
+          test -s "$OPENSSL_CONF"
+          chmod 0755 hop-node-linux/boreas-linux-x86_64-musl-pq768
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
+          sudo modprobe tun || true
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
+        id: perf_toolchain
       - name: Record performance runner and exact binary
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         run: |
           set -euo pipefail
           {
@@ -1013,7 +1218,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples
         id: candidate_delayed
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
@@ -1123,24 +1328,40 @@ jobs:
             fi
           done
           exit "$failed"
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tls-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            rust-tls-netns-delayed-*.log
+            rust-tls-netns-gigabit-*.log
+            rust-tls-gso-*.log
+            rust-tls-netns-multistream.log
+            rust-tls-perf-environment.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  mandatory-acceptance:
+    name: Mandatory real-device acceptance
+    needs: [functional-netns, serial-performance]
+    if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
       - name: Require every acceptance step to have actually passed
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
-          DNS_RESULT: ${{ steps.acceptance_private_dns.outcome }}
-          PUBLIC_DNS_RESULT: ${{ steps.acceptance_public_dns.outcome }}
-          POOL_CUTOVER_RESULT: ${{ steps.acceptance_pool_cutover.outcome }}
-          DNS_REPLICAS_RESULT: ${{ steps.acceptance_dns_replicas.outcome }}
-          MESH_RESULT: ${{ steps.acceptance_mesh.outcome }}
-          MULTI_ACTIVE_RESULT: ${{ steps.acceptance_multi_active.outcome }}
-          DELAYED_RESULT: ${{ steps.candidate_delayed.outcome }}
-          GIGABIT_RESULT: ${{ steps.candidate_gigabit.outcome }}
-          GSO_RESULT: ${{ steps.acceptance_gso.outcome }}
+          FUNCTIONAL_RESULT: ${{ needs.functional-netns.result }}
+          DELAYED_RESULT: ${{ needs.serial-performance.outputs.delayed }}
+          GIGABIT_RESULT: ${{ needs.serial-performance.outputs.gigabit }}
+          GSO_RESULT: ${{ needs.serial-performance.outputs.gso }}
+          PERFORMANCE_RESULT: ${{ needs.serial-performance.result }}
         run: |
           set -euo pipefail
           failed=0
           {
             printf '\n### Mandatory real-device acceptance\n\n'
-            for check in DNS PUBLIC_DNS DNS_REPLICAS POOL_CUTOVER MESH MULTI_ACTIVE DELAYED GIGABIT GSO; do
+            for check in FUNCTIONAL DELAYED GIGABIT GSO PERFORMANCE; do
               var="${check}_RESULT"
               outcome="${!var}"
               printf -- '- %s: `%s`\n' "$check" "${outcome:-not-run}"
@@ -1150,38 +1371,3 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$failed"
-      - name: Upload non-secret CI evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: rust-tls-${{ github.run_id }}
-          path: |
-            openssl-runtime.txt
-            openssl-build.txt
-            openssl-musl-runtime.txt
-            openssl-musl-build.txt
-            openssl-linkage.txt
-            rust-tls-format.patch
-            rust-tls-tests.log
-            rust-tls-pki-tests.log
-            rust-tls-tunnel-tests.log
-            rust-tls-supervisor-tests.log
-            rust-tls-verified-systemd.log
-            rust-tls-dns-tests.log
-            rust-tls-private-dns.log
-            rust-tls-public-dns-*.log
-            rust-tls-dns-replicas.log
-            rust-tls-pool-cutover.log
-            rust-tls-mesh-runtime.log
-            rust-tls-multi-active-*.log
-            rust-tls-cli-tests.log
-            rust-tls-netns-e2e.log
-            rust-tls-netns-delayed-*.log
-            rust-tls-netns-gigabit-*.log
-            rust-tls-gso-*.log
-            rust-tls-netns-multistream.log
-            rust-tls-perf-environment.txt
-            rust-tls-initial-backup.log
-            rust-tls-initial-backup-negative.log
-          if-no-files-found: warn
-          retention-days: 14
