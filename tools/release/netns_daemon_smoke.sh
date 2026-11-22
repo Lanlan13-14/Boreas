@@ -17,9 +17,9 @@
 # Runs warm 1-stream and then warm 4-stream rounds, full duplex in each round.
 # Direct multi-active fixture, using the same signed PKI/TUN setup and binary:
 #   BOREAS_NETNS_E2E_ACTIVE_LANES=4 bash tools/release/netns_daemon_smoke.sh /path/to/boreas
-# Observes separate established TCP sockets, sends four verified TCP flows per
-# direction, asserts progress on each authenticated lane, then removes only
-# one transport and checks that both cohorts tear down without success.
+# Observes separate established TCP sockets and checks bidirectional byte
+# integrity across persistent and fresh application TCP flows. Removes one
+# transport and checks continuity, fresh authentication, and no old-flow replay.
 # Set BOREAS_MULTISTREAM_BYTES for total measured bytes per direction per round
 # (32 MiB by default); BOREAS_PERF_TIMEOUT_SECONDS bounds each worker/round.
 set -euo pipefail
@@ -1049,103 +1049,171 @@ if [[ "$PRIVATE_DNS" == 1 ]]; then
 fi
 
 if [[ "$ACTIVE_LANES" != 0 ]]; then
-  # Both owners must publish all admitted lanes, not merely a connected first
-  # socket. Bound every kernel inspection to the test's disposable namespaces.
-  "$BIN" ctl status --socket "$CORE_STATE/control.sock" > "$WORK/core-active-before.json"
-  "$BIN" ctl status --socket "$EDGE_STATE/control.sock" > "$WORK/edge-active-before.json"
-  timeout 5 ip netns exec "$EDGE_NS" ss -Hnt state established dst 192.0.2.1:8443 > "$WORK/active-sockets.txt"
-  python3 - "$ACTIVE_LANES" "$WORK" <<'PYNETNS'
-import json
-import pathlib
-import sys
-
-expected = int(sys.argv[1])
-work = pathlib.Path(sys.argv[2])
-sockets = (work / "active-sockets.txt").read_text().splitlines()
-ports = {line.split()[-2].rsplit(":", 1)[1] for line in sockets}
-assert len(sockets) == len(ports) == expected, sockets
-for role, metric in (("core", "inbound_connections"), ("edge", "outbound_upstreams")):
-    status = json.loads((work / f"{role}-active-before.json").read_text())
-    assert status["daemon_connected"] is True and status["status_fresh"] is True, status
-    assert status[metric] == expected and status["security_mode"] == "e2e-required", status
-    assert [row["lane"] for row in status["multi_active_lanes"]] == list(range(1, expected + 1))
-print(f"distinct_established_underlay_sockets={expected}")
-PYNETNS
+  snapshot_lanes() {
+    local role state
+    for role in core edge; do
+      state="$CORE_STATE"
+      if [[ "$role" == edge ]]; then state="$EDGE_STATE"; fi
+      "$BIN" ctl status --socket "$state/control.sock" > "$WORK/$role-active-$1.json" || return
+    done
+  }
+  await_probe() {
+    for _ in $(seq 1 500); do
+      if [[ -f "$WORK/$1" ]]; then return; fi
+      if ! kill -0 "$probe_server" "$probe_client" 2>/dev/null; then break; fi
+      sleep 0.02
+    done
+    echo "ERROR: multi-active probe did not complete phase $1" >&2
+    return 1
+  }
+  edge_underlay_sockets() {
+    timeout 5 ip netns exec "$EDGE_NS" ss -Hnte state established dst 192.0.2.1:8443 |
+      python3 -c 'import re, sys
+sockets = []
+for line in sys.stdin:
+    # Socket cookie distinguishes actual kernel sockets even if a source port is reused.
+    port = re.search(r"\b192\.0\.2\.2:([0-9]+)\b", line).group(1)
+    cookie = re.search(r"\bsk:([0-9a-f]+)\b", line).group(1)
+    sockets.append(f"{port} {cookie}")
+for row in sorted(sockets):
+    print(row)'
+  }
+  snapshot_lanes initial
+  edge_underlay_sockets > "$WORK/underlay-initial"
+  [[ "$(wc -l < "$WORK/underlay-initial")" -eq "$ACTIVE_LANES" ]]
+  echo "distinct_established_underlay_sockets=$ACTIVE_LANES"
   PROBE="$(dirname "$PERF_SCRIPT")/netns_multi_active_probe.py"
-  probe_pids=()
-  ip netns exec "$CORE_NS" timeout 20 python3 "$PROBE" receive 10.20.1.1 10.20.1.2 &
-  probe_pids+=("$!")
-  ip netns exec "$EDGE_NS" timeout 20 python3 "$PROBE" receive 10.20.1.2 10.20.1.1 &
-  probe_pids+=("$!")
+  ip netns exec "$CORE_NS" timeout 45 python3 "$PROBE" serve 10.20.1.1 10.20.1.2 "$ACTIVE_LANES" "$WORK" &
+  probe_server=$!
   probe_ready=0
   for _ in $(seq 1 80); do
-    if ip netns exec "$CORE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.1:18082' &&
-       ip netns exec "$EDGE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.2:18082'; then
+    if ip netns exec "$CORE_NS" ss -Hltn sport = :18082 | grep -Fq '10.20.1.1:18082'; then
       probe_ready=1
       break
     fi
     sleep 0.05
   done
-  (( probe_ready )) || { echo 'ERROR: multi-active probe listeners did not start' >&2; exit 1; }
-  ip netns exec "$CORE_NS" timeout 20 python3 "$PROBE" send 10.20.1.1 10.20.1.2 &
-  probe_pids+=("$!")
-  ip netns exec "$EDGE_NS" timeout 20 python3 "$PROBE" send 10.20.1.2 10.20.1.1 &
-  probe_pids+=("$!")
-  probe_failed=0
-  for pid in "${probe_pids[@]}"; do
-    wait "$pid" || probe_failed=1
-  done
-  (( ! probe_failed )) || { echo 'ERROR: multi-active integrity probe failed' >&2; exit 1; }
-  "$BIN" ctl status --socket "$CORE_STATE/control.sock" > "$WORK/core-active-after.json"
-  "$BIN" ctl status --socket "$EDGE_STATE/control.sock" > "$WORK/edge-active-after.json"
-  python3 - "$ACTIVE_LANES" "$WORK" <<'PYNETNS'
+  (( probe_ready )) || { echo 'ERROR: multi-active probe listener did not start' >&2; exit 1; }
+  ip netns exec "$EDGE_NS" timeout 45 python3 "$PROBE" exercise 10.20.1.2 10.20.1.1 "$ACTIVE_LANES" "$WORK" &
+  probe_client=$!
+  await_probe baseline-done
+  snapshot_lanes baseline
+
+  # Block only *new* Edge SYNs at the Core veth during the degraded phase.
+  # Original application connections can progress only on surviving underlay
+  # sockets, regardless of how promptly the daemon attempts to dial again.
+  ip netns exec "$CORE_NS" tc qdisc add dev veth-core clsact
+  ip netns exec "$CORE_NS" tc filter add dev veth-core ingress protocol ip pref 10 flower \
+    src_ip 192.0.2.2 dst_ip 192.0.2.1 ip_proto tcp dst_port 8443 tcp_flags 0x02/0x12 action drop
+  read -r local_port socket_cookie < "$WORK/underlay-initial"
+  [[ "$local_port" =~ ^[0-9]+$ && "$socket_cookie" =~ ^[0-9a-f]+$ ]]
+  # Apply SOCK_DESTROY only to one fixture-owned underlay TCP connection,
+  # once on each side so neither kernel waits for a retransmit timeout.
+  timeout 5 ip netns exec "$EDGE_NS" ss -K src "192.0.2.2:$local_port" dst 192.0.2.1:8443
+  timeout 5 ip netns exec "$CORE_NS" ss -K src 192.0.2.1:8443 dst "192.0.2.2:$local_port"
+  python_status_check() {
+    python3 - "$ACTIVE_LANES" "$WORK" "$1" <<'PYNETNS'
 import json
-import pathlib
+from pathlib import Path
 import sys
 
-expected = int(sys.argv[1])
-work = pathlib.Path(sys.argv[2])
-for role in ("core", "edge"):
-    status = json.loads((work / f"{role}-active-after.json").read_text())
-    lanes = status["multi_active_lanes"]
-    assert status["daemon_connected"] is True and status["status_fresh"] is True, status
-    assert len(lanes) == expected, lanes
-    assert all(row["tx_packets"] > 0 and row["rx_packets"] > 0 for row in lanes), lanes
+count, work, phase = int(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+
+def load(role, name):
+    return json.loads((work / f"{role}-active-{name}.json").read_text())
+
+def bars(status, metric, ready):
+    assert status[metric] == ready, status
+    assert status["daemon_connected"] and status["status_fresh"], status
+    assert status["security_mode"] == "e2e-required" and status["path_epoch"] == 1, status
     assert status["failover_events"] == 0 and status["standby_ready"] is False, status
-    print(f"{role}_authenticated_lane_progress={json.dumps(lanes, separators=(',', ':'))}")
+    lanes = status["multi_active_lanes"]
+    assert [row["lane"] for row in lanes] == list(range(1, count + 1)), lanes
+    assert sum(row["ready"] for row in lanes) == ready, lanes
+    return lanes
+
+def progressed(before, after):
+    return all(after[key] > before[key] for key in ("rx_packets", "tx_packets"))
+
+losses, generations = [], []
+for role, metric in (("core", "inbound_connections"), ("edge", "outbound_upstreams")):
+    initial = bars(load(role, "initial"), metric, count)
+    baseline = bars(load(role, "baseline"), metric, count)
+    assert all(row["generation"] == 1 for row in initial + baseline), (initial, baseline)
+    # Counters start at zero, but the initial snapshot need not precede all SYNs in future fixtures.
+    assert all(min(row["rx_packets"], row["tx_packets"]) > 0 for row in baseline), baseline
+    degraded = bars(load(role, "degraded"), metric, count - 1)
+    missing, = (i for i, row in enumerate(degraded) if not row["ready"])
+    assert all(row["generation"] == 1 for row in degraded), degraded
+    losses.append(missing)
+    if phase != "degraded":
+        after = bars(load(role, "survivors"), metric, count - 1)
+        assert not after[missing]["ready"] and all(row["generation"] == 1 for row in after), after
+        assert all(progressed(row, after[i]) for i, row in enumerate(degraded) if i != missing), after
+    if phase in ("replaced", "fresh"):
+        restored = bars(load(role, "replaced"), metric, count)
+        assert restored[missing]["generation"] > 1, restored
+        assert all(row["generation"] == 1 for i, row in enumerate(restored) if i != missing), restored
+        generations.append(restored[missing]["generation"])
+    if phase == "fresh":
+        tested = bars(load(role, "fresh"), metric, count)
+        assert [row["generation"] for row in tested] == [row["generation"] for row in restored], tested
+        assert progressed(restored[missing], tested[missing]), (restored, tested)
+assert losses[0] == losses[1], losses
+if generations:
+    assert generations[0] == generations[1], generations
+print(losses[0] + 1)
 PYNETNS
-  # Destroy exactly one selected Edge socket. The peer observes a real
-  # unauthenticated transport loss, not a simulated queue or close_notify.
-  IFS= read -r first_socket < "$WORK/active-sockets.txt"
-  read -r -a socket_fields <<< "$first_socket"
-  local_address="${socket_fields[${#socket_fields[@]}-2]}"
-  local_port="${local_address##*:}"
-  [[ "$local_port" =~ ^[0-9]+$ ]]
-  timeout 5 ip netns exec "$EDGE_NS" ss -K src "192.0.2.2:$local_port" dst 192.0.2.1:8443
-  for role in edge core; do
-    pid="$(<"$WORK/$role.pid")"
-    for _ in $(seq 1 100); do
-      if ! kill -0 "$pid" 2>/dev/null; then break; fi
-      sleep 0.05
+  }
+  wait_for_lanes() {
+    for _ in $(seq 1 350); do
+      if snapshot_lanes "$1" && python_status_check "$1" > "$WORK/$1.next" 2> "$WORK/lane-status.err"; then
+        return
+      fi
+      sleep 0.04
     done
-    if kill -0 "$pid" 2>/dev/null || wait "$pid"; then
-      echo "ERROR: $role did not fail closed promptly after a single lane was destroyed" >&2
-      report_failure_evidence
-      exit 1
-    fi
-    if [[ "$(<"$WORK/$role.err")" != *'daemon multi-active: lane '* &&
-          "$(<"$WORK/$role.err")" != *'daemon multi-active: inbound lane worker disconnected'* ]]; then
-      echo "ERROR: $role did not attribute cancellation to a lane fault" >&2
-      report_failure_evidence
-      exit 1
-    fi
-  done
-  remaining_sockets="$(timeout 5 ip netns exec "$EDGE_NS" ss -Hnt state established dst 192.0.2.1:8443)"
-  if [[ -n "$remaining_sockets" ]]; then
-    echo 'ERROR: established multi-active socket remained after joint cancellation' >&2
-    exit 1
-  fi
-  echo 'multi_active_lane_loss=both_cohorts_halted_fail_closed'
+    cat "$WORK/lane-status.err" >&2
+    echo "ERROR: multi-active status did not reach $1" >&2
+    return 1
+  }
+  wait_for_lanes degraded
+  edge_underlay_sockets > "$WORK/underlay-degraded"
+  python3 - "$WORK" "$local_port" <<'PYNETNS'
+from pathlib import Path
+import sys
+work = Path(sys.argv[1])
+before = (work / "underlay-initial").read_text().splitlines()
+after = (work / "underlay-degraded").read_text().splitlines()
+assert len(set(before)) == len(before), before
+assert after == [row for row in before if row.split()[0] != sys.argv[2]], (before, after)
+PYNETNS
+  mv -- "$WORK/degraded.next" "$WORK/degraded"
+  await_probe degraded-done
+  snapshot_lanes survivors
+  python_status_check survivors >/dev/null
+  echo 'multi_active_lane_loss=healthy_circuit_forwarding'
+
+  ip netns exec "$CORE_NS" tc qdisc del dev veth-core clsact
+  wait_for_lanes replaced
+  edge_underlay_sockets > "$WORK/underlay-replaced"
+  python3 - "$WORK" <<'PYNETNS'
+from pathlib import Path
+import sys
+work = Path(sys.argv[1])
+survivors = set((work / "underlay-degraded").read_text().splitlines())
+restored = set((work / "underlay-replaced").read_text().splitlines())
+assert survivors < restored and len(restored) == len(survivors) + 1, (survivors, restored)
+new_socket, = restored - survivors
+initial_cookies = {row.split()[1] for row in (work / "underlay-initial").read_text().splitlines()}
+assert new_socket.split()[1] not in initial_cookies, (new_socket, initial_cookies)
+PYNETNS
+  mv -- "$WORK/replaced.next" "$WORK/replaced"
+  wait "$probe_client"
+  wait "$probe_server"
+  [[ -f "$WORK/fresh-done" && -f "$WORK/finish" && ! -e "$WORK/lost-delivered" ]]
+  snapshot_lanes fresh
+  python_status_check fresh >/dev/null
+  echo 'multi_active_lane_replacement=fresh_authenticated_circuit'
   exit 0
 fi
 

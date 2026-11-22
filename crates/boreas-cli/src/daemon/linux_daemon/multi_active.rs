@@ -1,4 +1,4 @@
-//! Direct fixed-size Edge/Core cohort. No worker owns or touches the TUN.
+//! Direct Edge/Core cohort with fixed ordinal and resource limits. Only the coordinator owns the TUN.
 
 use super::*;
 use boreas_tunnel::{
@@ -8,6 +8,7 @@ use boreas_tunnel::{
     e2e::{E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
 };
 use std::{
+    io::ErrorKind,
     net::Shutdown,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
@@ -17,11 +18,68 @@ const TICK: Duration = Duration::from_millis(1);
 const STARTUP_LIMIT: Duration = Duration::from_secs(45);
 const COHORT_MAGIC: &[u8; 5] = b"BCOH\x01";
 const COHORT_LEN: usize = 26;
+const REPLACEMENT_RETRY: Duration = Duration::from_secs(1);
+const REPLACEMENT_MAGIC: &[u8; 5] = b"BREP\x01";
+const REPLACEMENT_LEN: usize = COHORT_LEN + 8 + 16;
+
+#[derive(Debug)]
+enum Failure {
+    Transport(String),
+    Terminal(String),
+}
+
+impl From<String> for Failure {
+    fn from(reason: String) -> Self {
+        Self::Terminal(reason)
+    }
+}
+
+fn transport_kind(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+    )
+}
+
+fn tunnel_failure(phase: &str, error: TunnelError) -> Failure {
+    use boreas_tunnel::ws::WsError;
+    let reason = format!("{phase}: {error}");
+    match error {
+        TunnelError::Timeout
+        | TunnelError::Closed
+        | TunnelError::Ws(WsError::Timeout | WsError::Closed) => Failure::Transport(reason),
+        TunnelError::Io(kind) | TunnelError::Ws(WsError::Io(kind)) if transport_kind(kind) => {
+            Failure::Transport(reason)
+        }
+        // Opaque TLS handshake errors might be authorization failures. Never retry
+        // a rejection for which the backend cannot prove transport provenance.
+        _ => Failure::Terminal(reason),
+    }
+}
+
+fn business_failure(phase: &str, error: PacketPathError) -> Failure {
+    let reason = format!("{phase} circuit failed: {error:?}");
+    if matches!(error, PacketPathError::CircuitIo(kind) if transport_kind(kind)) {
+        Failure::Transport(reason)
+    } else {
+        Failure::Terminal(reason)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct LaneCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    state: AtomicU64, // high bits: generation; low bit: ready
 }
 
 pub(super) fn status_lanes(counters: &LiveCounters) -> String {
@@ -37,10 +95,13 @@ pub(super) fn status_lanes(counters: &LiveCounters) -> String {
         if index != 0 {
             json.push(',');
         }
+        let state = lane.state.load(Ordering::Acquire);
         let _ = write!(
             json,
-            "{{\"lane\":{},\"tx_packets\":{},\"rx_packets\":{}}}",
+            "{{\"lane\":{},\"generation\":{},\"ready\":{},\"tx_packets\":{},\"rx_packets\":{}}}",
             index + 1,
+            state >> 1,
+            state & 1 != 0,
             lane.tx.load(Ordering::Relaxed),
             lane.rx.load(Ordering::Relaxed),
         );
@@ -73,34 +134,75 @@ struct Cohort {
     running: AtomicBool,
     draining: AtomicBool,
     peer_closed: AtomicU8,
-    finished: AtomicU8,
     reason: OnceLock<String>,
     freshness: Mutex<Option<(Instant, u64)>>,
-    sockets: Mutex<Vec<TcpStream>>,
+    attempts: Mutex<Vec<Arc<Attempt>>>,
+    versions: Mutex<[Option<Version>; HARD_PAIR_CAP]>,
+}
+
+#[derive(Default)]
+struct Attempt {
+    socket: Mutex<Option<TcpStream>>,
+    ready: AtomicBool,
+    lost: AtomicBool,
+    progress: Mutex<Option<Instant>>,
+}
+
+impl Attempt {
+    fn interrupt(&self) {
+        if let Some(tcp) = lock_mutex(&self.socket).as_ref() {
+            let _ = tcp.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn lose(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.interrupt();
+    }
+
+    fn expire_if_stalled(&self) {
+        // Serialize expiry with start/end of an operation: an observed stale
+        // deadline cannot accidentally cancel a later healthy operation.
+        let mut progress = lock_mutex(&self.progress);
+        if progress.is_some_and(|expires| Instant::now() >= expires) {
+            self.lose();
+            *progress = None;
+        }
+    }
+
+    fn step<T>(&self, action: impl FnOnce() -> T) -> T {
+        *lock_mutex(&self.progress) = Some(Instant::now() + PATH_IO_TIMEOUT);
+        let result = action();
+        *lock_mutex(&self.progress) = None;
+        result
+    }
 }
 
 impl Cohort {
-    fn register(&self, tcp: &TcpStream) -> Result<TcpStream, String> {
+    fn register(&self, attempt: &Attempt, tcp: &TcpStream) -> Result<TcpStream, Failure> {
         let shutdown = tcp
             .try_clone()
             .map_err(|e| format!("duplicate lane socket: {e}"))?;
         let operation = tcp
             .try_clone()
             .map_err(|e| format!("duplicate lane socket: {e}"))?;
-        let mut sockets = lock_mutex(&self.sockets);
-        if self.stopped.load(Ordering::Acquire) || sockets.len() >= HARD_PAIR_CAP {
-            return Err("cohort cancelled or socket quota exhausted".into());
+        let mut socket = lock_mutex(&attempt.socket);
+        self.check()?;
+        if attempt.lost.load(Ordering::Acquire) {
+            return Err(Failure::Transport("lane attempt was interrupted".into()));
         }
-        sockets.push(shutdown);
+        *socket = Some(shutdown);
         Ok(operation)
+    }
+
+    fn forget(&self, attempt: &Arc<Attempt>) {
+        lock_mutex(&self.attempts).retain(|other| !Arc::ptr_eq(other, attempt));
     }
 
     fn cancel(&self) {
         self.stopped.store(true, Ordering::Release);
-        // Registration and shutdown share this lock, including when cancellation
-        // races with a just-connected socket. Never shut down a borrowed raw fd.
-        for tcp in lock_mutex(&self.sockets).iter() {
-            let _ = tcp.shutdown(Shutdown::Both);
+        for attempt in lock_mutex(&self.attempts).iter() {
+            attempt.interrupt();
         }
     }
 
@@ -240,10 +342,177 @@ impl Membership {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Version {
+    // The authenticated initial circuit identifies this slot for the entire
+    // cohort, including across unsuccessful/partially observed replacements.
+    anchor: CircuitId,
+    last_id: CircuitId,
+    generation: u64,
+    vacant: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Replacement {
+    ordinal: u8,
+    generation: u64,
+    anchor: CircuitId,
+}
+
+impl Replacement {
+    fn record(self, nonce: [u8; 16], count: u8, mtu: u16, kind: u8) -> [u8; REPLACEMENT_LEN] {
+        let mut wire = [0; REPLACEMENT_LEN];
+        wire[..COHORT_LEN].copy_from_slice(
+            &Membership {
+                nonce: Some(nonce),
+                ordinal: self.ordinal,
+                count,
+                mtu,
+            }
+            .record(kind, nonce),
+        );
+        wire[..5].copy_from_slice(REPLACEMENT_MAGIC);
+        wire[COHORT_LEN..COHORT_LEN + 8].copy_from_slice(&self.generation.to_be_bytes());
+        wire[COHORT_LEN + 8..].copy_from_slice(&self.anchor.0);
+        wire
+    }
+
+    fn parse(
+        wire: [u8; REPLACEMENT_LEN],
+        nonce: [u8; 16],
+        count: u8,
+        mtu: u16,
+    ) -> Result<Self, Failure> {
+        let offer = Self {
+            ordinal: wire[6],
+            generation: u64::from_be_bytes(
+                wire[COHORT_LEN..COHORT_LEN + 8]
+                    .try_into()
+                    .expect("fixed generation"),
+            ),
+            anchor: CircuitId(wire[COHORT_LEN + 8..].try_into().expect("fixed circuit ID")),
+        };
+        if offer.ordinal >= count
+            || !(2..=u64::MAX >> 1).contains(&offer.generation)
+            || wire != offer.record(nonce, count, mtu, 0)
+        {
+            return Err(Failure::Terminal(
+                "encrypted replacement membership mismatch".into(),
+            ));
+        }
+        Ok(offer)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Opening {
+    Initial(Membership),
+    Replace {
+        nonce: [u8; 16],
+        count: u8,
+        mtu: u16,
+        offer: Option<Replacement>,
+    },
+}
+
+impl Opening {
+    fn confirm(
+        self,
+        circuit: &mut E2eCircuit<'_>,
+        ctx: &WorkerContext<'_>,
+        until: Instant,
+    ) -> Result<([u8; 16], u8, u64), Failure> {
+        let edge = ctx.endpoint.is_edge();
+        match self {
+            Self::Initial(membership) => {
+                let nonce = membership.confirm(circuit, edge)?;
+                ctx.gate(until)?;
+                if membership.ordinal + 1 == membership.count {
+                    membership.confirm_full_cohort(circuit, edge, nonce)?;
+                }
+                Ok((nonce, membership.ordinal, 1))
+            }
+            Self::Replace {
+                nonce,
+                count,
+                mtu,
+                offer,
+            } => {
+                let read =
+                    |circuit: &mut E2eCircuit<'_>| -> Result<[u8; REPLACEMENT_LEN], Failure> {
+                        let mut received = [0; REPLACEMENT_LEN];
+                        let mut filled = 0;
+                        while filled < received.len() {
+                            match circuit.read(&mut received[filled..]) {
+                                Ok(0) => return Err(Failure::Terminal(
+                                    "authenticated close before complete replacement membership"
+                                        .into(),
+                                )),
+                                Ok(read) => filled += read,
+                                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                                    remaining(ctx.cohort, until)?;
+                                }
+                                Err(e) => {
+                                    return Err(tunnel_failure(
+                                        "read replacement membership",
+                                        e.into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(received)
+                    };
+                let write = |circuit: &mut E2eCircuit<'_>, offer: Replacement, kind| {
+                    circuit
+                        .write_all(&offer.record(nonce, count, mtu, kind))
+                        .and_then(|()| circuit.flush())
+                        .map_err(|e| tunnel_failure("write replacement membership", e.into()))
+                };
+                let offer = if let Some(offer) = offer {
+                    write(circuit, offer, 0)?;
+                    if read(circuit)? != offer.record(nonce, count, mtu, 1) {
+                        return Err(Failure::Terminal(
+                            "encrypted replacement acknowledgement mismatch".into(),
+                        ));
+                    }
+                    offer
+                } else {
+                    let offer = Replacement::parse(read(circuit)?, nonce, count, mtu)?;
+                    loop {
+                        remaining(ctx.cohort, until)?;
+                        let version = lock_mutex(&ctx.cohort.versions)[usize::from(offer.ordinal)]
+                            .ok_or_else(|| {
+                                Failure::Terminal("replacement has no initial cohort slot".into())
+                            })?;
+                        if offer.anchor != version.anchor || offer.generation <= version.generation
+                        {
+                            return Err(Failure::Terminal(
+                                "replacement does not name a fresh generation of this slot".into(),
+                            ));
+                        }
+                        if version.vacant {
+                            break;
+                        }
+                        // A correctly authenticated request may beat our loss detection.
+                        // It cannot itself invalidate a healthy lane or use its credit.
+                        thread::sleep(TICK);
+                    }
+                    ctx.gate(until)?;
+                    write(circuit, offer, 1)?;
+                    offer
+                };
+                Ok((nonce, offer.ordinal, offer.generation))
+            }
+        }
+    }
+}
+
 struct Ready {
     id: CircuitId,
     identity: BusinessIdentity,
     nonce: [u8; 16],
+    ordinal: u8,
+    generation: u64,
 }
 
 /// PacketPath still owns framing, E2E I/O and authenticated L3 authorization.
@@ -253,6 +522,7 @@ struct LaneIo {
     to_wire: Receiver<Vec<u8>>,
     from_wire: SyncSender<Vec<u8>>,
     cohort: Arc<Cohort>,
+    attempt: Arc<Attempt>,
 }
 
 impl PacketIo for LaneIo {
@@ -260,7 +530,8 @@ impl PacketIo for LaneIo {
         if self.cohort.stopped.load(Ordering::Acquire) {
             return Err(TunError::QueueClosed);
         }
-        if self.cohort.draining.load(Ordering::Acquire)
+        if self.attempt.lost.load(Ordering::Acquire)
+            || self.cohort.draining.load(Ordering::Acquire)
             || self.cohort.peer_closed.load(Ordering::Acquire) != 0
         {
             return Ok(None);
@@ -276,7 +547,8 @@ impl PacketIo for LaneIo {
         if self.cohort.stopped.load(Ordering::Acquire) {
             return Err(TunError::QueueClosed);
         }
-        if self.cohort.draining.load(Ordering::Acquire)
+        if self.attempt.lost.load(Ordering::Acquire)
+            || self.cohort.draining.load(Ordering::Acquire)
             || self.cohort.peer_closed.load(Ordering::Acquire) != 0
         {
             return Ok(());
@@ -293,24 +565,17 @@ impl PacketIo for LaneIo {
 struct DispatchLane {
     to_wire: SyncSender<Vec<u8>>,
     from_wire: Receiver<Vec<u8>>,
-    progress_deadline: Arc<AtomicU64>,
 }
 
-fn lane_channels(cohort: &Arc<Cohort>) -> (DispatchLane, LaneIo) {
+fn lane_channels(cohort: &Arc<Cohort>, attempt: &Arc<Attempt>) -> (DispatchLane, LaneIo) {
     let (to_wire, lane_input) = mpsc::sync_channel(QUEUE_PACKETS);
     let (lane_output, from_wire) = mpsc::sync_channel(QUEUE_PACKETS);
-    (
-        DispatchLane {
-            to_wire,
-            from_wire,
-            progress_deadline: Arc::new(AtomicU64::new(0)),
-        },
-        LaneIo {
-            to_wire: lane_input,
-            from_wire: lane_output,
-            cohort: Arc::clone(cohort),
-        },
-    )
+    (DispatchLane { to_wire, from_wire }, LaneIo {
+        to_wire: lane_input,
+        from_wire: lane_output,
+        cohort: Arc::clone(cohort),
+        attempt: Arc::clone(attempt),
+    })
 }
 
 enum Hop {
@@ -325,41 +590,38 @@ impl Endpoint {
 
     fn connect_socket(
         &self,
-        run: &Run<'_>,
-        cohort: &Cohort,
+        ctx: &WorkerContext<'_>,
         until: Instant,
-    ) -> Result<TcpStream, String> {
+    ) -> Result<TcpStream, Failure> {
         match self {
             Self::Edge(client, target) => {
-                let remaining = remaining_startup(cohort, until)?;
+                let remaining = remaining(ctx.cohort, until)?;
                 client
                     .connect_tcp(target, remaining.min(HANDSHAKE_TIMEOUT))
-                    .map_err(|e| format!("daemon multi-active: TCP dial failed: {e}"))
+                    .map_err(|e| tunnel_failure("TCP dial", e.into()))
             }
             Self::Core(listener, ..) => loop {
-                let remaining = remaining_startup(cohort, until)?;
+                let remaining = remaining(ctx.cohort, until)?;
                 match listener.accept() {
                     Ok((tcp, _)) => return Ok(tcp),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        run.policy_window.check()?;
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        ctx.run.policy_window.check()?;
                         thread::sleep(remaining.min(IDLE_POLL_TIMEOUT));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(format!("daemon multi-active: accept failed: {e}")),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(tunnel_failure("TCP accept", e.into())),
                 }
             },
         }
     }
 }
 
-fn remaining_startup(cohort: &Cohort, until: Instant) -> Result<Duration, String> {
+fn remaining(cohort: &Cohort, until: Instant) -> Result<Duration, Failure> {
     cohort.check()?;
     until
         .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| {
-            "daemon multi-active: incomplete authenticated cohort at startup deadline".into()
-        })
+        .filter(|time| !time.is_zero())
+        .ok_or_else(|| Failure::Transport("authenticated opening deadline elapsed".into()))
 }
 
 struct WorkerContext<'a> {
@@ -367,44 +629,33 @@ struct WorkerContext<'a> {
     admission: &'a Admission,
     run: &'a LanePolicy<'a>,
     cohort: &'a Cohort,
-    until: Instant,
     slots: [AuthenticatedPeer; 2],
-    clock: Instant,
 }
 
-fn elapsed_ms(clock: Instant) -> u64 {
-    u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+impl WorkerContext<'_> {
+    fn gate(&self, until: Instant) -> Result<(), Failure> {
+        self.run.policy_window.check()?;
+        lock_revocation_gate(self.run.store, self.run.status_path, self.slots)?;
+        remaining(self.cohort, until)?;
+        Ok(())
+    }
 }
 
-fn bounded_step<T>(clock: Instant, liveness: &AtomicU64, action: impl FnOnce() -> T) -> T {
-    // SO_RCVTIMEO only bounds one syscall. A trickle across many TLS/WS/frame
-    // reads must not hold a business operation (or its teardown) indefinitely.
-    let timeout = u64::try_from(PATH_IO_TIMEOUT.as_millis()).expect("fixed timeout fits u64");
-    liveness.store(elapsed_ms(clock).saturating_add(timeout), Ordering::Release);
-    let result = action();
-    liveness.store(0, Ordering::Release);
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
 fn run_lane(
     ctx: &WorkerContext<'_>,
-    tcp: TcpStream,
-    interrupt: &TcpStream,
-    membership: Membership,
+    attempt: &Attempt,
+    opening: Opening,
+    until: Instant,
     io: &LaneIo,
     ready: SyncSender<Ready>,
-    liveness: &AtomicU64,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let run = ctx.run;
     let cohort = ctx.cohort;
-    let gate = || {
-        remaining_startup(cohort, ctx.until)?;
-        run.policy_window.check()?;
-        lock_revocation_gate(run.store, run.status_path, ctx.slots)
-    };
-    gate()?;
-    let hop_until = (Instant::now() + HANDSHAKE_TIMEOUT).min(ctx.until);
+    ctx.gate(until)?;
+    let tcp = ctx.endpoint.connect_socket(ctx, until)?;
+    let interrupt = cohort.register(attempt, &tcp)?;
+    ctx.gate(until)?;
+    let hop_until = (Instant::now() + HANDSHAKE_TIMEOUT).min(until);
     let mut hop = match ctx.endpoint {
         Endpoint::Edge(client, target) => client
             .connect_preconnected_until(tcp, target, run.policy.clone(), hop_until)
@@ -413,13 +664,13 @@ fn run_lane(
             .accept_tls_stream_until(tcp, outer, run.policy.clone(), hop_until, ctx.admission)
             .map(Hop::Core),
     }
-    .map_err(|e| format!("WSS + pq768 hop session rejected: {e}"))?;
+    .map_err(|e| tunnel_failure("WSS + pq768 hop session rejected", e))?;
     let session = match &mut hop {
         Hop::Edge(session) => session,
         Hop::Core(accepted) => &mut accepted.session,
     };
-    gate()?;
-    let e2e_until = (Instant::now() + HANDSHAKE_TIMEOUT).min(ctx.until);
+    ctx.gate(until)?;
+    let e2e_until = (Instant::now() + HANDSHAKE_TIMEOUT).min(until);
     let edge = ctx.endpoint.is_edge();
     let mut circuit = if edge {
         open_e2e_with_l3_profile_until(
@@ -428,7 +679,7 @@ fn run_lane(
             run.policy.expected_peer,
             1,
             run.profile,
-            interrupt,
+            &interrupt,
             e2e_until,
         )
     } else {
@@ -437,11 +688,11 @@ fn run_lane(
             run.backend,
             run.policy.expected_peer,
             run.profile,
-            interrupt,
+            &interrupt,
             e2e_until,
         )
     }
-    .map_err(|e| format!("pq768 E2E circuit rejected: {e}"))?;
+    .map_err(|e| tunnel_failure("pq768 E2E circuit rejected", e))?;
     // Before any possibly-blocking circuit teardown on setup errors, interrupt
     // the socket. PacketPath owns the circuit after successful binding.
     let setup = (|| {
@@ -451,49 +702,45 @@ fn run_lane(
             || circuit.info().peer != run.policy.expected_peer
             || run.mtu > usize::from(circuit.mtu_cap())
         {
-            return Err(
+            return Err(Failure::Terminal(
                 "confirmed circuit is not the exact direct policy/identity/MTU binding".into(),
-            );
+            ));
         }
         bound_path_io(interrupt.as_raw_fd())?;
-        let nonce = membership.confirm(&mut circuit, edge)?;
-        gate()?;
-        if membership.ordinal + 1 == membership.count {
-            // Ordered admission guarantees all earlier lanes are locally
-            // bound. The final lane confirms that fact from both peers.
-            membership.confirm_full_cohort(&mut circuit, edge, nonce)?;
-            gate()?;
-        }
-        Ok(nonce)
+        let member = opening.confirm(&mut circuit, ctx, until)?;
+        ctx.gate(until)?;
+        Ok(member)
     })();
-    let nonce = match setup {
-        Ok(nonce) => nonce,
+    let (nonce, ordinal, generation) = match setup {
+        Ok(member) => member,
         Err(reason) => {
-            let _ = interrupt.shutdown(Shutdown::Both);
+            attempt.interrupt();
             return Err(reason);
         }
     };
     let mut path = PacketPath::try_new_over_e2e(io, circuit, run.mtu)
         .map_err(|e| format!("authenticated PacketPath bind rejected: {e:?}"))?;
-    // Avoid running CircuitStream's best-effort Drop write before the
-    // coordinator has been notified of errors from the worker loop.
-    let result: Result<(), String> = (|| {
+    let result = (|| {
         ready
             .send(Ready {
                 id: CircuitId(path.circuit_id()),
                 identity: business_identity(&path),
                 nonce,
+                ordinal,
+                generation,
             })
-            .map_err(|_| "cohort ended before lane admission")?;
-        while !cohort.running.load(Ordering::Acquire) {
-            cohort.check()?;
+            .map_err(|_| Failure::Terminal("cohort ended before lane admission".into()))?;
+        while !attempt.ready.load(Ordering::Acquire) || !cohort.running.load(Ordering::Acquire) {
+            if attempt.lost.load(Ordering::Acquire) {
+                return Err(Failure::Transport("lane attempt was interrupted".into()));
+            }
+            remaining(cohort, until)?;
             thread::sleep(TICK);
         }
-
-        let counters = &run.counters.multi_active_lanes[usize::from(membership.ordinal)];
+        let counters = &run.counters.multi_active_lanes[usize::from(ordinal)];
         let fd = interrupt.as_raw_fd();
         loop {
-            if cohort.stopped.load(Ordering::Acquire) {
+            if cohort.stopped.load(Ordering::Acquire) || attempt.lost.load(Ordering::Acquire) {
                 return Ok(());
             }
             if cohort.draining.load(Ordering::Acquire) {
@@ -505,8 +752,9 @@ fn run_lane(
             let outbound = if peer_closing {
                 None
             } else {
-                bounded_step(ctx.clock, liveness, || path.step_outbound())
-                    .map_err(|e| format!("outbound circuit failed: {e:?}"))?
+                attempt
+                    .step(|| path.step_outbound())
+                    .map_err(|e| business_failure("outbound", e))?
             };
             if let Some(bytes) = outbound {
                 counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -520,113 +768,378 @@ fn run_lane(
             } else {
                 TICK
             };
-            if (poll_io(fd, None, PathPoll::Read, wait)?.socket_readable || path.has_buffered_input())
+            if (poll_io(fd, None, PathPoll::Read, wait)?.socket_readable
+                || path.has_buffered_input())
                 && !cohort.stopped.load(Ordering::Acquire)
                 && !cohort.draining.load(Ordering::Acquire)
             {
                 cohort.forward(run.policy_window)?;
-                match bounded_step(ctx.clock, liveness, || path.step_inbound())
-                    .map_err(|e| format!("inbound circuit failed: {e:?}"))?
+                if attempt
+                    .step(|| path.step_inbound())
+                    .map_err(|e| business_failure("inbound", e))?
+                    .is_none()
                 {
-                    Some(_) => {}
-                    None => {
+                    if !attempt.lost.load(Ordering::Acquire) {
                         cohort.peer_closed.fetch_add(1, Ordering::AcqRel);
-                        return Ok(());
                     }
+                    return Ok(());
                 }
             }
         }
     })();
-    if let Err(reason) = &result
-        && !cohort.stopped.load(Ordering::Acquire)
-    {
-        cohort.fail(format!(
-            "daemon multi-active: lane {}: {reason}",
-            membership.ordinal + 1
-        ));
+    // Do not let the circuit's best-effort Drop write hold up failure publication.
+    match &result {
+        Err(Failure::Transport(_)) => attempt.lose(),
+        Err(Failure::Terminal(reason)) if !cohort.stopped.load(Ordering::Acquire) => {
+            cohort.fail(format!(
+                "daemon multi-active: lane {}: {reason}",
+                ordinal + 1
+            ));
+        }
+        _ => {}
     }
     result
 }
 
-fn check_progress(cohort: &Cohort, lanes: &[DispatchLane], clock: Instant) -> Result<(), String> {
-    cohort.check()?;
-    let now = elapsed_ms(clock);
-    for (index, lane) in lanes.iter().enumerate() {
-        let expires = lane.progress_deadline.load(Ordering::Acquire);
-        if expires != 0 && now >= expires {
-            return Err(format!(
-                "daemon multi-active: lane {} exceeded business I/O deadline",
-                index + 1
-            ));
-        }
-    }
-    Ok(())
+struct Task<'scope> {
+    attempt: Arc<Attempt>,
+    channels: DispatchLane,
+    ready: Receiver<Ready>,
+    worker: thread::ScopedJoinHandle<'scope, Result<(), Failure>>,
+    until: Instant,
 }
 
-fn dispatch(
-    run: &Run<'_>,
-    cohort: &Cohort,
-    pool: &mut CircuitPool,
-    lanes: &[DispatchLane],
-    ids: &[CircuitId],
-    clock: Instant,
-    deadline: Option<Instant>,
-) -> Result<&'static str, String> {
-    let tun_fd = run
-        .tun
-        .raw_fd()
-        .ok_or("multi-active requires real Linux TUN")?;
-    let io = run.tun.packet_io();
-    // Linux additionally reads one byte to detect oversize packets.
-    let mut scratch = vec![0; run.mtu + 1];
-    let mut peer_close_deadline = None;
-    'dispatch: loop {
-        check_progress(cohort, lanes, clock)?;
-        cohort.forward(run.policy_window)?;
-        let closed = usize::from(cohort.peer_closed.load(Ordering::Acquire));
-        if closed == lanes.len() {
-            return Ok("peer_closed_cleanly");
-        }
-        if closed != 0 {
-            // The first close_notify quiesces all lanes. Only *all* confirmed
-            // TLS EOFs count as clean; never hide another lane's transport or
-            // protocol failure behind the first clean notification.
-            let until =
-                *peer_close_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
-            if Instant::now() >= until {
-                return Err("daemon multi-active: lane close left an incomplete cohort".into());
-            }
-            thread::sleep(TICK);
-            continue;
-        }
-        if deadline.is_some_and(|until| Instant::now() >= until) {
-            return Ok("max_seconds_reached");
-        }
-        // One bounded visit to each lane, then one TUN read. No busy inbound
-        // lane can repeatedly win against another lane or the host queue.
-        let mut progressed = false;
-        for (index, lane) in lanes.iter().enumerate() {
-            if cohort.peer_closed.load(Ordering::Acquire) != 0 {
-                continue 'dispatch;
-            }
+impl<'scope> Task<'scope> {
+    fn spawn<'env>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        ctx: &'scope WorkerContext<'env>,
+        cohort: &Arc<Cohort>,
+        opening: Opening,
+        until: Instant,
+    ) -> Result<Self, String> {
+        let attempt = Arc::new(Attempt::default());
+        {
+            let mut attempts = lock_mutex(&cohort.attempts);
             cohort.check()?;
-            match lane.from_wire.try_recv() {
-                Ok(packet) => {
+            if attempts.len() >= usize::from(ctx.run.profile.active_lanes()) {
+                return Err("daemon multi-active: socket quota exhausted".into());
+            }
+            attempts.push(Arc::clone(&attempt));
+        }
+        let (channels, io) = lane_channels(cohort, &attempt);
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let control = Arc::clone(&attempt);
+        let worker = thread::Builder::new()
+            .name("boreas-lane".into())
+            .spawn_scoped(scope, move || {
+                let _guard = WorkerGuard(ctx.cohort);
+                let result = run_lane(ctx, &control, opening, until, &io, ready_tx);
+                if let Err(Failure::Terminal(reason)) = &result
+                    && !ctx.cohort.stopped.load(Ordering::Acquire)
+                {
+                    // Keep opaque TLS failures terminal even near a timeout.
+                    // The transport's own deadline guards report typed timeouts.
+                    ctx.cohort.fail(format!("daemon multi-active: {reason}"));
+                }
+                if result.is_err() {
+                    control.interrupt();
+                }
+                drop(lock_mutex(&control.socket).take());
+                result
+            });
+        match worker {
+            Ok(worker) => Ok(Self {
+                attempt,
+                channels,
+                ready,
+                worker,
+                until,
+            }),
+            Err(e) => {
+                cohort.forget(&attempt);
+                Err(format!("daemon multi-active: cannot spawn lane: {e}"))
+            }
+        }
+    }
+
+    fn join(self, cohort: &Cohort) -> Result<Result<(), Failure>, String> {
+        let result = self
+            .worker
+            .join()
+            .map_err(|_| "daemon multi-active: lane panicked".to_string());
+        cohort.forget(&self.attempt);
+        result
+    }
+}
+
+struct Active<'scope> {
+    task: Task<'scope>,
+    id: CircuitId,
+    retired: bool,
+}
+
+fn pool_error(error: PoolError) -> String {
+    format!("daemon multi-active: pool rejected lane/flow operation: {error:?}")
+}
+
+struct Dispatch<'a, 'scope> {
+    run: &'a Run<'a>,
+    cohort: &'a Arc<Cohort>,
+    pool: CircuitPool,
+    lanes: Vec<Option<Active<'scope>>>,
+    pending: Option<Task<'scope>>,
+    retry_at: Instant,
+    generation: u64,
+    nonce: [u8; 16],
+    mtu: u16,
+    identity: BusinessIdentity,
+    edge: bool,
+}
+
+impl<'scope> Dispatch<'_, 'scope> {
+    fn publish(&self) {
+        let count = self
+            .lanes
+            .iter()
+            .flatten()
+            .filter(|lane| !lane.retired)
+            .count() as u64;
+        Live::connections(self.run.counters, self.edge).store(count, Ordering::SeqCst);
+        self.run
+            .counters
+            .connected
+            .store(count != 0, Ordering::SeqCst);
+    }
+
+    fn maintain<'env>(
+        &mut self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        ctx: &'scope WorkerContext<'env>,
+        deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        let cohort = self.cohort;
+        let mut changed = false;
+        for (index, slot) in self.lanes.iter_mut().enumerate() {
+            let Some(lane) = slot else {
+                continue;
+            };
+            let attempt = &lane.task.attempt;
+            if !lane.retired {
+                attempt.expire_if_stalled();
+            }
+            // A worker can time out while racing the final admission bit.
+            // It never leaves a published ready lane with no worker.
+            let lost = attempt.lost.load(Ordering::Acquire);
+            if !lane.retired && (lost || lane.task.worker.is_finished()) {
+                if cohort.peer_closed.load(Ordering::Acquire) != 0 {
+                    continue;
+                }
+                cohort.check()?;
+                if !lost {
+                    attempt.lose();
+                }
+                self.pool.invalidate_lane(lane.id).map_err(pool_error)?;
+                lane.retired = true;
+                self.run.counters.multi_active_lanes[index]
+                    .state
+                    .fetch_and(!1, Ordering::Release);
+                changed = true;
+                self.retry_at = Instant::now() + REPLACEMENT_RETRY;
+            }
+            if lane.retired && lane.task.worker.is_finished() {
+                let lane = slot.take().expect("retired lane still occupies slot");
+                let result = lane.task.join(cohort)?;
+                cohort.check()?;
+                if let Err(Failure::Terminal(reason)) = result {
+                    return Err(reason);
+                }
+                self.pool.release_lane(lane.id).map_err(pool_error)?;
+                lock_mutex(&cohort.versions)[index]
+                    .as_mut()
+                    .expect("admitted version")
+                    .vacant = true;
+            }
+        }
+        if changed {
+            self.publish();
+        }
+        if cohort.peer_closed.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        // The coordinator never blocks on dial, TLS, or an unfinished worker.
+        if let Some(task) = &self.pending {
+            if task.worker.is_finished() {
+                let result = self.pending.take().expect("pending task").join(cohort)?;
+                cohort.check()?;
+                match result {
+                    Err(Failure::Transport(reason)) => {
+                        eprintln!("daemon multi-active: replacement transport: {reason}")
+                    }
+                    Err(Failure::Terminal(reason)) => return Err(reason),
+                    Ok(()) => {
+                        return Err(
+                            "daemon multi-active: replacement ended before admission".into()
+                        );
+                    }
+                }
+                self.retry_at = Instant::now() + REPLACEMENT_RETRY;
+            } else if Instant::now() >= task.until {
+                // The worker checks the same absolute deadline even while not
+                // registered (bounded connect or nonblocking listener polling).
+                task.attempt.lose();
+            } else if let Ok(ready) = task.ready.try_recv() {
+                cohort.forward(self.run.policy_window)?;
+                let index = usize::from(ready.ordinal);
+                let version =
+                    lock_mutex(&cohort.versions)[index].ok_or("missing admitted lane version")?;
+                if ready.nonce != self.nonce
+                    || ready.identity != self.identity
+                    || !version.vacant
+                    || ready.generation <= version.generation
+                    || ready.id == version.anchor
+                    || ready.id == version.last_id
+                {
+                    return Err(
+                        "daemon multi-active: replacement is not fresh in the authenticated cohort"
+                            .into(),
+                    );
+                }
+                self.pool.reserve_lane(ready.id).map_err(pool_error)?;
+                self.pool.mark_ready(ready.id).map_err(pool_error)?;
+                let task = self.pending.take().expect("ready task");
+                task.attempt.ready.store(true, Ordering::Release);
+                self.lanes[index] = Some(Active {
+                    task,
+                    id: ready.id,
+                    retired: false,
+                });
+                lock_mutex(&cohort.versions)[index] = Some(Version {
+                    generation: ready.generation,
+                    last_id: ready.id,
+                    vacant: false,
+                    ..version
+                });
+                self.run.counters.multi_active_lanes[index]
+                    .state
+                    .store(ready.generation << 1 | 1, Ordering::Release);
+                self.publish();
+            }
+        }
+        if self.pending.is_none()
+            && Instant::now() >= self.retry_at
+            && let Some(ordinal) = self.lanes.iter().position(Option::is_none)
+        {
+            let offer = if self.edge {
+                self.generation = self
+                    .generation
+                    .checked_add(1)
+                    .filter(|generation| *generation <= u64::MAX >> 1)
+                    .ok_or("daemon multi-active: exhausted replacement generations")?;
+                let version =
+                    lock_mutex(&cohort.versions)[ordinal].ok_or("missing admitted lane version")?;
+                Some(Replacement {
+                    ordinal: ordinal as u8,
+                    generation: self.generation,
+                    anchor: version.anchor,
+                })
+            } else {
+                None
+            };
+            let until = (Instant::now() + STARTUP_LIMIT).min(self.run.policy_window.deadline());
+            let until = deadline.map_or(until, |stop| until.min(stop));
+            let opening = Opening::Replace {
+                nonce: self.nonce,
+                count: self.lanes.len() as u8,
+                mtu: self.mtu,
+                offer,
+            };
+            self.pending = Some(Task::spawn(scope, ctx, cohort, opening, until)?);
+        }
+        Ok(())
+    }
+
+    fn forward<'env>(
+        &mut self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        ctx: &'scope WorkerContext<'env>,
+        deadline: Option<Instant>,
+    ) -> Result<&'static str, String> {
+        let run = self.run;
+        let cohort = self.cohort;
+        let tun_fd = run
+            .tun
+            .raw_fd()
+            .ok_or("multi-active requires real Linux TUN")?;
+        let io = run.tun.packet_io();
+        let mut scratch = vec![0; run.mtu + 1];
+        let mut peer_close = None;
+        loop {
+            cohort.forward(run.policy_window)?;
+            let closed = usize::from(cohort.peer_closed.load(Ordering::Acquire));
+            if closed != 0 {
+                let (expected, until) = *peer_close.get_or_insert_with(|| {
+                    (
+                        self.lanes
+                            .iter()
+                            .flatten()
+                            .filter(|lane| !lane.retired)
+                            .count(),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                });
+                // A clean close is a cohort shutdown, not a replacement trigger.
+                // Never hide a second lane's unexpected loss behind close_notify.
+                if self
+                    .lanes
+                    .iter()
+                    .flatten()
+                    .any(|lane| !lane.retired && lane.task.attempt.lost.load(Ordering::Acquire))
+                {
+                    return Err("daemon multi-active: transport loss during cohort close".into());
+                }
+                if closed == expected {
+                    return Ok("peer_closed_cleanly");
+                }
+                if Instant::now() >= until {
+                    return Err("daemon multi-active: lane close left an incomplete cohort".into());
+                }
+                thread::sleep(TICK);
+                continue;
+            }
+            if deadline.is_some_and(|until| Instant::now() >= until) {
+                return Ok("max_seconds_reached");
+            }
+            self.maintain(scope, ctx, deadline)?;
+            let mut progressed = false;
+            for (index, lane) in self
+                .lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, lane)| lane.as_ref().map(|lane| (index, lane)))
+            {
+                let usable = || {
+                    !lane.retired
+                        && !lane.task.attempt.lost.load(Ordering::Acquire)
+                        && cohort.peer_closed.load(Ordering::Acquire) == 0
+                };
+                if !usable() {
+                    continue;
+                }
+                if let Ok(packet) = lane.task.channels.from_wire.try_recv() {
                     progressed = true;
-                    match pool.accept_inbound(ids[index], &packet) {
+                    if !usable() {
+                        continue;
+                    }
+                    match self.pool.accept_inbound(lane.id, &packet) {
                         Ok(_) => {}
-                        // A bounded table may become full asymmetrically. No
-                        // flow is evicted, and an unknown non-SYN is never bound.
-                        Err(PoolError::FlowLimit | PoolError::UnknownFlow) => continue,
-                        Err(e) => {
-                            return Err(format!(
-                                "daemon multi-active: refused inbound lane/flow: {e:?}"
-                            ));
-                        }
+                        Err(
+                            PoolError::FlowLimit | PoolError::UnknownFlow | PoolError::FlowFailed,
+                        ) => continue,
+                        Err(e) => return Err(pool_error(e)),
                     }
                     cohort.forward(run.policy_window)?;
-                    if cohort.peer_closed.load(Ordering::Acquire) != 0 {
-                        continue 'dispatch;
+                    if !usable() {
+                        continue;
                     }
                     match io.write_packet(&packet) {
                         Ok(()) => {
@@ -638,63 +1151,47 @@ fn dispatch(
                                 .rx_bytes
                                 .fetch_add(packet.len() as u64, Ordering::Relaxed);
                         }
-                        Err(TunError::QueueFull) => {} // TCP retries on its pinned lane.
+                        Err(TunError::QueueFull) => {}
                         Err(e) => {
                             return Err(format!("daemon multi-active: TUN write failed: {e:?}"));
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    if cohort.peer_closed.load(Ordering::Acquire) != 0 {
-                        continue 'dispatch;
-                    }
-                    cohort.check()?;
-                    return Err("daemon multi-active: inbound lane worker disconnected".into());
-                }
             }
-        }
-        // The existing poll helper checks the second fd for terminal TUN
-        // events. The first fd is the same nonblocking TUN; ignore its result.
-        let wait = if progressed { Duration::ZERO } else { TICK };
-        if poll_io(tun_fd, Some(tun_fd), PathPoll::Read, wait)?.tun_readable
-            && let Some(packet) = io
-                .read_packet_with_scratch(&mut scratch)
-                .map_err(|e| format!("daemon multi-active: TUN read failed: {e:?}"))?
-        {
-            let packet = packet.as_ref();
-            let (_, id) = match pool.route_outbound(packet) {
-                Ok(binding) => binding,
-                Err(
-                    PoolError::PacketDenied(_)
-                    | PoolError::NotTcp
-                    | PoolError::Fragmented
-                    | PoolError::InvalidTcpHeader
-                    | PoolError::UnknownFlow
-                    | PoolError::FlowLimit,
-                ) => continue,
-                Err(e) => {
-                    return Err(format!(
-                        "daemon multi-active: outbound lane unavailable: {e:?}"
-                    ));
+            let wait = if progressed { Duration::ZERO } else { TICK };
+            if poll_io(tun_fd, Some(tun_fd), PathPoll::Read, wait)?.tun_readable
+                && let Some(packet) = io
+                    .read_packet_with_scratch(&mut scratch)
+                    .map_err(|e| format!("daemon multi-active: TUN read failed: {e:?}"))?
+            {
+                cohort.forward(run.policy_window)?;
+                if cohort.peer_closed.load(Ordering::Acquire) != 0 {
+                    continue;
                 }
-            };
-            let index = ids
-                .iter()
-                .position(|lane| *lane == id)
-                .ok_or("daemon multi-active: pool selected an unowned lane")?;
-            cohort.forward(run.policy_window)?;
-            if cohort.peer_closed.load(Ordering::Acquire) != 0 {
-                continue 'dispatch;
-            }
-            match lanes[index].to_wire.try_send(packet.to_vec()) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => {
-                    if cohort.peer_closed.load(Ordering::Acquire) != 0 {
-                        continue 'dispatch;
-                    }
-                    cohort.check()?;
-                    return Err("daemon multi-active: outbound lane worker disconnected".into());
+                let packet = packet.as_ref();
+                let (_, id) = match self.pool.route_outbound(packet) {
+                    Ok(binding) => binding,
+                    Err(
+                        PoolError::PacketDenied(_)
+                        | PoolError::NotTcp
+                        | PoolError::Fragmented
+                        | PoolError::InvalidTcpHeader
+                        | PoolError::UnknownFlow
+                        | PoolError::FlowLimit
+                        | PoolError::FlowFailed
+                        | PoolError::NoReadyLane,
+                    ) => continue,
+                    Err(e) => return Err(pool_error(e)),
+                };
+                let lane = self
+                    .lanes
+                    .iter()
+                    .flatten()
+                    .find(|lane| lane.id == id)
+                    .ok_or("daemon multi-active: pool selected an unowned lane")?;
+                if !lane.retired && !lane.task.attempt.lost.load(Ordering::Acquire) {
+                    // Backpressure drops on the pinned lane; never spill into a sibling.
+                    let _ = lane.task.channels.to_wire.try_send(packet.to_vec());
                 }
             }
         }
@@ -717,15 +1214,7 @@ struct Live<'a> {
     edge: bool,
 }
 
-impl<'a> Live<'a> {
-    fn publish(counters: &'a LiveCounters, edge: bool, count: u8) -> Self {
-        counters.multi_active_count.store(count, Ordering::Release);
-        Self::connections(counters, edge).store(u64::from(count), Ordering::SeqCst);
-        counters.path_epoch.store(1, Ordering::SeqCst);
-        counters.connected.store(true, Ordering::SeqCst);
-        Self { counters, edge }
-    }
-
+impl Live<'_> {
     fn connections(counters: &LiveCounters, edge: bool) -> &AtomicU64 {
         if edge {
             &counters.outbound_upstreams
@@ -738,6 +1227,9 @@ impl<'a> Live<'a> {
 impl Drop for Live<'_> {
     fn drop(&mut self) {
         self.counters.connected.store(false, Ordering::SeqCst);
+        for lane in &self.counters.multi_active_lanes {
+            lane.state.fetch_and(!1, Ordering::Release);
+        }
         Self::connections(self.counters, self.edge).store(0, Ordering::SeqCst);
     }
 }
@@ -783,9 +1275,15 @@ fn admit(
         check_identity_revocations(&mut store, run.status_path, slots)?;
         *lock_mutex(&cohort.freshness) = Some((deadline, utc));
     }
-    remaining_startup(cohort, until)?;
+    remaining(cohort, until).map_err(failure_reason)?;
     cohort.forward(run.policy_window)?;
     Ok((pool, ids, identity))
+}
+
+fn failure_reason(failure: Failure) -> String {
+    match failure {
+        Failure::Transport(reason) | Failure::Terminal(reason) => reason,
+    }
 }
 
 pub(super) fn run(endpoint: Endpoint, run: Run<'_>) -> Result<(), String> {
@@ -840,9 +1338,7 @@ pub(super) fn run(endpoint: Endpoint, run: Run<'_>) -> Result<(), String> {
         admission: &admission,
         run: &lane_policy,
         cohort: &cohort,
-        until,
         slots,
-        clock,
     };
     let cancel = Arc::clone(&cohort);
     let refresh = Arc::clone(&cohort);
@@ -858,60 +1354,36 @@ pub(super) fn run(endpoint: Endpoint, run: Run<'_>) -> Result<(), String> {
     );
     let result = thread::scope(|scope| {
         let _cancel_before_join = CancelOnDrop(&cohort);
-        let mut dispatchers = Vec::with_capacity(usize::from(count));
+        let mut tasks = Vec::with_capacity(usize::from(count));
         let mut readiness = Vec::with_capacity(usize::from(count));
         for ordinal in 0..count {
-            // Bounded serial admission (one in-progress handshake). Before
-            // business, only the fixed count of sockets can be accepted/dialed.
-            let tcp = endpoint.connect_socket(&run, &cohort, until)?;
-            let interrupt = cohort.register(&tcp)?;
-            let (dispatcher, io) = lane_channels(&cohort);
-            let liveness = Arc::clone(&dispatcher.progress_deadline);
-            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-            let membership = Membership {
+            let opening = Opening::Initial(Membership {
                 nonce,
                 ordinal,
                 count,
                 mtu,
-            };
-            let ctx = &context;
-            thread::Builder::new()
-                .name(format!("boreas-lane-{}", ordinal + 1))
-                .spawn_scoped(scope, move || {
-                    let _guard = WorkerGuard(ctx.cohort);
-                    let result =
-                        run_lane(ctx, tcp, &interrupt, membership, &io, ready_tx, &liveness);
-                    if let Err(reason) = result
-                        && !ctx.cohort.stopped.load(Ordering::Acquire)
-                    {
-                        ctx.cohort.fail(format!(
-                            "daemon multi-active: lane {}: {reason}",
-                            ordinal + 1
-                        ));
-                    }
-                    ctx.cohort.finished.fetch_add(1, Ordering::Release);
-                })
-                .map_err(|e| format!("daemon multi-active: cannot spawn lane: {e}"))?;
-            // Never wait unboundedly on a partial encrypted membership record.
-            // All earlier sockets remain registered while this lane is pending.
+            });
+            let task = Task::spawn(scope, &context, &cohort, opening, until)?;
             let ready = loop {
-                let remaining = remaining_startup(&cohort, until)?;
-                match ready_rx.recv_timeout(TICK.min(remaining)) {
+                let remaining = remaining(&cohort, until).map_err(failure_reason)?;
+                match task.ready.recv_timeout(TICK.min(remaining)) {
                     Ok(ready) => break ready,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let result = task.join(&cohort)?;
                         cohort.check()?;
-                        return Err(
-                            "daemon multi-active: lane worker disconnected before admission".into(),
-                        );
+                        return Err(result.err().map_or_else(
+                            || "initial lane exited before admission".into(),
+                            failure_reason,
+                        ));
                     }
                 }
             };
             nonce = Some(ready.nonce);
-            dispatchers.push(dispatcher);
+            tasks.push(task);
             readiness.push(ready);
         }
-        let (mut pool, ids, identity) = admit(&run, &cohort, readiness, until, edge, slots)?;
+        let (pool, ids, identity) = admit(&run, &cohort, readiness, until, edge, slots)?;
         let deadline = max_duration
             .map(|duration| {
                 Instant::now()
@@ -919,18 +1391,53 @@ pub(super) fn run(endpoint: Endpoint, run: Run<'_>) -> Result<(), String> {
                     .ok_or("daemon multi-active: invalid --max-seconds")
             })
             .transpose()?;
-        let live = Live::publish(run.counters, edge, count);
+        let lanes = tasks
+            .into_iter()
+            .zip(ids)
+            .enumerate()
+            .map(|(index, (task, id))| {
+                lock_mutex(&cohort.versions)[index] = Some(Version {
+                    anchor: id,
+                    last_id: id,
+                    generation: 1,
+                    vacant: false,
+                });
+                run.counters.multi_active_lanes[index]
+                    .state
+                    .store(3, Ordering::Release);
+                task.attempt.ready.store(true, Ordering::Release);
+                Some(Active {
+                    task,
+                    id,
+                    retired: false,
+                })
+            })
+            .collect();
+        let live = Live {
+            counters: run.counters,
+            edge,
+        };
+        let mut dispatch = Dispatch {
+            run: &run,
+            cohort: &cohort,
+            pool,
+            lanes,
+            pending: None,
+            retry_at: Instant::now(),
+            generation: 1,
+            nonce: nonce.expect("admitted cohort has a nonce"),
+            mtu,
+            identity,
+            edge,
+        };
+        run.counters.path_epoch.store(1, Ordering::SeqCst);
+        run.counters
+            .multi_active_count
+            .store(count, Ordering::Release);
+        dispatch.publish();
         cohort.running.store(true, Ordering::Release);
-        let result = dispatch(
-            &run,
-            &cohort,
-            &mut pool,
-            &dispatchers,
-            &ids,
-            clock,
-            deadline,
-        );
-        pool.revoke();
+        let result = dispatch.forward(scope, &context, deadline);
+        dispatch.pool.revoke();
         drop(live);
         let reason = match result {
             Ok(reason) => reason,
@@ -940,15 +1447,23 @@ pub(super) fn run(endpoint: Endpoint, run: Run<'_>) -> Result<(), String> {
             }
         };
         cohort.draining.store(true, Ordering::Release);
+        if let Some(task) = &dispatch.pending {
+            task.attempt.lose();
+        }
         let close_until = Instant::now() + Duration::from_secs(1);
-        while cohort.finished.load(Ordering::Acquire) != count && Instant::now() < close_until {
+        while dispatch
+            .lanes
+            .iter()
+            .flatten()
+            .any(|lane| !lane.task.worker.is_finished())
+        {
             cohort.check()?;
+            if Instant::now() >= close_until {
+                return Err("daemon multi-active: lane workers exceeded shutdown grace".into());
+            }
             thread::sleep(TICK);
         }
         cohort.check()?;
-        if cohort.finished.load(Ordering::Acquire) != count {
-            return Err("daemon multi-active: lane workers exceeded shutdown grace".into());
-        }
         Ok((identity, reason))
     });
     // All scoped workers are joined and their admission credits are released.
@@ -1012,7 +1527,8 @@ mod tests {
     #[test]
     fn saturation_keeps_the_lane_bound_and_cancellation_stops_queue_access() {
         let cohort = Arc::new(Cohort::default());
-        let (dispatcher, lane) = lane_channels(&cohort);
+        let attempt = Arc::new(Attempt::default());
+        let (dispatcher, lane) = lane_channels(&cohort, &attempt);
         for sequence in 0..QUEUE_PACKETS {
             lane.write_packet(&[sequence as u8]).unwrap();
             dispatcher.to_wire.try_send(vec![sequence as u8]).unwrap();
@@ -1031,33 +1547,91 @@ mod tests {
         }
         assert_eq!(dispatcher.from_wire.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(lane.read_packet(), Ok(None));
+        attempt.lose();
+        dispatcher.to_wire.try_send(vec![1]).unwrap();
+        assert_eq!(lane.read_packet(), Ok(None));
+        assert_eq!(lane.write_packet(&[1]), Ok(()));
+        assert_eq!(dispatcher.from_wire.try_recv(), Err(TryRecvError::Empty));
         cohort.cancel();
         assert_eq!(lane.read_packet(), Err(TunError::QueueClosed));
         assert_eq!(lane.write_packet(&[1]), Err(TunError::QueueClosed));
     }
 
     #[test]
-    fn joint_cancellation_interrupts_all_owned_sockets_and_rejects_late_registration() {
+    fn replacement_membership_binds_slot_and_rejects_corrupted_wire() {
+        let nonce = [0x37; 16];
+        let offer = Replacement {
+            ordinal: 2,
+            generation: 7,
+            anchor: CircuitId([0x52; 16]),
+        };
+        let wire = offer.record(nonce, 4, 1360, 0);
+        assert_eq!(Replacement::parse(wire, nonce, 4, 1360).unwrap(), offer);
+        for offset in [0, 5, 7, 8, 10] {
+            let mut wrong = wire;
+            wrong[offset] ^= 1;
+            assert!(Replacement::parse(wrong, nonce, 4, 1360).is_err());
+        }
+        assert!(Replacement::parse(offer.record(nonce, 4, 1360, 1), nonce, 4, 1360).is_err());
+    }
+
+    #[test]
+    fn only_typed_transport_errors_permit_replacement() {
+        assert!(matches!(
+            business_failure(
+                "test",
+                PacketPathError::CircuitIo(ErrorKind::ConnectionReset)
+            ),
+            Failure::Transport(_)
+        ));
+        for err in [
+            PacketPathError::CircuitIo(ErrorKind::InvalidData),
+            PacketPathError::CircuitProtocol,
+            PacketPathError::TruncatedFrame,
+            PacketPathError::IdentityMismatch,
+            PacketPathError::HostQueueClosed,
+        ] {
+            assert!(matches!(
+                business_failure("test", err),
+                Failure::Terminal(_)
+            ));
+        }
+        assert!(matches!(
+            tunnel_failure("test", TunnelError::InnerTls("e2e handshake")),
+            Failure::Terminal(_)
+        ));
+    }
+
+    #[test]
+    fn local_interrupt_does_not_cancel_sibling_socket() {
         let cohort = Cohort::default();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut peers = Vec::new();
-        let mut interrupts = Vec::new();
-        for _ in 0..HARD_PAIR_CAP {
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
             let tcp = TcpStream::connect(addr).unwrap();
             let (peer, _) = listener.accept().unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            interrupts.push(cohort.register(&tcp).unwrap());
+            let attempt = Arc::new(Attempt::default());
+            cohort.register(&attempt, &tcp).unwrap();
+            lock_mutex(&cohort.attempts).push(Arc::clone(&attempt));
             peers.push(peer);
+            attempts.push(attempt);
         }
-        let late = TcpStream::connect(addr).unwrap();
-        assert!(cohort.register(&late).is_err());
-        cohort.fail("lane fault".into());
-        assert_eq!(cohort.check(), Err("lane fault".into()));
-        for peer in &mut peers {
-            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-        }
-        assert!(cohort.register(&late).is_err());
-        drop(interrupts);
+        attempts[0].lose();
+        assert_eq!(peers[0].read(&mut [0]).unwrap(), 0);
+        assert_eq!(cohort.check(), Ok(()));
+        lock_mutex(&attempts[1].socket)
+            .as_ref()
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let mut value = [0];
+        peers[1].read_exact(&mut value).unwrap();
+        assert_eq!(value, *b"x");
+        cohort.fail("terminal lane fault".into());
+        assert_eq!(cohort.check(), Err("terminal lane fault".into()));
+        assert_eq!(peers[1].read(&mut [0]).unwrap(), 0);
     }
 }
