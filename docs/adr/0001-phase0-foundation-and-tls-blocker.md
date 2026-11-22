@@ -2,7 +2,7 @@
 
 - Status: Accepted as current implementation boundary; not an architecture freeze
 - Date: 2026-11-14
-- Plan: [BOREAS Master Plan v1.11.0](../plans/BOREAS-MASTER-PLAN-v1.11.0.md), especially §§2, 4, 5 and 11
+- Plan: BOREAS Master Plan v1.11.0, especially §§2, 4, 5 and 11
 
 ## Context
 

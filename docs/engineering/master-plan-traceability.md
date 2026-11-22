@@ -1,7 +1,7 @@
 # 全计划门禁追溯(Phase 0–5 × 24 gates)
 
 本文是 **Phase 0–5 完整计划**的逐门禁追溯,不是完成报告,也不替代任何验收。规范性基线是
-[BOREAS-MASTER-PLAN-v1.11.0.md](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) §11(第 820–875 行)。
+BOREAS-MASTER-PLAN-v1.11.0.md §11(第 820–875 行)。
 目的:纠正“只看最近 CI 是否绿”的追踪缺口——每个门禁必须同时回答**属于哪个 Phase、实现入口在哪、
 有哪些精确到 SHA/run 的证据、还缺哪些 runtime/外部验收**。
 

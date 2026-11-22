@@ -2,7 +2,7 @@
 
 本文规定开发版的呈现和未来生产发布的必要流程，不批准任何当前生产版本。**当前软件为 `0.1.0` 开发基础；没有生产发布获批，所有适用门禁 open。** 当前 `boreas` 没有 `daemon`、`pki`、`bench`、`probe` 命令，默认 artifact 没有 TLS 后端。WSS/E2E 库 API 不是完整 CLI VPN，CLI smoke 不是生产功能验证。
 
-规范依据：[安全主计划](<../plans/BOREAS-MASTER-PLAN-v1.11.0.md>) §2.4/§10/§11、[平台与发布门禁](<../engineering/platform-release-gates.md>)、[生产账本](<../engineering/gates.json>)、[发布工具说明](<../../tools/release/README.md>)。实际部署边界见[部署教程](<../deployment/README.md>)。
+规范依据：安全主计划 §2.4/§10/§11、[平台与发布门禁](<../engineering/platform-release-gates.md>)、[生产账本](<../engineering/gates.json>)、[发布工具说明](<../../tools/release/README.md>)。实际部署边界见[部署教程](<../deployment/README.md>)。
 
 ## 1. 版本与渠道
 
@@ -143,7 +143,7 @@ Emoji 数据库，结构通过也不证明内容真实、安全、签名或门�
 
 ## 5. 未来生产准入：全部必要，当前均不视为满足
 
-生产候选必须实现完整 daemon/数据面，并收齐[主计划](<../plans/BOREAS-MASTER-PLAN-v1.11.0.md>) Phase 0–5 的所有适用门禁：密码/独立互操作、帧、数据、资源/性能、注册/授权/撤权/DoS、设备/MTU/DNS/sandbox/升级、目录/前缀/故障切换、供应链/UI、E2E/无降级/成本、外部审查和运维演练。
+生产候选必须实现完整 daemon/数据面，并收齐主计划 Phase 0–5 的所有适用门禁：密码/独立互操作、帧、数据、资源/性能、注册/授权/撤权/DoS、设备/MTU/DNS/sandbox/升级、目录/前缀/故障切换、供应链/UI、E2E/无降级/成本、外部审查和运维演练。
 
 每项证据必须绑定同一完整 commit，含不可变 Actions URL、命令、工具/feature/环境、预期/实际结果及负样本、报告 SHA-256、独立审核人和 UTC 时间。账本验证器只检查 metadata 一致，不证明测量或审计为真，不证明 reviewer/verifier 真正独立。独立 crypto/protocol 审计、fuzz/依赖审计以及所有阻塞/高危问题闭环不能由 CI 自证。
 

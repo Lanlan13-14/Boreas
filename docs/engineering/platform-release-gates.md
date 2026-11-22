@@ -6,7 +6,7 @@ routing, DNS service or data plane. The workflows described here run real
 native builds, execute the real CLI, verify Linux static linkage, exercise real
 native TUN/Wintun/utun device tests where the crate provides them, and produce
 unsigned development archives. They do **not** pass the master-plan
-[Phase 0–5 gates](../plans/BOREAS-MASTER-PLAN-v1.11.0.md#十一实施路线图与发布门禁)
+Phase 0–5 gates
 or the common production exit conditions.
 
 Two statements are load-bearing:

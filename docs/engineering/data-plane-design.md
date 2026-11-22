@@ -1,6 +1,6 @@
 # Data-plane state primitives: limits and integration boundary
 
-Historical primitive-design note: the sections below describe isolated state types, not the complete current product. The Linux point-to-point daemon now has a real WSS/hop/E2E TLS and TUN path; that does not complete these primitives' topology-wide integration or the production resource audit. All plan gates remain open; see [the v1.11 master plan](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) §11 and [the implementation gate ledger](implementation-status.md).
+Historical primitive-design note: the sections below describe isolated state types, not the complete current product. The Linux point-to-point daemon now has a real WSS/hop/E2E TLS and TUN path; that does not complete these primitives' topology-wide integration or the production resource audit. All plan gates remain open; see the v1.11 master plan §11 and [the implementation gate ledger](implementation-status.md).
 
 ## Short daemon resource observations (candidate, pending Actions)
 

@@ -2,7 +2,7 @@
 
 - **状态：Proposed（Candidate）——未 Accepted、未 Frozen。**
 - 日期：2026-11-15
-- 适用计划：[BOREAS Master Plan v1.11.0](../plans/BOREAS-MASTER-PLAN-v1.11.0.md)，主要为 §1.1、§2.3、§4、§6.1–§6.2、第十一节 Phase 0 与 `G-CRYPTO`
+- 适用计划：BOREAS Master Plan v1.11.0，主要为 §1.1、§2.3、§4、§6.1–§6.2、第十一节 Phase 0 与 `G-CRYPTO`
 - 关系：不替代 [ADR 0001](0001-phase0-foundation-and-tls-blocker.md)。ADR 0001 确定的「无后端选型、无线格式冻结」边界在其被后续 Accepted ADR 明确替代前继续有效；本文只把候选、证据边界与接受条件写死。
 - 证据依据：[2026-11-14 密码/TLS 后端能力核查](../research/phase0-crypto-backend-assessment-2026-11-14.md)、[2026-11-15 TLS 双实现后端调研](../research/phase0-tls-backend-interop-2026-11-15.md)。两文均为源码级/同实现 PoC 级观察快照，不是本 ADR 作者复跑的互操作或静态构建证据。
 

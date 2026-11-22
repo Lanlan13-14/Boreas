@@ -2,7 +2,7 @@
 
 - Status: Proposed candidate deviation; pending plan/registry review. Not approved, not frozen.
 - Date: 2026-11-15
-- Plan: [BOREAS Master Plan v1.11.0](../plans/BOREAS-MASTER-PLAN-v1.11.0.md), §5.3 signature rules and §5.4 Control subnet registry
+- Plan: BOREAS Master Plan v1.11.0, §5.3 signature rules and §5.4 Control subnet registry
 - Related: `docs/protocol/control-messages-v1.md`, `docs/protocol/management-objects-v1.md`, `crates/boreas-proto/src/messages.rs`
 
 ## Context

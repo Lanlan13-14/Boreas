@@ -4,14 +4,14 @@
 
 **结论：已有大量策略、解析器、状态机、设备适配器和部分真实密码/传输库接口，但尚不能称为可部署的 Boreas VPN 产品；Phase 0–5 均未验收，生产发布仍被阻止。** 单元测试数量、文档覆盖率、模拟流量哈希、静态 CLI 构建，均不能代替真实守护进程的安全数据路径。
 
-本次静态审查覆盖 [v1.11.0 主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) 925 行、[门禁账本](gates.json)、同期工程状态文档和下列引用源码；没有运行编译、测试、格式化或验证脚本。
+本次静态审查覆盖 v1.11.0 主计划 925 行、[门禁账本](gates.json)、同期工程状态文档和下列引用源码；没有运行编译、测试、格式化或验证脚本。
 
 ### 版本快照与并发合并限制
 
 - 审查开始 HEAD：`dac120a5029bb3e6b430bd67670c4df6085fed26`，当时工作树已有修改和未跟踪实现，故**不是干净提交审计**。
 - `2026-11-15T12:42:56+08:00` 再采样 HEAD：`22d268c8018d81512a396e88f2e780b0ee0ed704`；MERGE_HEAD：`8457d0637c5714c08b73163b80e5e3e371f29c00`。当时合并未完成，索引有 10 个未解决路径，涉及 PKI、协议、supervisor、原生 TUN 和 tunnel 的清单/导出/TLS 适配器。`12:46:45+08:00` 完稿检查时 HEAD 与 MERGE_HEAD 仍相同。
 - 冲突标记属于**合并中的瞬时状态**，不作为已经提交的产品缺陷，也不据此推断最终代码编译失败。本报告引用的是所读取的工作树片段；合并完成后必须对最终 diff、模块导出、feature、依赖和调用方复审。
-- [主计划](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) SHA-256：`23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`。
+- 主计划 SHA-256：`23969614DD3F027EF8828B831F170BBBCAA3C29C99E93BEC20F5983F685086AA`。
 - [门禁账本](gates.json) SHA-256：`C0FC1C48B73ADB917C33272F7E5BC3530A96F2FE453275ABFB45D865BFC19658`。
 - [CLI 入口](../../crates/boreas-cli/src/main.rs) SHA-256：`A1081A396141B787A49FE7F28923F0106DA65372B46F6448BD9AE5E222994C70`。
 - [link runtime](../../crates/boreas-tunnel/src/runtime.rs) SHA-256：`860739F75EB5687E2212E4E034A92FB77BD501DE0ED0E1FC59A0F4D57BFD769B`。
@@ -51,7 +51,7 @@
 
 ## 3. Phase 0–5 细粒度需求—实现—集成—证据矩阵
 
-下表“已有测试”只表示源码或既有状态记录中有相关测试切片；**每行 gate 均未验收**。[主计划路线图](../plans/BOREAS-MASTER-PLAN-v1.11.0.md#L820-L875) 为统一判定标准。
+下表“已有测试”只表示源码或既有状态记录中有相关测试切片；**每行 gate 均未验收**。主计划路线图 为统一判定标准。
 
 ### Phase 0：决策、schema 与密码能力
 
@@ -122,7 +122,7 @@
 ### P0：在扩大实现前先收敛信任和接口
 
 1. **冻结输入，而不是冻结未完成协议。** 合并后记录干净的40位SHA、工作树diff、feature矩阵和证据对应版本；重新检查冲突路径，尤其依赖与模块导出。保持gate open，不把别的提交的绿CI复制到候选提交。
-2. **裁决主计划自身 Lease 大小矛盾。** [主计划Lease行](../plans/BOREAS-MASTER-PLAN-v1.11.0.md#L393-L407) 为4KiB；但两主体各Ed25519+ML-DSA要求仅签名块就6754/9390字节。[ADR0003](../adr/0003-lease-16k-dual-signature-envelope.md#L19-L43) 提议16KiB且尚未批准。应正式批准/否决并统一注册表、编码/decoder、独立向量、目录分页、接收配额、所有调用方；不得删签名凑4KiB。同时批准NodeIdentity新增Ed25519管理键的绑定与offline/CSR PoP/OID设计，不能私下扩schema后称计划已实现。
+2. **裁决主计划自身 Lease 大小矛盾。** 主计划Lease行 为4KiB；但两主体各Ed25519+ML-DSA要求仅签名块就6754/9390字节。[ADR0003](../adr/0003-lease-16k-dual-signature-envelope.md#L19-L43) 提议16KiB且尚未批准。应正式批准/否决并统一注册表、编码/decoder、独立向量、目录分页、接收配额、所有调用方；不得删签名凑4KiB。同时批准NodeIdentity新增Ed25519管理键的绑定与offline/CSR PoP/OID设计，不能私下扩schema后称计划已实现。
 3. **完成真实信任输入→业务许可的单一链路。** [ManagementTrust](../../crates/boreas-pki/src/management.rs#L15-L34) 明确不验证根证书授权链、replay不持久；[SessionPolicy](../../crates/boreas-tunnel/src/session.rs#L47-L69) 仍依赖外部已授权expected_peer/registered等输入。建立不可伪造的verified能力类型和durable trust store，权限/scope→签名→身份代次→freshness→业务gate缺一步即拒绝，不以bool或WriterProof替代。
 4. **在真实E2E交付业务前加入加密应用确认。** [finish_e2e](../../crates/boreas-tunnel/src/e2e.rs#L545-L563) 只检验TLS peer和suite后返回可Read/Write对象，没有§7.1要求的双方身份/代次、net_id、circuit ID、策略、能力交换。此确认应在E2E加密数据内、在任何L3业务之前，不用明文Control声明替代；加跨电路/跨网/代次/策略不一致负测。
 5. **G-CRYPTO产品路径先行。** 后端ADR仍候选；优先让最终Rust/WSS+真实管理身份链在CI双架构跑通严格mTLS正负矩阵、精确协商留证和独立实现互操作，再将其作为后续daemon可信基础，不用OpenSSL CLI自连替代。

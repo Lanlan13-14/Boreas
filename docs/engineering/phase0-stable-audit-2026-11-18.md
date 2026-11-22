@@ -1,6 +1,6 @@
 # Phase 0 稳定版本与 §4.2 标准引用审计（2026-11-18）
 
-范围：主计划 [BOREAS-MASTER-PLAN-v1.11.0.md](../plans/BOREAS-MASTER-PLAN-v1.11.0.md) §4.2
+范围：主计划 BOREAS-MASTER-PLAN-v1.11.0.md §4.2
 （第 241–267 行）的标准引用，以及截至 2026-11-18 的 Rust stable、OpenSSL stable/security release、
 ML-DSA in TLS 的标准状态。本文只做只读审计，不改 source、CI、workflow 或 gate 策略，不把任何
 CVE 标成 waiver，也不声称实现验收或独立审计。

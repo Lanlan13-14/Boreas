@@ -1,6 +1,6 @@
 # Sandbox audit & redacted diagnostics: evidence tooling for G-SANDBOX
 
-Authority: master plan v1.11.0 (`docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md`)
+Authority: master plan v1.11.0 (内部设计规范)
 §9.5 (process 0-UDP and isolation boundary), §10.3 (preflight), §10.4
 (telemetry/console, redacted diagnostics), §10.5 (service unit), and
 Phase 3 gate `G-SANDBOX`. Where this note and the plan disagree, the plan

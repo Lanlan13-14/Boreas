@@ -8,7 +8,7 @@
 //! here verifies a signature, and nothing here is an authority proof: a
 //! `StatusSnapshot` is signed only by the network `StatusSigner`, which is **not**
 //! the `IdentityAuthority`, `NetworkRoot`, `RouteAuthority` or a Core's
-//! `CoreOperationalKey` ([master plan §3.4](../../../docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md)).
+//! `CoreOperationalKey`.
 //! The only consumer, `boreas_pki::status_store`, keeps every revocation entry
 //! fail-closed in production (`StatusStore::open` authorizes no class) and exposes
 //! the accepting path only to crate tests. There is no daemon enablement here.

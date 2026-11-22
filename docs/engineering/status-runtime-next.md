@@ -253,7 +253,7 @@ store 自己也无法检测；这需要外部 monotonic anchor/remote watermark�
 
 - `StatusSnapshot.revocations` 是 `Vec<u8>`（`crates/boreas-proto/src/objects.rs:140-145`），
   只受 `MAX_OBJECT_LEN = 16 KiB` 限制；主计划也只说“各类吊销条目的摘要，分页，单对象 <= 16 KiB”
-  （`docs/plans/BOREAS-MASTER-PLAN-v1.11.0.md:387`），仓库里**没有条目级 wire format**。
+  （内部设计规范第 387 行），仓库里**没有条目级 wire format**。
 - `status_store::snapshot_from_verified`（`status_store.rs:752-790`）只检查
   `ObjectBody::StatusSnapshot(body)` 的窗口/envelope 一致性，**完全没有读 `body.revocations`**；
   `accept_signed_snapshot` 持久化的是整个 raw envelope，`FreshStatus` 也没有 revocation 方法。
