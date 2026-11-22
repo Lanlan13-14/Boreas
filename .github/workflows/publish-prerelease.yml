@@ -754,3 +754,26 @@ jobs:
               --notes-file "$notes" \
               release-bundle/*
           fi
+          git fetch origin release
+          git switch --detach origin/release
+          python3 - "$tag" "$channel" release-manifest.json <<'PY'
+          import json
+          import pathlib
+          import sys
+          tag, channel, path_text = sys.argv[1:]
+          path = pathlib.Path(path_text)
+          document = json.loads(path.read_text(encoding="utf-8"))
+          if channel == "prerelease":
+              document["prerelease"] = tag
+          else:
+              document["stable"] = tag
+          path.write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          git add release-manifest.json
+          if git diff --cached --quiet; then
+            echo "release discovery manifest already points at $tag"
+          else
+            git -c user.name=Boreas -c user.email=boreas@local.invalid \
+              commit -m "Update release discovery manifest to $tag"
+            git push origin HEAD:release
+          fi
