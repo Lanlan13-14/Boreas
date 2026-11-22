@@ -269,7 +269,7 @@ jobs:
             image: alpine:3.22
     steps:
       - name: Download Linux development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-${{ matrix.target }}-${{ github.run_id }}
           path: artifact
@@ -503,37 +503,37 @@ jobs:
           python-version: '3.12'
 
       - name: Download Linux x86_64 development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-x86_64-unknown-linux-musl-${{ github.run_id }}
           path: downloaded/x86_64-unknown-linux-musl
 
       - name: Download Linux aarch64 development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-aarch64-unknown-linux-musl-${{ github.run_id }}
           path: downloaded/aarch64-unknown-linux-musl
 
       - name: Download Windows x86_64 development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-x86_64-pc-windows-msvc-${{ github.run_id }}
           path: downloaded/x86_64-pc-windows-msvc
 
       - name: Download macOS Intel development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-x86_64-apple-darwin-${{ github.run_id }}
           path: downloaded/x86_64-apple-darwin
 
       - name: Download macOS Apple Silicon development artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-development-aarch64-apple-darwin-${{ github.run_id }}
           path: downloaded/aarch64-apple-darwin
 
       - name: Download pq768 development binaries
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boreas-pq768-${{ github.run_id }}
           path: downloaded/pq768
