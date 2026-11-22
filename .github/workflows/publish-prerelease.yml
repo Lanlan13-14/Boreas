@@ -707,6 +707,8 @@ jobs:
               boreas-pq768-linux-x86_64.zip \
               > "SHA256SUMS-${version}"
           )
+          find release-bundle -type f ! -name 'boreas-*' ! -name "SHA256SUMS-${version}" -delete
+          find release-bundle -type f -print
 
       - name: Publish the stable release or prerelease
         shell: bash
