@@ -1,19 +1,42 @@
 //! Endpoint-side §7.2 policy for one authenticated permanent IPv4 VIP pair.
 //!
 //! This module does not open circuits or authorize identities. The caller owns
-//! TLS, packet I/O, global admission and the timing of TCP flow retirement. Use
-//! one pool per node pair across concurrent openings, rotations and teardowns.
-//! Use the VIPs and MTU from the authenticated packet policy, and only reserve
-//! lanes for this exact pair and identity epoch. Never replace the pool while
-//! older lanes still consume resources or older packets can enter the new pool.
+//! TLS, serialized packet I/O and global admission. Use one pool per node pair
+//! across concurrent openings, rotations and teardowns. Both directions must
+//! use the pinned lane's FIFO packet path. Use the authenticated VIPs and MTU,
+//! and reserve lanes only for this exact pair and identity epoch. Never replace
+//! the pool while old lanes or packets can enter the new pool.
 
+mod tcp_close;
+
+use self::tcp_close::{Close, Finish, Segment, close_retry, tcp_checksum};
 use crate::circuit::{CircuitId, DEFAULT_PAIR_CAP, HARD_PAIR_CAP};
 use crate::packet_path::{PacketDeny, PacketPathError, PointToPoint};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::time::{Duration, Instant};
 
-/// Hard per-pair cap on tracked TCP tuples, including failed bindings.
+/// Hard cap on active/failed flows per pair. At most twice the configured
+/// flow limit is retained in total (active/failed plus closed tuple guards).
 pub const MAX_TRACKED_FLOWS: usize = 4096;
+
+// TIME-WAIT-style guard, not a wire TTL. The ordered authenticated lane and
+// the runtime's bounded queues/deadlines are also required; a finite guard
+// cannot reject arbitrary replay forever. Never evict a guard early for room.
+const CLOSE_GUARD: Duration = Duration::from_secs(120);
+
+type GuardKey = (Instant, FlowKey);
+
+#[derive(Debug)]
+enum Flow {
+    Pinned(CircuitId, Close),
+    Failed,
+    Closed {
+        lane: CircuitId,
+        fins: [Finish; 2],
+        charged: bool,
+    },
+}
 
 /// An IPv4/TCP tuple in canonical endpoint order, independent of direction.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -79,7 +102,9 @@ pub struct CircuitPool {
     lanes: [Option<Lane>; HARD_PAIR_CAP],
     next_slot: usize,
     flow_limit: usize,
-    flows: BTreeMap<FlowKey, FlowBinding>,
+    flows: BTreeMap<FlowKey, Flow>,
+    charged: usize,
+    guards: BTreeSet<GuardKey>,
     revoked: bool,
 }
 
@@ -107,6 +132,8 @@ impl CircuitPool {
             next_slot: 0,
             flow_limit,
             flows: BTreeMap::new(),
+            charged: 0,
+            guards: BTreeSet::new(),
             revoked: false,
         })
     }
@@ -130,18 +157,23 @@ impl CircuitPool {
             .map(|slot| self.lanes[slot].expect("occupied slot").state)
     }
 
+    /// Charged bindings, including guarded closes that could not free a slot.
     pub fn flow_count(&self) -> usize {
-        self.flows.len()
+        self.charged
     }
 
     pub fn binding(&self, key: FlowKey) -> Option<FlowBinding> {
-        self.flows.get(&key).copied()
+        match self.flows.get(&key)? {
+            Flow::Pinned(id, _) => Some(FlowBinding::Pinned(*id)),
+            Flow::Failed => Some(FlowBinding::Failed),
+            Flow::Closed { .. } => None,
+        }
     }
 
     pub fn pinned_count(&self, id: CircuitId) -> usize {
         self.flows
             .values()
-            .filter(|binding| **binding == FlowBinding::Pinned(id))
+            .filter(|flow| matches!(flow, Flow::Pinned(bound, _) if *bound == id))
             .count()
     }
 
@@ -185,9 +217,9 @@ impl CircuitPool {
     pub fn invalidate_lane(&mut self, id: CircuitId) -> Result<usize, PoolError> {
         self.lane_mut(id)?.state = LaneState::Closing;
         let mut failed = 0;
-        for binding in self.flows.values_mut() {
-            if *binding == FlowBinding::Pinned(id) {
-                *binding = FlowBinding::Failed;
+        for flow in self.flows.values_mut() {
+            if matches!(flow, Flow::Pinned(bound, _) if *bound == id) {
+                *flow = Flow::Failed;
                 failed += 1;
             }
         }
@@ -215,28 +247,36 @@ impl CircuitPool {
         }
         let cleared = self.flows.len();
         self.flows.clear();
+        self.guards.clear();
+        self.charged = 0;
         cleared
     }
 
-    /// Retire a tuple only when the caller knows the old TCP flow and its
-    /// outstanding traffic are finished/aborted. Do not infer this from a
-    /// single FIN, an idle timer, or an unverified RST. Failed bindings count
-    /// toward the limit until explicitly retired (no implicit eviction).
+    /// Explicitly override a live or failed binding only with external proof
+    /// that its socket and outstanding traffic are gone. This cannot bypass
+    /// the guard for an automatically closed flow. No idle or RST-based expiry
+    /// exists for incomplete or failed bindings.
     pub fn retire_flow(&mut self, key: FlowKey) -> Option<FlowBinding> {
-        self.flows.remove(&key)
+        let binding = self.binding(key)?;
+        self.flows.remove(&key);
+        self.charged -= 1;
+        Some(binding)
     }
 
     /// Route local IPv4/TCP. A previously unseen tuple may bind only on an
     /// opening SYN. New flows are distributed round-robin over Ready lanes;
     /// existing flows remain pinned even when lane membership changes.
     pub fn route_outbound(&mut self, packet: &[u8]) -> Result<(FlowKey, CircuitId), PoolError> {
-        let (key, opening) = self.inspect(packet, true)?;
-        match self.binding(key) {
-            Some(FlowBinding::Pinned(id)) => return Ok((key, id)),
-            Some(FlowBinding::Failed) => return Err(PoolError::FlowFailed),
-            None => {}
+        self.route_at(packet, Instant::now())
+    }
+
+    fn route_at(&mut self, packet: &[u8], now: Instant) -> Result<(FlowKey, CircuitId), PoolError> {
+        let (key, segment) = self.inspect(packet, true)?;
+        self.expire_guards(now);
+        if let Some(id) = self.existing_flow(key, segment, None, now)? {
+            return Ok((key, id));
         }
-        self.check_new_flow(opening)?;
+        self.check_new_flow(segment.opening())?;
         let (slot, id) = (0..self.lane_limit)
             .map(|offset| (self.next_slot + offset) % self.lane_limit)
             .find_map(|slot| match self.lanes[slot] {
@@ -244,7 +284,7 @@ impl CircuitPool {
                 _ => None,
             })
             .ok_or(PoolError::NoReadyLane)?;
-        self.flows.insert(key, FlowBinding::Pinned(id));
+        self.pin(key, id, segment);
         self.next_slot = (slot + 1) % self.lane_limit;
         Ok((key, id))
     }
@@ -254,19 +294,97 @@ impl CircuitPool {
     /// Thereafter both directions must use that lane. Conflicting opens (also
     /// possible with simultaneous TCP open) fail closed, never re-pin.
     pub fn accept_inbound(&mut self, id: CircuitId, packet: &[u8]) -> Result<FlowKey, PoolError> {
-        let (key, opening) = self.inspect(packet, false)?;
-        match self.binding(key) {
-            Some(FlowBinding::Pinned(bound)) if id == bound => return Ok(key),
-            Some(FlowBinding::Pinned(_)) => return Err(PoolError::WrongLane),
-            Some(FlowBinding::Failed) => return Err(PoolError::FlowFailed),
-            None => {}
+        self.accept_at(id, packet, Instant::now())
+    }
+
+    fn accept_at(
+        &mut self,
+        id: CircuitId,
+        packet: &[u8],
+        now: Instant,
+    ) -> Result<FlowKey, PoolError> {
+        let (key, segment) = self.inspect(packet, false)?;
+        self.expire_guards(now);
+        if self.existing_flow(key, segment, Some(id), now)?.is_some() {
+            return Ok(key);
         }
         if self.lane_state(id).ok_or(PoolError::UnknownLane)? != LaneState::Ready {
             return Err(PoolError::InvalidLaneState);
         }
-        self.check_new_flow(opening)?;
-        self.flows.insert(key, FlowBinding::Pinned(id));
+        self.check_new_flow(segment.opening())?;
+        self.pin(key, id, segment);
         Ok(key)
+    }
+
+    fn pin(&mut self, key: FlowKey, id: CircuitId, segment: Segment) {
+        self.flows
+            .insert(key, Flow::Pinned(id, Close::new(segment)));
+        self.charged += 1;
+    }
+
+    fn existing_flow(
+        &mut self,
+        key: FlowKey,
+        segment: Segment,
+        inbound: Option<CircuitId>,
+        now: Instant,
+    ) -> Result<Option<CircuitId>, PoolError> {
+        let Some(flow) = self.flows.get_mut(&key) else {
+            return Ok(None);
+        };
+        match flow {
+            Flow::Failed => Err(PoolError::FlowFailed),
+            Flow::Closed { lane, fins, .. } => {
+                // This is a packet drop, not a lane/protocol failure. A queued
+                // old packet must not tear down healthy unrelated lanes.
+                let id = *lane;
+                if inbound.is_some_and(|lane| lane != id)
+                    || !close_retry(segment, *fins)
+                    || !matches!(
+                        self.lane_state(id),
+                        Some(LaneState::Ready | LaneState::Draining)
+                    )
+                {
+                    return Err(PoolError::UnknownFlow);
+                }
+                Ok(Some(id))
+            }
+            Flow::Pinned(id, close) => {
+                let id = *id;
+                if inbound.is_some_and(|lane| lane != id) {
+                    return Err(PoolError::WrongLane);
+                }
+                if let Some(fins) = close.observe(segment)
+                    && let Some(until) = now.checked_add(CLOSE_GUARD)
+                {
+                    let charged = self.guards.len() >= self.flow_limit;
+                    *flow = Flow::Closed {
+                        lane: id,
+                        fins,
+                        charged,
+                    };
+                    self.guards.insert((until, key));
+                    if !charged {
+                        self.charged -= 1;
+                    }
+                }
+                Ok(Some(id))
+            }
+        }
+    }
+
+    fn expire_guards(&mut self, now: Instant) {
+        while let Some(&(until, key)) = self.guards.first() {
+            if until > now {
+                break;
+            }
+            self.guards.pop_first();
+            match self.flows.remove(&key) {
+                Some(Flow::Closed { charged: true, .. }) => self.charged -= 1,
+                Some(Flow::Closed { charged: false, .. }) => {}
+                _ => unreachable!("guard index must name a closed tuple"),
+            }
+        }
     }
 
     fn lane_slot(&self, id: CircuitId) -> Option<usize> {
@@ -301,13 +419,13 @@ impl CircuitPool {
         if !opening {
             return Err(PoolError::UnknownFlow);
         }
-        if self.flows.len() == self.flow_limit {
+        if self.charged >= self.flow_limit {
             return Err(PoolError::FlowLimit);
         }
         Ok(())
     }
 
-    fn inspect(&self, packet: &[u8], outbound: bool) -> Result<(FlowKey, bool), PoolError> {
+    fn inspect(&self, packet: &[u8], outbound: bool) -> Result<(FlowKey, Segment), PoolError> {
         if self.revoked {
             return Err(PoolError::Revoked);
         }
@@ -327,7 +445,11 @@ impl CircuitPool {
             return Err(PoolError::PacketDenied(PacketDeny::Ipv6NotNegotiated));
         };
         let tcp = &packet[info.header_len..];
-        if tcp.len() < 20 || !((20..=tcp.len()).contains(&(usize::from(tcp[12] >> 4) * 4))) {
+        if tcp.len() < 20 {
+            return Err(PoolError::InvalidTcpHeader);
+        }
+        let tcp_header = usize::from(tcp[12] >> 4) * 4;
+        if !(20..=tcp.len()).contains(&tcp_header) {
             return Err(PoolError::InvalidTcpHeader);
         }
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
@@ -338,13 +460,21 @@ impl CircuitPool {
         let a = SocketAddrV4::new(src, src_port);
         let b = SocketAddrV4::new(dst, dst_port);
         let key = if a < b { FlowKey(a, b) } else { FlowKey(b, a) };
-        // SYN set; ACK, RST and FIN unset. ECN flags do not alter the key.
-        // Do not use TCP checksum/sequence state here: the host TCP stack
-        // validates it, and offload can leave checksum work outstanding.
-        let opening = tcp[13] & 0x17 == 0x02;
-        Ok((key, opening))
+        // Checksums only qualify lifecycle evidence; they are not a
+        // substitute for TCP input validation by the destination host.
+        Ok((key, Segment {
+            seq: u32::from_be_bytes(tcp[4..8].try_into().expect("TCP fixed header")),
+            ack: u32::from_be_bytes(tcp[8..12].try_into().expect("TCP fixed header")),
+            data: (tcp.len() - tcp_header) as u32,
+            flags: tcp[13],
+            outbound,
+            checksum_ok: tcp_checksum(&packet[12..20], tcp) == 0,
+        }))
     }
 }
+
+#[cfg(test)]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -361,19 +491,22 @@ mod tests {
     const ACK: u8 = 0x10;
     const MTU: usize = 1500;
 
-    fn ip_checksum(bytes: &mut [u8]) {
+    pub(super) fn ip_checksum(bytes: &mut [u8]) {
         bytes[10..12].fill(0);
         let header_len = usize::from(bytes[0] & 15) * 4;
         let (words, tail) = bytes[..header_len].as_chunks::<2>();
         assert!(tail.is_empty());
-        let mut sum: u32 = words.iter().map(|&word| u32::from(u16::from_be_bytes(word))).sum();
+        let mut sum: u32 = words
+            .iter()
+            .map(|&word| u32::from(u16::from_be_bytes(word)))
+            .sum();
         while sum > 0xffff {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         bytes[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
     }
 
-    fn packet(reverse: bool, client_port: u16, flags: u8) -> [u8; 40] {
+    pub(super) fn packet(reverse: bool, client_port: u16, flags: u8) -> [u8; 40] {
         let (src, dst, sport, dport) = if reverse {
             (PEER, LOCAL, 443u16, client_port)
         } else {
