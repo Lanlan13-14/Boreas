@@ -682,6 +682,11 @@ if [[ -n "${BOREAS_ROOTFS:-}" ]]; then
     fi
     mkdir -p -- "$destination"
   done
+  # The CI rootfs is unpacked as the runner user; inside chroot its `/`
+  # and `/tmp` must satisfy the same ancestor checks as a real rootfs.
+  chown 0:0 -- "$BOREAS_ROOTFS" "$BOREAS_ROOTFS/tmp"
+  chmod 0755 -- "$BOREAS_ROOTFS"
+  chmod 1777 -- "$BOREAS_ROOTFS/tmp"
   for device in net/tun urandom; do
     destination="$BOREAS_ROOTFS/dev/$device"
     [[ ! -L "$destination" ]] && { [[ ! -e "$destination" ]] || [[ -f "$destination" || -c "$destination" ]]; } || {

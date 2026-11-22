@@ -1410,7 +1410,7 @@ fn shared_directory_listener_discovers_provisioned_spkis_and_rejects_unlisted_co
     let c_members = [a_raw, b_raw];
     let (listen, target) = listener();
     let outer = || OpenSslOuterTlsConnector::with_root_certificates(&f.outer_ca);
-    let acceptor = outer_for(&f, 2);
+    let acceptor = outer_for(f, 2);
     let admission = route_admission();
     let stranger_members = [b_raw];
     for client_id in [4, 3, 1, 3] {
@@ -1577,7 +1577,7 @@ fn authenticated_forwarded_core_lsa_fork_preserves_both_envelopes_and_blocks_res
             probe.accept_directory_member(
                 accept_socket(listen),
                 &a_members,
-                &outer_for(&f, 1),
+                &outer_for(f, 1),
                 &route_admission(),
             )
         });
