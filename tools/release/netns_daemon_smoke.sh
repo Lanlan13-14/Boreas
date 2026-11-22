@@ -943,6 +943,9 @@ ip netns exec "$EDGE_NS" ip link set veth-edge up
 
 if [[ ${BOREAS_NETNS_POOL_CUTOVER:-0} == 1 ]]; then
   source "$(dirname "$PERF_SCRIPT")/netns_pool_cutover.sh"
+  # Inherit ERR inside the fixture functions so a failed assertion prints
+  # the live daemon errors before EXIT removes the namespaces and logs.
+  set -E
   pool_cutover_matrix "$POLICY_FIXTURE_DIR"
   exit 0
 fi

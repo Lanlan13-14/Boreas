@@ -2,7 +2,13 @@
 # Sourced by netns_daemon_smoke.sh after two-node fixture provisioning.
 cutover_offline() {
   local phase="$1"; shift
-  timeout --kill-after=2s 10s "$BIN" "$@" > "$WORK/$phase.out" 2> "$WORK/$phase.err"
+  local rc=0
+  timeout --kill-after=2s 10s "$BIN" "$@" > "$WORK/$phase.out" 2> "$WORK/$phase.err" || rc=$?
+  if (( rc != 0 )); then
+    printf 'pool_cutover_phase=%s exit=%s\n' "$phase" "$rc" >&2
+    cat "$WORK/$phase.out" "$WORK/$phase.err" >&2
+  fi
+  return "$rc"
 }
 
 cutover_reject() {
@@ -167,12 +173,25 @@ PY
   ip -n "$EDGE_NS" link set btun0 up
   ip -n "$CORE_NS" route add 172.19.1.2/32 dev btun0
   ip -n "$EDGE_NS" route add 172.19.1.1/32 dev btun0
+  local ready=0
   for _ in $(seq 1 120); do
-    if "$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>/dev/null | jq -e '.daemon_connected' >/dev/null; then break; fi
+    if "$BIN" ctl status --socket "$EDGE_STATE/control.sock" 2>/dev/null | jq -e '.daemon_connected' >/dev/null &&
+       "$BIN" ctl status --socket "$CORE_STATE/control.sock" 2>/dev/null | jq -e '.daemon_connected' >/dev/null; then
+      ready=1
+      break
+    fi
+    kill -0 "$(<"$WORK/core.pid")" "$(<"$WORK/edge.pid")" 2>/dev/null || break
     sleep .05
   done
-  ip netns exec "$CORE_NS" ping -c 2 -W 2 172.19.1.2
-  ip netns exec "$EDGE_NS" ping -c 2 -W 2 172.19.1.1
+  if (( ready != 1 )); then
+    echo 'ERROR: resumed cutover never confirmed both endpoints' >&2
+    report_failure_evidence
+    return 1
+  fi
+  ip -n "$CORE_NS" -4 route get 172.19.1.2 from 172.19.1.1
+  ip -n "$EDGE_NS" -4 route get 172.19.1.1 from 172.19.1.2
+  ip netns exec "$CORE_NS" ping -c 2 -W 2 -I 172.19.1.1 172.19.1.2
+  ip netns exec "$EDGE_NS" ping -c 2 -W 2 -I 172.19.1.2 172.19.1.1
   # Even if operators mistakenly put the old addresses back on the TUN,
   # the authenticated packet path must not carry either old peer VIP.
   ip -n "$CORE_NS" addr add 10.20.1.1/32 dev btun0
