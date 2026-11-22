@@ -878,6 +878,7 @@ jobs:
           echo 'initial_backup_negative=pass'
           echo 'initial_backup_negative.backup_usable=control-connect-through-same-proxy-status-ok'
       - name: Upload hop-node development binary
+        id: acceptance_binary
         if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -887,7 +888,7 @@ jobs:
           retention-days: 14
       - name: Verify opt-in DoH and DoT on isolated real Core and Edge TUNs
         id: acceptance_public_dns
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/test/v111-dns-public-forwarding')
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/test/v111-dns-public-forwarding') }}
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -907,7 +908,7 @@ jobs:
           fixture doh no-grant startup_rejected_without_upstream
       - name: Verify opt-in private DNS on real Core and Edge TUNs
         id: acceptance_private_dns
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -925,7 +926,7 @@ jobs:
           grep -Fx 'private_dns_pin_withdrawal=core_halted_fail_closed' rust-tls-private-dns.log
       - name: Verify signed IPv4 cutover on two real Linux TUNs
         id: acceptance_pool_cutover
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime')
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') }}
         timeout-minutes: 3
         env:
           BOREAS_NETNS_POOL_CUTOVER: '1'
@@ -938,7 +939,7 @@ jobs:
           grep -Fx 'pool_cutover_revocation=source_denial_halted_successor_and_survived_restart' rust-tls-pool-cutover.log
       - name: Verify private DNS replica selection on three real Linux TUNs
         id: acceptance_dns_replicas
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff') }}
         timeout-minutes: 4
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
@@ -961,7 +962,7 @@ jobs:
           grep -Fx 'dns_replica_revocation=revoked_backup_denied_before_dial_and_after_mailbox_removal' rust-tls-dns-replicas.log
       - name: Verify four-process Core routing, failover, and revocation on real TUN
         id: acceptance_mesh
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-mesh-runtime' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         timeout-minutes: 5
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -984,7 +985,7 @@ jobs:
           grep -F 'test result: ok. 4 passed; 0 failed; 0 ignored' rust-tls-mesh-runtime.log
       - name: Verify 2–4 independent encrypted circuits on real Linux devices
         id: acceptance_multi_active
-        if: success() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff')
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') }}
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -998,7 +999,7 @@ jobs:
             test "$(grep -Fxc 'multi_active_lane_replacement=fresh_authenticated_circuit' "$log")" -eq 1
           done
       - name: Record performance runner and exact binary
-        if: success() && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         run: |
           set -euo pipefail
           {
@@ -1012,7 +1013,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples
         id: candidate_delayed
-        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff'))
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'

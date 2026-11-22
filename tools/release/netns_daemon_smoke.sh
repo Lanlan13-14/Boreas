@@ -778,6 +778,12 @@ if [[ -n "$POLICY_OPENSSL_BIN" ]]; then
     done
   )
   POLICY_NOW_US="$(($(date +%s) * 1000000))"
+  # The real target signer backdates issuance by one second. In the cutover
+  # fixture make the independently signed source strictly older even on a
+  # fast runner, without sleeping or changing the actual rollback check.
+  if [[ ${BOREAS_NETNS_POOL_CUTOVER:-0} == 1 ]]; then
+    POLICY_NOW_US=$((POLICY_NOW_US - 5000000))
+  fi
   BOREAS_OPENSSL_BIN="$POLICY_OPENSSL_BIN" python3 "$(dirname "$PERF_SCRIPT")/network_policy_test_fixture.py" \
     --out-dir "$POLICY_FIXTURE_DIR" --net-id "$TEST_NET_ID" --sequence 1 \
     --issued-at-us "$POLICY_NOW_US" --expires-us "$((POLICY_NOW_US + 3600000000))"
