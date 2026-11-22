@@ -4256,6 +4256,7 @@ mod linux_daemon {
             } else {
                 poll_io(sock_fd, tun_fd, PathPoll::SendDeferred, Duration::ZERO)?.socket_readable
             };
+            let mut received_in_turn = false;
             for step in 0..MAX_INBOUND_BATCH_PACKETS {
                 if let Some(reason) = watchdog.fault() {
                     path.close();
@@ -4298,28 +4299,14 @@ mod linux_daemon {
                     break;
                 }
                 let result = if let Some(timing) = &mut io_timing {
-                    timing.inbound_step(buffered, tun.raw_fd(), || path.step_inbound())
+                    timing.inbound_step(buffered, tun_fd, || path.step_inbound())
                 } else {
                     path.step_inbound()
                 };
                 match result {
                     Ok(Some(_len)) => {
                         made_progress = true;
-                        let stats = path.stats();
-                        counters
-                            .rx_packets
-                            .store(stats.inbound_packets, Ordering::Relaxed);
-                        counters
-                            .rx_bytes
-                            .store(stats.inbound_bytes, Ordering::Relaxed);
-                        if private_dns.is_some() && mode_name == "serve" {
-                            counters
-                                .tx_packets
-                                .store(stats.outbound_packets, Ordering::Relaxed);
-                            counters
-                                .tx_bytes
-                                .store(stats.outbound_bytes, Ordering::Relaxed);
-                        }
+                        received_in_turn = true;
                     }
                     Ok(None) => {
                         if let Some(reason) = watchdog.fault() {
@@ -4341,6 +4328,15 @@ mod linux_daemon {
                             reason: format!("inbound circuit error: {error:?}"),
                         };
                     }
+                }
+            }
+            if received_in_turn {
+                let stats = path.stats();
+                counters.rx_packets.store(stats.inbound_packets, Ordering::Relaxed);
+                counters.rx_bytes.store(stats.inbound_bytes, Ordering::Relaxed);
+                if private_dns.is_some() && mode_name == "serve" {
+                    counters.tx_packets.store(stats.outbound_packets, Ordering::Relaxed);
+                    counters.tx_bytes.store(stats.outbound_bytes, Ordering::Relaxed);
                 }
             }
             buffered = path.has_buffered_input();
@@ -4374,13 +4370,12 @@ mod linux_daemon {
             return Err("daemon: private DNS authorization lost (fail-closed)".into());
         }
 
-        Ok(PathReport {
-            stop,
-            identity,
-            stats: path.stats(),
-            local_vip,
-            peer_vip,
-        })
+        let stats = path.stats();
+        counters.rx_packets.store(stats.inbound_packets, Ordering::Relaxed);
+        counters.rx_bytes.store(stats.inbound_bytes, Ordering::Relaxed);
+        counters.tx_packets.store(stats.outbound_packets, Ordering::Relaxed);
+        counters.tx_bytes.store(stats.outbound_bytes, Ordering::Relaxed);
+        Ok(PathReport { stop, identity, stats, local_vip, peer_vip })
     }
     #[cfg(test)]
     mod watchdog_tests {
