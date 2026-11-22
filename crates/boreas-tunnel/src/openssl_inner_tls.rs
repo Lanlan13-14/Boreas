@@ -558,7 +558,13 @@ impl PeerIdentityExtractor for PkiIdentityExtractor {
             }
         }
         let identity = matched?;
-        let expected_vip = boreas_pki::expected_vip(
+        // Recheck the address under the same authenticated policy used to
+        // construct this identity, not under the legacy fixed overlay.
+        let overlay = match identity.policy {
+            Some(policy) => boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok()?,
+            None => boreas_pki::OverlayPrefix::DEFAULT,
+        };
+        let expected_vip = overlay.vip(
             identity.home_core_id,
             identity.vip[3],
             match identity.role {
