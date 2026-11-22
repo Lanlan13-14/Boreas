@@ -1172,6 +1172,7 @@ jobs:
       OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
+      BOREAS_NETNS_WAN_TUNED: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1201,6 +1202,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
           sudo modprobe tun || true
+          # Built-in BBR works even if modprobe reports no module.
+          sudo modprobe tcp_bbr || true
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
         id: perf_toolchain
       - name: Record performance runner and exact binary
@@ -1223,7 +1226,7 @@ jobs:
         env:
           BOREAS_NETEM_RTT_MS: '200'
           BOREAS_NETEM_LOSS_PERCENT: '0.1'
-          BOREAS_NETEM_RATE_MBIT: '100'
+          BOREAS_NETEM_RATE_MBIT: 'unlimited'
           BOREAS_MAX_PING_MS: '415'
           BOREAS_MIN_THROUGHPUT_MBPS: '3'
           BOREAS_PERF_BYTES: '8388608'
@@ -1296,7 +1299,7 @@ jobs:
           BOREAS_MULTISTREAM_BYTES: '8388608'
           BOREAS_NETEM_RTT_MS: '200'
           BOREAS_NETEM_LOSS_PERCENT: '0.1'
-          BOREAS_NETEM_RATE_MBIT: '100'
+          BOREAS_NETEM_RATE_MBIT: 'unlimited'
           BOREAS_MAX_PING_MS: '415'
           BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '100'
           BOREAS_PERF_TIMEOUT_SECONDS: '45'

@@ -68,7 +68,7 @@ jobs:
   netem:
     # Manual and automatic execution use only the validated source run and SHA.
     needs: source
-    name: one-way ${{ matrix.rtt }}ms / loss ${{ matrix.loss }}% / ${{ matrix.rate }}Mbps
+    name: one-way ${{ matrix.rtt }}ms / loss ${{ matrix.loss }}% / rate ${{ matrix.rate }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -77,28 +77,28 @@ jobs:
         include:
           - rtt: 50
             loss: 0
-            rate: 10
+            rate: unlimited
             max_ping: 115
             min_mbps: 3
             payload_bytes: 67108864
             edge_lifetime_seconds: 230
           - rtt: 200
             loss: 0.1
-            rate: 100
+            rate: unlimited
             max_ping: 415
             min_mbps: 3
             payload_bytes: 67108864
             edge_lifetime_seconds: 230
           - rtt: 400
             loss: 1
-            rate: 1000
+            rate: unlimited
             max_ping: 815
             min_mbps: 1
             payload_bytes: 67108864
             edge_lifetime_seconds: 620
           - rtt: 200
             loss: 3
-            rate: 1000
+            rate: unlimited
             max_ping: 415
             min_mbps: 0.5
             payload_bytes: 16777216
@@ -124,6 +124,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y iproute2 iputils-ping
+          sudo modprobe tcp_bbr || true
           test -s artifact/boreas-linux-x86_64-musl-pq768
           (cd artifact && sha256sum --check --strict SHA256SUMS)
           chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
@@ -132,6 +133,7 @@ jobs:
           python-version: '3.12'
       - name: Run isolated impaired-path full-duplex test
         env:
+          BOREAS_NETNS_WAN_TUNED: '1'
           BOREAS_NETEM_RTT_MS: ${{ matrix.rtt }}
           BOREAS_NETEM_LOSS_PERCENT: ${{ matrix.loss }}
           BOREAS_NETEM_RATE_MBIT: ${{ matrix.rate }}
@@ -158,7 +160,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: netem-${{ needs.source.outputs.run }}-${{ matrix.rtt }}ms-${{ matrix.loss }}pct-${{ matrix.rate }}mbps
+          name: netem-${{ needs.source.outputs.run }}-${{ matrix.rtt }}ms-${{ matrix.loss }}pct-rate-${{ matrix.rate }}
           path: netem-*.log
           if-no-files-found: warn
           retention-days: 14
@@ -206,7 +208,7 @@ jobs:
   window-diagnostic:
     if: github.event_name == 'workflow_dispatch' && inputs.run_window_diagnostic
     # Independent read-only diagnostic: same validated source binary, same
-    # one-way 200 ms / 0.1% loss / 100 Mbit profile as the strict netem gate,
+    # one-way 200 ms / 0.1% loss / unshaped profile as the strict netem gate,
     # with an 8 MiB probe and a 64 MiB probe. Both samples run even if the
     # first fails; the job fails if either sample fails. The short probe is
     # dominated by slow start; the long one is the sustained rate. Neither is
@@ -217,7 +219,7 @@ jobs:
     # That evidence is diagnostic only: it changes no threshold, wait, netem
     # profile or byte count, and nothing in it can mark a sample as accepted.
     needs: source
-    name: Diagnostic 8 MiB vs 64 MiB (one-way 200 ms, loss 0.1%, 100 Mbps)
+    name: Diagnostic 8 MiB vs 64 MiB (one-way 200 ms, loss 0.1%, unshaped)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -241,6 +243,7 @@ jobs:
       - name: Validate the single validated-source binary
         run: |
           set -euo pipefail
+          sudo modprobe tcp_bbr || true
           test -s artifact/boreas-linux-x86_64-musl-pq768
           (cd artifact && sha256sum --check --strict SHA256SUMS)
           chmod 0755 artifact/boreas-linux-x86_64-musl-pq768
@@ -253,10 +256,11 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.source.outputs.sha }}
           SOURCE_RUN: ${{ needs.source.outputs.run }}
+          BOREAS_NETNS_WAN_TUNED: '1'
           BOREAS_NETEM_RTT_MS: '200'
           BOREAS_NETEM_LOSS_PERCENT: '0.1'
-          BOREAS_NETEM_RATE_MBIT: '100'
-          # Same regression bounds as the strict 200 ms / 0.1% / 100 Mbps gate.
+          BOREAS_NETEM_RATE_MBIT: 'unlimited'
+          # Same regression bounds as the strict 200 ms / 0.1% / unshaped gate.
           BOREAS_MAX_PING_MS: '415'
           BOREAS_MIN_THROUGHPUT_MBPS: '3'
         run: |
@@ -266,7 +270,7 @@ jobs:
           {
             echo "diagnostic_source_sha=${SOURCE_SHA}"
             echo "diagnostic_source_run=${SOURCE_RUN}"
-            echo 'diagnostic_profile=one-way-200ms-loss-0.1pct-rate-100mbit'
+            echo 'diagnostic_profile=one-way-200ms-loss-0.1pct-unshaped'
             echo 'diagnostic_scope=single-paired-short-window-not-steady-state'
             echo 'diagnostic_telemetry=namespace-periodic-ss-tin+tc-qdisc+ip-link-diag-only'
           } > diagnostic-status.txt

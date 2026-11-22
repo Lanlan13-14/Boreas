@@ -29,6 +29,12 @@ BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
 TUN_GSO_ARGS=()
+WAN_TUNED="${BOREAS_NETNS_WAN_TUNED:-0}"
+case "$WAN_TUNED" in
+  0) ;;
+  1) ;;
+  *) echo 'ERROR: BOREAS_NETNS_WAN_TUNED must be 0 or 1' >&2; exit 1 ;;
+esac
 case "${BOREAS_NETNS_TCPV4_GSO:-0}" in
   0) ;;
   1) TUN_GSO_ARGS=(--tun-tcpv4-gso) ;;
@@ -1001,9 +1007,16 @@ if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
   for spec in "$CORE_NS:veth-core" "$EDGE_NS:veth-edge"; do
     ns="${spec%%:*}"
     dev="${spec##*:}"
-    ip netns exec "$ns" tc qdisc add dev "$dev" root netem \
-      delay "${BOREAS_NETEM_RTT_MS}ms" loss "${BOREAS_NETEM_LOSS_PERCENT:-0}%" \
-      rate "${BOREAS_NETEM_RATE_MBIT:-1000}mbit"
+    if [[ "$WAN_TUNED" == 1 && "${BOREAS_NETEM_RATE_MBIT:-unlimited}" == unlimited ]]; then
+      # A finite large queue can hold the delay line without the default
+      # 1000-packet queue acting as an accidental bandwidth cap.
+      ip netns exec "$ns" tc qdisc add dev "$dev" root handle 1: netem \
+        limit 32768 delay "${BOREAS_NETEM_RTT_MS}ms" loss "${BOREAS_NETEM_LOSS_PERCENT:-0}%"
+    else
+      ip netns exec "$ns" tc qdisc add dev "$dev" root handle 1: netem \
+        delay "${BOREAS_NETEM_RTT_MS}ms" loss "${BOREAS_NETEM_LOSS_PERCENT:-0}%" \
+        rate "${BOREAS_NETEM_RATE_MBIT:-1000}mbit"
+    fi
   done
   NETEM_EFFECTIVE_RTT_MS=$(( BOREAS_NETEM_RTT_MS * 2 ))
   echo "netem_one_way_per_device_ms=${BOREAS_NETEM_RTT_MS}"
@@ -1012,6 +1025,37 @@ if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
   # Floor: the measured average must reach at least 60% of the effective RTT, so
   # the impairment is shown to be in effect. The existing ceiling still bounds it.
   export BOREAS_MIN_PING_MS=$(( NETEM_EFFECTIVE_RTT_MS * 60 / 100 ))
+fi
+
+if [[ "$WAN_TUNED" == 1 ]]; then
+  # Configuration applies to both overlay TCP and underlay TCP sockets created
+  # in these disposable namespaces. The advertised window is still dynamic.
+  for spec in "$CORE_NS:veth-core" "$EDGE_NS:veth-edge"; do
+    ns="${spec%%:*}"
+    dev="${spec##*:}"
+    if ! ip netns exec "$ns" sysctl -w net.ipv4.tcp_congestion_control=bbr; then
+      echo 'ERROR: BBR is unavailable on this runner; refusing to benchmark with another algorithm' >&2
+      exit 1
+    fi
+    ip netns exec "$ns" sysctl -w 'net.ipv4.tcp_rmem=4096 33554432 33554432' \
+      'net.ipv4.tcp_wmem=4096 33554432 33554432' net.ipv4.tcp_moderate_rcvbuf=1
+    for key in tcp_rmem tcp_wmem; do
+      read -r minimum initial maximum < <(ip netns exec "$ns" sysctl -n "net.ipv4.$key")
+      [[ "$minimum" == 4096 && "$initial" == 33554432 && "$maximum" == 33554432 ]]
+    done
+    [[ "$(ip netns exec "$ns" sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]]
+    [[ "$(ip netns exec "$ns" sysctl -n net.ipv4.tcp_moderate_rcvbuf)" == 1 ]]
+    if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
+      ip netns exec "$ns" tc qdisc add dev "$dev" parent 1:1 handle 2: fq limit 32768
+    else
+      ip netns exec "$ns" tc qdisc add dev "$dev" root fq
+    fi
+    printf 'tcp_benchmark_namespace=%s congestion=bbr pacing=fq auto_buffer_default_and_max_bytes=33554432\n' "$ns"
+    ip netns exec "$ns" tc qdisc show dev "$dev"
+  done
+  if [[ -n "${BOREAS_NETEM_RTT_MS:-}" ]]; then
+    printf 'netem_rate_mbit=%s\n' "${BOREAS_NETEM_RATE_MBIT:-unlimited}"
+  fi
 fi
 
 # Bounded diagnostic sampling starts before the daemons so a run that never
