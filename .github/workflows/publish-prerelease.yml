@@ -24,6 +24,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"
+  OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+  OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+  OPENSSL_VERSION_TRIPLE: 4.1.1
+  OPENSSL_PRERELEASE: dev
+  OPENSSL_VERSION: 4.1.1-dev
+  OPENSSL_NO_VENDOR: "1"
 
 jobs:
   validate-tag:
@@ -368,13 +374,6 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             openssl_target: linux-aarch64
-    env:
-      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
-      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
-      OPENSSL_VERSION_TRIPLE: 4.1.1
-      OPENSSL_PRERELEASE: dev
-      OPENSSL_VERSION: 4.1.1-dev
-      OPENSSL_NO_VENDOR: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
@@ -467,14 +466,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     env:
-      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
-      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
-      OPENSSL_VERSION_TRIPLE: 4.1.1
-      OPENSSL_PRERELEASE: dev
-      OPENSSL_VERSION: 4.1.1-dev
       OPENSSL_PREFIX: ${{ github.workspace }}/.rust-tls-openssl
       OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
-      OPENSSL_NO_VENDOR: '1'
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
     steps:
