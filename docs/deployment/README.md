@@ -1,33 +1,41 @@
 # Boreas 部署教程：从材料准备到双机互通
 
-本页带你搭一条只连接两个 IPv4 VIP 的 Linux 隧道。建议在两台可回收的主机上演练，保留 SSH 和云控制台等旁路管理入口。完成标志不是“服务显示运行中”，而是**两端的隧道路由正确、双向 `ping` 成功、收发计数增长**。
+简体中文 · [繁體中文](README.zh-TW.md) · [English](README.en.md)
 
-| 你手中的制品 | 使用哪一节 |
+按照本教程部署一条只连接两个 IPv4 VIP 的 Linux 点对点隧道。请在两台可回收的主机上演练，并全程保留 SSH 和云控制台等旁路管理入口。判定部署完成的唯一标准不是“服务显示运行中”，而是**两端隧道路由指向正确、双向 `ping` 成功、收发包计数持续增长**。
+
+首先根据你手中的制品选择对应路径：
+
+| 你手中的制品 | 选择路径与操作说明 |
 | --- | --- |
-| 可信的当前开发构建（Linux、`openssl-inner-tls`） | 按本页走完 [准备 → 签发 → 配置 → 安装 → 互通](#workflow)。开发版 `daemon` 要求显式策略、网络根 pin 和持久水位，不能照搬公开包的命令。 |
-| 公开发布的 `v0.1.0-pre.3` x86-64 pq768 二进制 | 看 [公开预发布双机演练](#public-pre3)。不使用当前 `install.sh` 的服务包装器或离线双签服务。 |
-| 已独立预配软件发布根和双签候选 | 共用下面的签发、配置思路，安装接到 [离线签名 systemd 服务](VERIFIED-SERVICE.md)，与旧 root 模板二选一。 |
-| 要连通多个 Core | 转到 [四 Core 拓扑教程](linux-core-mesh-topology.md)；它有独立的 CLI、清单、材料名及 TUN 所有权。 |
+| 可信的当前开发构建（Linux、`openssl-inner-tls`） | 按顺序完成本页 [准备 → 签发 → 配置 → 安装 → 互通](#workflow)。开发版 `daemon` 强制要求显式网络策略、网络根 pin 与持久防回退水位，不能照搬公开预发布包的命令。 |
+| 公开发布的 `v0.1.0-pre.3` x86-64 pq768 二进制 | 直接跳至 [公开预发布双机演练](#public-pre3)。该版本不使用当前 `install.sh` 服务包装器或离线双签服务。 |
+| 已独立预配软件发布根与双签候选包 | 共用第 2、3 节的签发与配置思路，安装与托管接入 [离线签名 systemd 服务](VERIFIED-SERVICE.md)，勿与旧 root 服务模板混用。 |
+| 需要连通多个 Core 节点 | 转到 [四 Core 拓扑教程](linux-core-mesh-topology.md)；多 Core 组网使用独立的 CLI、拓扑清单、材料命名与 TUN 管理方式。 |
 
 <a id="workflow"></a>
 
 ## 1. 准备环境与地址
 
-- **离线签发机**：使用预先验证可信、支持 pq768 PKI 的 Boreas；保持工作目录私有，并确保系统时钟准确。下载或转运制品与托管私钥应分开，不在离线签发机联网拉取未知程序。
-- **两台 Linux 节点**：使用同一源码修订的制品，核对 CPU 架构。开发制品需与所用 `tools/deploy/` 来自兼容修订；可以从[构建工作流](../../.github/workflows/rust-tls.yml)的对应运行取得候选，不假定有新的公开版本。若自行替换 OpenSSL 或 provider，不能沿用原有验收结论。
-- **底层网络**：Core 接受 Edge 来源的 TCP `8443`（同时检查云安全组与主机防火墙）；Edge 能主动拨出即可，不要求为本例开 UDP。本文走直连 WSS，不配置 CDN/反代。选用未占用的端口和 TUN 名，避开宿主已有路由、管理网和业务网。
-- **系统工具**：完整 `iproute2`、`ss`、`ping`；安装器还需 `readelf`、SHA-256 等工具。systemd 仅用于选用对应服务路径的主机。本例不修改全局 IPv6、DNS 或默认路由。
+动手前先核对环境、版本来源与网络边界，避免因架构、时间偏差或路由冲突导致后续失败：
 
-| 项目 | Core | Edge |
+- **离线签发机**：准备预先验证可信、支持 pq768 PKI 的 Boreas 二进制；将工作目录设为私有权限，并确保系统 UTC 时钟准确。务必将制品下载/转运与私钥保管隔离，不在离线签发机联网拉取未知程序。
+- **两台 Linux 节点**：两台主机须运行同一源码修订构建的制品，并提前核对 CPU 架构。开发构建必须与所用 `tools/deploy/` 来自兼容的源码修订；可从[构建工作流](../../.github/workflows/rust-tls.yml)的对应运行获取候选制品，不要假定存在新的公开版本。如自行替换 OpenSSL 或 provider，原有验收结论不再适用。
+- **底层网络**：Core 须对 Edge 放行入向 TCP `8443`（同时核查云安全组与主机防火墙）；Edge 只需能主动拨出即可，本例无需开放 UDP。链路走直连 WSS，不经过 CDN 或反向代理。端口与 TUN 网卡名须避开宿主机已有服务、管理网和业务网。
+- **系统工具与默认边界**：两台主机须具备完整 `iproute2`、`ss`、`ping`；运行安装器还需 `readelf`、SHA-256 校验工具等。只有选用 systemd 服务路径时才依赖 systemd。默认部署不会改动宿主机全局 IPv6、系统 DNS 或默认路由，仅配置授权对端 IPv4 VIP 的 `/32` 路由，不启用任意 `/24` 路由、网段导出或转发。
+
+下表定义本例的 Core 与 Edge 地址及隧道参数：
+
+| 配置项 | Core | Edge |
 | --- | --- | --- |
-| 底层地址 | `0.0.0.0:8443` 监听；示例可达地址 `203.0.113.10:8443` | 拨 Core 的真实可达地址，允许位于 NAT 后 |
-| 外层 TLS 名称 | `wss.example.net`（证书 DNS SAN） | 校验 `wss.example.net`；HTTP Host 可带 `:8443` |
+| 底层网络地址 | 监听 `0.0.0.0:8443`；示例公网可达地址 `203.0.113.10:8443` | 主动拨号至 Core 的真实可达地址，允许位于 NAT 后 |
+| 外层 TLS 名称 | `wss.example.net`（写入证书 DNS SAN） | 校验 `wss.example.net`；HTTP `Host` 可带 `:8443` |
 | `[node]` 槽位 | `home_core_id=1`、`vip_octet=1`、`node_id=1` | `home_core_id=1`、`vip_octet=2`、`node_id=2` |
-| 隧道参数 | `btun0`、MTU 1360、`10.20.1.1/32` | `btun0`、MTU 1360、`10.20.1.2/32` |
+| 隧道接口参数 | `btun0`、MTU 1360、`10.20.1.1/32` | `btun0`、MTU 1360、`10.20.1.2/32` |
 
-`203.0.113.10` 是文档保留地址，必须替换；裸 IP 拨号时，示例 DNS 名仅用作证书校验和 HTTP Host，不必让它公开解析。永久 VIP 是 `10.20.<home_core_id>.<vip_octet>`，节点 ID 是 `((home_core_id - 1) << 8) | vip_octet`；写配置时以签发材料为准，而不是自行挑选 VIP。
+注意：`203.0.113.10` 是文档保留地址，操作时必须替换为 Core 的真实可达 IP；直接用裸 IP 拨号时，示例域名 `wss.example.net` 仅用于外层证书 SAN 校验和 HTTP `Host` 请求头，无需配置公网 DNS 解析。永久 VIP 计算规则为 `10.20.<home_core_id>.<vip_octet>`，节点 ID 为 `((home_core_id - 1) << 8) | vip_octet`；编写配置时必须以签发出的材料为准，不要自行选定 VIP。
 
-两台节点先做只读检查：
+在两台节点先执行以下只读前置检查：
 
 ```sh
 uname -m
@@ -38,11 +46,13 @@ ip -4 route get 203.0.113.10
 ss -ltn
 ```
 
-最后两个检查分别用来核实底层路由和监听端口（在 Edge 上替换为 Core 实际地址；Core 上也检查自己的管理路由）。缺少 `/dev/net/tun` 时，先由管理员确认内核、设备透传和权限；支持模块加载的 Linux 可用 `sudo modprobe tun`。容器有 UID 0 不代表有 TUN 或网管能力。systemd 主机可用 `timedatectl status` 检查时间同步；离线机也要核对 UTC。
+后两条命令分别用于核对底层出向路由和监听端口占用（在 Edge 上将目标地址替换为 Core 的真实底层 IP；在 Core 上也应检查自身管理连接路由，避免后续配置冲突）。若缺少 `/dev/net/tun`，由管理员排查内核支持、容器设备透传与权限；支持模块加载的 Linux 可执行 `sudo modprobe tun`。需注意，容器内拥有 UID 0 并不代表具备 TUN 设备或网络管理能力。使用 systemd 的主机可执行 `timedatectl status` 检查时钟同步状态；离线签发机也需确认 UTC 时间准确。
+
+<a id="offline-issuance"></a>
 
 ## 2. 离线签发（只在签发机执行）
 
-在新建的私有工作目录操作。先 `boreas doctor` 检查实际构建，再签发；基础 CLI 归档不能代替启用了 OpenSSL 后端的二进制。下方 `NET_ID` 后续还要写入两台节点的配置和安装参数，可记录它，但私钥不得随之转运。
+在签发机新建一个私有工作目录后开始签发。先执行 `boreas doctor` 核查实际使用的二进制构建（确认具备所需 TLS 后端等能力；基础 CLI 归档包不能替代启用了 OpenSSL 后端的二进制）。下述生成的 `NET_ID` 后续会写入两台节点的配置与安装参数，可记录并在安全范围内传递，但任何私钥严禁随其转运。
 
 ```sh
 umask 077
@@ -67,11 +77,13 @@ boreas pki verify-bundle --material-dir ./core --require-peer
 boreas pki verify-bundle --material-dir ./edge --require-peer
 ```
 
-验包应报告 `status: ok`；Core 的本地/对端 ID 为 `1/2`，Edge 为 `2/1`。`issue-node` 自带的初始快照只有约一小时，另签的示例快照有效期为 24 小时。`peer.signed` 是**公开签名身份**，不是对端的证书私钥。每台机器只收自己的节点包，`identity.key`/`outer.key` 不互换。**整个 `ca/` 留在离线保管区**，其中含 NetworkRoot、IdentityAuthority、StatusSigner 及外层 TLS CA 私钥。
+执行后，验包命令应返回 `status: ok`；Core 的本地/对端 ID 应报告为 `1/2`，Edge 为 `2/1`。`issue-node` 自带的初始状态快照有效期仅约 1 小时，命令中另行签发的示例快照有效期为 24 小时。`peer.signed` 是**公开签名身份文件**，不包含对端证书私钥。分发时每台主机只能收到自己的节点包，`identity.key` 与 `outer.key` 绝对不可互换。**整个 `ca/` 目录必须始终留在离线保管区**，其中包含 NetworkRoot、IdentityAuthority、StatusSigner 及外层 TLS CA 私钥。
+
+<a id="network-policy"></a>
 
 ### 当前开发构建：额外签发网络策略
 
-**公开 pre.3 演练跳过此小节**，其余签发步骤不变。对开发构建，策略与节点必须使用同一 `net_id`。以下命令签发当前 CLI 提供的 `10.20.0.0` 基址策略，然后把三个签名输入与两个公钥 pin 分开放：
+**如果走公开 `v0.1.0-pre.3` 演练，请跳过本小节**，其余签发操作保持不变。使用当前开发构建时，网络策略与节点材料必须绑定同一个 `net_id`。运行以下命令签发当前 CLI 支持的 `10.20.0.0` 基址策略，并将生成的三个签名输入文件与两个公钥 pin 分开保管：
 
 ```sh
 boreas pki sign-policy --ca-dir ./ca --out-dir ./policy-issued \
@@ -84,7 +96,7 @@ install -m 0600 ./policy-issued/root-ed25519.der ./pins/root.ed25519.der
 install -m 0600 ./policy-issued/root-mldsa65.der ./pins/root.mldsa65.der
 ```
 
-由掌管 NetworkRoot 的人员通过独立可信途径预配这两个公开 pin；不能用待验证制品自带的根作信任锚。以下预检用**已信任**的 verifier CLI 和已核对的 pin，只验对象，不记录水位：
+这两个公开 pin 必须由掌管 NetworkRoot 的管理员通过独立、可信的带外途径预配到目标主机；绝不能把待验证制品自带的根材料当成信任锚。使用**已确认可信**的 verifier CLI 与已核对无误的 pin 执行以下预检，此步骤仅校验对象本身，不会记录防回退水位：
 
 ```sh
 boreas pki verify-policy --net-id "$NET_ID" \
@@ -95,11 +107,11 @@ boreas pki verify-policy --net-id "$NET_ID" \
   --root-mldsa65-der ./pins/root.mldsa65.der
 ```
 
-将各自的节点材料包、策略三文件和已预配的 pin 分发到私有 staging；请核对 SSH 主机密钥或使用经批准的安全转运。不要上传 CA 目录，也不要混入备份和临时文件。两份节点包各存一份受保护的离线副本，记录初次签发的序号和失效时间。
+校验通过后，将各自主机的节点材料包、策略三文件以及独立预配的 pin 分发到目标主机的私有 staging 目录；传输时务必核对 SSH 主机密钥或使用经批准的安全传输通道。切勿上传 `ca/` 目录，也不要混入编辑器备份或临时文件。请同时在离线保管区留存两份节点包的受保护副本，并记录初次签发的序号与过期时间。
 
 ## 3. 配置两个节点
 
-下面是**完整的 Core TOML**。在每台机器创建自己的 `node.toml`（`0600`），把 `REPLACE_WITH_NET_ID` 换成同一个实际值。示例 `[paths]` 适合下文的 pre.3 手工路径；开发安装器在安装时会重定位这三项，建议源配置仍指向私有 staging 中真实存在的文件和目录。离线双签 systemd 路径则使用其[固定目录布局](VERIFIED-SERVICE.md#首次安装管理员)，不经旧安装器重定位。
+以下为**完整的 Core 端 TOML 配置**。在两台主机分别创建各自的 `node.toml`（权限设为 `0600`），并将 `REPLACE_WITH_NET_ID` 替换为第 2 节记录的同一 `NET_ID` 值。示例中的 `[paths]` 对应下文 `v0.1.0-pre.3` 的手工路径布局；开发版安装器在部署时会自动重定位这三项路径，但源配置文件仍应指向私有 staging 中真实存在的文件和目录。若采用离线双签 systemd 服务路径，则需遵循其[固定目录布局](VERIFIED-SERVICE.md#首次安装管理员)，不经过旧安装器重定位。
 
 ```toml
 version = 2
@@ -133,23 +145,27 @@ allow_edges = true
 default_route = false
 ```
 
-**Edge 从这份文件复制**：将 `role` 改为 `"edge"`，`vip_octet` 和 `node_id` 改为 `2`，`allow_edges` 改为 `false`；其余字段不变（如果两端实际路径不同，各填本机路径）。`identity_generation` 与 `issue-node --generation` 匹配。不要把 `paths = 4` 当成开启四条活动连接：这是 `[uplink]` 配置中的路径上限，不是本示例的实测电路数。
+**生成 Edge 配置时从此文件复制并修改以下字段**：将 `role` 改为 `"edge"`，`vip_octet` 与 `node_id` 改为 `2`，`allow_edges` 改为 `false`；其余字段保持一致（若两机本地路径不同，各自填写本机实际路径）。请确保 `identity_generation` 与 `issue-node --generation` 参数匹配。此外，配置里的 `paths = 4` 表示 `[uplink]` 的路径上限，并非本例实际建立四条活动连接。
 
-- `[node]` 对应已签发身份；改 TOML 不会改身份。Core 的 `allow_edges` 允许担任接入端，不会替代 `peer.signed` 的点对点授权。
-- `[paths]` 用绝对路径。私钥只给运行 UID，状态目录必须持久、可由该 UID 写入。不要为两台节点或两个进程共用同一个运行状态目录。
-- `[uplink]` 必需。我们用 `--listen` / `BOREAS_LISTEN` 设定监听、用 `--connect` / `BOREAS_CONNECT` 显式拨底层 IP；`--tls-name` / `BOREAS_TLS_NAME` 对照证书 SAN，`--ws-host` / `BOREAS_WS_HOST` 是 WebSocket 请求的 Host。不要把三者都填成隧道 VIP。
+填写配置时注意以下约束：
 
-用已受信的对应构建执行 `boreas config-check /实际路径/node.toml`。它通过只表示静态检查成功；实际材料、策略、监听、对端及 TUN 要到运行时验证。
+- **`[node]` 槽位绑定**：配置中的节点字段必须与已签发身份完全对应，修改 TOML 并不能改变证书中的身份。Core 的 `allow_edges` 仅允许其担任接入端，无法替代 `peer.signed` 的点对点显式授权。
+- **`[paths]` 绝对路径与权限**：三项路径必须使用绝对路径。私钥只允许运行 daemon 的 UID 读取；状态目录必须持久存在且可由该 UID 写入。严禁让两台节点或两个进程共用同一运行状态目录。
+- **`[uplink]` 运行参数**：该段不可省略。通过 `--listen` / `BOREAS_LISTEN` 设定监听地址，通过 `--connect` / `BOREAS_CONNECT` 显式拨号底层 IP；`--tls-name` / `BOREAS_TLS_NAME` 用于核对证书 SAN，`--ws-host` / `BOREAS_WS_HOST` 用于设置 WebSocket HTTP `Host` 请求头。切勿将这三项都填成隧道 VIP。
+
+配置写好后，使用已受信的对应构建执行 `boreas config-check /实际路径/node.toml`。该检查通过只表示静态语法与字段格式有效；材料一致性、网络策略、端口监听、对端连通性及 TUN 创建均在运行时验证。
 
 ## 4. 安装并启动当前开发构建
 
-跟随[一键安装操作单](ONE_CLICK.md)：在两台主机准备同布局的私有 staging，逐台比对可信摘要，先 `--dry-run`，再用 `--service systemd --accept-legacy-service` 安装。分别写入 Core/Edge 的 `boreas.env`，**先启动 Core，看到 TCP 监听后立刻启动 Edge**。旧模板使用 root，适用于隔离评估；不要与离线双签单元混装。安装成功且 `active` 已切换，不代表本机进程已在运行或隧道已经连通。若用 `--service none`，只完成安装，不启动 daemon。
+按[一键安装操作单](ONE_CLICK.md)执行部署：在两台主机分别建立结构相同的私有 staging 目录，逐台核对可信 SHA-256 摘要，先执行 `--dry-run` 预演，确认无误后再使用 `--service systemd --accept-legacy-service` 完成安装。随后分别写入 Core 与 Edge 的 `boreas.env`，**务必先启动 Core，确认 Core 已开始 TCP 监听后立刻启动 Edge**。注意，旧服务模板以 root 运行，仅适合隔离评估环境，切勿与离线双签 systemd 单元混装在同一主机。安装脚本返回成功且 `active` 符号链接切换，并不代表本机 daemon 已成功启动或隧道已经连通。如果传入 `--service none`，安装器仅落地文件，不会启动 daemon。
 
-每台机器看到的是自己的 `<prefix>/releases/<id>/config.toml` 与 `materials/`，两台可使用同一个 release id，但不能混用材料。一键部署的启动脚本让两端各自将本机组网 VIP 配到 `btun0`，只添加一条指向对端 VIP 的 `/32` 路由。它不替换已有地址或路由，退出时只清理自己添加的条目。不改默认路由，也不改 Core 或 Edge 的系统 DNS。普通上网和外层连接仍由宿主原有路由处理；若组网地址与本地网络冲突，先解决冲突再启动。**不要在这一条路径上预建 `btun0`**；离线双签服务则要求管理员预建持久 TUN 和对端路由。
+安装完成后，每台主机只看到自己的 `<prefix>/releases/<id>/config.toml` 与 `materials/`；两端可以使用相同的 release id，但绝不可混用节点材料。一键部署的启动包装脚本会让两端各自把本机组网 VIP 配置到 `btun0`，并且只添加一条指向已授权对端 IPv4 VIP 的 `/32` 路由（不会进行任意 `/24` 路由、网段导出或流量转发）。脚本不会替换已有地址或路由，服务退出时也只清理自己添加的条目。此路径不修改默认路由，也不改变 Core 或 Edge 的系统 DNS 解析，普通上网流量和外层隧道连接继续走宿主机原有路由；若组网 VIP 与本地网络发生冲突，必须在启动前解决。**走一键安装路径时不要预先手动创建 `btun0`**；与之相对，离线双签服务路径则要求管理员提前创建持久 TUN 设备及对端路由。
+
+<a id="verify-and-maintain"></a>
 
 ## 5. 验收与日常维护
 
-先从底层查到应用层。Core 的监听存在不是握手成功；`ss` 里出现 TCP 连接也不表示已建立认证电路。
+排查与验收均应遵循从底层网络到应用层的顺序。需注意，Core 处于端口监听状态不代表外层握手成功；`ss` 中出现 TCP 连接也不代表已建立起完成认证的端到端电路。
 
 ```sh
 # Core
@@ -164,7 +180,7 @@ ip -4 route get 10.20.1.1 from 10.20.1.2
 ip -4 route get 203.0.113.10
 ```
 
-旧安装器默认前缀下，用运行 daemon 的相同 UID（此处 root）查状态。离线双签服务改为 `sudo -u boreas` 与 `/var/lib/boreas/state/control.sock`，pre.3 改为 `/var/lib/boreas/control.sock`。没有现成 socket 时，先看日志，不要放宽权限。查看旧模板的控制台时服务名显式设为 `boreas`。
+在旧安装器的默认前缀下，需使用运行 daemon 的同一 UID（此处为 root）查询运行状态。若使用离线双签服务，请改用 `sudo -u boreas` 并指定 `/var/lib/boreas/state/control.sock`；若为 `v0.1.0-pre.3` 演练路径，则指向 `/var/lib/boreas/control.sock`。找不到控制 socket 时先查日志定位进程状态，不要通过放宽权限解决。查看旧服务模板日志时，需显式指定服务名 `boreas`。
 
 ```sh
 sudo boreas ctl status --socket /opt/boreas/state/control.sock
@@ -177,25 +193,25 @@ ping -c 4 -I 10.20.1.2 10.20.1.1
 ping -c 4 -I 10.20.1.1 10.20.1.2
 ```
 
-预期：对端 `/32` 路由选中 `btun0`；`daemon_connected:true`、`security_mode:"e2e-required"`、`status_fresh:true`；双向 `ping` 成功，两侧 `tx_packets` 和 `rx_packets` 增长。若要再验证 TCP，可在 Core 用 `iperf3 -s -B 10.20.1.1`，Edge 用 `iperf3 -c 10.20.1.1 -B 10.20.1.2 -t 10`；故障排除后再做压测，隔离测试结果不是公网 SLA。
+验收成功时应观察到以下结果：对端 `/32` 路由选定经由 `btun0` 转发；状态输出包含 `daemon_connected:true`、`security_mode:"e2e-required"` 及 `status_fresh:true`；双向 `ping` 均通，且两端 `tx_packets` 与 `rx_packets` 计数同步增长。如需进一步验证隧道内 TCP 吞吐，可在 Core 执行 `iperf3 -s -B 10.20.1.1`，在 Edge 执行 `iperf3 -c 10.20.1.1 -B 10.20.1.2 -t 10`；建议在基础故障排除完成后再压测，且隔离环境下的测试结果不代表公网 SLA。
 
 ### 可选：让两台节点使用私有域名
 
-先确认上面的双向 `ping` 已通过。接着按[私有 DNS 部署说明](../engineering/dns-daemon-deployment.md)签发私有区、安装两端的固定版本文件，并用私有地址直接发起查询。只用专用应用直接查询时，不必修改系统解析器。要让普通应用自动解析私有域名，再由管理员配置按域分流：只把私有后缀送到组网 DNS，其他域名仍走宿主原来的解析器。不要替换全局 DNS；私有后缀在隧道断开时也不应回退到公网。开启 TCP 查询时，两端都要显式设置 `[dns].tcp = true`。这个选项只启用隧道内的私有 DNS，不会替你安装系统解析规则，也不会把查询转到公网。
+使用私有 DNS 前，先确保上述双向 `ping` 验证已全部通过。随后按[私有 DNS 部署说明](../engineering/dns-daemon-deployment.md)签发私有区数据、在两端安装固定版本的区文件，并通过私有 VIP 地址直接发起 DNS 查询验证。仅使用专用应用直连隧道内解析器时，无需改动系统解析配置。若希望普通应用自动解析私有域名，须由管理员在操作系统层面手动配置严格的按域分流规则：仅将私有域名后缀转发至隧道内私有 DNS，且即使隧道断开也不得回退到公网 DNS，其余域名仍走宿主机原解析器；安装器不会自动修改系统解析器或代为配置分流规则，切勿替换全局系统 DNS。如需开启隧道内 TCP DNS 查询，两端配置必须显式设置 `[dns].tcp = true`；该开关只启用隧道内私有 DNS 的 TCP 监听，既不会安装系统解析规则，也不会将查询转发至公网。
 
 ### 续签、重启和停用
 
-- **状态快照**：过期前在离线签发机做新版本，例如 `boreas pki sign-status --ca-dir ./ca --out ./status-2.signed --sequence 2 --ttl-seconds 86400`（仅在当前序号确为 `1` 时用 `2`）。将同一份新快照分发到两端，在实际 daemon 材料目录内复制成临时文件，设正确属主/`0600`，同文件系统原子改名为 `status.signed`。daemon 会复核快照；如果已因过期停机，要先修复材料再启动。再次检查 `status_sequence`、`status_fresh` 及双向流量。同序号异内容或低序号不能当续签。
-- **旧开发安装的发布目录**：续签在线 `status.signed` 是运行材料更新，不等于原安装 bundle 字节未变；不要继续用同 release id 重发已变的输入。新安装代际用新 id。策略或根变更应单独评估过期、根指纹与水位，按[策略及状态规则](POLICY-STATE.md)计划，而不是覆盖历史文件。软件回退不能让旧的、过期的或已撤销的授权重新生效。
-- **停用**：旧 systemd 路径用 `sudo systemctl stop boreas.service`，如不再开机启动，再用 `sudo systemctl disable boreas.service`；确认 wrapper 所加 `/32` 和 TUN 已清理。手工前台路径在**对应终端**停止，不用全局 `pkill`。离线双签或 mesh 的持久 TUN 由管理员维护，停服务不等于删设备。保留状态与必要日志以便检查，不清空水位作为重试手段。
+- **状态快照续签**：在当前快照过期前于离线签发机签发新序号版本，例如 `boreas pki sign-status --ca-dir ./ca --out ./status-2.signed --sequence 2 --ttl-seconds 86400`（仅当当前在线序号确为 `1` 时才使用 `2`）。将同一份新快照安全分发到两台主机，先复制到实际 daemon 材料目录内的临时文件，设置正确的属主与 `0600` 权限，再在同一文件系统内原子重命名为 `status.signed`。daemon 会自动复核新快照；若此前已因状态过期而停机，需先更新材料后再启动服务。更新完成后重新核对 `status_sequence`、`status_fresh` 及双向流量。注意，同序号不同内容或更低序号均不能作为有效续签。
+- **旧开发安装的发布目录处理**：在线续签 `status.signed` 属于运行时材料更新，并不等于原始安装 bundle 字节未变；因此不要再用同一个 release id 重新发布已改变的输入，新的安装代际必须分配新的 release id。若涉及网络策略或根密钥变更，应按照[策略及状态规则](POLICY-STATE.md)单独评估过期时间、根指纹与防回退水位并规划切换，切勿直接覆盖历史文件。软件版本回退同样不能让旧的、已过期的或已撤销的授权恢复生效。
+- **停用与清理**：使用旧 systemd 路径时，执行 `sudo systemctl stop boreas.service` 停止服务；如不再需要开机自启，再执行 `sudo systemctl disable boreas.service`，并确认包装脚本添加的 `/32` 路由与 `btun0` 已被清理。采用手工前台启动时，直接在**对应终端**中止进程，不要使用全局 `pkill`。对于离线双签服务或多 Core mesh 拓扑，其持久 TUN 由管理员自行维护，停止服务不会删除网卡设备。停用后请保留状态目录与必要日志以便审计排查，严禁将清空水位文件作为重试手段。
 
 <a id="public-pre3"></a>
 
 ## 6. 公开预发布双机演练（仅 `v0.1.0-pre.3`）
 
-这是独立的 **x86-64 Linux** 手工路径。若目标机器已有 Boreas 服务、TUN、路由或配置，请用另一台隔离主机，不覆盖现有安装。`.tar.gz` 基础归档与下面的 pq768 二进制不是一回事。
+本节为独立的 **x86-64 Linux** 手工演练路径。若目标机器已有其他 Boreas 服务、TUN 设备、路由或配置文件，请另选两台隔离主机演练，避免覆盖现有部署。注意，公开 `.tar.gz` 基础 CLI 归档包与下面使用的 pq768 二进制不是同一制品。
 
-**下载端**在空目录取官方固定标签的两个文件，使用 `&&` 保证任一下载/校验失败就停止这一组操作：
+在**下载端**新建空目录获取官方固定标签下的两个文件，使用 `&&` 确保任一步下载或校验失败即中止整组命令：
 
 ```sh
 BASE=https://github.com/Lanlan13-14/Boreas/releases/download/v0.1.0-pre.3
@@ -205,16 +221,16 @@ curl -fLO "$BASE/$BIN" &&
   grep '  boreas-linux-x86_64-musl-pq768$' SHA256SUMS-PRE3 | sha256sum -c -
 ```
 
-看到该二进制 `OK` 并退出 `0` 后，再独立核对来源/摘要。两个文件同源，这一步只检测下载完整性，不是发布双签；无法建立信任时不要以 root 执行。确认无命名冲突后，在两节点安装已验过的同一制品，离线机由可信转运取得签发工具：
+确认输出显示该二进制 `OK` 且命令以退出码 `0` 结束后，再独立核对制品来源与 SHA-256 摘要。由于这两个文件同源，这一步仅用于验证下载完整性，不构成发布双签信任；在无法建立来源信任前，不要以 root 身份执行。确认目标主机不存在命名冲突后，在两台节点安装校验通过的同一份二进制，并通过可信介质转运至离线签发机：
 
 ```sh
 sudo install -m 0755 "$BIN" /usr/local/bin/boreas
 boreas doctor
 ```
 
-预期该版本 `doctor` 包含 `daemon: true` 和 `tls_backend: true`。按第 2 节签发并验包，**跳过网络策略小节**。通过安全通道把各自的包送到各自的 `/etc/boreas/material`，按第 3 节写 `/etc/boreas/node.toml`；这里的 `[paths]` 保持示例布局。创建 root 所有的 `/etc/boreas`、`/etc/boreas/material` 和 `/var/lib/boreas` 私有目录（`0700`），配置和私钥用 `0600`，检查文件归属后运行 `sudo boreas config-check /etc/boreas/node.toml`。
+执行 `boreas doctor` 应确认输出包含 `daemon: true` 与 `tls_backend: true`。按第 2 节流程完成离线签发与验包，**跳过其中的网络策略小节**。随后通过安全通道将各自材料包送到对应主机的 `/etc/boreas/material`，并参照第 3 节编写 `/etc/boreas/node.toml`（本路径 `[paths]` 保留示例默认布局即可）。创建属主为 root、权限为 `0700` 的 `/etc/boreas`、`/etc/boreas/material` 与 `/var/lib/boreas` 私有目录，将配置文件和私钥设为 `0600`，检查文件归属无误后运行 `sudo boreas config-check /etc/boreas/node.toml`。
 
-先准备双方终端。Core 上执行前台命令，看到监听后请在首连等待窗口（30 秒）内启动 Edge；如果窗口已过，查看错误再重新启动 Core。
+准备好两边终端后开始启动。先在 Core 上运行前台命令，看到监听就绪提示后，请在首连等待窗口（30 秒）内启动 Edge；若超时窗口已过，先查看报错原因再重新启动 Core：
 
 ```sh
 # Core，终端 1
@@ -231,7 +247,7 @@ sudo boreas daemon connect --config /etc/boreas/node.toml \
   --tun-name btun0 --mtu 1360
 ```
 
-在各自第二个终端用 `ip link show dev btun0` 等到 daemon 创建 TUN，然后只在自己的主机执行对应三行。`add` 冲突时停下检查，不改成 `replace` 强行覆盖。
+分别在两台主机的第二个终端执行 `ip link show dev btun0`，确认 daemon 已创建 `btun0` 后，再各自执行对应主机的三条网络配置命令。如果 `ip ... add` 提示冲突，应立即停下排查，切勿改成 `replace` 强行覆盖：
 
 ```sh
 # Core，终端 2
@@ -247,7 +263,7 @@ sudo ip addr add 10.20.1.2/32 dev btun0
 sudo ip route add 10.20.1.1/32 dev btun0
 ```
 
-按第 5 节做双向验证，状态命令改用 `sudo boreas ctl status --socket /var/lib/boreas/control.sock`。停止时结束两边前台进程并确认本次 TUN/地址/路由已消失。这一节不把旧版手工命令写入当前服务模板；需要常驻时按目标开发构建选对应的服务路径。
+配置完成后按第 5 节方法完成双向验证，查询状态时将 socket 参数改为 `sudo boreas ctl status --socket /var/lib/boreas/control.sock`。演练结束时中止两端前台进程，并确认本次创建的 TUN 设备、VIP 地址和 `/32` 路由已自动消失。不要直接将本节的旧版手工命令写入当前 systemd 服务模板；如需长期常驻运行，请根据目标开发构建选择对应的服务部署路径。
 
 <a id="troubleshooting"></a>
 
@@ -269,4 +285,4 @@ sudo ip route add 10.20.1.1/32 dev btun0
 
 ## 8. 无公网机器时如何验证
 
-仓库的 [TLS 工作流](../../.github/workflows/rust-tls.yml) 用 `tools/release/netns_daemon_smoke.sh` 在隔离 Linux runner 中验证开发构建的真实 TUN/数据面；这不是拿 pre.3 二进制运行的脚本。只在具备 `/dev/net/tun`、网络和挂载命名空间权限的可销毁 runner 上，按工作流同一提交、二进制和参数执行。旧安装器、离线双签服务与多 Core 有各自测试入口，分别见对应文档。记录准确 SHA 和实际通过的步骤，不能用普通 Rust 测试或被跳过的设备步骤代替真实包 I/O。
+仓库的 [TLS 工作流](../../.github/workflows/rust-tls.yml) 用 `tools/release/netns_daemon_smoke.sh` 在隔离 Linux runner 中验证开发构建的真实 TUN/数据面；这不是拿 pre.3 二进制运行的脚本。只在具备 `/dev/net/tun`、网络和挂载命名空间权限的可销毁 runner 上，按工作流同一提交、二进制和参数执行。旧安装器、离线双签服务与多 Core 有各自测试入口，分别见对应文档。记录准确的源码修订版本 和实际通过的步骤，不能用普通 Rust 测试或被跳过的设备步骤代替真实包 I/O。

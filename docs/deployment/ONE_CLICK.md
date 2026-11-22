@@ -1,12 +1,14 @@
 # Boreas 一键安装：先预演，再启动
 
-`tools/deploy/install.sh` 安装一份**已经构建并由你核对来源**的静态 Linux 二进制。它还能检查配置、预置材料、切换本地版本，到此即完成了“安装”。它不编译、不签发证书、不自动发现对端，也不会代你放通防火墙。要试通双机，请先完成[部署教程第 1–3 节](README.md#workflow)。
+简体中文 · [繁體中文](ONE_CLICK.zh-TW.md) · [English](ONE_CLICK.en.md)
 
-这里的 `systemd`/`procd` 是显式启用的旧开发模板，以 root 运行；在需要认证发布清单、非特权运行和就绪回退时，改用[离线双签 systemd 路径](VERIFIED-SERVICE.md)，不要混装。本页面向**当前兼容开发构建**；公开 `v0.1.0-pre.3` 没有这里所需的 daemon 策略参数。
+使用 `tools/deploy/install.sh` 可将一份**已经构建并由你核对来源**的静态 Linux 二进制部署到本机，同时完成配置校验、材料预置与本地活动版本切换——到此即完成“安装”。该脚本不负责编译、不签发证书、不自动发现对端，也不会代为放通防火墙。如需打通双机通信，请先完成[部署教程第 1–3 节](README.md#workflow)。
+
+**部署路径与版本范围说明**：此处提供的 `systemd`/`procd` 均为显式启用的旧开发模板，默认以 root 运行；如果你需要经认证的发布清单、非特权运行及就绪失败回退，请改用[离线双签 systemd 路径](VERIFIED-SERVICE.md)，切勿在同一主机混装两条路径。本页面向**当前兼容开发构建**；公开版本 `v0.1.0-pre.3` 尚不包含此处所需的 daemon 策略参数。
 
 ## 1. 在 Core、Edge 各准备一份输入
 
-在目标机准备 `/root/boreas-stage`（root 所有，`0700`），把目录内文件设为 root 所有、`0600`；二进制输入本身不必预先可执行。目录可以使用自己的私有绝对路径。另备已审核的源码 checkout（包含 `tools/deploy/install.sh` 及其同目录模板）。以下操作均从 checkout 根目录执行。
+在每台目标机创建 `/root/boreas-stage`（root 所有，权限 `0700`），并将目录内文件设为 root 所有、权限 `0600`（候选二进制本身无需预先赋予可执行权限）。你也可以改用自己的私有绝对路径。另请准备一份已审核的源码 checkout（需包含 `tools/deploy/install.sh` 及其同目录模板），后续命令均在 checkout 根目录执行。
 
 ```text
 /root/boreas-stage/
@@ -22,14 +24,16 @@
     └── root.mldsa65.der
 ```
 
-- **制品**：从独立可信渠道取得 64 位十六进制 SHA-256（或先验受信签名清单），核对源提交、架构与静态链接；`sha256sum` 只计算本地文件的摘要，不会证明来源。安装器经过摘要、ELF 检查后会**执行**候选的 `doctor`、`config-migrate`、`config-check`、`pki verify-bundle`。所以真实性检查必须在安装器执行之前完成，不能让候选替自己作证。
-- **网络信任**：按[签发步骤](README.md#2-离线签发只在签发机执行)准备并用可信 CLI `pki verify-policy` 预检；两个网络根 pin 独立预配，不放进 `material/`。脚本校验路径与权限，不验证策略双签；daemon 启动时还会按 pin 验签并记录水位，失败不承载业务。
-- **文件与路径**：材料只允许节点包文件和对端身份，不接受离线 CA 私钥、未知文件、符号链接、特殊文件或子目录；策略和 pin 要非空、普通文件、单硬链接，父目录也要可信。安装目标 `/opt/boreas` 与默认 `/usr/local/bin` 不能是符号链接、不能被组/其他人写入；`--bindir` 要提前存在。不要把安装前缀放在 `/tmp` 或复用系统目录。完整规则见[策略与状态](POLICY-STATE.md)。
-- **工具**：完整 Linux `iproute2`、`readelf`、`sha256sum` 和通用 POSIX shell 工具；脚本不自动安装依赖。若是远程主机，先确认管理路径不经过待创建的 TUN。
+在进入预演前，请逐项核对以下前置条件：
+
+- **制品真实性**：从独立可信渠道获取 64 位十六进制 SHA-256（或预先受信的签名清单），核对源码修订来源、目标架构与静态链接属性；注意 `sha256sum` 仅计算本地文件摘要，无法证明文件来源。安装器在校验摘要和 ELF 后，会直接**执行**候选二进制的 `doctor`、`config-migrate`、`config-check` 与 `pki verify-bundle`，因此真实性核验必须在运行安装器之前完成，绝不能让未验真的候选程序替自己作证。
+- **网络信任材料**：按[签发步骤](README.md#offline-issuance)备齐材料，并用可信 CLI 执行 `pki verify-policy` 预检；两个网络根 pin 必须独立预配，严禁放入 `material/`。安装脚本只检查路径与权限，不校验证书/策略双签；daemon 启动时会按 pin 验签并记录水位，一旦失败将拒绝承载任何业务流量。
+- **文件与路径约束**：`material/` 目录仅允许存放节点包文件和对端身份，不接受离线 CA 私钥、未知文件、符号链接、特殊文件或子目录；策略文件与 pin 必须是非空普通文件且仅有一个硬链接，其各级父目录也必须可信。安装目标 `/opt/boreas` 与默认 `/usr/local/bin` 均不能是符号链接，且不能对组或其他用户可写；若指定 `--bindir`，该目录须预先存在。切勿将安装前缀放在 `/tmp` 或复用系统目录。完整规则见[策略与状态](POLICY-STATE.md)。
+- **系统工具与管理链路**：目标机须备齐完整的 Linux `iproute2`、`readelf`、`sha256sum` 及常规 POSIX shell 工具，脚本不会自动安装依赖。若通过远程会话操作，请先确认管理连接不经过即将创建的 TUN 接口，以免启动后失联。
 
 ## 2. 使用同一组参数预演与安装
 
-请把下面两个 `REPLACE_…` 占位符替换为实际值。这段函数只用于复用安装命令；切换终端后需重新定义。先用 `--dry-run`，查看预期路径及服务类型；对 root 所有输入要用相同 UID 预演。
+执行前，请将下方两个 `REPLACE_…` 占位符替换为实际值。示例中的 shell 函数仅用于保证预演与正式安装使用完全一致的参数；切换终端会话后需重新定义。请先运行 `--dry-run` 核对预期落盘路径与服务类型；面对 root 所有的输入文件时，必须使用相同 UID 执行预演。
 
 ```sh
 STAGE=/root/boreas-stage
@@ -50,9 +54,9 @@ install_boreas() {
 install_boreas --service systemd --accept-legacy-service --dry-run
 ```
 
-预演只读：不下载、不写目标、不运行候选或服务管理器。它只检查摘要、ELF、路径和文件来源，不能证明配置或策略验签会通过。`--url` 不是本教程的路线：脚本只接受直接 HTTPS 二进制 URL，要求 `--accept-weak-https`，仍不能验证发布签名。
+预演过程严格只读：不会下载文件、不会写入目标路径，也不会执行候选二进制或调用服务管理器。它仅校验摘要、ELF、路径与文件来源，不能证明配置校验或策略验签一定通过。此外，`--url` 不属于本教程路线：脚本仅接受直接的 HTTPS 二进制 URL 且要求附带 `--accept-weak-https`，但仍无法验证发布签名。
 
-仅在预演和信任检查无误后执行正式安装。若只取版本和入口、不装服务，改选 `--service none`（预演时也应选同一模式）。若主机已在运行 `boreas.service`，先规划停机并检查现有服务及路径，不要直接按首次安装操作；旧模板不能替换离线双签服务。
+仅当预演输出与信任核查全部无误后，再执行正式安装。若你只需安装版本目录和命令入口、不部署系统服务，请将服务模式改为 `--service none`（预演时也应使用同一参数）。若主机上已在运行 `boreas.service`，请先规划停机并检查现有服务及路径，不要直接套用首次安装流程；旧模板也不能用于替换离线双签服务。
 
 ```sh
 install_boreas --service systemd --accept-legacy-service
@@ -60,7 +64,7 @@ sudo cat /opt/boreas/active
 sudo /usr/local/bin/boreas doctor
 ```
 
-安装器默认**不启动**。`active` 应输出 `local-eval-1`，`doctor` 应表明该二进制具有 daemon 和 TLS 支持。`/opt/boreas` 为 `0700`，此示例的 dispatcher 与运行状态用 root 访问。结果布局：
+安装器默认**不会启动**服务。安装完成后，预期结果如下：`active` 应输出 `local-eval-1`，`doctor` 应确认该二进制具备 daemon 与 TLS 支持。`/opt/boreas` 权限为 `0700`，本示例中的 dispatcher 与运行状态均由 root 访问。落盘目录结构如下：
 
 ```text
 /opt/boreas/
@@ -74,18 +78,18 @@ sudo /usr/local/bin/boreas doctor
     └── status.state / policy.state       # 由 daemon 创建；安装器不预建
 ```
 
-`config-migrate` 生成 `version = 2` 配置，不改源文件；安装器核对 `net_id`，把 `[paths]` 的 `identity_key` / `roots` / `state_dir` 改为活动版本下的私钥、roots 和共享状态目录。其他配置仍由你审核。`boreas` / `boreas-easy` 由默认 `/usr/local/bin` 的入口指向 dispatcher。
+安装器调用 `config-migrate` 生成 `version = 2` 配置且不修改源文件；同时核对 `net_id`，并将 `[paths]` 下的 `identity_key`、`roots`、`state_dir` 改写为活动版本下的私钥、roots 与共享状态目录。其余配置项仍需由你自行审核。默认 `/usr/local/bin` 下的 `boreas` 与 `boreas-easy` 入口均指向 dispatcher。
 
 ## 3. 写入本机角色与启动参数
 
-检查 `/etc/boreas` 未被其他服务使用后，创建 root 所有的非符号链接目录（`0700`）和 `/etc/boreas/boreas.env`（普通文件，精确 `0600`）。新文件可用下面两条命令建立；**第二条会清空现有文件，仅用于首次**。随后以管理员身份编辑该文件，只写入本机对应的配置，不要把两段合在一起。
+确认 `/etc/boreas` 未被其他服务占用后，创建 root 所有的非符号链接目录（`0700`）和 `/etc/boreas/boreas.env`（普通文件，精确权限 `0600`）。新建文件可执行下方两条命令；**注意第二条命令会清空现有文件，仅限首次建档使用**。随后以管理员身份编辑该文件，仅写入匹配本机角色的那一段配置，切勿将 Core 与 Edge 两段合并写入。
 
 ```sh
 sudo install -d -m 0700 -o root -g root /etc/boreas
 sudo install -m 0600 -o root -g root /dev/null /etc/boreas/boreas.env
 ```
 
-Core（监听端口需要安全组及防火墙放行）：
+Core 节点（监听端口须在云安全组及本机防火墙放行）：
 
 ```ini
 BOREAS_ROLE=core
@@ -96,7 +100,7 @@ BOREAS_TUN_NAME=btun0
 BOREAS_MTU=1360
 ```
 
-Edge（替换底层 IP，核对证书 SAN，不填隧道 VIP）：
+Edge 节点（替换底层 IP、核对证书 SAN，不要填写隧道 VIP）：
 
 ```ini
 BOREAS_ROLE=edge
@@ -109,9 +113,9 @@ BOREAS_TUN_NAME=btun0
 BOREAS_MTU=1360
 ```
 
-VIP 使用签名身份中 RFC1918 的地址，不带 `/32`，不允许前导零；底层监听/拨号为数字 IPv4 加端口；TUN 名不超过 15 字符；wrapper MTU 范围 `1280..1400`。不要预建同名接口或对端 `/32`，该 wrapper 创建自己的运行资源，冲突会拒启，不覆盖现有网络。停止时仅尝试撤掉它加的地址/路由，不清空路由表，也不改默认路由、防火墙或 DNS。
+参数与网络边界约束如下：VIP 必须取自签名身份中的 RFC1918 地址，不带 `/32` 后缀且不允许前导零；底层监听或拨号地址为数字 IPv4 加端口；TUN 接口名不超过 15 个字符；wrapper 允许的 MTU 范围为 `1280..1400`。不要提前创建同名接口或对端 `/32` 路由——该 wrapper 会自行创建运行资源，遇到冲突会直接拒绝启动，不会覆盖现有网络。停止服务时，wrapper 仅尝试撤除自身添加的地址与路由，不会清空路由表，也不会修改默认路由、防火墙或主机 DNS（默认部署仅添加已授权对端的 IPv4 VIP `/32` 路由，不配置任意 `/24` 路由、导出或转发）。
 
-先在 Core 上执行 `daemon-reload` 与 `start`，确认 Core 已开始监听 TCP 端口后，再在 Edge 执行同样两条。仅在[双向验收](README.md#5-验收与日常维护)通过后，才考虑 `enable` 设置开机启动。
+启动顺序上，请先在 Core 执行 `daemon-reload` 与 `start`，确认 Core 已成功监听 TCP 端口后，再在 Edge 执行相同两条命令。仅当[双向验收](README.md#verify-and-maintain)全部通过后，再考虑执行 `enable` 开启开机自启。
 
 ```sh
 sudo systemctl daemon-reload
@@ -120,27 +124,27 @@ sudo systemctl status boreas.service
 sudo journalctl -u boreas.service -n 100 --no-pager
 ```
 
-`Type=simple` 的 `active` 不等于握手、路由或流量正常。查询实际 daemon：
+`Type=simple` 显示 `active` 并不代表握手、路由或实际流量已就绪。请查询实际 daemon 状态进行确认：
 
 ```sh
 sudo /usr/local/bin/boreas ctl status --socket /opt/boreas/state/control.sock
 sudo /usr/local/bin/boreas-easy --socket /opt/boreas/state/control.sock --service boreas
 ```
 
-确认要开机启动时用 `sudo systemctl enable boreas.service`。升级后已运行进程不会随 `active` 自动替换；审核并按计划 `sudo systemctl restart boreas.service`，再做双向验收。`--start` 也可以显式选择启用并（重）启，但要求预先准备合规的 `boreas.env`，且不验证数据面，此处刻意先分步检查。
+确认需要开机自启时，再执行 `sudo systemctl enable boreas.service`。后续升级时，已运行的进程不会随着 `active` 指针切换而自动替换；请先审核变更，再按计划执行 `sudo systemctl restart boreas.service` 并重做双向验收。虽然也可以显式传入 `--start` 来启用并（重）启服务，但这要求事先备好完全合规的 `boreas.env` 且不会校验数据面连通性，因此本指南刻意采用分步检查。
 
 ### 仅供评估的 procd 模板
 
-旧模板可用 `--service procd --accept-legacy-service` 渲染 `/etc/init.d/boreas`；环境文件同上。模板按白名单读取字面 `KEY=VALUE`，不要加引号、行尾注释、空格、变量展开或 CRLF。目标机需要完整的 `iproute2`、Linux TUN 及其他所需工具；模板的存在不表示已验证 BusyBox `ip` 或物理 OpenWrt。先在目标镜像的不启动模式审阅路径、工具和架构；没有验证环境就走 Linux/systemd 路径。
+使用 `--service procd --accept-legacy-service` 可基于旧模板渲染 `/etc/init.d/boreas`，环境文件规则与上文相同。该模板严格按白名单读取字面 `KEY=VALUE` 行，严禁添加引号、行尾注释、多余空格、变量展开或 CRLF 换行符。目标机必须具备完整的 `iproute2`、Linux TUN 及其他所需工具；存在此模板并不意味着已验证 BusyBox `ip` 或物理 OpenWrt 设备。请先在目标镜像上以不启动模式审阅路径、工具和架构；若缺少已验证环境，请直接选用 Linux/systemd 路径。
 
 ## 4. 安装失败、停止与回退
 
-- **预演拒绝**：看第一条错误。检查落盘路径各级祖先、材料 allowlist、两个 pin 是否在材料之外、三份策略是否有多余文件，以及静态 ELF/架构。不要加宽目录权限或忽略摘要失败。
-- **安装失败**：安装锁 `<prefix>/.install.lock` 串行化运行；遗留锁先调查，不抢占。`active` 最后切换，切换后若安装步骤明确失败，安装器尝试恢复旧指针；已发布的文件可能保留。`sync` 不是断电验收。核对 `active`、日志和实际进程，不把指针恢复当成旧服务已运行。
-- **服务启动失败或反复重启**：先 `sudo systemctl stop boreas.service` 并看日志。`78` 是旧 wrapper 的配置拒绝，模板不重启此退出码；普通错误有重启限额。装好的服务不会因为运行时故障自动把版本回退。
-- **升级与手工回退**：同 release id 只接受字节一致的输入，任何改动用新 id；历史代际不覆盖。必要时停服务，审核旧制品、旧策略及现有持久状态仍兼容且有效，再按[策略状态和回退语义](POLICY-STATE.md#6-升级-start-与回滚)恢复指针，启动并复验。不得用删除 `status.state`/`policy.state` 或降低授权水位来恢复。
+- **预演拒绝**：优先查看第一条报错。依次排查落盘路径的各级祖先目录、材料 allowlist、两个 pin 是否已放在 `material/` 之外、三份策略文件是否混入多余文件，以及静态 ELF 与目标架构是否匹配。切勿通过放宽目录权限或忽略摘要失败来强行继续。
+- **安装失败**：安装锁 `<prefix>/.install.lock` 用于串行化执行；若发现遗留锁，应先排查原因而非直接抢占。`active` 指针在最后阶段切换；若切换后后续安装步骤明确失败，安装器会尝试恢复旧指针，但已发布的文件仍可能保留在目录中。注意 `sync` 并不等同于断电可靠性验收。恢复后务必核对 `active`、日志和实际存活进程，不要把指针回退误判为旧服务已恢复运行。
+- **服务启动失败或反复重启**：立即执行 `sudo systemctl stop boreas.service` 并查看日志。退出码 `78` 代表旧 wrapper 的配置拒绝，服务模板不会对退出码 `78` 自动重启；普通运行错误则会受重启次数限额控制。已安装的服务不会因为运行时故障而自动回退版本。
+- **升级与手工回退**：同一 release ID 仅接受字节完全一致的输入，任何变动都必须使用新 ID，绝不覆盖历史代际。确需回退时，先停服并审核旧制品、旧策略及现有持久状态是否仍兼容且有效，再按[策略状态和回退语义](POLICY-STATE.md#6-升级--start-与回滚)恢复指针、重启并重新验收。严禁通过删除 `status.state`/`policy.state` 或降低授权水位来恢复服务。
 
 ### 如何区分测试证据
 
-- `tools/deploy/test-install.sh` 是隔离的 shell 回归（模拟系统工具，不以 root 执行、不在已有 Boreas 服务的主机运行）。它检查文件来源、路径、权限、版本指针和 wrapper 约束，不证明真实包传输。
-- `tools/deploy/test-real-install.sh` 由 [deploy 工作流](../../.github/workflows/deploy.yml)在受控 runner 验证静态安装，使用 `--service none`；没有启动服务或现场 TUN 验收。真实数据面请看 [TLS 工作流](../../.github/workflows/rust-tls.yml) 和 [双机验收清单](README.md#5-验收与日常维护)。
+- `tools/deploy/test-install.sh`：隔离环境下的 shell 回归测试（模拟系统工具，不以 root 执行，且不得在已有 Boreas 服务的主机上运行）。它只验证文件来源、路径、权限、版本指针与 wrapper 约束，不能证明真实数据包的转发能力。
+- `tools/deploy/test-real-install.sh`：由 [deploy 工作流](../../.github/workflows/deploy.yml) 在受控 runner 上以 `--service none` 验证静态安装流程，不会启动服务或执行现场 TUN 验收。真实数据面验证请查阅 [TLS 工作流](../../.github/workflows/rust-tls.yml)与[双机验收清单](README.md#verify-and-maintain)。

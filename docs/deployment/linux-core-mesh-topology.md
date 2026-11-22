@@ -1,8 +1,17 @@
 # 四 Core 互通：业务路径、目录发现与故障切换
 
-这是一条独立的 Linux 实验路线：`boreas node mesh-run <node.toml> <material-dir> <runtime.toml>`。不使用普通 Core/Edge 的 `daemon`、`boreas-run` 或离线签名 daemon 单元。它只服务**一对 Core 永久 IPv4 VIP**；Source 发起电路，确认后两个端点都可收发。下面的 `[[routes]]` 配方每实例最多三条显式路径，每条经过三或四个不重复的 Core。也可以用[签名拓扑 `[routing]` 配方](linux-core-mesh-runtime.md#configure-signed-topology-routing-and-tun)：只配置端点对和相邻传输，不列端到端路径，支持直达或最多两个中继；两种配方均要求 Source 槽位小于 Destination。它不做任意子网、Edge、默认路由、IPv6 或 DNS 转发。
+简体中文 · [繁體中文](linux-core-mesh-topology.zh-TW.md) · [English](linux-core-mesh-topology.en.md)
 
-**先选实现版本：** 三种目录方式在[第 4 节](#directory)区分。本页完整示例使用含 `4363e0e` 的 Linux `openssl-inner-tls` 开发构建；不适用于公开 `v0.1.0-pre.3`。如果只有不含发现改动的 `43b744a` 构建，删除协调器配置并选择手工种子或静态控制邻接。下文的持久 CoreLSA 防重放与冲突处置也只适用于包含发现改动的构建。判断制品是否具备这些能力，要看实际构建的源码提交；文档存在或其他提交的 CI 通过都不是证据。
+这是一条独立的 Linux 实验路线，使用 `boreas node mesh-run <node.toml> <material-dir> <runtime.toml>` 运行，不使用普通 Core/Edge 的 `daemon`、`boreas-run` 或离线签名 daemon 单元。
+
+**适用边界与路由选择：** 本路线仅服务**一对 Core 永久 IPv4 `/32` VIP**；由 Source 发起电路，确认后两个端点均可收发。默认部署不修改宿主 DNS、不写入默认路由，也不提供任意 `/24` 子网路由、网段导出、通用转发、Edge、IPv6 或 DNS 转发；即便配置操作系统路由，也不会突破仅限授权对端 VIP `/32` 的限制。你可以二选一配置路径：
+
+- **显式路径配方（本页 `[[routes]]`）**：每实例最多三条显式路径，每条经过三或四个不重复的 Core。
+- **签名拓扑配方（[签名拓扑 `[routing]` 配方](linux-core-mesh-runtime.md#configure-signed-topology-routing-and-tun)）**：只配置端点对和相邻传输，不列端到端路径，支持直达或最多两个中继。
+
+两种配方均要求 Source 槽位号小于 Destination 槽位号。
+
+**先核对二进制能力再部署：** 三种目录同步方式在[第 4 节](#directory)区分。本页完整示例要求 Linux `openssl-inner-tls` 开发构建具备**目录发现协调器及持久 CoreLSA 防重放与冲突处置能力**；公开版本 `v0.1.0-pre.3` 不具备这些能力，不能直接套用。如果你使用的是**不含目录发现与持久 CoreLSA 改动的构建**，请删除协调器配置并改用手工种子或静态控制邻接；下文的持久 CoreLSA 防重放与冲突处置机制同样只适用于包含目录发现改动的构建。判断制品是否具备上述能力，必须核查构建所用的实际源码修订；文档存在或其他源码修订的 CI 通过均不能作为依据。
 
 ## 1. 拓扑和端口
 
@@ -19,11 +28,15 @@
 | Core 3 | `3 / 513` | Relay + 目录协调器，`192.0.2.3`，`core3.example.com` | TCP `18082` 主路径、`18083` 备路径、`18183` 目录 | 无 |
 | Core 4 | `4 / 769` | Destination，`192.0.2.4`，`core4.example.com` | TCP `18082` 主路径、`18083` 备路径 | `btun0`，`10.20.4.1/32` |
 
-示例地址不能在公网直接使用。目标主机必须预先配置好底层监听地址；拨号配置填写实际的数字 IP 地址和端口，不要填 VIP。防火墙按表和有向链路开放 TCP，并限制来源：Core 2 的主业务端口接 Core 1，Core 3 的主/备端口分别接 Core 2/1，Core 4 的两个业务端口都接 Core 3；协调器端口接预配的 1、2、4。底层名称以证书 DNS SAN 校验；用 IP 拨号不要求这些名称公开解析。部署前核对 SSH 路由、已有 `10.20.*` 地址、端口和接口；示例不是 CDN 或任意反代配置。
+部署前必须满足以下网络与防火墙前提：
+
+1. **预配置底层地址与拨号目标**：示例 IP 不能在公网直接使用。目标主机须事先配置好底层监听地址；拨号配置必须填写实际数字 IP 地址和端口，禁止填写 VIP。
+2. **按有向链路开放防火墙 TCP 端口并限制来源**：Core 2 的主业务端口（`18082`）仅放行 Core 1；Core 3 的主路径端口（`18082`）放行 Core 2、备路径端口（`18083`）放行 Core 1；Core 4 的两个业务端口（`18082`、`18083`）均放行 Core 3；协调器端口（`18183`）仅放行预配的 Core 1、2、4。
+3. **核对主机冲突与证书名**：底层名称通过证书 DNS SAN 校验，使用 IP 拨号时不要求公网 DNS 解析这些域名，且不要修改宿主 DNS。启动前先确认 SSH 管理路由、主机现有 `10.20.*` 地址、端口及网卡无冲突；本示例不是 CDN 或任意反向代理配置。
 
 ## 2. 离线签发节点、策略和每个 Core 的拓扑通告
 
-用[双机教程的离线准备方法](README.md#workflow)生成新 `NET_ID` 并初始化 `./ca`，只做一次。本节以同一可信 pq768 构建、私有工作目录和正确 UTC 为前提。**不要签发 Edge，也不要交叉复制 `peer.signed`**；专用 mesh 使用下面的 `core-N.signed`。为了实验容易复现，这组命令为每个 Core 都签一份外层 TLS 证书；当前拓扑中仅监听者需要外层服务端私钥。
+开始签发前，确保所有签发机使用同一可信 `pq768` 构建、私有工作目录且系统 UTC 时间准确。先参照[双机教程的离线准备方法](README.md#workflow)生成新的 `NET_ID` 并初始化 `./ca`（全局只执行一次）。**不要签发 Edge，也不要交叉复制 `peer.signed`**；专用 mesh 统一使用下文的 `core-N.signed`。为便于实验复现，以下命令为每个 Core 都签发了外层 TLS 证书；在当前拓扑中，实际只有监听节点需要外层服务端私钥。
 
 ```sh
 for slot in 1 2 3 4; do
@@ -35,7 +48,7 @@ boreas pki sign-status --ca-dir ./ca --out ./status.signed --sequence 1 --ttl-se
 boreas pki sign-policy --ca-dir ./ca --out-dir ./policy-issued --sequence 1 --ttl-seconds 604800
 ```
 
-确认四份 `local.signed` 和节点密钥均成功签发后再继续。下一步的签名者是**受 NetworkRoot 授权、限于指定 Core 槽位的 CoreOperational**，不是运行账号。以下目录和参数用 Core 1 示范：
+确认四份 `local.signed` 和节点密钥全部签发成功后再进入下一步。接下来的签名操作由**受 NetworkRoot 授权、且限于指定 Core 槽位的 CoreOperational** 完成，严禁使用运行账号私钥代替。以下目录与参数以 Core 1 为例：
 
 ```sh
 # Core 1 的签发机；新的 ./operational-1 目录只保存在签发区
@@ -45,9 +58,14 @@ boreas pki core-authorize ./ca ./ca/roots.cbor \
   ./operational-1/core.request ./roots-1.cbor 1
 ```
 
-为槽位 `2`、`3`、`4` 各重复一次：`core-request` 的第 3 个参数改成该槽位，目录不要复用；`core-authorize` 每次读取**上一步输出**，例如 Core 2 读 `roots-1.cbor`、写 `roots-2.cbor`，最后得到 `roots-4.cbor`。每个槽位一份受限签发授权，不能复用别的槽位私钥。分发最终公开 `roots-4.cbor` 给所有签发机和运行节点，运行节点统一以它替代初始 `roots.cbor`。不要让中间版本混入节点。NetworkRoot、IdentityAuthority、StatusSigner、外层 CA 和 CoreOperational 的私钥都不进运行目录。
+为槽位 `2`、`3`、`4` 依次重复上述授权流程：
 
-在**各自**签发机上，用最终 roots 签发各自的 LSA。下面四行分别对应四个槽位；输出文件是新名字，参数依次为 `core-generation`、`seq`、有效秒数和零至 15 个 `对端槽位:RTT毫秒:丢包ppm`：
+- 将 `core-request` 的第 3 个参数替换为对应槽位号，每个槽位使用独立目录，不得复用。
+- `core-authorize` 每次必须读取**上一步的输出**——例如 Core 2 读取 `roots-1.cbor` 并输出 `roots-2.cbor`，最终产出 `roots-4.cbor`。每个槽位拥有一份受限签发授权，不得混用其他槽位私钥。
+- 将最终公开的 `roots-4.cbor` 分发给所有签发机与运行节点，在所有运行节点上用它统一替换初始 `roots.cbor`，避免中间版本混入。
+- NetworkRoot、IdentityAuthority、StatusSigner、外层 CA 以及 CoreOperational 的私钥均不得放入运行目录。
+
+在**各自**签发机上，使用最终 `roots-4.cbor` 签发本槽位的拓扑通告（LSA）。下面四行命令分别对应四个槽位，输出文件名互不相同，参数依次为 `core-generation`、`seq`、有效秒数，以及 0 至 15 个 `对端槽位:RTT毫秒:丢包ppm`：
 
 ```sh
 boreas pki core-sign-lsa ./operational-1 ./roots-4.cbor ./core-1.lsa-1 1 1 1800 2:5:0 3:30:0
@@ -56,13 +74,13 @@ boreas pki core-sign-lsa ./operational-3 ./roots-4.cbor ./core-3.lsa-1 1 1 1800 
 boreas pki core-sign-lsa ./operational-4 ./roots-4.cbor ./core-4.lsa-1 1 1 1800 3:5:0
 ```
 
-签发器将邻接标为 CDN 类；**这里的类是协议属性，不代表实验经过真实 CDN**。一段业务边必须在两端的签名通告中出现；本例在丢包值相同的情况下用较低总 RTT 让 `1→2→3→4` 优先。目录连接不是业务邻接（例如 `2→3` 可以有两种不同端口，`1→3` 的目录认证不会给业务路径签授权）。签发有效期最长 3600 秒；临近启动再签，预留分发时间。续签时递增 `seq`，不能改同一代次/序号已签内容。空邻接列表可以签发为撤回；它不新增授权。
+签发器将业务邻接标记为 CDN 类；**这里的类仅是协议属性，不代表实验流量经过真实 CDN**。一条业务边必须在两端节点的签名通告中同时出现才具备授权；本例在丢包率相同的情况下通过更低的总 RTT 让 `1→2→3→4` 成为主选路径。目录连接不属于业务邻接（例如 `2→3` 可使用两个不同端口，而 `1→3` 的目录认证不会为业务路径授予转发权）。LSA 签发有效期最长为 3600 秒，建议临近启动再签发并预留分发窗口；续签时必须递增 `seq`，不得修改同一代次和序号下已签发的内容。签发空邻接列表表示撤回通告，不会新增任何授权。
 
 ## 3. 逐台配置：先 `node.toml`，再 `runtime.toml`
 
-每台主机预配专用非特权账号 `boreas`。示例路径 `/etc/boreas-mesh` 和 `/var/lib/boreas-mesh` 的各级父目录都必须可信且不能是符号链接。配置、私钥和状态仅限运行 UID 访问；建议私有目录用 `0700`，文件用 `0600`。节点和实例均使用独立持久状态。不要并行启动第二个实例读写同一状态，亦不要用 `mesh-probe` 同时写同一目录。
+每台主机须预先创建专用非特权账号 `boreas`。示例路径 `/etc/boreas-mesh` 和 `/var/lib/boreas-mesh` 的所有父级目录都必须可信且不能包含符号链接。配置文件、私钥与运行状态仅允许运行 UID 访问，建议私有目录权限设为 `0700`、文件权限设为 `0600`。每个节点与实例使用独立的持久状态目录，严禁并行启动第二个实例读写同一状态目录，也不要同时使用 `mesh-probe` 写入同一目录。
 
-在**每台**主机按表放文件：
+按以下清单在**每台**主机放置文件：
 
 | 安装位置 | 来源 |
 | --- | --- |
@@ -77,9 +95,9 @@ boreas pki core-sign-lsa ./operational-4 ./roots-4.cbor ./core-4.lsa-1 1 1 1800 
 | `…/network-policy.ed25519.sig`、`…/network-policy.mldsa65.sig` | `policy-issued/ed25519.sig`、`policy-issued/mldsa65.sig` |
 | `…/network-root.ed25519.der`、`…/network-root.mldsa65.der` | 独立预配的两个 NetworkRoot pin，对应策略输出 `root-ed25519.der` 与 `root-mldsa65.der` |
 
-先用可信 verifier [预检策略](README.md#当前开发构建额外签发网络策略)，再部署。不要把三个路线上不同的策略命名混用：专用 mesh 读 `network-policy.*`，离线双签 daemon 读 `policy.*`，旧安装器 wrapper 则加 release 前缀。运行期的 `status.state`、`network-policy.state` 和（含发现改动时）`core-lsa.state` 由运行时建立，不预建空文件。`outer-ca.pem` 只管外层；内层 pq768 mTLS 仍匹配签名节点证书的 SPKI（公钥信息），不能用外层 TLS 名或 IP 代替。
+部署策略文件前，先用可信 verifier 完成[预检策略](README.md#network-policy)。切勿混用三条运行路线的策略文件命名：专用 mesh 读取 `network-policy.*`，离线双签 daemon 读取 `policy.*`，旧安装器 wrapper 则带有 release 前缀。`status.state`、`network-policy.state` 以及（当构建包含发现改动时）`core-lsa.state` 均由运行时自动创建，不要提前新建空文件。`outer-ca.pem` 仅校验外层 TLS；内层 `pq768` mTLS 仍严格匹配已签名节点证书的 SPKI（公钥信息），不能由外层 TLS 名称或 IP 替代。
 
-以下为 Core 1 的完整 `node.toml`（`/etc/boreas-mesh/node.toml`）：
+以下是 Core 1 的完整 `/etc/boreas-mesh/node.toml`：
 
 ```toml
 version = 2
@@ -113,9 +131,13 @@ allow_edges = false
 default_route = false
 ```
 
-换成实际 `NET_ID`。Core 2/3/4 对照上表改 `home_core_id` 和 `node_id`；其余可沿用。`[uplink]` 为通用 schema 必填，不决定 mesh 的实际拨号；不加 `[dns]` 或其他可选能力。以服务 UID 运行 `sudo -u boreas boreas config-check /etc/boreas-mesh/node.toml`，先检查通用配置。专用的 `runtime.toml` 由 `mesh-run` 解析，不在 `config-check` 的范围内。
+将配置中的占位符替换为实际 `NET_ID`。Core 2、3、4 对照第 1 节表格修改 `home_core_id` 和 `node_id`，其余字段可保持一致。`[uplink]` 仅用于满足通用配置 schema，不决定 mesh 的实际拨号目标；不要添加 `[dns]` 或其他可选功能（本方案保持默认不接管宿主 DNS，若需专用私有后缀 split DNS 请另行按对应指引显式启用，而专用 mesh 本身不支持 DNS 转发）。保存后，务必以服务账号预检通用配置：
 
-以下四份 `runtime.toml` 分别存到**对应主机**的 `/etc/boreas-mesh/runtime.toml`。`listen` 与前一节点的 `next` 要逐段对应；路线 `path` 必须在所有沿途节点一致。业务和控制的 socket 不可复用。下方不含目录段，按第 4 节追加。
+`sudo -u boreas boreas config-check /etc/boreas-mesh/node.toml`
+
+确认检查通过再继续。专用 `runtime.toml` 由 `mesh-run` 解析，不在 `config-check` 检查范围内。
+
+将以下四份 `runtime.toml` 分别保存到**对应主机**的 `/etc/boreas-mesh/runtime.toml`。配置时必须确保本节点的 `listen` 与上一跳的 `next` 逐段对应，沿途所有节点上的路线 `path` 定义完全一致，且业务 socket 与控制 socket 不得复用端口。以下配置暂不含目录段落，需按第 4 节所选方式追加到文件末尾。
 
 **Core 1 — Source**
 
@@ -189,7 +211,9 @@ listen = "192.0.2.4:18083"
 
 ## 4. 选择一种目录方式
 
-**A. 预配成员 + 一个协调器（含 `4363e0e` 的构建）。** Core 3 在自己的运行清单末尾追加：
+根据你的目标二进制能力与运维偏好，从下列三种方式中任选一种（格式不可混用）：
+
+**A. 预配成员 + 单一协调器（要求具备目录发现与持久 CoreLSA 能力的构建）。** Core 3 在其 `runtime.toml` 末尾追加：
 
 ```toml
 [directory_discovery]
@@ -197,7 +221,7 @@ coordinator = 3
 listen = "192.0.2.3:18183"
 ```
 
-Core 1、2、4 分别在各自清单末尾追加同一配置：
+Core 1、2、4 分别在各自 `runtime.toml` 末尾追加同一段协调器客户端配置：
 
 ```toml
 [directory_discovery]
@@ -206,11 +230,11 @@ next = "192.0.2.3:18183"
 tls_name = "core3.example.com"
 ```
 
-这不是发现任意新成员。每个节点都必须预配其他三份 `core-N.signed` 和一致的最终 roots。TLS 客户端验证协调器外层名称、链和签名身份；协调器按内层 TLS 的精确 SPKI 匹配预配成员，不从 TCP 来源、DNS、SessionHello 或 LSA 学习成员/公钥。协调器交换已验证的原始签名通告，不代签、不授予业务边，也不会自动选举替代协调器。
+注意：协调器不发现任意未知成员。每个节点仍须预先配置其余三个槽位的 `core-N.signed` 和一致的最终 `roots.cbor`。TLS 客户端会校验协调器的外层域名、证书链与签名身份；协调器则依据内层 TLS 的精确 SPKI 匹配预配成员，绝不从 TCP 来源、DNS、SessionHello 或 LSA 中学习成员或公钥。协调器仅负责交换已验证的原始签名通告，不代签、不授予业务边，也不会自动选举备用协调器。
 
-**冷启动：只在 Core 3 放一份当前有效的 Core 1 通告**（`material/core-1-lsa.signed`），让 Core 2、3、4 在 Source 进程启动前获知 Core 1。其余远端 LSA 在本例从目录获取，不逐对复制。缺少通告时，目录可先交换，但业务监听与 TUN 附着会等待图具备可用路径。任何显式放在磁盘的种子仍是校验输入；续签后要原子替换种子，或在确认新头已持久化后移除不再需要的**种子文件**。不能把过期种子留在目录，也不能删除持久状态文件。
+**冷启动与种子管理：** 仅在 Core 3 放置一份当前有效的 Core 1 通告（`material/core-1-lsa.signed`），以便 Core 2、3、4 在 Source 启动前提前获知 Core 1。其余远端 LSA 均通过目录获取，无需逐对复制。当部分通告尚未到位时，目录交换可先行工作，但业务监听与 TUN 附着会一直等待，直到拓扑图中存在可用路径。任何显式置于磁盘的种子文件都视为校验输入；续签 LSA 后，应原子替换种子文件，或在确认新头已持久化后删除不再需要的**种子文件**。严禁将过期种子留在目录中，也严禁删除持久状态文件。
 
-**B. 静态控制邻接（`[[directory]]`）。** 两种格式不能同用。配置专用控制边，较低槽位拨较高槽位。例：Core 1 拨 Core 2 的 `192.0.2.2:18182`：
+**B. 静态控制邻接（`[[directory]]`）。** 此格式不得与方式 A 混用。为控制面配置专用控制边，按较低槽位拨较高槽位配置。例如，Core 1 拨 Core 2 的 `192.0.2.2:18182`：
 
 ```toml
 # Core 1
@@ -227,15 +251,15 @@ peer = 1
 listen = "192.0.2.2:18182"
 ```
 
-其他控制边沿用同样规则，每一条应有两端的配置及独立端口；例如控制链 `1→2→3→4`。给每个目录监听者配置本机外层 TLS 服务证书，拨号者配置可信链。为保证下游先就绪，可以先预置当前有效的全部 LSA；启用静态同步后，学到的远端头不要求再写一份种子。不要依赖尚未运行的 Source 把第一份签名 LSA 传到下游。
+其余控制边遵循同样规则，每条边须在两端成对配置并使用独立端口（例如建立 `1→2→3→4` 控制链）。为每个目录监听端配置本机外层 TLS 服务端证书，为拨号端配置可信 CA 链。为保证下游先行就绪，可在启动前预置当前有效的全部 LSA；启用静态同步后，学到的远端头无需再落盘写入新的种子文件。不要指望由尚未启动的 Source 把第一份签名 LSA 推向下游。
 
-**C. 纯手工种子（不写任何目录段）。** 初次部署按 `peers` 为每节点放齐各 `core-N-lsa.signed`，再按顺序启动。没有跨跳同步；运行时仍可接收通过认证的直接业务邻居的新通告。包含 `4363e0e` 的构建可在重启复用有效的持久头；不含该改动时不能依赖跨重启保存。
+**C. 纯手工种子（不写任何目录段）。** 初次部署时按 `peers` 为每个节点放齐所有对端的 `core-N-lsa.signed`，再按顺序启动。此方式无跨跳同步；运行期间仍可接收来自已认证直接业务邻居的新通告。若使用具备目录发现与持久 CoreLSA 能力的构建，重启后可复用有效的持久头；若使用不含该改动的构建，则不能依赖跨重启持久化。
 
-目录同步校验直接通告、身份撤权及第三方签名通告；每页是一份原始签名 LSA，校验签名、委派范围、时间及回放水位，已认证页可独立提交。拨号方在上一次尝试结束五秒后安排下一次尝试，和其他控制任务、业务轮次共用调度。**这不是五秒收敛保证。**协调器暂时不可达时，已完整授权的业务图在自己的有效边界内仍可使用；签名、授权或新鲜度失败不会降级放行。目录不分发身份、授权、租约或冲突证据。
+**同步校验与调度行为：** 目录同步会校验直接通告、身份撤权及第三方签名通告；每次同步分页对应一份原始签名 LSA，逐一验证签名、委派范围、时间戳和防重放水位，通过认证的页面会独立提交。拨号方在上一次同步尝试结束 5 秒后调度下一次尝试，并与其他控制任务及业务轮次共享调度器——**这不构成 5 秒收敛保证**。当协调器暂时不可达时，已完整授权的业务图在其有效期内仍可继续工作；任何签名、授权或新鲜度校验失败都不会降级放行。目录本身不分发身份凭据、业务授权、租约或冲突证据。
 
 ## 5. 管理员预建两端 TUN，再启动四个进程
 
-Core 1 与 Core 4 各有一个交给 `boreas` 的持久、单队列、无包信息头的 TUN。下面先确认设备及路由没有冲突，再逐台执行。不要以 `replace` 覆盖宿主旧路由。两个 Relay 不建 TUN。
+Core 1 与 Core 4 各需一个交给 `boreas` 使用的持久、单队列、无包信息头（`no_pi`）的 TUN 设备。执行创建前先确认本机设备名与路由无冲突，再逐台配置，严禁使用 `replace` 覆盖宿主原有路由。Core 2 和 Core 3 两个 Relay 不建 TUN。
 
 ```sh
 # 只在 Core 1
@@ -253,18 +277,20 @@ sudo ip addr add 10.20.4.1/32 dev btun0
 sudo ip route add 10.20.1.1/32 dev btun0 src 10.20.4.1
 ```
 
-端点只能收发这两个经认证的 VIP；底层地址和默认路由不要指向 TUN。`mesh-run` 附着并校验现有设备，不创建或清理它。主机重启后由管理员或本机网络管理器重建专用 TUN 和授权 `/32`。
+两端点仅允许收发这两个经认证的 `/32` VIP 流量；底层地址和宿主默认路由绝不能指向 TUN。`mesh-run` 只附着并校验已存在的设备，不负责创建或清理。主机重启后，必须由管理员或本地网络管理器重新创建该专用 TUN 与对应授权 `/32` 路由。
 
-用可信路径上可由 `boreas` 执行的二进制，在每台主机前台运行同一命令（配置内容各不相同）。先 Core 3，再 Core 4 和 Core 2；等三个下游均记录 `mesh ready node=…`，并用 `ss -ltn` 核对其业务端口，再启动 Core 1。`mesh ready` 表示本机图已具备可用路径、相应监听或 TUN 已打开，不是端到端电路已就绪。不要让 Source 在下游未就绪时试拨：认证确认前的失败不是可以用来倒换的证据。
+确认四台主机上 `boreas` 账号均可通过可信路径执行目标二进制后，在每台主机前台运行以下命令（使用各自对应的配置文件）。**启动顺序要求：** 先启动 Core 3，再启动 Core 4 和 Core 2；待三个下游节点均打印 `mesh ready node=…` 且通过 `ss -ltn` 确认对应业务端口处于监听状态后，最后启动 Core 1。`mesh ready` 仅表示本机拓扑图已有可用路径且对应监听或 TUN 已就绪，并不代表端到端电路已建通。切勿在下游未就绪时让 Source 提前试拨：认证确认前出现的失败不能作为倒换依据。
 
 ```sh
 sudo -u boreas boreas node mesh-run /etc/boreas-mesh/node.toml \
   /etc/boreas-mesh/material /etc/boreas-mesh/runtime.toml
 ```
 
-守护运行时捕获 stderr、用 SIGTERM 停止。此入口**没有** `control.sock`，不要用普通 daemon 的 `ctl status` 判定 mesh 离线。
+若以守护进程方式托管，请捕获 `stderr` 并使用 `SIGTERM` 停止进程。此运行入口**没有** `control.sock`，不要使用普通 daemon 的 `ctl status` 来判断 mesh 是否在线。
 
 ## 6. 验收、倒换和排错
+
+进程就绪后，按以下步骤验证主路径连通性、故障倒换和撤权行为：
 
 ```sh
 # Core 1
@@ -275,19 +301,19 @@ ip -4 route get 10.20.1.1 from 10.20.4.1
 ping -c 4 -I 10.20.4.1 10.20.1.1
 ```
 
-1. 在 Source 和 Destination 核对相同的已确认 `circuit` ID 及 `path=[1, 2, 3, 4]`。两端日志应看到 `tx`/`rx`，Relay 报密文计数，不记录业务内容。
-2. **仅在可销毁的环境**，确认主路径在承载流量时，停止 Core 2 进程（不是停协调器 Core 3）。等待双方确认 `path=[1, 3, 4]`，新 ID 应相同且不同于旧 ID；再发新的 `ping`。运行只在有合格的失链证据、另一路径仍获授权时尝试新跳链和新 E2E TLS，不重放旧包或密文。确认前的 EOF/reset、认证/协议错误、过期或撤权不是自动改走备路的依据。没有无损切换承诺，测试 TCP 时由上层自行恢复。
+1. **核对主路径电路与流量**：在 Source 和 Destination 日志中核对相同的已确认 `circuit` ID 以及 `path=[1, 2, 3, 4]`。两端日志应出现 `tx`/`rx` 计数，Relay 仅报告密文转发计数，不记录明文业务内容。
+2. **测试故障倒换（仅限可销毁测试环境）**：确认主路径正在承载流量后，停止 Core 2 进程（不要停止协调器 Core 3）。等待两端确认新路径 `path=[1, 3, 4]`，新 `circuit` ID 在两端应一致且不同于旧 ID；随后发起新的 `ping` 测试连通性。运行时仅在取得合格的失链证据、且备选路径仍处于有效授权时，才会尝试新的跳链与新的端到端 TLS 握手，绝不重放旧数据包或旧密文。电路确认前的 EOF/reset、认证或协议错误、凭据过期或撤权均不会触发自动改走备路。故障切换不提供无损承诺，TCP 等上层连接需由应用或协议栈自行恢复。
 3. 进一步的撤权测试由[仓库验收](#acceptance)完成。独立身份撤权材料使用 `identity-revocation.signed` 入口；StatusSigner 的日常快照不替代 IdentityAuthority 撤权。已提交撤权不会因删除邮箱文件或重启而消失。业务电路存续时也轮询邮箱；撤权涉及路径成员时，先持久化决定再关闭电路。被撤的是远端时，仍可通过健康的目录邻接传播原始签名证据；若被撤的是本机代次，进程停止。
 
 | 现象 | 检查顺序 |
 | --- | --- |
 | 目录端口在听但不出 `mesh ready` | 查三台是否拨同一协调器、TCP/证书 SAN、预配 `core-N.signed` 是否齐全，是否缺 Core 1 的引导种子或存在过期 LSA；确认业务边两端均有签名声明、清单沿途一致。 |
-| `invalid directory discovery configuration` / `overlapping legacy links` | 目标二进制是否含 `4363e0e`；协调器只配 `listen`，其他节点只配 `next` 和 `tls_name`；不要混用两种目录段或占用业务地址/端口。 |
+| `invalid directory discovery configuration` / `overlapping legacy links` | 目标二进制是否支持协调器目录发现；协调器只配 `listen`，其他节点只配 `next` 和 `tls_name`；不要混用两种目录段或占用业务地址/端口。 |
 | `mesh TUN attach` / VIP 不通 | 端点专用设备是否持久、归 `boreas`、名称/MTU 匹配；比较两端 `ip -4 route get` 与选中的源 VIP；用已确认路径 ID 检查是否同一电路。 |
 | 已有业务突然停，日志显示状态、授权或 LSA 失效 | 先核对 UTC、策略及状态期限、撤权和所有拓扑通告。发行更高序号不是忽略独立撤权或同版分叉的办法；修复原因后再按需协调重启。 |
 | `LsaConflict` / `LsaState` 或启动拒绝 | 停止进程，保留受保护的 `core-lsa.state`、`core-lsa.state.lock` 及可能的 `core-lsa.state.staging`；查文件系统、权限、旧状态与签发方。不要删文件或换到空目录恢复。 |
 
-### 持久 CoreLSA 冲突证据（含 `4363e0e`）
+### 持久 CoreLSA 冲突证据（须支持持久 CoreLSA）
 
 `mesh-run` 和 `mesh-probe` 使用 `state_dir/core-lsa.state`。该状态仅供服务 UID 使用，绑定 `net_id`、NetworkRoot 指纹及本机槽位；保存每槽位至多一份当前原始签名通告（最多 16 个槽位）。首个同 `(core_generation, seq)`、签名有效但待签字节不同的分叉保留两份原始信封并停止使用该授权。锁协调写入并标记初始化或写冲突意图；提交会同步私有 staging、原子安装并同步父目录。提交失败、冲突标记未解决、中断 staging、已初始化状态缺失、路径不安全、损坏或验证到分叉都会拒绝启动或停止运行授权。提高代次不能清空已持久化冲突。
 
@@ -297,7 +323,7 @@ ping -c 4 -I 10.20.4.1 10.20.1.1
 
 ## 7. 验收入口及证据范围
 
-在与目标 SHA 匹配的 [TLS 工作流](../../.github/workflows/rust-tls.yml)和受控 Linux runner 上，使用工作流固定的 OpenSSL、环境与 features。仓库的两个入口：
+在与目标制品源码修订一致的 [TLS 工作流](../../.github/workflows/rust-tls.yml)和受控 Linux runner 上，使用工作流固定的 OpenSSL、环境与 features。仓库的两个入口：
 
 ```sh
 cargo test --locked -p boreas-tunnel --features openssl-inner-tls --test mesh_probe_live

@@ -1,46 +1,49 @@
 # Boreas
 
-**先让两台 Linux 主机通过加密隧道互相访问。** Boreas 是用 Rust 编写的实验性三层隧道。它通过 TUN 接收 IP 包，用 TLS 1.3 和 WebSocket 在 TCP 上承载流量；在本文所用的 `pq768` / `e2e-required` 路径中，节点用预配的签名身份相互认证，业务端点再建立端到端加密电路。
+[简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md)
 
-如果你第一次上手，不妨从 `Core ↔ Edge` 开始：不接管默认路由，只让两个隧道地址互通。等两端的 `ping` 和收发计数都符合预期，再考虑服务托管或多 Core 实验。
+## Boreas 是什么？
 
-[部署教程](docs/deployment/README.md) · [一键安装](docs/deployment/ONE_CLICK.md) · [配置参考](docs/config/README.md) · [多 Core 拓扑](docs/deployment/linux-core-mesh-topology.md)
+Boreas 把分散在不同网络里的主机连成一个私有 IP 网络。最简单的用法是让一台 Linux 主机做 Core，另一台做 Edge：Edge 主动连上 Core，之后两端都可用隧道 IP 访问对方。比如，你可以从家里通过隧道访问服务器上的 SSH 或管理页面，不必把这些业务端口直接暴露在公网。Core 的隧道接入端口仍需让 Edge 能连到。
 
-## 选择一条路线
+## 能做什么？
 
-| 你想做什么 | 从哪里开始 |
+| 用途 | 怎么用 |
 | --- | --- |
-| 手上没有开发构建，想用公开包试通两台 x86-64 Linux 主机 | [公开预发布 `v0.1.0-pre.3` 双机演练](docs/deployment/README.md#public-pre3)；使用实际发布的 Linux pq768 二进制。 |
-| 已有可信的当前开发制品，想从安装走到互通 | [两节点完整流程](docs/deployment/README.md#workflow)，再按[一键安装](docs/deployment/ONE_CLICK.md)先预演、后安装。脚本不编译、不签发节点、不自动组网。 |
-| 目标是 Linux/systemd 下的离线双签部署及受控回退 | [离线签名服务](docs/deployment/VERIFIED-SERVICE.md)。需要独立预配的发布根、管理工具和双签候选；不能拿公开预发布资产直接套用。 |
-| 想验证多 Core 路径或目录同步 | [四 Core 拓扑教程](docs/deployment/linux-core-mesh-topology.md)。`node mesh-run` 是独立入口，目录协调器模式需要包含 `4363e0e` 的发现实现；它不是普通 Core/Edge daemon 的配置开关。 |
+| 双机互通 | 一台 Core、一台 Edge。先用双向 `ping` 确认隧道通了，再用隧道 IP 访问 SSH 或私有服务。 |
+| 并行传输 | Linux 开发构建支持显式启用 2–4 条独立加密电路。不同连接分到不同电路；不是把一条 TCP 流拆成几份并发发送。 |
+| 多 Core 互联 | 可用独立的 `boreas node mesh-run` 按签名拓扑选路和验证备用路径。它不是普通双机模式里勾一个开关。 |
+| 私有域名 | 可为组网内的服务配置私有 DNS。只想按 IP 访问时可以完全不用它。 |
 
-公开预发布包与仓库开发构建有不同的命令和运行状态要求。先记下二进制的版本或源码提交、架构和来源；同源 SHA-256 可以检查文件完整性，不能代替独立认证。
+## TCP 直连和 WebSocket 是什么关系？
 
-## 先分清三个地址
+**当前双机入口是 WSS，也就是 TLS 上的 WebSocket；最底层用 TCP。** 可以把 Edge 直接拨到 Core 的 `IP:端口`，不经过反向代理；这仍然会做 TLS 握手和 WebSocket 升级，并不是跳过 WebSocket 的裸 TCP 模式。当前教程不提供独立的裸 TCP 或明文 `ws://` 入口。
 
-- **底层地址**：如 `203.0.113.10:8443`，Edge 通过它连接 Core 的 TCP 端口；该连接走原有网络，不走 TUN。
-- **TLS 名称**：如 `wss.example.net`，需与 Core 外层证书的 DNS SAN 一致；即使用 IP 连接，也不能跳过名称校验。节点内部身份则由预配的签名对象和证书公钥确定，不由域名或 IP 决定。
-- **隧道地址（VIP）**：如 `10.20.1.1` 和 `10.20.1.2`，签发时绑定节点槽位。验证时 `ping` 对端 VIP，而不是公网地址。
+- `--connect` 填 Core 可达的底层 `IP:端口`，不是隧道 IP。
+- `--tls-name` 填证书上的名称；`--ws-host` 和 `--ws-path` 分别设定 WebSocket 请求的 Host 和路径。
+- 用 Rust 实现，Linux TUN 接收和送回 IP 包；隧道用 TLS 1.3、WebSocket 和预配的签名身份，在 `pq768` / `e2e-required` 路径上由业务两端另建端到端加密电路。
 
-## 日常操作
+## 从这里开始
+
+- **第一次部署：** [双机教程](docs/deployment/README.md)从签发和配置开始。已有材料和二进制的话，直接看[一键安装](docs/deployment/ONE_CLICK.md)。
+- **手上是公开预览版：** 用 [`v0.1.0-pre.3` 双机演练](docs/deployment/README.md#public-pre3)里的命令；不要与开发构建的安装步骤混用。
+- **想连接多台 Core：** [四 Core 互联](docs/deployment/linux-core-mesh-topology.md)有拓扑、启动顺序和排错方法。
+
+## 默认哪些流量走隧道？
+
+双机部署只添加指向对端隧道 IP 的 `/32` 路由。普通上网、默认路由和 Core、Edge 的系统 DNS 不变。私有 DNS 需要另行启用。当前组网范围为 `10.20.0.0/16`，节点地址须与签发的身份一致。
+
+连不上时，先区分 Core 的底层连接地址、证书上的 TLS 名称和隧道 IP，再按[排错指南](docs/deployment/README.md#troubleshooting)检查。部署后可用 `boreas ctl status --socket <PATH>` 看实际连接和收发计数。
+
+## 常用操作
 
 | 命令 | 用途 |
 | --- | --- |
-| `boreas doctor` | 查看当前二进制的编译能力；不会建立隧道或验证生产就绪。 |
-| `boreas config-check <FILE>` | 检查配置语法、字段和文件权限；不会验证对端在线。 |
-| `boreas config-migrate <FILE>` | 将支持的旧版配置规范化到 stdout，不覆盖源文件。 |
-| `boreas ctl status --socket <PATH>` | 使用与 daemon 相同的 UID 查询实际控制 socket。 |
-| `boreas console` / `boreas-easy` | 行式控制台；`--json` 获取一次状态，`--lang zh-CN` 切换简体中文。`boreas-easy` 由安装器提供，也可直接用 `boreas console`。 |
+| `boreas doctor` | 查看当前构建包含哪些功能 |
+| `boreas config-check <FILE>` | 检查配置文件 |
+| `boreas ctl status --socket <PATH>` | 读取实时状态与流量计数 |
+| `boreas console` | 打开交互控制台 |
 
-控制台默认查找 `/run/boreas/control.sock`，而 daemon 会把 socket 放在配置的 `state_dir` 下；路径不同时请显式传入 `--socket`。在 Linux 开发构建中，`config-save-candidate` 需精确传入 `--confirm SAVE`。它只保存端点候选片段并返回 `applied:false`，不会应用或建立连接；控制台只能预览，不能保存。详见[配置参考](docs/config/README.md)。
+[配置参考](docs/config/README.md) · [离线签名部署](docs/deployment/VERIFIED-SERVICE.md) · [CI 与测试说明](docs/engineering/ci-workflows.md)
 
-## 项目状态
-
-Boreas 仍处于开发预发布阶段，未获生产批准。Linux 隧道、目录或服务的某个场景通过验证，不等于已覆盖真实设备、开放网络、所有拓扑或其他系统。Windows/macOS 基础归档及 OpenWrt 模板也不是 daemon 产品支持声明。请在可回收的测试环境中使用，不承载关键或敏感业务。
-
-- 查实现和精确提交的证据：[实现状态](docs/engineering/implementation-status.md) · [CI 导航](docs/engineering/ci-workflows.md) · [生产门禁](docs/engineering/gates.json)
-- 维护网络信任：[策略与状态目录](docs/deployment/POLICY-STATE.md) · [升级信任边界](docs/upgrade/README.md)
-- 遇到错误：[按层排查](docs/deployment/README.md#troubleshooting)
-
-许可证：[GPL-3.0-only](LICENSE)。
+Boreas 目前是开发预览，以上教程以 Linux 为主。许可证：[GPL-3.0-only](LICENSE)。
