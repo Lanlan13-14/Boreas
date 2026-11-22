@@ -349,6 +349,18 @@ impl ReleaseRoot {
     pub fn ml_dsa_65_public_key_der(&self) -> &[u8] {
         &self.ml_dsa_65_public_key_der
     }
+
+    /// Fail before network I/O if the independently provisioned anchor or
+    /// its crypto provider cannot be used. Actual verification repeats these
+    /// checks; this is not proof of a signature.
+    #[cfg(feature = "openssl-backend")]
+    pub fn check_key_types(&self) -> Result<(), ManifestError> {
+        crate::release_crypto::check_key_types(
+            self.ed25519_public_key_der(),
+            self.ml_dsa_65_public_key_der(),
+        )
+        .map_err(ManifestError::Invalid)
+    }
 }
 
 /// The detached dual signature over one manifest's exact raw bytes.
@@ -859,7 +871,7 @@ fn validate_identifier(value: &str, max: usize, field: &'static str) -> Result<(
 /// IPv6 literal, and no dot segment. `https://host?x@evil` therefore fails at
 /// the authority label check rather than being silently mis-split, and
 /// `https://host:0/`, `https://host:99999/` and `https:///p` are all rejected.
-fn validate_https_url(url: &str) -> Result<(), ManifestError> {
+pub fn validate_https_url(url: &str) -> Result<(), ManifestError> {
     if url.len() > MAX_URL_BYTES {
         return Err(ManifestError::Invalid(
             "asset URL exceeds the configured limit",

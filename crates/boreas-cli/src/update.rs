@@ -1,7 +1,10 @@
-//! Advisory release discovery only. No value here authorizes an artifact.
+//! Advisory and authenticated metadata discovery; only the separate offline
+//! operator command can ask the installed supervisor to admit a release.
 
 mod json;
 mod offline;
+#[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
+mod signed;
 mod transport;
 
 pub(crate) fn offline(args: &[String]) -> (u8, String, String) {
@@ -356,10 +359,26 @@ pub(crate) fn check(channel: Channel, lang: Lang) -> (bool, Vec<String>) {
 }
 
 pub(crate) fn blocked(lang: Lang) -> &'static str {
-    localized(lang, "Auto-update blocked: no trusted feed; offline operator action only.", "自动更新已禁用：无可信更新源，仅支持管理员离线操作。", "自動更新已停用：無可信更新來源，僅支援管理員離線操作。")
+    localized(lang, "Auto-update blocked: installation requires offline operator approval.", "自动更新已禁用：安装必须经管理员离线批准。", "自動更新已停用：安裝必須經管理員離線批准。")
 }
 
+const USAGE: &str = "usage: boreas update-check [--channel stable|pre]\n       boreas update-check --signed-feed HTTPS_BASE_URL --trust-dir ABSOLUTE_PATH";
+
 pub(crate) fn run(args: &[String], lang: Lang) -> (u8, String, String) {
+    if let [flag, base, trust_flag, trust_dir] = args
+        && flag == "--signed-feed" && trust_flag == "--trust-dir"
+    {
+        #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
+        return signed::run(base, trust_dir, lang);
+        #[cfg(not(all(target_os = "linux", feature = "openssl-inner-tls")))]
+        {
+            let _ = (base, trust_dir);
+            return (1, String::new(), "Signed update check requires a Linux build with openssl-inner-tls (OpenSSL 3.5+).".into());
+        }
+    }
+    if args.len() == 1 && args[0] == "--help" {
+        return (0, USAGE.into(), String::new());
+    }
     let channel = match args {
         [] => Some(Channel::default()),
         [flag, value] if flag == "--channel" => Channel::parse(value),
@@ -367,7 +386,7 @@ pub(crate) fn run(args: &[String], lang: Lang) -> (u8, String, String) {
         _ => None,
     };
     let Some(channel) = channel else {
-        return (2, String::new(), "usage: boreas update-check [--channel stable|pre]".into());
+        return (2, String::new(), USAGE.into());
     };
     let (ok, rows) = check(channel, lang);
     let mut output = vec![format!("Boreas {} / {}", local_build(), channel.key())];
@@ -466,6 +485,27 @@ mod tests {
         assert_eq!(static_tag(&json::parse(wrong).unwrap(), Channel::Stable), Err(Issue::Invalid));
         let empty = br#"{"product":"boreas","schema":1,"stable":null,"prerelease":null}"#;
         assert_eq!(static_tag(&json::parse(empty).unwrap(), Channel::Stable), Ok(None));
+    }
+
+    #[test]
+    fn signed_mode_is_explicit_and_cannot_select_a_channel_or_install() {
+        let signed = ["--signed-feed", "https://candidate.example.test", "--trust-dir", "/pins"];
+        for args in [
+            signed[..2].to_vec(),
+            [&signed[..], &["--channel=pre"]].concat(),
+            [&signed[..], &["--install"]].concat(),
+        ] {
+            let args: Vec<_> = args.into_iter().map(String::from).collect();
+            assert_eq!(run(&args, Lang::En).0, 2);
+        }
+        assert!(run(&["--help".into()], Lang::En).1.contains("--signed-feed"));
+        #[cfg(not(all(target_os = "linux", feature = "openssl-inner-tls")))]
+        {
+            let (exit, out, error) = run(&signed.map(String::from), Lang::En);
+            assert_eq!(exit, 1);
+            assert!(out.is_empty());
+            assert!(error.contains("OpenSSL"));
+        }
     }
 
     #[test]

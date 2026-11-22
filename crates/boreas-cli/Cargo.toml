@@ -18,6 +18,7 @@ openssl-inner-tls = [
     "dep:boreas-crypto",
     "dep:boreas-proto",
     "dep:boreas-supervisor",
+    "boreas-supervisor/openssl-backend",
     "dep:boreas-tun",
     "dep:boreas-tunnel",
     "boreas-crypto/openssl-backend",

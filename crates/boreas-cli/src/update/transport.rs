@@ -1,5 +1,5 @@
-//! A system curl adapter: fixed OS paths and URLs, no shell, no config,
-//! redirection, inherited proxy/credentials, or HTTP request customization.
+//! A system curl adapter: fixed OS paths, caller-validated HTTPS URLs; no
+//! shell, config, redirection, inherited proxy/credentials, or HTTP customization.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -68,6 +68,15 @@ fn stop(mut child: Child) {
 }
 
 pub(super) fn fetch(source: Source, deadline: Instant) -> Result<Vec<u8>, Issue> {
+    fetch_https(source.url(), MAX_BYTES, "Accept: application/json", deadline)
+}
+
+pub(super) fn fetch_https(
+    url: &str,
+    max_bytes: usize,
+    accept: &'static str,
+    deadline: Instant,
+) -> Result<Vec<u8>, Issue> {
     let exe = system_curl().ok_or(Issue::NoCurl)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.as_millis() == 0 {
@@ -92,15 +101,15 @@ pub(super) fn fetch(source: Source, deadline: Instant) -> Result<Vec<u8>, Issue>
             "--max-time",
             &format!("{}.{:03}", remaining.as_secs(), remaining.subsec_millis()),
             "--max-filesize",
-            &MAX_BYTES.to_string(),
+            &max_bytes.to_string(),
             "--header",
-            "Accept: application/json",
+            accept,
             "--user-agent",
             "boreas-release-check",
             "--write-out",
             "\n%{http_code}",
             "--",
-            source.url(),
+            url,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -127,18 +136,15 @@ pub(super) fn fetch(source: Source, deadline: Instant) -> Result<Vec<u8>, Issue>
     };
     let (sender, receiver) = sync_channel(1);
     if thread::Builder::new().spawn(move || {
-        let mut bytes = Vec::new();
-        // Independent of curl version (older versions may only check the
-        // advertised Content-Length, not chunked bodies). Allow the 4-byte
-        // status suffix and stop after one overflow byte.
-        let result = stdout.take((MAX_BYTES + 5) as u64).read_to_end(&mut bytes);
-        let _ = sender.send(result.map(|_| bytes));
+        // Permit the 4-byte status suffix and detect one overflow byte, even
+        // with curl versions that cannot limit a chunked response themselves.
+        let _ = sender.send(read_response(stdout, max_bytes));
     }).is_err() {
         stop(child);
         return Err(Issue::Transport);
     }
     let bytes = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(Ok(bytes)) if bytes.len() <= MAX_BYTES + 4 => bytes,
+        Ok(Ok(bytes)) if bytes.len() <= max_bytes + 4 => bytes,
         other => {
             stop(child);
             return Err(match other {
@@ -163,6 +169,12 @@ pub(super) fn fetch(source: Source, deadline: Instant) -> Result<Vec<u8>, Issue>
             }
         }
     }
+}
+
+fn read_response(reader: impl Read, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take((max_bytes + 5) as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn response(exit: Option<i32>, mut bytes: Vec<u8>) -> Result<Vec<u8>, Issue> {
@@ -191,6 +203,15 @@ fn response(exit: Option<i32>, mut bytes: Vec<u8>) -> Result<Vec<u8>, Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_reader_keeps_binary_bodies_and_detects_overflow() {
+        let exact = b"\x00\xff\n200\n200";
+        let bytes = read_response(&exact[..], 6).unwrap();
+        assert_eq!(response(Some(0), bytes), Ok(b"\x00\xff\n200".to_vec()));
+        let overflow = std::io::repeat(0);
+        assert_eq!(read_response(overflow, 64).unwrap().len(), 64 + 5);
+    }
 
     #[test]
     fn status_suffix_does_not_accept_redirects_or_errors() {

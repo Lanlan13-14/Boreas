@@ -1518,6 +1518,7 @@ fn help_text() -> String {
      \x20 boreas-easy   (line-mode console: menu, service status/start/stop, updates)\n\
      \x20 boreas --version          local CLI build identity\n\
      \x20 boreas update-check [--channel stable|pre]  advisory discovery (default: stable)\n\
+     \x20 boreas update-check --help  includes signed metadata discovery (Linux/OpenSSL)\n\
      \x20 boreas update --help     operator-only verified offline update (Linux/systemd)\n\n\
      OPTIONS:\n\
      \x20 --lang <zh-CN|zh-TW|en>   console language (else BOREAS_LANG/LC_ALL/LANG)\n\
