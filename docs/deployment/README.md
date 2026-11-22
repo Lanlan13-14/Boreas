@@ -179,6 +179,10 @@ ping -c 4 -I 10.20.1.1 10.20.1.2
 
 预期：对端 `/32` 路由选中 `btun0`；`daemon_connected:true`、`security_mode:"e2e-required"`、`status_fresh:true`；双向 `ping` 成功，两侧 `tx_packets` 和 `rx_packets` 增长。若要再验证 TCP，可在 Core 用 `iperf3 -s -B 10.20.1.1`，Edge 用 `iperf3 -c 10.20.1.1 -B 10.20.1.2 -t 10`；故障排除后再做压测，隔离测试结果不是公网 SLA。
 
+### 可选：让两台节点使用私有域名
+
+先确认上面的双向 `ping` 已通过。接着按[私有 DNS 部署说明](../engineering/dns-daemon-deployment.md)签发私有区、安装两端的固定版本文件，并用私有地址直接发起查询。先验证指定域名和不存在的名称，再配置系统的按域分流；不要先替换主机的全局 DNS。开启 TCP 查询时，两端都要显式设置 `[dns].tcp = true`。这个选项只启用隧道内的私有 DNS，不会替你安装系统解析规则，也不会把查询转到公网。
+
 ### 续签、重启和停用
 
 - **状态快照**：过期前在离线签发机做新版本，例如 `boreas pki sign-status --ca-dir ./ca --out ./status-2.signed --sequence 2 --ttl-seconds 86400`（仅在当前序号确为 `1` 时用 `2`）。将同一份新快照分发到两端，在实际 daemon 材料目录内复制成临时文件，设正确属主/`0600`，同文件系统原子改名为 `status.signed`。daemon 会复核快照；如果已因过期停机，要先修复材料再启动。再次检查 `status_sequence`、`status_fresh` 及双向流量。同序号异内容或低序号不能当续签。
