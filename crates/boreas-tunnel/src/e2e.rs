@@ -264,6 +264,8 @@ impl<'a> CircuitStream<'a> {
             self.path_hops,
             &data[..take],
         )?;
+        #[cfg(any(test, feature = "record-diagnostics"))]
+        crate::record_diagnostics::observe(crate::record_diagnostics::Layer::Circuit, &data[..take]);
         let advance =
             u64::try_from(take).map_err(|_| TunnelError::Circuit(CircuitReject::BadBody))?;
         self.send_offset = self

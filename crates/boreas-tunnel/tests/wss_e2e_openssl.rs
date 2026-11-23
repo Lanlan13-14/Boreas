@@ -45,6 +45,9 @@ use std::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(all(target_os = "linux", feature = "record-diagnostics"))]
+#[path = "support/single_core_diagnostics.rs"]
+mod single_core_diagnostics;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 const APP_LEN: usize = 196_613;
 const NET: [u8; 16] = [0x39; 16];

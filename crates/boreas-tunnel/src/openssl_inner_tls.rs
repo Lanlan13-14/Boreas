@@ -69,6 +69,8 @@ impl OpenSslInnerConnector {
             .connect(transport)
             .map_err(|_| TunnelError::InnerTls("handshake"))?;
         let negotiated = established.negotiated();
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=hop negotiated={negotiated:?}");
         let certificate = established
             .peer_certificate()
             .to_der()
@@ -107,6 +109,8 @@ impl OpenSslInnerAcceptor {
             .accept(transport)
             .map_err(|_| TunnelError::InnerTls("handshake"))?;
         let negotiated = established.negotiated();
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=hop negotiated={negotiated:?}");
         let certificate = established
             .peer_certificate()
             .to_der()
@@ -186,6 +190,8 @@ impl E2eTlsBackend for OpenSslE2eBackend {
             .connect(transport)
             .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
         let negotiated = established.negotiated();
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=e2e negotiated={negotiated:?}");
         let certificate = established
             .peer_certificate()
             .to_der()
@@ -203,6 +209,8 @@ impl E2eTlsBackend for OpenSslE2eBackend {
             .accept(transport)
             .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
         let negotiated = established.negotiated();
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=e2e negotiated={negotiated:?}");
         let certificate = established
             .peer_certificate()
             .to_der()
@@ -640,10 +648,14 @@ impl OpenSslOuterTlsConnector {
 
 impl OuterTlsConnector for OpenSslOuterTlsConnector {
     fn connect(&self, tcp: TcpStream, server_name: &str) -> Result<Box<dyn Duplex>, TunnelError> {
+        #[cfg(feature = "record-diagnostics")]
+        let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .connector
             .connect(server_name, tcp)
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer handshake", &error)))?;
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
         Ok(Box::new(stream))
     }
 }
@@ -712,17 +724,21 @@ impl OpenSslOuterTlsAcceptor {
 
 impl OuterTlsAcceptor for OpenSslOuterTlsAcceptor {
     fn accept(&self, tcp: TcpStream) -> Result<Box<dyn Duplex>, TunnelError> {
+        #[cfg(feature = "record-diagnostics")]
+        let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .acceptor
             .accept(tcp)
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer accept", &error)))?;
+        #[cfg(feature = "record-diagnostics")]
+        eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
         Ok(Box::new(stream))
     }
 }
 
-fn outer_tls_reason(
+fn outer_tls_reason<S>(
     stage: &'static str,
-    error: &openssl::ssl::HandshakeError<TcpStream>,
+    error: &openssl::ssl::HandshakeError<S>,
 ) -> &'static str {
     let io_error = match error {
         openssl::ssl::HandshakeError::SetupFailure(_) => return "outer tls setup",

@@ -1,0 +1,141 @@
+name: Single-core capacity diagnostics
+on:
+  push:
+    branches: ['work/single-core-diagnostics']
+    paths:
+      - '.github/workflows/single-core-diagnostics.yml'
+      - 'crates/boreas-tunnel/**'
+      - 'tools/release/single_core*'
+      - 'tools/release/test_single_core*'
+  workflow_dispatch:
+    inputs:
+      packets:
+        description: 'Bounded A/B packet count (multiple of 32)'
+        type: string
+        default: '16384'
+      seconds:
+        description: 'C-tier receiver window seconds (short screening, not certification)'
+        type: string
+        default: '5'
+permissions:
+  contents: read
+concurrency:
+  group: single-core-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  diagnostics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
+      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_VERSION_TRIPLE: 4.1.1
+      OPENSSL_PRERELEASE: dev
+      OPENSSL_VERSION: 4.1.1-dev
+      OPENSSL_PREFIX: ${{ github.workspace }}/.diagnostic-openssl
+      OPENSSL_DIR: ${{ github.workspace }}/.diagnostic-openssl
+      OPENSSL_STATIC: '1'
+      OPENSSL_CONF: ${{ github.workspace }}/.diagnostic-openssl/ssl/openssl.cnf
+      OPENSSL_NO_VENDOR: '1'
+      BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.diagnostic-openssl/bin/openssl
+      BOREAS_REQUIRE_TLS_TESTS: '1'
+      BOREAS_RECORD_PACKETS: ${{ inputs.packets || '16384' }}
+      BOREAS_CAPACITY_SECONDS: ${{ inputs.seconds || '5' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          components: clippy, rustfmt
+      - name: Validate inputs and record environment
+        run: |
+          python3 -c 'import os; n=int(os.environ["BOREAS_RECORD_PACKETS"]); s=float(os.environ["BOREAS_CAPACITY_SECONDS"]); assert 32<=n<=1000000 and n%32==0; assert 0<s<=30'
+          mkdir evidence
+          git rev-parse HEAD > evidence/candidate-sha
+          printf '%s\n' b240461a5ffbd5e54a39dcdd6d5bbed5c969427c > evidence/baseline-sha
+          { uname -a; lscpu; cat /sys/fs/cgroup/cpu.max; cat /proc/cpuinfo; } > evidence/environment.txt
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential perl curl ca-certificates pkg-config iproute2 iputils-ping ethtool
+      - name: Build and verify reviewed OpenSSL snapshot
+        run: |
+          set -euo pipefail
+          bash tools/dependencies/fetch-openssl.sh openssl-src
+          cd openssl-src
+          ./Configure linux-x86_64 no-quic no-cms no-siv no-shared no-tests --prefix="$OPENSSL_PREFIX" --openssldir="$OPENSSL_PREFIX/ssl"
+          make -j2
+          make install_sw
+          mkdir -p "$OPENSSL_PREFIX/ssl"
+          printf '%s\n' 'openssl_conf = openssl_init' '[openssl_init]' 'providers = providers' '[providers]' 'default = default' '[default]' 'activate = 1' > "$OPENSSL_CONF"
+          cd "$GITHUB_WORKSPACE"
+          bash tools/dependencies/verify-openssl-build.sh openssl-src "$OPENSSL_PREFIX" evidence/openssl-runtime.txt evidence/openssl-build.txt
+      - name: Existing security suite and new diagnostics unit coverage
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/release -p 'test_single_core*.py' -v 2>&1 | tee evidence/python-tests.log
+          cargo clippy --locked -p boreas-tunnel --all-targets --features openssl-inner-tls,record-diagnostics -- -D warnings
+          cargo test --locked -p boreas-tunnel --features openssl-inner-tls,record-diagnostics -- --test-threads=2 2>&1 | tee evidence/security-tests.log
+      - name: Build release-profile A/B diagnostic executable
+        run: |
+          cargo test --release --locked -p boreas-tunnel --test wss_e2e_openssl --features openssl-inner-tls,record-diagnostics --no-run --message-format=json > evidence/diagnostic-build.jsonl
+          python3 -c 'import json; from pathlib import Path; rows=[json.loads(s) for s in Path("evidence/diagnostic-build.jsonl").read_text().splitlines()]; p=next(r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r["target"]["name"]=="wss_e2e_openssl" and r.get("executable")); Path("evidence/diagnostic-executable").write_text(p)'
+      - name: A ordinary TUN packet cost
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          binary=$(cat evidence/diagnostic-executable)
+          sudo -E timeout 240 unshare --net --mount --propagation private bash -e -c 'mount --make-rprivate /; umount -l /sys; mount -t sysfs sysfs /sys; ip link set lo up; exec "$1" single_core_diagnostics::ordinary_tun_packet_capacity --ignored --exact --nocapture --test-threads=1' diagnostic "$binary" 2>&1 | tee evidence/tier-a.log
+      - name: B authenticated record-chain capacity
+        if: ${{ !cancelled() && success() }}
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          binary=$(cat evidence/diagnostic-executable)
+          timeout 420 "$binary" single_core_diagnostics::authenticated_record_chain_capacity --ignored --exact --nocapture --test-threads=1 2>&1 | tee evidence/tier-b.log
+      - name: Build uninstrumented candidate and exact pre6 baseline
+        run: |
+          cargo build --release --locked -p boreas-cli --features openssl-inner-tls
+          cp target/release/boreas evidence/candidate
+          git worktree add --detach "$RUNNER_TEMP/boreas-pre6" b240461a5ffbd5e54a39dcdd6d5bbed5c969427c
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-baseline" cargo build --manifest-path "$RUNNER_TEMP/boreas-pre6/Cargo.toml" --release --locked -p boreas-cli --features openssl-inner-tls
+          cp target-baseline/release/boreas evidence/pre6
+          sha256sum evidence/candidate evidence/pre6 > evidence/binaries.sha256
+      - name: C short paired screens low RTT then approximately 67ms
+        timeout-minutes: 20
+        env:
+          BOREAS_NETNS_HOOK_VERSION: '1'
+          BOREAS_NETNS_HOOK: ${{ github.workspace }}/tools/release/single_core_hook.sh
+          BOREAS_NETNS_WAN_TUNED: '1'
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '110'
+          BOREAS_DIAGNOSTIC_TIMING: '0'
+          BOREAS_PERF_BYTES: '8388608'
+          BOREAS_PERF_TIMEOUT_SECONDS: '25'
+        run: |
+          set -euo pipefail
+          failed=0
+          # Alternating order; every sample is preserved, none selected green.
+          index=0
+          for profile in low-rtt rtt68ms; do
+            if [[ "$profile" == rtt68ms ]]; then
+              export BOREAS_NETEM_RTT_MS=34 BOREAS_NETEM_LOSS_PERCENT=0 BOREAS_NETEM_RATE_MBIT=unlimited BOREAS_MAX_PING_MS=200
+            fi
+            for version in pre6 candidate candidate pre6; do
+              index=$((index + 1))
+              export BOREAS_CAPACITY_BINARY="$GITHUB_WORKSPACE/evidence/$version"
+              export BOREAS_CAPACITY_OUTPUT="$GITHUB_WORKSPACE/evidence/c-$index-$profile-$version"
+              if ! sudo -E timeout --kill-after=5s 160 bash tools/release/netns_daemon_smoke.sh "$BOREAS_CAPACITY_BINARY" 2>&1 | tee "evidence/c-$index-$profile-$version.log"; then failed=1; fi
+            done
+          done
+          exit "$failed"
+      - name: Preserve all diagnostics without changing original gates
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: single-core-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/**
+            !evidence/candidate
+            !evidence/pre6
+          if-no-files-found: error
+          retention-days: 14

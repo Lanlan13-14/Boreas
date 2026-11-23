@@ -146,19 +146,17 @@ impl Duplex for CircuitStream<'_> {
 }
 
 #[cfg(feature = "openssl-inner-tls")]
-impl Duplex for openssl::ssl::SslStream<TcpStream> {
+impl<S: Duplex> Duplex for openssl::ssl::SslStream<S> {
     fn has_buffered_input(&self) -> bool {
-        self.ssl().pending() > 0
+        self.ssl().pending() > 0 || self.get_ref().has_buffered_input()
     }
 
     fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.get_ref().set_read_timeout(timeout)?;
-        self.get_ref().set_write_timeout(timeout)
+        self.get_ref().set_io_timeout(timeout)
     }
 
     fn clear_handshake_deadline(&self) -> io::Result<()> {
-        self.get_ref().set_read_timeout(None)?;
-        self.get_ref().set_write_timeout(None)
+        self.get_ref().clear_handshake_deadline()
     }
 }
 

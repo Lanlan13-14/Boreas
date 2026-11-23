@@ -314,7 +314,12 @@ impl<T: Read + Write> WsStream<T> {
             &mut self.write_buf,
         )?;
         self.io.write_all(frame).map_err(map_io)?;
-        self.io.flush().map_err(map_io)
+        self.io.flush().map_err(map_io)?;
+        #[cfg(any(test, feature = "record-diagnostics"))]
+        if opcode == OpCode::Binary {
+            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::WebSocket, payload);
+        }
+        Ok(())
     }
 
     fn respond_close(&mut self, payload: &[u8]) -> Result<(), WsError> {

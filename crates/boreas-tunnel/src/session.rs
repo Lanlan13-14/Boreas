@@ -287,6 +287,10 @@ impl FrameIo {
         if result.is_err() {
             self.poison();
         }
+        #[cfg(any(test, feature = "record-diagnostics"))]
+        if result.is_ok() {
+            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::Frame, &self.write_buf);
+        }
         result.map_err(TunnelError::from)
     }
 

@@ -68,6 +68,8 @@ pub mod mesh_route;
 pub mod packet_path;
 pub mod pmtu;
 pub mod probe_budget;
+#[cfg(any(test, feature = "record-diagnostics"))]
+pub mod record_diagnostics;
 pub mod relay;
 pub mod resource;
 pub mod runtime;

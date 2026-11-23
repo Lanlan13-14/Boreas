@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Counters only; no alternate authentication or data path. Off in published builds.
+record-diagnostics = []
 # Links the reviewed OpenSSL pq768 inner-TLS backend from `boreas-crypto`, plus
 # the in-tree outer HTTPS(WSS) adapter, the `boreas-pki` verified-object
 # identity extractor, and the diagnostic inner-TLS seam helpers. The default
