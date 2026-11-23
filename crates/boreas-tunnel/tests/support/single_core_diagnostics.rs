@@ -59,6 +59,9 @@ fn packet(local: [u8; 4], peer: [u8; 4]) -> Vec<u8> {
     bytes[..IP_TCP].fill(0);
     bytes[0] = 0x45;
     bytes[2..4].copy_from_slice(&(MTU as u16).to_be_bytes());
+    // IP_HDRINCL fills a zero ID in raw-socket sends. Specify a nonzero
+    // fixture ID so the kernel does not mutate the expected exact bytes.
+    bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
     bytes[8] = 64;
     bytes[9] = 6;
     bytes[12..16].copy_from_slice(&local);
