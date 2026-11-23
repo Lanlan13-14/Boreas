@@ -77,7 +77,7 @@ fn l3(src: [u8; 4], dst: [u8; 4], body: &[u8]) -> Vec<u8> {
     p[16..20].copy_from_slice(&dst);
     p[20..].copy_from_slice(body);
     let mut sum: u32 = p[..20]
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|x| u32::from(u16::from_be_bytes([x[0], x[1]])))
         .sum();
     while sum >> 16 != 0 {
