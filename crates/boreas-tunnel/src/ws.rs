@@ -377,8 +377,11 @@ impl<T: Read + Write> WsStream<T> {
     /// One absolute deadline covers the whole call, and a frame budget bounds
     /// both control floods and empty binary frames. An empty data frame makes no
     /// progress, so it must not restart the deadline or loop forever.
-    fn next_data_payload(&mut self) -> Result<Option<Vec<u8>>, WsError> {
+    fn next_data_payload(&mut self) -> Result<bool, WsError> {
         let deadline = Instant::now() + self.limits.message_deadline;
+        // The previous payload is fully consumed before this method runs.
+        // Reuse its connection-private allocation for control and data frames.
+        let mut payload = std::mem::take(&mut self.pending);
         let mut frames = 0usize;
         let mut control_frames = 0usize;
         let mut control_bytes = 0usize;
@@ -394,7 +397,7 @@ impl<T: Read + Write> WsStream<T> {
                     pos: &mut self.read_pos,
                     len: &mut self.read_len,
                 };
-                read_frame(&mut reader, self.role, &self.limits, deadline)?
+                read_frame_into(&mut reader, self.role, &self.limits, deadline, payload)?
             };
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
@@ -410,17 +413,22 @@ impl<T: Read + Write> WsStream<T> {
                         OpCode::Close => {
                             self.close_received = true;
                             self.respond_close(&frame.payload)?;
-                            return Ok(None);
+                            self.pending = frame.payload;
+                            self.pending.clear();
+                            return Ok(false);
                         }
                         _ => {}
                     }
+                    payload = frame.payload;
                 }
                 OpCode::Binary | OpCode::Continuation => {
                     self.track_message(frame.opcode, frame.fin, frame.payload.len())?;
                     if frame.payload.is_empty() {
+                        payload = frame.payload;
                         continue;
                     }
-                    return Ok(Some(frame.payload));
+                    self.pending = frame.payload;
+                    return Ok(true);
                 }
                 OpCode::Text => return Err(WsError::TextFrame),
             }
@@ -479,14 +487,15 @@ impl<T: Read + Write> Read for WsStream<T> {
                 self.pending_pos += take;
                 return Ok(take);
             }
-            self.pending.clear();
+            // Keep the fully consumed allocation initialized for reuse. The
+            // next validated frame replaces its logical length before exposure.
             self.pending_pos = 0;
             if self.close_received {
                 return Ok(0);
             }
             match self.next_data_payload() {
-                Ok(Some(payload)) => self.pending = payload,
-                Ok(None) => return Ok(0),
+                Ok(true) => {}
+                Ok(false) => return Ok(0),
                 Err(error) => {
                     // Any framing/protocol error is fatal: bytes may already be
                     // partially consumed, so a later read must never try to
@@ -603,11 +612,22 @@ fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn read_frame<T: Read>(
     io: &mut T,
     role: WsRole,
     limits: &WsLimits,
     deadline: Instant,
+) -> Result<RawFrame, WsError> {
+    read_frame_into(io, role, limits, deadline, Vec::new())
+}
+
+fn read_frame_into<T: Read>(
+    io: &mut T,
+    role: WsRole,
+    limits: &WsLimits,
+    deadline: Instant,
+    mut payload: Vec<u8>,
 ) -> Result<RawFrame, WsError> {
     let mut head = [0u8; 2];
     read_exact(io, &mut head, deadline)?;
@@ -665,7 +685,7 @@ fn read_frame<T: Read>(
     } else {
         None
     };
-    let mut payload = vec![0u8; payload_len];
+    payload.resize(payload_len, 0);
     read_exact(io, &mut payload, deadline)?;
     if let Some(mask) = mask {
         unmask_payload(&mut payload, mask);
@@ -1200,6 +1220,7 @@ pub fn client_handshake_tcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod optimization_tests;
     use std::io::Cursor;
     use std::net::TcpListener;
     use std::thread;

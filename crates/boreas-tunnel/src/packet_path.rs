@@ -77,8 +77,8 @@ use std::time::Instant;
 use crate::e2e::E2eCircuit;
 use crate::error::TunnelError;
 use crate::relay::MAX_RELAY_HOPS;
-use crate::ws::WsError;
 use crate::tls::PeerIdentity;
+use crate::ws::WsError;
 
 /// Width of the length prefix inside the E2E stream, in bytes.
 pub const FRAME_PREFIX_LEN: usize = 2;
@@ -93,6 +93,12 @@ pub const MAX_MTU: usize = 1500;
 pub const DEFAULT_MTU: usize = 1500;
 /// Largest encoded frame: prefix plus one full-MTU packet.
 pub const MAX_FRAME_BYTES: usize = FRAME_PREFIX_LEN + MAX_MTU;
+
+// The daemon already targets a single 16,288-byte plaintext record. Keep
+// initialized space for one full guarded read after the byte threshold; the
+// threshold is checked BEFORE reading, just like the original batch path.
+const INLINE_BATCH_THRESHOLD: usize = 16_288;
+const INLINE_BATCH_STORAGE: usize = INLINE_BATCH_THRESHOLD + MAX_FRAME_BYTES + 1;
 
 /// Bounded retries for `ErrorKind::Interrupted` reads before the path gives up.
 /// A stream that never makes progress must not spin forever.
@@ -793,6 +799,56 @@ fn prefetched_frame_ready(bytes: &[u8], mtu: usize) -> bool {
     len == 0 || len > mtu || rest.len() >= len
 }
 
+/// None means a refill is required; errors never consume or deliver bytes.
+fn deliver_prefetched<P: PacketIo + ?Sized>(
+    io: &P,
+    policy: &PointToPoint,
+    bytes: &[u8],
+) -> Option<Result<(usize, usize), PacketPathError>> {
+    let [hi, lo, rest @ ..] = bytes else {
+        return None;
+    };
+    let length = usize::from(u16::from_be_bytes([*hi, *lo]));
+    if length == 0 {
+        return Some(Err(PacketPathError::EmptyFrame));
+    }
+    if length > policy.mtu() {
+        return Some(Err(PacketPathError::FrameTooLarge));
+    }
+    if rest.len() < length {
+        return None;
+    }
+    Some(
+        deliver_host_packet(io, policy, &rest[..length])
+            .map(|length| (FRAME_PREFIX_LEN + length, length)),
+    )
+}
+
+/// The same ordinary host-delivery checks for borrowed and copied packets.
+fn deliver_host_packet<P: PacketIo + ?Sized>(
+    io: &P,
+    policy: &PointToPoint,
+    bytes: &[u8],
+) -> Result<usize, PacketPathError> {
+    let packet = policy
+        .inspect_bytes(bytes)
+        .map_err(PacketPathError::Denied)?;
+    deliver_inspected_host_packet(io, policy, packet)
+}
+
+fn deliver_inspected_host_packet<P: PacketIo + ?Sized>(
+    io: &P,
+    policy: &PointToPoint,
+    packet: InspectedPacket<'_>,
+) -> Result<usize, PacketPathError> {
+    let packet = policy
+        .authorize_inspected(packet, Direction::PeerToHost)
+        .map_err(PacketPathError::Denied)?;
+    io.write_inspected_packet(packet)
+        .map_err(PacketPathError::from_host_error)?;
+    Ok(packet.info().packet_len)
+}
+
 /// Read one whole frame into caller-provided storage and return whether a
 /// frame was present (`Ok(false)` on clean EOF at a frame boundary).
 fn read_packet_frame_into<C: Read + ?Sized>(
@@ -842,6 +898,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     state: PathState,
     stats: PacketStats,
     outbound_batch: Vec<u8>,
+    // One initialized high-water allocation; only `used` bytes may be sent.
+    outbound_inline: Vec<u8>,
     // Linux TUN may truncate to the supplied read length; reserve a guard byte.
     outbound_scratch: [u8; MAX_MTU + 1],
     inbound_scratch: Vec<u8>,
@@ -1142,9 +1200,39 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
     /// Whether the next packet can be handled without refilling E2E plaintext.
     /// `None` means this circuit does not use the optional direct prefetcher.
     pub fn prefetched_frame_ready(&self) -> Option<bool> {
-        self.circuit.as_ref()?.prefetched_plaintext().map(|bytes| {
-            prefetched_frame_ready(bytes, self.policy.mtu())
-        })
+        self.circuit
+            .as_ref()?
+            .prefetched_plaintext()
+            .map(|bytes| prefetched_frame_ready(bytes, self.policy.mtu()))
+    }
+
+    /// Deliver one already-complete ordinary packet directly from the E2E
+    /// plaintext buffer. DNS and partial frames keep the original path. The
+    /// caller's per-packet stop/revocation checks remain outside this call.
+    pub fn step_inbound_prefetched(&mut self) -> Result<Option<usize>, PacketPathError> {
+        self.check_open()?;
+        #[cfg(feature = "openssl-inner-tls")]
+        if self.private_dns.is_some() || self.edge_dns.is_some() || self.dns_replica_only {
+            return self.step_inbound();
+        }
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let result = circuit
+            .prefetched_plaintext()
+            .and_then(|bytes| deliver_prefetched(self.io, &self.policy, bytes));
+        match result {
+            None => self.step_inbound(),
+            Some(Err(error)) => Err(self.fail(error)),
+            Some(Ok((used, length))) => {
+                if !circuit.consume_prefetched_plaintext(used) {
+                    return Err(self.fail(PacketPathError::Poisoned));
+                }
+                self.stats.inbound_packets = self.stats.inbound_packets.saturating_add(1);
+                self.stats.inbound_bytes = self.stats.inbound_bytes.saturating_add(length as u64);
+                Ok(Some(length))
+            }
+        }
     }
 
     /// Close the path after telling the peer: TLS `close_notify`, then the
@@ -1197,6 +1285,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             state: PathState::Open,
             stats: PacketStats::default(),
             outbound_batch: Vec::new(),
+            outbound_inline: Vec::new(),
             // Keep this independent of the path MTU: the host adapter must read
             // at its own MTU, then policy checks the complete packet below.
             outbound_scratch: [0; MAX_MTU + 1],
@@ -1326,6 +1415,144 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     ///
     /// Returns the number of packets delivered to the circuit (`0` if none).
     pub fn step_outbound_batch(
+        &mut self,
+        max_packets: usize,
+        max_bytes: usize,
+    ) -> Result<usize, PacketPathError> {
+        // Preserve the old unbounded-API behavior for callers above the
+        // production single-record threshold; ordinary daemon batches use
+        // the bounded direct-read storage below.
+        if max_bytes > INLINE_BATCH_THRESHOLD {
+            return self.step_outbound_batch_legacy(max_packets, max_bytes);
+        }
+        self.check_open()?;
+        if max_packets == 0 || max_bytes == 0 {
+            return Ok(0);
+        }
+        if self.outbound_inline.is_empty() {
+            self.outbound_inline.resize(INLINE_BATCH_STORAGE, 0);
+        }
+        let Some(circuit) = self.circuit.as_mut() else {
+            return Err(PacketPathError::Poisoned);
+        };
+        let mut used = 0usize;
+        let mut drained = 0usize;
+        let mut payload_bytes = 0u64;
+        let mut attempts = 0usize;
+        let max_attempts = max_packets.saturating_mul(2);
+        let mut failure = None;
+        #[cfg(feature = "openssl-inner-tls")]
+        let mut contains_dns = false;
+        while drained < max_packets && used < max_bytes && attempts < max_attempts {
+            attempts += 1;
+            let body_start = used + FRAME_PREFIX_LEN;
+            // Full adapter MTU plus guard, not just remaining frame budget.
+            let target = &mut self.outbound_inline[body_start..body_start + MAX_MTU + 1];
+            let target_ptr = target.as_ptr();
+            let packet = match self.io.read_for_forwarding(target) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(error) => {
+                    failure = Some(PacketPathError::from_host_error(error));
+                    break;
+                }
+            };
+            let bytes = packet.as_ref();
+            let authorized = authorize_outbound_read(
+                &self.policy,
+                &packet,
+                #[cfg(feature = "openssl-inner-tls")]
+                self.edge_dns.as_mut(),
+                #[cfg(feature = "openssl-inner-tls")]
+                self.dns_replica_only,
+            );
+            match authorized {
+                Ok(info) => {
+                    #[cfg(feature = "openssl-inner-tls")]
+                    if self
+                        .edge_dns
+                        .as_ref()
+                        .is_some_and(|dns| info.destination == IpAddr::V4(dns.vip))
+                    {
+                        contains_dns = true;
+                    }
+                    let prefix = match packet_frame_prefix(bytes, self.policy.mtu()) {
+                        Ok(prefix) => prefix,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    let packet_len = bytes.len();
+                    // Borrow-capable TUNs already filled this exact region.
+                    // Owned/foreign adapters retain the legacy one-copy path.
+                    let fallback = if bytes.as_ptr() == target_ptr {
+                        None
+                    } else {
+                        Some(match packet {
+                            PacketRead::Bytes(std::borrow::Cow::Owned(bytes)) => bytes,
+                            other => other.as_ref().to_vec(),
+                        })
+                    };
+                    if let Some(bytes) = fallback {
+                        self.outbound_inline[body_start..body_start + packet_len]
+                            .copy_from_slice(&bytes);
+                    }
+                    self.outbound_inline[used..body_start].copy_from_slice(&prefix);
+                    used = body_start + packet_len;
+                    drained += 1;
+                    payload_bytes = payload_bytes
+                        .saturating_add(u64::try_from(info.packet_len).unwrap_or(u64::MAX));
+                }
+                Err(deny) if deny.is_local_discard() => {
+                    self.stats.dropped_outbound = self.stats.dropped_outbound.saturating_add(1);
+                }
+                Err(deny) => {
+                    failure = Some(PacketPathError::Denied(deny));
+                    break;
+                }
+            }
+        }
+        #[cfg(any(test, feature = "record-diagnostics"))]
+        {
+            use crate::record_diagnostics::{BatchExit, observe_batch};
+            let exit = if failure.is_some() {
+                BatchExit::Fatal
+            } else if drained >= max_packets {
+                BatchExit::PacketBudget
+            } else if used >= max_bytes {
+                BatchExit::ByteBudget
+            } else if attempts >= max_attempts {
+                BatchExit::DiscardBudget
+            } else {
+                BatchExit::Empty
+            };
+            observe_batch(exit, drained, payload_bytes, used);
+        }
+        if let Some(error) = failure {
+            return Err(self.fail(error));
+        }
+        if drained == 0 {
+            return Ok(0);
+        }
+        let result = write_outbound(
+            circuit,
+            &self.outbound_inline[..used],
+            #[cfg(feature = "openssl-inner-tls")]
+            self.edge_dns.as_ref().filter(|_| contains_dns),
+        );
+        if let Err(error) = result {
+            return Err(self.fail(error));
+        }
+        self.stats.outbound_packets = self
+            .stats
+            .outbound_packets
+            .saturating_add(u64::try_from(drained).unwrap_or(u64::MAX));
+        self.stats.outbound_bytes = self.stats.outbound_bytes.saturating_add(payload_bytes);
+        Ok(drained)
+    }
+
+    fn step_outbound_batch_legacy(
         &mut self,
         max_packets: usize,
         max_bytes: usize,
@@ -1696,6 +1923,7 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         return Ok(None);
     }
     let packet = policy.inspect_bytes(packet).map_err(PacketPathError::Denied)?;
+    #[cfg(feature = "openssl-inner-tls")]
     let info = packet.info();
     #[cfg(feature = "openssl-inner-tls")]
     if let Some(dns) = dns
@@ -1757,13 +1985,9 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     if dns_replica_only {
         return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
     }
-    let packet = policy
-        .authorize_inspected(packet, Direction::PeerToHost)
-        .map_err(PacketPathError::Denied)?;
-    io.write_inspected_packet(packet)
-        .map_err(PacketPathError::from_host_error)?;
+    let length = deliver_inspected_host_packet(io, policy, packet)?;
     Ok(Some(InboundDelivery {
-        length: info.packet_len,
+        length,
         reply_len: None,
     }))
 }
@@ -1974,6 +2198,8 @@ mod tests {
     //! are not a production, G-DATA or 1 GiB acceptance claim.
 
     use super::*;
+    #[path = "optimization_tests.rs"]
+    mod optimization_tests;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -3055,9 +3281,7 @@ mod tests {
                 scratch: &'buf mut [u8],
             ) -> Result<Option<PacketRead<'buf>>, TunError> {
                 assert_eq!(scratch.len(), MAX_MTU + 1);
-                if let Some(previous) = self.address.replace(Some(scratch.as_ptr())) {
-                    assert_eq!(scratch.as_ptr(), previous);
-                }
+                self.address.set(Some(scratch.as_ptr()));
                 let Some(bytes) = self.reads.borrow_mut().pop_front() else {
                     return Ok(None);
                 };
@@ -3097,6 +3321,8 @@ mod tests {
         assert_eq!(path.step_outbound(), Ok(Some(p1.len())));
         // The byte threshold stops the next read but must not split a frame.
         assert_eq!(path.step_outbound_batch(16, 1), Ok(1));
+        assert_eq!(host.address.get(), Some(path.outbound_inline[2..].as_ptr()));
+        assert_eq!(path.outbound_inline.len(), INLINE_BATCH_STORAGE);
         let mut expected = encode_packet_frame(&p1, mtu).unwrap();
         expected.extend(encode_packet_frame(&p2, mtu).unwrap());
         assert_eq!(

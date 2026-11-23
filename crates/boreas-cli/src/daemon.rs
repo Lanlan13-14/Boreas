@@ -4313,9 +4313,9 @@ mod linux_daemon {
                     break;
                 }
                 let result = if let Some(timing) = &mut io_timing {
-                    timing.inbound_step(buffered, tun_fd, || path.step_inbound())
+                    timing.inbound_step(buffered, tun_fd, || path.step_inbound_prefetched())
                 } else {
-                    path.step_inbound()
+                    path.step_inbound_prefetched()
                 };
                 match result {
                     Ok(Some(_len)) => {

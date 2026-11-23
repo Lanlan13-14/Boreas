@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/single-core-diagnostics.yml'
       - 'crates/boreas-tunnel/**'
+      - 'crates/boreas-cli/src/daemon.rs'
       - 'tools/release/single_core*'
       - 'tools/release/test_single_core*'
   workflow_dispatch:
@@ -74,8 +75,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/release -p 'test_single_core*.py' -v 2>&1 | tee evidence/python-tests.log
-          cargo clippy --locked -p boreas-tunnel --all-targets --features openssl-inner-tls,record-diagnostics -- -D warnings
-          cargo test --locked -p boreas-tunnel --features openssl-inner-tls,record-diagnostics -- --test-threads=2 2>&1 | tee evidence/security-tests.log
+          cargo test --locked -p boreas-tunnel --no-default-features 2>&1 | tee evidence/default-tests.log
+          cargo clippy --locked -p boreas-tunnel -p boreas-cli --all-targets --features boreas-tunnel/openssl-inner-tls,boreas-tunnel/record-diagnostics,boreas-cli/openssl-inner-tls -- -D warnings
+          cargo test --locked -p boreas-tunnel -p boreas-cli --features boreas-tunnel/openssl-inner-tls,boreas-tunnel/record-diagnostics,boreas-cli/openssl-inner-tls -- --test-threads=2 2>&1 | tee evidence/security-tests.log
       - name: Build release-profile A/B diagnostic executable
         id: diagnostic_build
         run: |

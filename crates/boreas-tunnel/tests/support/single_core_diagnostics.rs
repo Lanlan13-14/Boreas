@@ -155,12 +155,13 @@ impl PacketIo for SourceSink {
     }
 }
 fn run_path(
-    circuit: boreas_tunnel::e2e::E2eCircuit<'_>,
+    mut circuit: boreas_tunnel::e2e::E2eCircuit<'_>,
     io: &SourceSink,
     send: bool,
     batch: usize,
     label: &str,
 ) {
+    circuit.enable_direct_read_ahead();
     let mut path = PacketPath::try_new_over_e2e(io, circuit, MTU).unwrap();
     let scope = boreas_tunnel::record_diagnostics::Scope::begin();
     let cpu = cpu_seconds();
@@ -172,7 +173,7 @@ fn run_path(
             assert!(count > 0);
             delivered += count;
         } else {
-            assert_eq!(path.step_inbound().unwrap(), Some(MTU));
+            assert_eq!(path.step_inbound_prefetched().unwrap(), Some(MTU));
             delivered += 1;
         }
     }

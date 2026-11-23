@@ -911,7 +911,22 @@ impl<'a> E2eCircuit<'a> {
     /// Plaintext already in the optional read-ahead buffer. Lower-layer
     /// readiness alone does not guarantee that an entire L3 frame is ready.
     pub(crate) fn prefetched_plaintext(&self) -> Option<&[u8]> {
-        self.read_ahead.as_ref().map(|buf| &buf.bytes[buf.start..buf.end])
+        self.read_ahead
+            .as_ref()
+            .map(|buf| &buf.bytes[buf.start..buf.end])
+    }
+
+    /// Advance only bytes already present in authenticated direct plaintext.
+    /// No refill, I/O or extra packet delivery is performed here.
+    pub(crate) fn consume_prefetched_plaintext(&mut self, count: usize) -> bool {
+        let Some(buffer) = self.read_ahead.as_mut() else {
+            return false;
+        };
+        if count > buffer.end - buffer.start {
+            return false;
+        }
+        buffer.start += count;
+        true
     }
 
     /// Amortize record reads for the default authenticated direct packet path.

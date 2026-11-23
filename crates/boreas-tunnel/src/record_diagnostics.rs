@@ -73,8 +73,37 @@ impl Records {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchExit {
+    Empty,
+    PacketBudget,
+    ByteBudget,
+    DiscardBudget,
+    Fatal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Batches {
+    pub exits: [u64; 5],
+    pub packets: u64,
+    pub effective_bytes: u64,
+    pub framed_bytes: u64,
+}
+pub(crate) fn observe_batch(exit: BatchExit, packets: usize, effective: u64, framed: usize) {
+    ACTIVE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            let batches = &mut state.batches;
+            batches.exits[exit as usize] += 1;
+            batches.packets += packets as u64;
+            batches.effective_bytes += effective;
+            batches.framed_bytes += framed as u64;
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
+    pub batches: Batches,
     pub circuit: Writes,
     pub frame: Writes,
     pub websocket: Writes,

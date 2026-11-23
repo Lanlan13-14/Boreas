@@ -45,6 +45,8 @@ use std::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(12);
+#[path = "support/optimization_differential.rs"]
+mod optimization_differential;
 #[cfg(all(target_os = "linux", feature = "record-diagnostics"))]
 #[path = "support/single_core_diagnostics.rs"]
 mod single_core_diagnostics;
