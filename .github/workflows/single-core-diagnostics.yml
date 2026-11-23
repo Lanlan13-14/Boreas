@@ -55,7 +55,7 @@ jobs:
           mkdir evidence
           git rev-parse HEAD > evidence/candidate-sha
           printf '%s\n' b240461a5ffbd5e54a39dcdd6d5bbed5c969427c > evidence/baseline-sha
-          { uname -a; lscpu; cat /sys/fs/cgroup/cpu.max; cat /proc/cpuinfo; } > evidence/environment.txt
+          { uname -a; lscpu; if [[ -r /sys/fs/cgroup/cpu.max ]]; then cat /sys/fs/cgroup/cpu.max; else printf 'cgroup_cpu_max=unavailable\n'; fi; cat /proc/cpuinfo; } > evidence/environment.txt
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y build-essential perl curl ca-certificates pkg-config iproute2 iputils-ping ethtool
       - name: Build and verify reviewed OpenSSL snapshot
