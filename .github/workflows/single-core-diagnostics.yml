@@ -77,6 +77,7 @@ jobs:
           cargo clippy --locked -p boreas-tunnel --all-targets --features openssl-inner-tls,record-diagnostics -- -D warnings
           cargo test --locked -p boreas-tunnel --features openssl-inner-tls,record-diagnostics -- --test-threads=2 2>&1 | tee evidence/security-tests.log
       - name: Build release-profile A/B diagnostic executable
+        id: diagnostic_build
         run: |
           cargo test --release --locked -p boreas-tunnel --test wss_e2e_openssl --features openssl-inner-tls,record-diagnostics --no-run --message-format=json > evidence/diagnostic-build.jsonl
           python3 -c 'import json; from pathlib import Path; rows=[json.loads(s) for s in Path("evidence/diagnostic-build.jsonl").read_text().splitlines()]; p=next(r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r["target"]["name"]=="wss_e2e_openssl" and r.get("executable")); Path("evidence/diagnostic-executable").write_text(p)'
@@ -85,15 +86,17 @@ jobs:
         run: |
           set -euo pipefail
           binary=$(cat evidence/diagnostic-executable)
-          sudo -E timeout 240 unshare --net --mount --propagation private bash -e -c 'mount --make-rprivate /; umount -l /sys; mount -t sysfs sysfs /sys; ip link set lo up; exec "$1" single_core_diagnostics::ordinary_tun_packet_capacity --ignored --exact --nocapture --test-threads=1' diagnostic "$binary" 2>&1 | tee evidence/tier-a.log
+          sudo -E timeout 240 unshare --net --mount --propagation private bash -e -c 'mount --make-rprivate /; umount -l /sys; mount -t sysfs sysfs /sys; ip link set lo up; sysctl -qw net.ipv6.conf.all.disable_ipv6=1; sysctl -qw net.ipv6.conf.default.disable_ipv6=1; exec "$1" single_core_diagnostics::ordinary_tun_packet_capacity --ignored --exact --nocapture --test-threads=1' diagnostic "$binary" 2>&1 | tee evidence/tier-a.log
       - name: B authenticated record-chain capacity
-        if: ${{ !cancelled() && success() }}
+        if: ${{ !cancelled() && steps.diagnostic_build.outcome == 'success' }}
         timeout-minutes: 8
         run: |
           set -euo pipefail
           binary=$(cat evidence/diagnostic-executable)
           timeout 420 "$binary" single_core_diagnostics::authenticated_record_chain_capacity --ignored --exact --nocapture --test-threads=1 2>&1 | tee evidence/tier-b.log
       - name: Build uninstrumented candidate and exact pre6 baseline
+        id: daemon_build
+        if: ${{ !cancelled() && steps.diagnostic_build.outcome == 'success' }}
         run: |
           cargo build --release --locked -p boreas-cli --features openssl-inner-tls
           cp target/release/boreas evidence/candidate
@@ -102,6 +105,7 @@ jobs:
           cp target-baseline/release/boreas evidence/pre6
           sha256sum evidence/candidate evidence/pre6 > evidence/binaries.sha256
       - name: C short paired screens low RTT then approximately 67ms
+        if: ${{ !cancelled() && steps.daemon_build.outcome == 'success' }}
         timeout-minutes: 20
         env:
           BOREAS_NETNS_HOOK_VERSION: '1'
