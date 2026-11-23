@@ -42,11 +42,11 @@ jobs:
       BOREAS_RECORD_PACKETS: ${{ inputs.packets || '16384' }}
       BOREAS_CAPACITY_SECONDS: ${{ inputs.seconds || '5' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
         with:
           components: clippy, rustfmt
       - name: Validate inputs and record environment
@@ -67,7 +67,7 @@ jobs:
           make -j2
           make install_sw
           mkdir -p "$OPENSSL_PREFIX/ssl"
-          printf '%s\n' 'openssl_conf = openssl_init' '[openssl_init]' 'providers = providers' '[providers]' 'default = default' '[default]' 'activate = 1' > "$OPENSSL_CONF"
+          printf '%s\n' 'openssl_conf = openssl_init' '[openssl_init]' 'providers = provider_sect' '[provider_sect]' 'default = default_sect' '[default_sect]' 'activate = 1' > "$OPENSSL_CONF"
           cd "$GITHUB_WORKSPACE"
           bash tools/dependencies/verify-openssl-build.sh openssl-src "$OPENSSL_PREFIX" evidence/openssl-runtime.txt evidence/openssl-build.txt
       - name: Existing security suite and new diagnostics unit coverage
@@ -130,7 +130,7 @@ jobs:
           exit "$failed"
       - name: Preserve all diagnostics without changing original gates
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: single-core-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
