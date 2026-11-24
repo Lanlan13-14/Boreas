@@ -76,11 +76,11 @@ jobs:
       runtime_id: ${{ steps.acceptance_runtime.outputs.artifact-id }}
       mesh_id: ${{ steps.acceptance_mesh_binary.outputs.artifact-id }}
     env:
-      # openssl-4.1 @ 941390af2ac3: the first commit that contains all eight
-      # advisory fixes and their regression tests. 4.1.1 is not released, so
-      # this builds the 4.1.1-dev snapshot rather than the 4.1.0 release.
-      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
-      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      # openssl-4.1 @ a7e57082ccb2: contains all twelve reviewed fixes
+      # through the 2026-11-24 advisory. This is a 4.1.1-dev snapshot,
+      # NOT the unreleased 4.1.1 release; archive identity is verified.
+      OPENSSL_COMMIT: a7e57082ccb27330a42f5f116a4e125b13bdcfef
+      OPENSSL_SHA256: 21a34f1e90d7accefefb9ad23b0e15a83a7d5504ffb53142f9193ecb44364340
       OPENSSL_VERSION_TRIPLE: 4.1.1
       OPENSSL_PRERELEASE: dev
       OPENSSL_VERSION: 4.1.1-dev

@@ -14,10 +14,10 @@ jobs:
   openssl-ml-dsa-tls:
     name: Verify CLI handshakes with the pinned OpenSSL source
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
-      OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
-      OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+      OPENSSL_COMMIT: a7e57082ccb27330a42f5f116a4e125b13bdcfef
+      OPENSSL_SHA256: 21a34f1e90d7accefefb9ad23b0e15a83a7d5504ffb53142f9193ecb44364340
       OPENSSL_VERSION_TRIPLE: 4.1.1
       OPENSSL_PRERELEASE: dev
       OPENSSL_VERSION: 4.1.1-dev
@@ -68,6 +68,32 @@ jobs:
             openssl-src "${OPENSSL_PREFIX}" \
             "${ARTIFACT_DIR}/openssl-runtime.txt" \
             "${ARTIFACT_DIR}/openssl-build.txt"
+      - name: Upstream regressions for the reviewed security snapshot
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Deliberately separate full-feature TEST build: the production
+          # no-quic/no-cms/no-siv/no-tests configuration remains unchanged.
+          # Run only upstream recipes relevant to X509/DANE/QUIC/PEM/CMS,
+          # and retain the full TAP output including any explicit skips.
+          mkdir -p upstream-security-evidence
+          git rev-parse HEAD > upstream-security-evidence/boreas-sha.txt
+          printf '%s\n' "$OPENSSL_COMMIT" "$OPENSSL_SHA256" > upstream-security-evidence/openssl-pin.txt
+          bash tools/dependencies/fetch-openssl.sh openssl-upstream-tests
+          cd openssl-upstream-tests
+          ./Configure linux-x86_64 no-shared enable-tests > ../upstream-security-evidence/configure.log 2>&1
+          make -j2 > ../upstream-security-evidence/build.log 2>&1
+          make test TESTS='test_dane test_verify test_verify_extra test_quic_stream test_quic_radix test_pem_reading test_pem_read_depr test_cms' HARNESS_VERBOSE=yes 2>&1 | tee ../upstream-security-evidence/regressions.log
+          printf 'UPSTREAM_REGRESSIONS=PASSED\n' > ../upstream-security-evidence/result.txt
+      - name: Preserve upstream regression evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: openssl-upstream-security-${{ github.run_id }}-${{ github.run_attempt }}
+          path: upstream-security-evidence/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Fail if private TLS material escaped sanitizer
         if: always()
         shell: bash

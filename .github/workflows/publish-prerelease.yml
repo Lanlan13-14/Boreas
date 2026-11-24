@@ -24,8 +24,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"
-  OPENSSL_COMMIT: 941390af2ac35f41d2f95bb0bac823dbf0700845
-  OPENSSL_SHA256: c0d0e0990d645607c07fb3c7cd37d18d080c72fee9a6191859a8bcb990deeb5d
+  OPENSSL_COMMIT: a7e57082ccb27330a42f5f116a4e125b13bdcfef
+  OPENSSL_SHA256: 21a34f1e90d7accefefb9ad23b0e15a83a7d5504ffb53142f9193ecb44364340
   OPENSSL_VERSION_TRIPLE: 4.1.1
   OPENSSL_PRERELEASE: dev
   OPENSSL_VERSION: 4.1.1-dev
@@ -565,7 +565,7 @@ jobs:
           printf '%s\n' \
             'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
             'Source commit: '"$GITHUB_SHA" \
-            'Feature: openssl-inner-tls (OpenSSL 4.1.1-dev snapshot 941390af2ac3, no-quic/no-cms/no-siv; X25519MLKEM768 + ML-DSA-65)' \
+            'Feature: openssl-inner-tls (OpenSSL 4.1.1-dev snapshot a7e57082ccb2, no-quic/no-cms/no-siv; X25519MLKEM768 + ML-DSA-65)' \
             'Included binaries:' \
             '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
             '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
@@ -736,7 +736,7 @@ jobs:
             '' \
             "$channel_line" \
             '' \
-            'This run compiled and tested all five targets, checked both static Linux executables in Ubuntu, Debian, Fedora and Alpine containers, and built the Linux pq768 daemon (glibc and fully static musl) against the reviewed OpenSSL 4.1.1-dev snapshot `941390af2ac35f41d2f95bb0bac823dbf0700845`. Real-device throughput and network-namespace acceptance were not run by this publication workflow.' \
+            'This run compiled and tested all five targets, checked both static Linux executables in Ubuntu, Debian, Fedora and Alpine containers, and built the Linux pq768 daemon (glibc and fully static musl) against the reviewed OpenSSL 4.1.1-dev snapshot `a7e57082ccb27330a42f5f116a4e125b13bdcfef`. Real-device throughput and network-namespace acceptance were not run by this publication workflow.' \
             '' \
             "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > "$notes"

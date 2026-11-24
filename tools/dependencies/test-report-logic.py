@@ -89,6 +89,12 @@ def main():
     check('an unorderable pin is a blocking finding', 'not a comparable release' in report.affected_range_findings(None, ranges)[0])
     check('an unorderable pin does not raise', report.affected_range_findings('not-a-release', ranges) != [])
 
+    # Exact snapshot migration: old pins, wrong digest, missing patches and
+    # future notices must remain blocking. No network or native build here.
+    import runpy
+    fixture = runpy.run_path(str(TOOLS / 'snapshot-gate-fixture.py'))
+    fixture['check_snapshot_gate'](report, review, check)
+
     if FAILURES:
         print('\nFAIL - {} assertion(s) failed'.format(len(FAILURES)))
         for failure in FAILURES:
