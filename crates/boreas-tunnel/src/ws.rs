@@ -209,6 +209,11 @@ const WS_READ_BUFFER_BYTES: usize = 32 * 1024;
 /// `Read` yields payload bytes of binary messages only. `Write` emits one
 /// binary message per call, splitting into frames at
 /// `limits.max_frame_payload`.
+mod incremental;
+#[cfg(test)]
+mod resume_tests;
+use incremental::{Incoming, ReceiveTurn};
+
 pub struct WsStream<T> {
     io: T,
     role: WsRole,
@@ -219,6 +224,7 @@ pub struct WsStream<T> {
     write_buf: Vec<u8>,
     pending: Vec<u8>,
     pending_pos: usize,
+    receive_turn: Option<ReceiveTurn>,
     message: MessageState,
     close_sent: bool,
     close_received: bool,
@@ -298,6 +304,7 @@ impl<T: Read + Write> WsStream<T> {
             write_buf: Vec::new(),
             pending: Vec::new(),
             pending_pos: 0,
+            receive_turn: None,
             message: MessageState::default(),
             close_sent: false,
             close_received: false,
@@ -378,17 +385,14 @@ impl<T: Read + Write> WsStream<T> {
     /// both control floods and empty binary frames. An empty data frame makes no
     /// progress, so it must not restart the deadline or loop forever.
     fn next_data_payload(&mut self) -> Result<bool, WsError> {
-        let deadline = Instant::now() + self.limits.message_deadline;
-        // The previous payload is fully consumed before this method runs.
-        // Reuse its connection-private allocation for control and data frames.
+        self.receive_turn.get_or_insert_with(|| ReceiveTurn::new(self.limits.message_deadline));
         let mut payload = std::mem::take(&mut self.pending);
-        let mut frames = 0usize;
-        let mut control_frames = 0usize;
-        let mut control_bytes = 0usize;
         loop {
-            frames += 1;
-            if frames > MAX_FRAMES_PER_READ {
-                return Err(WsError::FrameFlood);
+            let turn = self.receive_turn.as_mut().expect("receive turn installed");
+            if turn.incoming.is_none() {
+                turn.frames += 1;
+                if turn.frames > MAX_FRAMES_PER_READ { return Err(WsError::FrameFlood); }
+                turn.incoming = Some(Incoming::new(payload));
             }
             let frame = {
                 let mut reader = BufferedReader {
@@ -397,14 +401,16 @@ impl<T: Read + Write> WsStream<T> {
                     pos: &mut self.read_pos,
                     len: &mut self.read_len,
                 };
-                read_frame_into(&mut reader, self.role, &self.limits, deadline, payload)?
+                turn.incoming.as_mut().expect("incoming installed")
+                    .receive(&mut reader, self.role, &self.limits, turn.deadline)?
             };
+            turn.incoming = None;
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
-                    control_frames += 1;
-                    control_bytes = control_bytes.saturating_add(frame.payload.len());
-                    if control_frames > MAX_CONTROL_FRAMES_PER_READ
-                        || control_bytes > MAX_CONTROL_BYTES_PER_READ
+                    turn.controls += 1;
+                    turn.control_bytes = turn.control_bytes.saturating_add(frame.payload.len());
+                    if turn.controls > MAX_CONTROL_FRAMES_PER_READ
+                        || turn.control_bytes > MAX_CONTROL_BYTES_PER_READ
                     {
                         return Err(WsError::ControlFlood);
                     }
@@ -415,6 +421,7 @@ impl<T: Read + Write> WsStream<T> {
                             self.respond_close(&frame.payload)?;
                             self.pending = frame.payload;
                             self.pending.clear();
+                            self.receive_turn = None;
                             return Ok(false);
                         }
                         _ => {}
@@ -428,6 +435,7 @@ impl<T: Read + Write> WsStream<T> {
                         continue;
                     }
                     self.pending = frame.payload;
+                    self.receive_turn = None;
                     return Ok(true);
                 }
                 OpCode::Text => return Err(WsError::TextFrame),
@@ -496,7 +504,11 @@ impl<T: Read + Write> Read for WsStream<T> {
             match self.next_data_payload() {
                 Ok(true) => {}
                 Ok(false) => return Ok(0),
+                Err(WsError::Io(io::ErrorKind::WouldBlock)) => {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
                 Err(error) => {
+                    self.receive_turn = None;
                     // Any framing/protocol error is fatal: bytes may already be
                     // partially consumed, so a later read must never try to
                     // resynchronise on the same stream.
@@ -591,6 +603,7 @@ struct RawFrame {
 /// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
 /// handshake the runtime supplies that transport timeout; the data plane
 /// deliberately has none, so this check bounds progress between reads there.
+#[cfg(test)]
 fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<(), WsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -622,6 +635,7 @@ fn read_frame<T: Read>(
     read_frame_into(io, role, limits, deadline, Vec::new())
 }
 
+#[cfg(test)]
 fn read_frame_into<T: Read>(
     io: &mut T,
     role: WsRole,
