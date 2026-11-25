@@ -9,7 +9,7 @@ This is a working record, **not a completion or performance claim**.
 1. `262c426`: empty ReadAhead fills once before borrowed first-packet delivery; same-cursor partial completion, bounded interrupts, clean EOF, poison on failed delivery.
 2. `8616f9e`: daemon configures after DNS/replica binding; ordinary packets in mixed DNS use the borrowed path; one classifier gives Core DNS, Edge DNS, then host order. DNS handlers keep live authority/transaction checks. ReadAhead owns its Admission byte credit, exhaustion falls back.
 3. `13677ca`: CircuitStream hands back the allocation only after consuming its final byte; FrameIo and FrameDecoder have at most one recycled relay body, count actual capacities, and retain 8KiB feed/error atomicity.
-4. **Not repaired yet:** established bidirectional progress. `d33c733` adds barrier evidence for synchronous partial-L3 stalling, not an acceptance success. Need TLS-midrecord, WS-across-TLS, relay-across-feed, and L3-prefix cases with role reversal and control. No unconditional declaration that blocking I/O is safe.
+4. `a2f59c8` / `fa10f5e`: **partially repaired at the L3 completion boundary only.** Incomplete length prefixes/bodies stay in the original admitted 16KiB allocation; explicit Pending returns to the daemon policy/TUN turn, incomplete L3 alone is not readiness, and an absolute 30s assembly deadline stops indefinite retention. `85b3713` adds both-role real WSS/hop/E2E pq768 proof with 257-byte lower short I/O: peer withholds the tail until it receives a byte-exact reverse packet. **Still NOT implemented:** nonblocking incomplete TLS record / WS frame / relay-frame progress with stable pending WANT read/write operations. Do not call this full completion of item 4.
 
 ## Actual verification
 
@@ -22,10 +22,17 @@ This is a working record, **not a completion or performance claim**.
 
 Full main acceptance allowlists include `fix/pre8-data-plane` (`7dfe368`), without changing thresholds, timeouts or cases. Do not treat skipped downstream netns/performance jobs after compile failure as passed.
 
-## Still mandatory
+## Release decision (latest user authorization)
 
-- Finish item 4 at the first losing-progress boundary, preserving TLS same-operation retry buffers, absolute deadlines, control flood limits, authorization/cancel discard, stable pending owners, and genuine readiness waits.
-- Expand real daemon assembly evidence to both roles/mixed DNS/replica/non-single-lane and live expiry / mismatched DNS response, rather than substituting only helper tests.
-- Integrate all assertions and run combined Actions; inspect exact SHA, full functional matrix, serial/aggregate performance, default-platform tests and dependency gates.
-- No local cargo/OpenSSL compilation, no subagents, no GSO, no lane increase, no 256KiB watermark increase, no gate weakening.
-- Only after the complete specification and verification: merge reviewed candidate, revalidate main, publish official `v0.1.0-pre.8`, independently verify tag/assets/checksums/release manifest. Do not deploy. No prior performance-failure waiver carries over.
+The latest user clarification explicitly requires completing **TLS/WS half-record resumable progress before pre8**. Only performance measurement is waived: after the complete repair and sound build/correctness/security verification, merge and publish without waiting for performance results. **No authorization to publish partial item 4.** Keep failed performance results red and disclose actual numbers; do not alter thresholds or blame CPU without evidence. Use the official publication workflow; no deployment.
+
+`00af3c7` integration `45632366953`: default checks `45632375848`, security `45632361369`, real TUN `45632361214`, base backend tests and all six functional cases passed. Delayed scenario passed on this run; ordinary low-RTT throughput failed the unchanged 1000Mbps-each-direction requirement (Edge→Core 925–931Mbps, Core→Edge 901–1003Mbps); byte/SHA256 checks passed. Environment was AMD EPYC 9V74, 4 visible vCPUs / 2 cores × 2 threads, not the requested 7713 1C1G. Raw evidence retained locally under `pre8-evidence/45632366953/`.
+
+`a2f59c8` integration `45637123361` failed to compile ONLY the newly added SplitPlaintext fixture missing its required readiness method; `fa10f5e` fixes it explicitly without removing any assertion. Default strict Linux/Windows checks `45637756950`, dependency `45637743067`, real TUN `45637743143` passed on fa10f5e. Complete backend/functional run `45637747618` is in progress. `85b3713` real TLS circular-wait regression is the final additional test pending validation.
+
+## Still required before pre8
+
+- Complete item 4 below L3: TLS-midrecord, WS-across-TLS, relay-across-feed, stable WANT owners, and genuine socket interest-set waits.
+- Retain all existing resource, authority, terminal, flood and handshake-deadline semantics.
+- No local cargo/OpenSSL compilation, subagents, GSO/default changes, lane increase or 256KiB watermark increase.
+- Official pre8 assets, exact tag, SHA256, embedded commit, and discovery manifest must be independently checked. No deployment.
