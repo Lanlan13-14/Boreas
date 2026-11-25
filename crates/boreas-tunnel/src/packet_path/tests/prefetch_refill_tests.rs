@@ -174,3 +174,61 @@ fn daemon_configuration_entry_uses_lease_final_policy_and_releases_credit() {
     assert_eq!(path.step_inbound_prefetched(), Ok(None));
     assert_eq!(admission.snapshot().unwrap().bytes, 0);
 }
+
+#[test]
+fn prefetched_dns_checks_current_lease_and_matching_transaction_at_delivery() {
+    use crate::dns_runtime::tests::{dns_query, udp_datagram};
+    use std::sync::atomic::AtomicBool;
+    let local = identity(0x0209, NodeRole::Edge);
+    let peer = identity(0x0201, NodeRole::Core);
+    let vip = [10,20,0,53];
+    let query = dns_query("host.private.example", 1);
+    let mut answer = query.clone();
+    answer[2] |= 0x84;
+    let valid = udp_datagram(vip, [10,20,3,9], 53, 40_001, &answer, true);
+    let wrong = udp_datagram(vip, [10,20,3,9], 53, 40_002, &answer, true);
+    for expired in [false, true] {
+        for optimized in [false, true] {
+            let io = MatrixIo::new(vec![], 0);
+            let reads = Arc::new(AtomicUsize::new(0));
+            let live = Arc::new(AtomicBool::new(true));
+            let mut bytes = encode_packet_frame(&wrong, DEFAULT_MTU).unwrap();
+            bytes.extend(encode_packet_frame(&valid, DEFAULT_MTU).unwrap());
+            bytes.extend(encode_packet_frame(&valid, DEFAULT_MTU).unwrap());
+            let mut circuit = crate::e2e::test_plaintext_circuit(Box::new(Source {
+                bytes: io::Cursor::new(bytes), reads, chunk: usize::MAX, interrupted: false,
+            }), local, peer);
+            circuit.enable_direct_read_ahead();
+            let mut path = PacketPath::try_new(&io, circuit, endpoints(local,peer), DEFAULT_MTU).unwrap();
+            let current = live.clone();
+            let mut dns = EdgeDns {
+                vip: vip.into(), zone: "private.example", public: false,
+                current: Box::new(move || current.load(Ordering::SeqCst)),
+                pending: Default::default(), tcp: None,
+            };
+            let request = udp_datagram([10,20,3,9], vip, 40_001, 53, &query, true);
+            let request = PacketRead::Inspected(InspectedPacket::new(&request).unwrap());
+            assert!(authorize_outbound_read(&path.policy, &request, Some(&mut dns), false).is_ok());
+            path.edge_dns = Some(dns);
+            assert!(matches!(path.circuit.as_mut().unwrap().fill_prefetched_plaintext(),
+                crate::e2e::PrefetchFill::HasBytes));
+            // Revoke after bytes arrived but before the dispatcher can publish.
+            live.store(!expired, Ordering::SeqCst);
+            let step = |path: &mut PacketPath<'_, E2eCircuit<'_>, MatrixIo>| {
+                if optimized { path.step_inbound_prefetched() } else { path.step_inbound() }
+            };
+            if expired {
+                assert_eq!(step(&mut path), Err(PacketPathError::DnsAuthorizationLost));
+                assert!(io.writes.borrow().is_empty());
+                assert!(path.circuit.is_none());
+            } else {
+                assert_eq!(step(&mut path), Ok(Some(wrong.len())));
+                assert!(io.writes.borrow().is_empty());
+                assert_eq!(step(&mut path), Ok(Some(valid.len())));
+                assert_eq!(io.writes.borrow().as_slice(), std::slice::from_ref(&valid));
+                assert_eq!(step(&mut path), Ok(Some(valid.len())));
+                assert_eq!(io.writes.borrow().len(), 1); // replay not published twice
+            }
+        }
+    }
+}
