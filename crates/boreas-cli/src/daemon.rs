@@ -4050,7 +4050,7 @@ mod linux_daemon {
         let protect_send = gso_may_have_pending || (tun_fd.is_some() && private_dns.is_none());
         let mut send_deferred_since = None;
         let dns_deferred_core = mode_name == "serve"
-            && private_dns.is_some_and(|dns| dns.tcp || dns.public);
+            && private_dns.is_some_and(|dns| queued_progress || dns.tcp || dns.public);
         // Only emit a promotable authenticated close while authorization
         // is still current. Re-read durable status/revocation and the pin
         // in the branch that actually sends close_notify.

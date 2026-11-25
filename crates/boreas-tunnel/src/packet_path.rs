@@ -1254,7 +1254,11 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let result=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?
             .enable_queued_progress(admission);
         match result {
-            Ok(active)=>{self.queued_progress=active;Ok(active)},
+            Ok(active)=>{
+                self.queued_progress=active;
+                if active && let Some(dns)=self.private_dns.as_mut() {dns.deferred=true;}
+                Ok(active)
+            },
             Err(error)=>Err(self.fail(circuit_io(error))),
         }
     }
@@ -1720,8 +1724,13 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         self.check_open()?;
         let Some((mut cursor,used,count,bytes,dns))=self.outbound_pending else {return Ok(0);};
         #[cfg(feature="openssl-inner-tls")]
-        if dns && let Some(lease)=self.edge_dns.as_ref() {
-            lease.check().map_err(|error|self.fail(error))?;
+        {
+            if dns && let Some(lease)=self.edge_dns.as_ref() {
+                lease.check().map_err(|error|self.fail(error))?;
+            }
+            if let Some(lease)=self.private_dns.as_mut() {
+                lease.live_utc().map_err(|error|self.fail(error))?;
+            }
         }
         #[cfg(not(feature="openssl-inner-tls"))]
         let _=dns;
@@ -1909,6 +1918,23 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     #[cfg(feature = "openssl-inner-tls")]
     pub fn step_private_dns(&mut self, max_packets: usize) -> Result<usize, PacketPathError> {
         self.check_open()?;
+        if self.queued_progress {
+            // Do not dequeue DNS output while another frame still owns the
+            // E2E write acknowledgement. Ordinary outbound resumes that owner.
+            if self.outbound_pending.is_some() || max_packets==0 {return Ok(0);}
+            let Some(dns)=self.private_dns.as_mut().filter(|dns|dns.deferred) else {return Ok(0);};
+            let now=dns.live_utc()?;
+            if dns.service.poll(now).is_none() {
+                return Err(self.fail(PacketPathError::DnsAuthorizationLost));
+            }
+            let now=dns.live_utc()?;
+            let Some(reply)=dns.service.pop_output(now) else {return Ok(0);};
+            let length=validate_private_dns_reply(&self.policy,dns,&reply,None)?;
+            if self.outbound_inline.is_empty() {self.outbound_inline.resize(INLINE_BATCH_STORAGE,0);}
+            let used=encode_packet_frame_into(&reply,self.policy.mtu(),&mut self.outbound_inline)?;
+            self.outbound_pending=Some((0,used,1,length as u64,true));
+            return self.resume_outbound_pending();
+        }
         let Some(dns) = self.private_dns.as_mut().filter(|dns| dns.deferred) else {
             return Ok(0);
         };
@@ -2321,10 +2347,9 @@ fn poll_private_dns<C: Write>(
 }
 
 #[cfg(feature = "openssl-inner-tls")]
-fn write_private_dns<C: Write>(
-    circuit: &mut C,
+fn validate_private_dns_reply(
     policy: &PointToPoint,
-    dns: &mut PrivateDns<'_>,
+    dns: &PrivateDns<'_>,
     bytes: &[u8],
     udp_client: Option<u16>,
 ) -> Result<usize, PacketPathError> {
@@ -2344,15 +2369,24 @@ fn write_private_dns<C: Write>(
     {
         return Err(PacketPathError::Denied(PacketDeny::BadHeader));
     }
+    Ok(info.packet_len)
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn write_private_dns<C: Write>(
+    circuit: &mut C, policy: &PointToPoint, dns: &mut PrivateDns<'_>,
+    bytes: &[u8], udp_client: Option<u16>,
+) -> Result<usize, PacketPathError> {
+    let length=validate_private_dns_reply(policy,dns,bytes,udp_client)?;
     let mut frame = [0; MAX_FRAME_BYTES];
-    let frame_len = encode_packet_frame_into(reply.bytes(), policy.mtu(), &mut frame)?;
+    let frame_len = encode_packet_frame_into(bytes, policy.mtu(), &mut frame)?;
     // Guard each partial write and the flush. On loss, abandon this circuit;
     // bytes already accepted by an underlying blocking write cannot be recalled.
     write_all_guarded(circuit, &frame[..frame_len], || dns.live_utc().map(|_| ()))?;
     dns.live_utc()?;
     circuit.flush().map_err(circuit_io)?;
     dns.live_utc()?;
-    Ok(info.packet_len)
+    Ok(length)
 }
 
 impl PacketPathError {

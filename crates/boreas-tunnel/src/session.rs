@@ -17,7 +17,7 @@
 //! frozen protocol. `SessionHello` is the only accepted first frame.
 
 
-use std::io;
+use std::{io, time::{Duration, Instant}};
 use boreas_crypto::{NodeRole, Policy};
 use boreas_proto::messages::{
     self, LocalIdentity, PathRole, SessionAccept, SessionHello, SessionParams,
@@ -207,6 +207,7 @@ struct FrameIo {
     write_buf: Vec<u8>,
     write_cursor: Option<usize>,
     progress_enabled: bool,
+    partial_deadline: Option<Instant>,
     // Store each decoded batch in reverse so pop() delivers it in wire order.
     pending: Vec<Frame>,
     failed: bool,
@@ -219,7 +220,7 @@ impl FrameIo {
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
-            write_cursor:None, progress_enabled:false,
+            write_cursor:None, progress_enabled:false, partial_deadline:None,
             pending: Vec::new(),
             failed: false,
         }
@@ -325,7 +326,14 @@ impl FrameIo {
         })
     }
 
+    fn check_partial_deadline(&mut self)->io::Result<()> {
+        if self.partial_deadline.is_some_and(|deadline|Instant::now()>=deadline) {
+            self.poison();return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
     fn recv(&mut self) -> Result<Frame, TunnelError> {
+        self.check_partial_deadline()?;
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
@@ -351,6 +359,9 @@ impl FrameIo {
                 self.poison();
                 return Err(error.into());
             }
+            if self.progress_enabled && self.decoder.buffered_len()>0 {
+                self.partial_deadline.get_or_insert_with(||Instant::now()+Duration::from_secs(30));
+            } else {self.partial_deadline=None;}
             // Check the full batch before publishing any frame. The decoder's
             // byte limit alone does not bound queued frame metadata.
             if self.pending.len() > MAX_PENDING_FRAMES
@@ -392,6 +403,7 @@ impl EstablishedSession {
         self.io.stream.wait_progress(timeout,write)
     }
     pub(crate) fn progress_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        self.io.check_partial_deadline()?;
         self.io.stream.progress_io()
     }
 
@@ -798,6 +810,43 @@ mod tests {
             assert_eq!(io.write_cursor,Some(0));
         }
         assert_eq!(TunnelError::from(io::Error::from(io::ErrorKind::WouldBlock)),TunnelError::Timeout);
+    }
+
+    #[test]
+    fn partial_relay_body_yields_reverse_and_expires_without_renewal() {
+        struct Gated { input:io::Cursor<Vec<u8>>, split:usize, release:Arc<std::sync::atomic::AtomicBool>, record:Arc<Mutex<Vec<u8>>> }
+        impl Read for Gated {
+            fn read(&mut self,out:&mut[u8])->io::Result<usize> {
+                let pos=self.input.position() as usize;
+                if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    if pos>=self.split{return Err(io::ErrorKind::WouldBlock.into());}
+                    let n=out.len().min(self.split-pos);return self.input.read(&mut out[..n]);
+                }
+                self.input.read(out)
+            }
+        }
+        impl Write for Gated {
+            fn write(&mut self,bytes:&[u8])->io::Result<usize>{self.record.lock().unwrap().extend_from_slice(bytes);Ok(bytes.len())}
+            fn flush(&mut self)->io::Result<()>{Ok(())}
+        }
+        impl Duplex for Gated {fn has_buffered_input(&self)->bool{false}}
+        for split in [1,10,READ_CHUNK+3] {
+            let body=vec![0x65;READ_CHUNK+50];
+            let header=AppHeader{proto_major:PROTO_MAJOR,kind:Kind::RelayCircuit,flags:0,body_len:body.len() as u32};
+            let mut wire=header.encode().unwrap().to_vec();wire.extend_from_slice(&body);
+            let release=Arc::new(std::sync::atomic::AtomicBool::new(false));let record=Arc::new(Mutex::new(vec![]));
+            let mut io=FrameIo::new(Box::new(Gated{input:io::Cursor::new(wire),split,release:release.clone(),record:record.clone()}));
+            io.progress_enabled=true;
+            assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            let deadline=io.partial_deadline;assert!(deadline.is_some());
+            for _ in 0..3 {assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));assert_eq!(io.partial_deadline,deadline);}
+            io.send(Kind::Control,b"reverse").unwrap();assert!(!record.lock().unwrap().is_empty());
+            release.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(io.recv().unwrap().body,body);assert!(io.partial_deadline.is_none());
+        }
+        let mut io=FrameIo::new(Box::new(io::Cursor::new(vec![0u8;1])));io.progress_enabled=true;
+        io.partial_deadline=Some(Instant::now());assert!(io.check_partial_deadline().is_err());
+        assert!(io.failed);assert!(io.send(Kind::Control,b"forbidden").is_err());
     }
 
     #[test]
