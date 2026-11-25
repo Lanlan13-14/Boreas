@@ -195,6 +195,12 @@ impl std::io::Write for Socket {
 }
 #[cfg(all(feature = "record-diagnostics", feature = "openssl-inner-tls"))]
 impl crate::stream::Duplex for Socket {
+    fn enable_progress(&mut self) -> std::io::Result<bool> { self.0.set_nonblocking(true)?; Ok(true) }
+    fn progress_io(&mut self) -> std::io::Result<crate::stream::ProgressIo> {
+        Ok(crate::stream::ProgressIo {read:true,..Default::default()})
+    }
+    fn is_raw_socket(&self) -> bool {true}
+
     fn has_buffered_input(&self) -> bool {
         false
     }

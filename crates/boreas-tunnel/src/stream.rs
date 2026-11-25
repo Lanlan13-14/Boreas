@@ -26,8 +26,23 @@ use crate::ws::WsStream;
 /// circuit fragments. Polling only the TCP fd misses all of those cases. It is
 /// deliberately conservative for a partial frame: just like socket readiness,
 /// it permits a read attempt but does not promise that a whole frame is ready.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgressIo {
+    pub advanced: bool,
+    pub read: bool,
+    pub write: bool,
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) mod queued_tls;
+
 pub trait Duplex: Read + Write + Send {
     fn has_buffered_input(&self) -> bool;
+    /// Explicit activation happens only after authenticated ordinary-path bind.
+    fn enable_progress(&mut self) -> io::Result<bool> { Ok(false) }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { Ok(ProgressIo::default()) }
+    fn is_raw_socket(&self) -> bool { false }
+
 
     /// Install a per-operation transport timeout for a bounded handshake.
     ///
@@ -63,6 +78,12 @@ pub trait Duplex: Read + Write + Send {
 }
 
 impl Duplex for TcpStream {
+    fn enable_progress(&mut self) -> io::Result<bool> { self.set_nonblocking(true)?; Ok(true) }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> {
+        Ok(ProgressIo { read: true, ..Default::default() })
+    }
+    fn is_raw_socket(&self) -> bool { true }
+
     fn has_buffered_input(&self) -> bool {
         false
     }
@@ -78,6 +99,10 @@ impl Duplex for TcpStream {
 }
 
 impl<T: Duplex + ?Sized> Duplex for Box<T> {
+    fn enable_progress(&mut self) -> io::Result<bool> { (**self).enable_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { (**self).progress_io() }
+    fn is_raw_socket(&self) -> bool { (**self).is_raw_socket() }
+
     fn has_buffered_input(&self) -> bool {
         (**self).has_buffered_input()
     }
@@ -103,6 +128,9 @@ impl Duplex for Cursor<Vec<u8>> {
 }
 
 impl<T: Duplex> Duplex for WsStream<T> {
+    fn enable_progress(&mut self) -> io::Result<bool> { self.enable_transport_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.progress_transport_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()
     }
@@ -132,6 +160,9 @@ impl<S: Duplex> Duplex for EstablishedStream<S> {
 }
 
 impl Duplex for CircuitStream<'_> {
+    fn enable_progress(&mut self) -> io::Result<bool> { self.enable_session_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.progress_session_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()
     }
@@ -332,6 +363,12 @@ impl<T: Duplex> Write for DeadlineIo<T> {
 }
 
 impl<T: Duplex> Duplex for DeadlineIo<T> {
+    fn enable_progress(&mut self) -> io::Result<bool> {
+        if self.armed.load(Ordering::Relaxed) { return Err(io::ErrorKind::PermissionDenied.into()); }
+        self.inner.enable_progress()
+    }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.inner.progress_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.inner.has_buffered_input()
     }

@@ -66,7 +66,7 @@ impl OpenSslInnerConnector {
     fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         let established = self
             .connector
-            .connect(transport)
+            .connect(crate::stream::queued_tls::QueueIo::new(transport))
             .map_err(|_| TunnelError::InnerTls("handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
@@ -77,7 +77,7 @@ impl OpenSslInnerConnector {
             .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
         let peer = peer_identity(&self.extractor, &certificate)?;
         Ok(EstablishedInner::new(
-            Box::new(established),
+            Box::new(crate::stream::queued_tls::QueuedTls::new(established.into_parts().0)),
             InnerTlsSession::from_verified_certificate(peer, negotiated),
         ))
     }
@@ -106,7 +106,7 @@ impl OpenSslInnerAcceptor {
     fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         let established = self
             .acceptor
-            .accept(transport)
+            .accept(crate::stream::queued_tls::QueueIo::new(transport))
             .map_err(|_| TunnelError::InnerTls("handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
@@ -117,7 +117,7 @@ impl OpenSslInnerAcceptor {
             .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
         let peer = peer_identity(&self.extractor, &certificate)?;
         Ok(EstablishedInner::new(
-            Box::new(established),
+            Box::new(crate::stream::queued_tls::QueuedTls::new(established.into_parts().0)),
             InnerTlsSession::from_verified_certificate(peer, negotiated),
         ))
     }
@@ -187,7 +187,7 @@ impl E2eTlsBackend for OpenSslE2eBackend {
     fn connect<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError> {
         let established = self
             .connector
-            .connect(transport)
+            .connect(crate::stream::queued_tls::QueueIo::new(transport))
             .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
@@ -198,7 +198,7 @@ impl E2eTlsBackend for OpenSslE2eBackend {
             .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
         let peer = peer_identity(&self.extractor, &certificate)?;
         Ok(E2eEstablished::new(
-            Box::new(established),
+            Box::new(crate::stream::queued_tls::QueuedTls::new(established.into_parts().0)),
             InnerTlsSession::from_verified_certificate(peer, negotiated),
         ))
     }
@@ -206,7 +206,7 @@ impl E2eTlsBackend for OpenSslE2eBackend {
     fn accept<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError> {
         let established = self
             .acceptor
-            .accept(transport)
+            .accept(crate::stream::queued_tls::QueueIo::new(transport))
             .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
@@ -217,9 +217,31 @@ impl E2eTlsBackend for OpenSslE2eBackend {
             .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
         let peer = peer_identity(&self.extractor, &certificate)?;
         Ok(E2eEstablished::new(
-            Box::new(established),
+            Box::new(crate::stream::queued_tls::QueuedTls::new(established.into_parts().0)),
             InnerTlsSession::from_verified_certificate(peer, negotiated),
         ))
+    }
+}
+
+impl E2eStream for crate::stream::queued_tls::QueuedTls<CircuitStream<'_>> {
+    fn close_stream(&mut self) -> io::Result<()> { self.close_notify() }
+    fn read_with_authenticated_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.read_authenticated(out)
+    }
+    #[cfg(target_os = "linux")]
+    fn finish_dedicated(&mut self) -> Result<(), TunnelError> {
+        self.close_notify()?;
+        self.transport_mut().send_close()
+    }
+    #[cfg(target_os = "linux")]
+    fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
+        use std::io::Read;
+        let mut byte=[0];
+        match self.read(&mut byte) {
+            Err(error) if error.kind()==io::ErrorKind::UnexpectedEof=>self.transport_mut().wait_close(),
+            Err(error)=>Err(error.into()),
+            Ok(_)=>Err(crate::CircuitReject::UnexpectedFrame.into()),
+        }
     }
 }
 
@@ -652,11 +674,11 @@ impl OuterTlsConnector for OpenSslOuterTlsConnector {
         let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .connector
-            .connect(server_name, tcp)
+            .connect(server_name, crate::stream::queued_tls::QueueIo::new(tcp))
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer handshake", &error)))?;
         #[cfg(feature = "record-diagnostics")]
         eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
-        Ok(Box::new(stream))
+        Ok(Box::new(crate::stream::queued_tls::QueuedTls::new(stream)))
     }
 }
 
@@ -728,11 +750,11 @@ impl OuterTlsAcceptor for OpenSslOuterTlsAcceptor {
         let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .acceptor
-            .accept(tcp)
+            .accept(crate::stream::queued_tls::QueueIo::new(tcp))
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer accept", &error)))?;
         #[cfg(feature = "record-diagnostics")]
         eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
-        Ok(Box::new(stream))
+        Ok(Box::new(crate::stream::queued_tls::QueuedTls::new(stream)))
     }
 }
 

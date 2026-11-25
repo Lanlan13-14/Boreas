@@ -17,6 +17,7 @@
 //! frozen protocol. `SessionHello` is the only accepted first frame.
 
 
+use std::io;
 use boreas_crypto::{NodeRole, Policy};
 use boreas_proto::messages::{
     self, LocalIdentity, PathRole, SessionAccept, SessionHello, SessionParams,
@@ -204,6 +205,8 @@ struct FrameIo {
     decoder: FrameDecoder,
     buffer: Vec<u8>,
     write_buf: Vec<u8>,
+    write_cursor: Option<usize>,
+    progress_enabled: bool,
     // Store each decoded batch in reverse so pop() delivers it in wire order.
     pending: Vec<Frame>,
     failed: bool,
@@ -216,6 +219,7 @@ impl FrameIo {
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
+            write_cursor:None, progress_enabled:false,
             pending: Vec::new(),
             failed: false,
         }
@@ -240,7 +244,7 @@ impl FrameIo {
 
     fn has_buffered_input(&self) -> bool {
         !self.pending.is_empty()
-            || self.decoder.buffered_len() > 0
+            || (!self.progress_enabled && self.decoder.buffered_len() > 0)
             || self.stream.has_buffered_input()
     }
 
@@ -279,6 +283,7 @@ impl FrameIo {
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
+        if self.write_cursor.is_some() { return self.send_buffered(); }
         if let Err(error) = self.prepare_frame(kind, body) {
             self.poison();
             return Err(error);
@@ -290,13 +295,23 @@ impl FrameIo {
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
-        // Offer TLS the whole frame, not separate header and body writes.
-        // Short writes are retried; any write or flush error is terminal.
-        let result = self
-            .stream
-            .write_all(&self.write_buf)
-            .and_then(|()| self.stream.flush());
-        if result.is_err() {
+        let result = if self.progress_enabled {
+            let mut cursor=self.write_cursor.unwrap_or(0);
+            loop {
+                if cursor==self.write_buf.len() {
+                    match self.stream.flush() {
+                        Ok(())=>{self.write_cursor=None;break Ok(());},
+                        Err(e)=>{self.write_cursor=Some(cursor);break Err(e);},
+                    }
+                }
+                match self.stream.write(&self.write_buf[cursor..]) {
+                    Ok(0)=>break Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n)=>{cursor+=n;self.write_cursor=Some(cursor);},
+                    Err(e)=>{self.write_cursor=Some(cursor);break Err(e);},
+                }
+            }
+        } else { self.stream.write_all(&self.write_buf).and_then(|()|self.stream.flush()) };
+        if result.as_ref().is_err_and(|e|e.kind()!=io::ErrorKind::WouldBlock || !self.progress_enabled) {
             self.poison();
         }
         #[cfg(any(test, feature = "record-diagnostics"))]
@@ -316,6 +331,9 @@ impl FrameIo {
             }
             let read = match self.stream.read(&mut self.buffer) {
                 Ok(read) => read,
+                Err(error) if self.progress_enabled && error.kind()==io::ErrorKind::WouldBlock => {
+                    return Err(error.into());
+                }
                 Err(error) => {
                     self.poison();
                     return Err(error.into());
@@ -359,6 +377,14 @@ pub struct EstablishedSession {
 }
 
 impl EstablishedSession {
+    pub(crate) fn enable_progress(&mut self) -> io::Result<bool> {
+        self.io.progress_enabled=self.io.stream.enable_progress()?;
+        Ok(self.io.progress_enabled)
+    }
+    pub(crate) fn progress_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        self.io.stream.progress_io()
+    }
+
     pub fn peer(&self) -> PeerIdentity {
         self.authorized.peer
     }
@@ -432,6 +458,7 @@ impl EstablishedSession {
         hops_remaining: u8,
         payload: &[u8],
     ) -> Result<(), TunnelError> {
+        if self.io.write_cursor.is_some() { return self.io.send_buffered(); }
         let fragment_header = messages::RelayFragment::encode_header(
             circuit_id,
             direction,

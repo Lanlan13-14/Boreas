@@ -2714,6 +2714,7 @@ mod linux_daemon {
         Read,
         SendPreflight,
         SendDeferred,
+        ProgressWrite,
     }
 
     #[derive(Debug, Default)]
@@ -2749,6 +2750,7 @@ mod linux_daemon {
         }
         let (socket_events, tun_events) = match mode {
             PathPoll::Read => (libc::POLLIN, libc::POLLIN),
+            PathPoll::ProgressWrite => (libc::POLLIN | libc::POLLOUT, 0),
             PathPoll::SendPreflight => (libc::POLLIN | libc::POLLOUT, libc::POLLIN),
             // Keep the TUN fd in the poll set: HUP/ERR/NVAL still surface
             // with events=0, but an already queued packet won't wake us.
@@ -4037,6 +4039,8 @@ mod linux_daemon {
             counters.connected.store(true, Ordering::SeqCst);
         }
 
+        let queued_progress = path.configure_queued_progress(buffer_admission)
+            .map_err(|error|format!("daemon: progress activation: {error:?}"))?;
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;
         let tun_fd = tun.raw_fd();
@@ -4110,6 +4114,10 @@ mod linux_daemon {
                 };
             }
 
+            let transport_progress=if queued_progress {
+                path.progress_transport().map_err(|error|format!("daemon: transport progress: {error:?}"))?
+            } else {boreas_tunnel::stream::ProgressIo::default()};
+
             // Standby maintenance is one non-blocking transport poll plus, at
             // most, one background dial. It never blocks this loop and never
             // touches the active circuit; it is not a ProbePing exchange.
@@ -4133,7 +4141,7 @@ mod linux_daemon {
             let batch_read_threshold = SINGLE_RECORD_BATCH
                 - (mtu + boreas_tunnel::packet_path::FRAME_PREFIX_LEN - 1);
             const MAX_INBOUND_BATCH_PACKETS: usize = 32;
-            let mut made_progress = false;
+            let mut made_progress = transport_progress.advanced;
             let remaining_budget = max_packets
                 .map(|limit| {
                     let stats = path.stats();
@@ -4174,7 +4182,7 @@ mod linux_daemon {
             // When both sides write into full receive windows, neither can
             // reach the inbound turn. Leave packets in the host queue before
             // framing/encrypting them so the inbound path still makes progress.
-            let preflight = if protect_send {
+            let preflight = if protect_send && !queued_progress {
                 Some(poll_io(sock_fd, tun_fd, PathPoll::SendPreflight, Duration::ZERO)?)
             } else {
                 None
@@ -4403,7 +4411,11 @@ mod linux_daemon {
                     // One wait on both sources: an outbound packet arriving on
                     // the TUN wakes the loop immediately, and a TUN HUP/ERR is
                     // fail-closed inside `poll_io` instead of idling forever.
-                    poll_io(sock_fd, tun_fd, PathPoll::Read, IDLE_POLL_TIMEOUT)?;
+                    let mode=if queued_progress && transport_progress.write {
+                        PathPoll::ProgressWrite
+                    } else {PathPoll::Read};
+                    let host_fd=if queued_progress && path.has_pending_output() {None}else{tun_fd};
+                    poll_io(sock_fd, host_fd, mode, IDLE_POLL_TIMEOUT)?;
                 }
             }
         };

@@ -244,6 +244,13 @@ impl<'a> CircuitStream<'a> {
     }
 
     /// Whether a previous read left bytes above the raw hop socket.
+    pub(crate) fn enable_session_progress(&mut self) -> io::Result<bool> {
+        self.session.enable_progress()
+    }
+    pub(crate) fn progress_session_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        self.session.progress_io()
+    }
+
     pub fn has_buffered_input(&self) -> bool {
         self.inbound_pos < self.inbound.len() || self.session.has_buffered_input()
     }
@@ -415,14 +422,20 @@ impl Drop for CircuitStream<'_> {
 impl Read for CircuitStream<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.read_bytes(out)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .map_err(|error| match error {
+                TunnelError::Io(error)=>error,
+                error=>io::Error::new(io::ErrorKind::InvalidData,error),
+            })
     }
 }
 
 impl Write for CircuitStream<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .map_err(|error| match error {
+                TunnelError::Io(error)=>error,
+                error=>io::Error::new(io::ErrorKind::InvalidData,error),
+            })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -655,11 +668,13 @@ struct ReadAhead {
     // Production uses a live admission guard, released with this allocation.
     _credit: Option<ByteCredit>,
     partial_deadline: Option<Instant>,
+    progress_credit: Option<ByteCredit>,
+    progress_enabled: bool,
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None }
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None, progress_credit:None, progress_enabled:false }
     }
 
     fn pending(&self) -> bool {
@@ -1072,6 +1087,22 @@ impl<'a> E2eCircuit<'a> {
         buffer._credit = Some(credit);
         self.read_ahead = Some(buffer);
         true
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn enable_queued_progress(&mut self, admission:&Admission) -> io::Result<bool> {
+        let Some(buffer)=&mut self.read_ahead else {return Ok(false);};
+        if buffer.progress_enabled {return Ok(true);}
+        let Ok(credit)=admission.reserve_bytes(3*crate::stream::queued_tls::TLS_PROGRESS_BYTES) else {
+            return Ok(false);
+        };
+        if !self.stream.enable_progress()? {return Ok(false);}
+        buffer.progress_credit=Some(credit);
+        buffer.progress_enabled=true;
+        Ok(true)
+    }
+    pub(crate) fn progress_transport(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        self.stream.progress_io()
     }
 
     pub fn info(&self) -> E2eInfo {

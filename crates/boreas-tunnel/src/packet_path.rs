@@ -943,6 +943,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     outbound_batch: Vec<u8>,
     // One initialized high-water allocation; only `used` bytes may be sent.
     outbound_inline: Vec<u8>,
+    outbound_pending: Option<(usize,usize,usize,u64,bool)>,
+    queued_progress:bool,
     // Linux TUN may truncate to the supplied read length; reserve a guard byte.
     outbound_scratch: [u8; MAX_MTU + 1],
     inbound_scratch: Vec<u8>,
@@ -1244,6 +1246,24 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         })
     }
 
+    #[cfg(feature = "openssl-inner-tls")]
+    pub fn configure_queued_progress(&mut self, admission:&crate::resource::Admission)
+        -> Result<bool,PacketPathError>
+    {
+        self.check_open()?;
+        let result=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?
+            .enable_queued_progress(admission);
+        match result {
+            Ok(active)=>{self.queued_progress=active;Ok(active)},
+            Err(error)=>Err(self.fail(circuit_io(error))),
+        }
+    }
+    pub fn progress_transport(&mut self) -> Result<crate::stream::ProgressIo,PacketPathError> {
+        self.check_open()?;
+        let result=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?.progress_transport();
+        result.map_err(|error|self.fail(circuit_io(error)))
+    }
+
     /// One plaintext continuation per event-loop turn. This repairs the L3
     /// prefix/body completion boundary, not incomplete records below E2E TLS.
     /// All complete packets still traverse the existing DNS/host dispatcher.
@@ -1266,6 +1286,9 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
                 Ok(crate::e2e::PlaintextProgress::Ready | crate::e2e::PlaintextProgress::Disabled) => {
                     return self.step_inbound_prefetched().map(|packet|
                         packet.map_or(InboundProgress::Closed, InboundProgress::Packet));
+                }
+                Err(error) if error.kind()==io::ErrorKind::WouldBlock => {
+                    return Ok(InboundProgress::Pending);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     interrupts += 1;
@@ -1391,6 +1414,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             circuit.close_gracefully();
         }
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
@@ -1425,6 +1449,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             stats: PacketStats::default(),
             outbound_batch: Vec::new(),
             outbound_inline: Vec::new(),
+            outbound_pending:None, queued_progress:false,
             // Keep this independent of the path MTU: the host adapter must read
             // at its own MTU, then policy checks the complete packet below.
             outbound_scratch: [0; MAX_MTU + 1],
@@ -1501,6 +1526,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             self.state = PathState::Closed;
         }
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
@@ -1561,6 +1587,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         // Preserve the old unbounded-API behavior for callers above the
         // production single-record threshold; ordinary daemon batches use
         // the bounded direct-read storage below.
+        if self.outbound_pending.is_some() { return self.resume_outbound_pending(); }
         if max_bytes > INLINE_BATCH_THRESHOLD {
             return self.step_outbound_batch_legacy(max_packets, max_bytes);
         }
@@ -1674,22 +1701,57 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         if drained == 0 {
             return Ok(0);
         }
-        let result = write_outbound(
-            circuit,
-            &self.outbound_inline[..used],
-            #[cfg(feature = "openssl-inner-tls")]
-            self.edge_dns.as_ref().filter(|_| contains_dns),
-        );
-        if let Err(error) = result {
-            return Err(self.fail(error));
+        if !self.queued_progress {
+            let result=write_outbound(circuit,&self.outbound_inline[..used],
+                #[cfg(feature="openssl-inner-tls")]
+                self.edge_dns.as_ref().filter(|_|contains_dns));
+            if let Err(error)=result {return Err(self.fail(error));}
+            self.stats.outbound_packets=self.stats.outbound_packets.saturating_add(drained as u64);
+            self.stats.outbound_bytes=self.stats.outbound_bytes.saturating_add(payload_bytes);
+            return Ok(drained);
         }
-        self.stats.outbound_packets = self
-            .stats
-            .outbound_packets
-            .saturating_add(u64::try_from(drained).unwrap_or(u64::MAX));
-        self.stats.outbound_bytes = self.stats.outbound_bytes.saturating_add(payload_bytes);
-        Ok(drained)
+        self.outbound_pending=Some((0,used,drained,payload_bytes,
+            { #[cfg(feature="openssl-inner-tls")] {contains_dns}
+              #[cfg(not(feature="openssl-inner-tls"))] {false} }));
+        self.resume_outbound_pending()
     }
+
+    fn resume_outbound_pending(&mut self) -> Result<usize,PacketPathError> {
+        self.check_open()?;
+        let Some((mut cursor,used,count,bytes,dns))=self.outbound_pending else {return Ok(0);};
+        #[cfg(feature="openssl-inner-tls")]
+        if dns && let Some(lease)=self.edge_dns.as_ref() {
+            lease.check().map_err(|error|self.fail(error))?;
+        }
+        #[cfg(not(feature="openssl-inner-tls"))]
+        let _=dns;
+        let circuit=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?;
+        let mut interrupts=0;
+        loop {
+            let result=if cursor<used {
+                circuit.write(&self.outbound_inline[cursor..used]).map(Some)
+            } else {circuit.flush().map(|()|None)};
+            match result {
+                Ok(Some(0))=>return Err(self.fail(PacketPathError::CircuitIo(io::ErrorKind::WriteZero))),
+                Ok(Some(n))=>{interrupts=0;cursor+=n;self.outbound_pending=Some((cursor,used,count,bytes,dns));},
+                Ok(None)=>break,
+                Err(e) if e.kind()==io::ErrorKind::Interrupted=>{
+                    interrupts+=1;
+                    if interrupts>=MAX_INTERRUPT_RETRIES {return Err(self.fail(circuit_io(e)));}
+                }
+                Err(e) if e.kind()==io::ErrorKind::WouldBlock=>{
+                    self.outbound_pending=Some((cursor,used,count,bytes,dns));return Ok(0);
+                }
+                Err(e)=>return Err(self.fail(circuit_io(e))),
+            }
+        }
+        self.outbound_pending=None;
+        self.stats.outbound_packets=self.stats.outbound_packets.saturating_add(count as u64);
+        self.stats.outbound_bytes=self.stats.outbound_bytes.saturating_add(bytes);
+        Ok(count)
+    }
+
+    pub fn has_pending_output(&self) -> bool { self.outbound_pending.is_some() }
 
     fn step_outbound_batch_legacy(
         &mut self,
@@ -1870,6 +1932,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         self.stats.failures = self.stats.failures.saturating_add(1);
         self.state = PathState::Poisoned(error);
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
