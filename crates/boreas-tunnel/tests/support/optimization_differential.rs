@@ -27,6 +27,8 @@ impl Write for ShortDuplex {
     }
 }
 impl Duplex for ShortDuplex {
+    fn enable_progress(&mut self) -> io::Result<bool> { self.inner.enable_progress() }
+    fn progress_io(&mut self) -> io::Result<boreas_tunnel::stream::ProgressIo> { self.inner.progress_io() }
     fn has_buffered_input(&self) -> bool {
         self.inner.has_buffered_input()
     }
@@ -175,6 +177,13 @@ fn optimized_packets_cross_real_wss_pq768_with_bounded_short_io_both_directions(
 /// our independently originated packet. This does not cover partial TLS/WS.
 #[test]
 fn partial_l3_record_allows_reverse_packet_before_tail_over_real_wss_pq768() {
+    real_partial_l3_progress(false);
+}
+#[test]
+fn queued_three_layer_tls_preserves_reverse_progress_and_releases_credits() {
+    real_partial_l3_progress(true);
+}
+fn real_partial_l3_progress(queued: bool) {
     use boreas_tunnel::{e2e::E2eCircuit, packet_path::{InboundProgress, encode_packet_frame}};
     use std::sync::{Mutex, mpsc};
     struct Trace {
@@ -203,23 +212,42 @@ fn partial_l3_record_allows_reverse_packet_before_tail_over_real_wss_pq768() {
         assert_eq!(circuit.read(&mut end).unwrap(),0);
     }
     fn receiver(mut circuit: E2eCircuit<'_>, local: [u8;4], peer: [u8;4],
-        prefix: mpsc::Receiver<()>, events: Arc<Mutex<Vec<&'static str>>>) {
+        prefix: mpsc::Receiver<()>, events: Arc<Mutex<Vec<&'static str>>>, queued: bool) {
         circuit.enable_direct_read_ahead();
         let (device,host)=VirtualTun::try_pair(8,8,1360).unwrap();
         let mut path=PacketPath::try_new_over_e2e(&device,circuit,1360).unwrap();
+        let ledger=boreas_tunnel::resource::Admission::new(boreas_tunnel::resource::Limits {
+            handshakes_global:1,authenticated_global:1,authenticated_per_peer:1,bytes_global:128*1024,
+        });
+        if queued {assert!(path.configure_queued_progress(&ledger).unwrap());}
         prefix.recv_timeout(IO_TIMEOUT).unwrap();
+        let until=Instant::now()+IO_TIMEOUT;
+        path.progress_transport().unwrap();
         assert_eq!(path.step_inbound_progress(IO_TIMEOUT).unwrap(),InboundProgress::Pending);
         events.lock().unwrap().push("partial_returned");
         device.inject(&l3(local,peer,b"reverse")).unwrap();
-        assert_eq!(path.step_outbound_batch(1,14000).unwrap(),1);
+        let mut sent=0;
+        while sent==0 {
+            path.progress_transport().unwrap();
+            sent=path.step_outbound_batch(1,14000).unwrap();
+            assert!(Instant::now()<until,"queued outbound stalled");
+        }
+        assert_eq!(sent,1);
         events.lock().unwrap().push("reverse_committed");
-        assert_eq!(path.step_inbound_progress(IO_TIMEOUT).unwrap(),
-            InboundProgress::Packet(l3(peer,local,b"withheld-tail").len()));
+        loop {
+            path.progress_transport().unwrap();
+            match path.step_inbound_progress(IO_TIMEOUT).unwrap() {
+                InboundProgress::Pending=>assert!(Instant::now()<until,"queued inbound stalled"),
+                InboundProgress::Packet(n)=>{assert_eq!(n,l3(peer,local,b"withheld-tail").len());break;},
+                InboundProgress::Closed=>panic!("premature close"),
+            }
+        }
         assert_eq!(host.read_packet().unwrap().unwrap(),l3(peer,local,b"withheld-tail"));
         events.lock().unwrap().push("packet_delivered");
         assert_eq!(path.stats().inbound_packets,1);
         assert_eq!(path.stats().outbound_packets,1);
         path.close_gracefully();
+        assert_eq!(ledger.snapshot().unwrap().bytes,0);
     }
     let t=Temp::new(); setup(&t);
     for paused_server in [false,true] {
@@ -237,7 +265,7 @@ fn partial_l3_record_allows_reverse_packet_before_tail_over_real_wss_pq768() {
                     &ShortAcceptor{inner:server_side.outer,chunk:257},
                     policy(server_side.local,server_side.peer),IO_TIMEOUT,&admission()).unwrap();
                 let circuit=accept_e2e(&mut accepted.session,&server_side.e2e,server_side.peer).unwrap();
-                if paused_server { receiver(circuit,[10,20,1,1],[10,20,1,2],prefix_rx,server_events); }
+                if paused_server { receiver(circuit,[10,20,1,1],[10,20,1,2],prefix_rx,server_events,queued); }
                 else { sender(circuit,[10,20,1,1],[10,20,1,2],split,Trace{events:server_events,prefix:server_tx}); }
             });
             let link=LinkClient::new(Box::new(ShortConnector{inner:client_side.outer,chunk:257}),client_side.hop);
@@ -245,7 +273,7 @@ fn partial_l3_record_allows_reverse_packet_before_tail_over_real_wss_pq768() {
                 policy(client_side.local,client_side.peer),IO_TIMEOUT).unwrap();
             let circuit=open_e2e(&mut hop,&client_side.e2e,client_side.peer,1).unwrap();
             if paused_server { sender(circuit,[10,20,1,2],[10,20,1,1],split,Trace{events:events.clone(),prefix:prefix_tx}); }
-            else { receiver(circuit,[10,20,1,2],[10,20,1,1],client_rx,events.clone()); }
+            else { receiver(circuit,[10,20,1,2],[10,20,1,1],client_rx,events.clone(),queued); }
             server.join().unwrap();
             let events=events.lock().unwrap();
             let at=|event| events.iter().position(|e| *e==event).unwrap();

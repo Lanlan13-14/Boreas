@@ -423,7 +423,7 @@ impl Read for CircuitStream<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.read_bytes(out)
             .map_err(|error| match error {
-                TunnelError::Io(error)=>error,
+                TunnelError::Io(error)=>error.into(),
                 error=>io::Error::new(io::ErrorKind::InvalidData,error),
             })
     }
@@ -433,7 +433,7 @@ impl Write for CircuitStream<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)
             .map_err(|error| match error {
-                TunnelError::Io(error)=>error,
+                TunnelError::Io(error)=>error.into(),
                 error=>io::Error::new(io::ErrorKind::InvalidData,error),
             })
     }
