@@ -799,11 +799,46 @@ fn prefetched_frame_ready(bytes: &[u8], mtu: usize) -> bool {
     len == 0 || len > mtu || rest.len() >= len
 }
 
-/// None means a refill is required; errors never consume or deliver bytes.
-fn deliver_prefetched<P: PacketIo + ?Sized>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundClass { Host, CoreDns, EdgeDns }
+
+/// One rule for copied and borrowed ingress. Classification is not authority:
+/// DNS leases/transactions are still checked by the original dispatchers.
+fn classify_inbound(
+    policy: &PointToPoint,
+    packet: InspectedPacket<'_>,
+    core_dns: Option<Ipv4Addr>,
+    edge_dns: Option<Ipv4Addr>,
+    replica_only: bool,
+) -> Result<InboundClass, PacketPathError> {
+    let info = packet.info();
+    if core_dns.is_some_and(|vip| info.destination == IpAddr::V4(vip)) {
+        if info.source != IpAddr::V4(policy.peer_vip()) {
+            return Err(PacketPathError::Denied(PacketDeny::SourceNotPeer));
+        }
+        return Ok(InboundClass::CoreDns);
+    }
+    if edge_dns.is_some_and(|vip| info.source == IpAddr::V4(vip)) {
+        if info.destination != IpAddr::V4(policy.local_vip()) {
+            return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
+        }
+        return Ok(InboundClass::EdgeDns);
+    }
+    if replica_only {
+        return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
+    }
+    Ok(InboundClass::Host)
+}
+
+/// None means a refill or the original DNS dispatcher is required. In either
+/// case the plaintext cursor has not moved. Errors never consume bytes.
+fn deliver_prefetched_classified<P: PacketIo + ?Sized>(
     io: &P,
     policy: &PointToPoint,
     bytes: &[u8],
+    core_dns: Option<Ipv4Addr>,
+    edge_dns: Option<Ipv4Addr>,
+    replica_only: bool,
 ) -> Option<Result<(usize, usize), PacketPathError>> {
     let [hi, lo, rest @ ..] = bytes else {
         return None;
@@ -818,22 +853,25 @@ fn deliver_prefetched<P: PacketIo + ?Sized>(
     if rest.len() < length {
         return None;
     }
-    Some(
-        deliver_host_packet(io, policy, &rest[..length])
-            .map(|length| (FRAME_PREFIX_LEN + length, length)),
-    )
+    let packet = match policy.inspect_bytes(&rest[..length]).map_err(PacketPathError::Denied) {
+        Ok(packet) => packet,
+        Err(error) => return Some(Err(error)),
+    };
+    match classify_inbound(policy, packet, core_dns, edge_dns, replica_only) {
+        Err(error) => Some(Err(error)),
+        Ok(InboundClass::CoreDns | InboundClass::EdgeDns) => None,
+        Ok(InboundClass::Host) => Some(
+            deliver_inspected_host_packet(io, policy, packet)
+                .map(|length| (FRAME_PREFIX_LEN + length, length)),
+        ),
+    }
 }
 
-/// The same ordinary host-delivery checks for borrowed and copied packets.
-fn deliver_host_packet<P: PacketIo + ?Sized>(
-    io: &P,
-    policy: &PointToPoint,
-    bytes: &[u8],
-) -> Result<usize, PacketPathError> {
-    let packet = policy
-        .inspect_bytes(bytes)
-        .map_err(PacketPathError::Denied)?;
-    deliver_inspected_host_packet(io, policy, packet)
+#[cfg(test)]
+fn deliver_prefetched<P: PacketIo + ?Sized>(
+    io: &P, policy: &PointToPoint, bytes: &[u8],
+) -> Option<Result<(usize, usize), PacketPathError>> {
+    deliver_prefetched_classified(io, policy, bytes, None, None, false)
 }
 
 fn deliver_inspected_host_packet<P: PacketIo + ?Sized>(
@@ -1188,6 +1226,19 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         Ok(path)
     }
 
+    /// Enable only after role, DNS lease and replica binding are final. This
+    /// is also the assembly entry used by daemon regression tests.
+    pub fn configure_direct_read_ahead(
+        &mut self, real_tun: bool, replica_epoch: bool, admission: &crate::resource::Admission,
+    ) -> bool {
+        #[cfg(feature = "openssl-inner-tls")]
+        if self.dns_replica_only { return false; }
+        self.circuit.as_mut().is_some_and(|circuit| {
+            circuit.direct_read_ahead_eligible(real_tun, replica_epoch)
+                && circuit.enable_direct_read_ahead_admitted(admission)
+        })
+    }
+
     /// Whether inbound bytes are buffered above the raw outer TCP socket.
     /// The daemon combines this with socket readiness before entering a
     /// blocking frame read, avoiding both arbitrary sleeps and missed TLS data.
@@ -1211,10 +1262,18 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
     /// caller's per-packet stop/revocation checks remain outside this call.
     pub fn step_inbound_prefetched(&mut self) -> Result<Option<usize>, PacketPathError> {
         self.check_open()?;
+        // Dedicated replica streams retain authenticated-EOF reads unchanged.
         #[cfg(feature = "openssl-inner-tls")]
-        if self.private_dns.is_some() || self.edge_dns.is_some() || self.dns_replica_only {
+        if self.dns_replica_only {
             return self.step_inbound();
         }
+        #[cfg(feature = "openssl-inner-tls")]
+        let (core_dns, edge_dns) = (
+            self.private_dns.as_ref().map(|dns| dns.service.dns_vip()),
+            self.edge_dns.as_ref().map(|dns| dns.vip),
+        );
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        let (core_dns, edge_dns) = (None, None);
         let Some(circuit) = self.circuit.as_mut() else {
             return Err(PacketPathError::Poisoned);
         };
@@ -1241,7 +1300,9 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         }
         let result = circuit
             .prefetched_plaintext()
-            .and_then(|bytes| deliver_prefetched(self.io, &self.policy, bytes));
+            .and_then(|bytes| deliver_prefetched_classified(
+                self.io, &self.policy, bytes, core_dns, edge_dns, false,
+            ));
         match result {
             None => self.step_inbound(),
             Some(Err(error)) => Err(self.fail(error)),
@@ -1947,12 +2008,13 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     #[cfg(feature = "openssl-inner-tls")]
     let info = packet.info();
     #[cfg(feature = "openssl-inner-tls")]
-    if let Some(dns) = dns
-        && info.destination == IpAddr::V4(dns.service.dns_vip())
-    {
-        if info.source != IpAddr::V4(policy.peer_vip()) {
-            return Err(PacketPathError::Denied(PacketDeny::SourceNotPeer));
-        }
+    let class = classify_inbound(
+        policy, packet,
+        dns.as_ref().map(|dns| dns.service.dns_vip()),
+        edge_dns.as_ref().map(|dns| dns.vip), dns_replica_only,
+    )?;
+    #[cfg(feature = "openssl-inner-tls")]
+    if let Some(dns) = dns.filter(|_| class == InboundClass::CoreDns) {
         // Never reclassify a DNS VIP packet as host traffic, even when
         // unanswered or authorization expired during the read.
         let reply_len = dispatch_private_dns(circuit, policy, dns, packet)?;
@@ -1962,12 +2024,7 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         }));
     }
     #[cfg(feature = "openssl-inner-tls")]
-    if let Some(dns) = edge_dns
-        && info.source == IpAddr::V4(dns.vip)
-    {
-        if info.destination != IpAddr::V4(policy.local_vip()) {
-            return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
-        }
+    if let Some(dns) = edge_dns.filter(|_| class == InboundClass::EdgeDns) {
         dns.check()?;
         let expected = if info.protocol == 6 {
             let (port, client, flags) = dns_tcp_segment(packet.bytes(), info)
@@ -2001,10 +2058,6 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
             length: info.packet_len,
             reply_len: None,
         }));
-    }
-    #[cfg(feature = "openssl-inner-tls")]
-    if dns_replica_only {
-        return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
     }
     let length = deliver_inspected_host_packet(io, policy, packet)?;
     Ok(Some(InboundDelivery {

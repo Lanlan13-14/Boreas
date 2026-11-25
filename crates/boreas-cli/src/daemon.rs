@@ -3280,6 +3280,7 @@ mod linux_daemon {
             counters,
             private_dns,
             replica_epoch,
+            &admission,
         );
 
         counters.connected.store(false, Ordering::SeqCst);
@@ -3363,6 +3364,12 @@ mod linux_daemon {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
         let outer_conn = direct_outer_connector(mat_dir)?;
         let budget = Arc::new(ConnectionBudget::new());
+        // Same bounded byte ledger for the active path across promotions;
+        // optional read-ahead credits are released with their owning circuit.
+        let buffer_admission = Admission::new(Limits {
+            handshakes_global: 8, authenticated_global: 8,
+            authenticated_per_peer: 2, bytes_global: 16 * 1024 * 1024,
+        });
         let link_client = LinkClient::new(
             Box::new(outer_conn),
             Box::new(OpenSslInnerConnector::new(
@@ -3553,6 +3560,7 @@ mod linux_daemon {
                     counters,
                     private_dns,
                     None,
+                    &buffer_admission,
                 );
                 counters.connected.store(false, Ordering::SeqCst);
                 counters.outbound_upstreams.store(0, Ordering::SeqCst);
@@ -3816,7 +3824,7 @@ mod linux_daemon {
         mode_name: &str,
         sock_fd: i32,
         tun: &TunEndpoint,
-        mut e2e: E2eCircuit<'_>,
+        e2e: E2eCircuit<'_>,
         mtu: usize,
         status_path: &Path,
         policy_window: PolicyWindow,
@@ -3829,10 +3837,8 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
         replica_epoch: Option<private_dns_replica::Epoch>,
+        buffer_admission: &Admission,
     ) -> Result<PathReport, String> {
-        if private_dns.is_none() && tun.raw_fd().is_some() {
-            e2e.enable_direct_read_ahead();
-        }
         let local_e2e = e2e.local();
         let peer_e2e = e2e.info().peer;
         let endpoints = [
@@ -3927,6 +3933,11 @@ mod linux_daemon {
             PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
         }
         .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
+        // No business bytes have been read. All role, replica and DNS lease
+        // construction above is final; per-packet DNS authority remains live.
+        let _read_ahead_enabled = path.configure_direct_read_ahead(
+            tun.raw_fd().is_some(), replica_epoch.is_some(), buffer_admission,
+        );
         let _dns_interrupt = if let (Some(dns), Some((lease, sequence))) = (private_dns, &dns_lease)
         {
             let fd = duplicate_shutdown_fd(sock_fd)

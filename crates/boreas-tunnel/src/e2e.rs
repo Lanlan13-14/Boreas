@@ -56,7 +56,7 @@ use crate::relay::{
     CircuitId, Direction, HopSessionToken, MAX_RELAY_HOPS, NodeRef, RelayTable, Segment,
     VerifiedE2eSession,
 };
-use crate::resource::Admission;
+use crate::resource::{Admission, ByteCredit};
 use crate::runtime::{DiagnosticTimer, diagnostic_timing_enabled};
 use crate::session::EstablishedSession;
 use crate::stream::Duplex;
@@ -648,11 +648,13 @@ struct ReadAhead {
     bytes: Box<[u8]>,
     start: usize,
     end: usize,
+    // Production uses a live admission guard, released with this allocation.
+    _credit: Option<ByteCredit>,
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0 }
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None }
     }
 
     fn pending(&self) -> bool {
@@ -965,6 +967,30 @@ impl<'a> E2eCircuit<'a> {
         {
             self.read_ahead = Some(ReadAhead::new());
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_read_ahead_for_test(&mut self) { self.read_ahead = None; }
+
+    /// Policy shared by the daemon assembly and its tests. DNS configuration
+    /// is deliberately absent: it changes per-packet classification, not EOF.
+    pub fn direct_read_ahead_eligible(&self, real_tun: bool, replica_epoch: bool) -> bool {
+        real_tun && !replica_epoch && self.l3_profile == E2eL3Profile::SINGLE_LANE
+            && !self.private_dns_only
+            && matches!(self.local.role, NodeRole::Edge | NodeRole::Core)
+            && matches!(self.info.peer.role, NodeRole::Edge | NodeRole::Core)
+    }
+
+    /// Reserve before allocating. Exhaustion disables only this optimization;
+    /// it never rejects otherwise legal business or weakens authorization.
+    pub fn enable_direct_read_ahead_admitted(&mut self, admission: &Admission) -> bool {
+        if !self.direct_read_ahead_eligible(true, false) { return false; }
+        if self.read_ahead.is_some() { return true; }
+        let Ok(credit) = admission.reserve_bytes(READ_AHEAD_BYTES) else { return false; };
+        let mut buffer = ReadAhead::new();
+        buffer._credit = Some(credit);
+        self.read_ahead = Some(buffer);
+        true
     }
 
     pub fn info(&self) -> E2eInfo {

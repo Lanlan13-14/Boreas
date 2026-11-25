@@ -93,3 +93,84 @@ fn refill_error_and_every_truncation_match_legacy_terminal_semantics() {
     assert_eq!(reads.load(Ordering::SeqCst), usize::from(MAX_INTERRUPT_RETRIES));
     assert!(fast.circuit.is_none());
 }
+
+#[test]
+fn mixed_dns_borrows_ordinary_packet_and_preserves_special_cursor() {
+    let ordinary = ipv4([10,20,3,9], [10,20,3,1], b"ordinary");
+    let dns = ipv4([10,20,0,53], [10,20,3,1], b"not a valid DNS response");
+    let mut wire = encode_packet_frame(&ordinary, DEFAULT_MTU).unwrap();
+    wire.extend(encode_packet_frame(&dns, DEFAULT_MTU).unwrap());
+    let io = MatrixIo::new(vec![], 0);
+    let (mut path, reads) = path(&io, wire, usize::MAX, false);
+    path.edge_dns = Some(EdgeDns {
+        vip: [10,20,0,53].into(), zone: "private.example",
+        public: false, current: Box::new(|| true), pending: Default::default(), tcp: None,
+    });
+    path.inbound_scratch = vec![0xa5; 37];
+    assert_eq!(path.step_inbound_prefetched(), Ok(Some(ordinary.len())));
+    assert_eq!(path.inbound_scratch, vec![0xa5; 37]);
+    assert_eq!(io.writes.borrow().as_slice(), &[ordinary]);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    // DNS bytes are not consumed by classification. The original responder
+    // reparses once and rejects malformed content rather than forwarding it.
+    let pending = path.circuit.as_ref().unwrap().prefetched_plaintext().unwrap();
+    let policy = path.policy;
+    assert!(deliver_prefetched_classified(&io, &policy, pending,
+        None, Some([10,20,0,53].into()), false).is_none());
+    assert!(path.step_inbound_prefetched().is_err());
+    assert_eq!(path.stats().inbound_packets, 1);
+    assert_eq!(io.writes.borrow().len(), 1);
+    assert!(path.circuit.is_none());
+}
+
+#[test]
+fn classification_priority_and_replica_isolation_match_both_entry_points() {
+    let policy = PointToPoint::try_new([10,20,3,1].into(), [10,20,3,9].into(), DEFAULT_MTU).unwrap();
+    for (src, dst, replica, expected) in [
+        ([10,20,3,9], [10,20,3,1], false, Ok(InboundClass::Host)),
+        ([10,20,3,9], [10,20,0,53], true, Ok(InboundClass::CoreDns)),
+        ([10,20,3,7], [10,20,0,53], false, Err(PacketPathError::Denied(PacketDeny::SourceNotPeer))),
+        ([10,20,0,53], [10,20,3,1], true, Ok(InboundClass::EdgeDns)),
+        ([10,20,0,53], [10,20,3,7], false, Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal))),
+        ([10,20,3,9], [10,20,3,1], true, Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic))),
+    ] {
+        let packet = ipv4(src, dst, b"classification");
+        let inspected = policy.inspect_bytes(&packet).unwrap();
+        assert_eq!(classify_inbound(&policy, inspected,
+            Some([10,20,0,53].into()), Some([10,20,0,53].into()), replica), expected);
+    }
+}
+
+#[test]
+fn daemon_configuration_entry_uses_lease_final_policy_and_releases_credit() {
+    use crate::resource::{Admission, Limits};
+    for (real_tun, replica, dedicated, want) in [
+        (true,false,false,true), (false,false,false,false),
+        (true,true,false,false), (true,false,true,false),
+    ] {
+        let io = MatrixIo::new(vec![], 0);
+        let (mut path, _) = path(&io, vec![], usize::MAX, false);
+        // Clear the fixture-only optimization to test production admission.
+        path.circuit.as_mut().unwrap().disable_read_ahead_for_test();
+        path.dns_replica_only = dedicated;
+        let admission = Admission::new(Limits {
+            handshakes_global: 1, authenticated_global: 1,
+            authenticated_per_peer: 1, bytes_global: 16384,
+        });
+        assert_eq!(path.configure_direct_read_ahead(real_tun, replica, &admission), want);
+        assert_eq!(admission.snapshot().unwrap().bytes, if want { 16384 } else { 0 });
+        path.close();
+        assert_eq!(admission.snapshot().unwrap().bytes, 0);
+    }
+    let io = MatrixIo::new(vec![], 0);
+    let (mut path, _) = path(&io, vec![], usize::MAX, false);
+    path.circuit.as_mut().unwrap().disable_read_ahead_for_test();
+    let admission = Admission::new(Limits {
+        handshakes_global: 1, authenticated_global: 1,
+        authenticated_per_peer: 1, bytes_global: 16383,
+    });
+    assert!(!path.configure_direct_read_ahead(true, false, &admission));
+    assert!(path.is_open());
+    assert_eq!(path.step_inbound_prefetched(), Ok(None));
+    assert_eq!(admission.snapshot().unwrap().bytes, 0);
+}
