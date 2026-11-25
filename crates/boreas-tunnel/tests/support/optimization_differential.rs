@@ -169,3 +169,90 @@ fn optimized_packets_cross_real_wss_pq768_with_bounded_short_io_both_directions(
         server.join().unwrap();
     }
 }
+
+/// Real three-layer TLS proof for the L3 completion boundary only. The peer
+/// withholds a whole later E2E record containing the L3 tail until it receives
+/// our independently originated packet. This does not cover partial TLS/WS.
+#[test]
+fn partial_l3_record_allows_reverse_packet_before_tail_over_real_wss_pq768() {
+    use boreas_tunnel::{e2e::E2eCircuit, packet_path::{InboundProgress, encode_packet_frame}};
+    use std::sync::{Mutex, mpsc};
+    struct Trace {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        prefix: mpsc::Sender<()>,
+    }
+    fn sender(mut circuit: E2eCircuit<'_>, local: [u8;4], peer: [u8;4], split: usize, trace: Trace) {
+        let packet = l3(local,peer,b"withheld-tail");
+        let wire = encode_packet_frame(&packet,1360).unwrap();
+        circuit.write_all(&wire[..split]).unwrap();
+        circuit.flush().unwrap();
+        trace.events.lock().unwrap().push("prefix_sent");
+        trace.prefix.send(()).unwrap();
+        // A true circular wait in the old code: do not send tail until the
+        // reverse packet is completely received and byte-exact.
+        let mut prefix=[0;2]; circuit.read_exact(&mut prefix).unwrap();
+        let mut reverse=vec![0;usize::from(u16::from_be_bytes(prefix))];
+        assert!(reverse.len()<=1360);
+        circuit.read_exact(&mut reverse).unwrap();
+        assert_eq!(reverse,l3(peer,local,b"reverse"));
+        trace.events.lock().unwrap().push("reverse_received");
+        circuit.write_all(&wire[split..]).unwrap();
+        circuit.flush().unwrap();
+        trace.events.lock().unwrap().push("tail_sent");
+        let mut end=[0;1];
+        assert_eq!(circuit.read(&mut end).unwrap(),0);
+    }
+    fn receiver(mut circuit: E2eCircuit<'_>, local: [u8;4], peer: [u8;4],
+        prefix: mpsc::Receiver<()>, events: Arc<Mutex<Vec<&'static str>>>) {
+        circuit.enable_direct_read_ahead();
+        let (device,host)=VirtualTun::try_pair(8,8,1360).unwrap();
+        let mut path=PacketPath::try_new_over_e2e(&device,circuit,1360).unwrap();
+        prefix.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(path.step_inbound_progress(IO_TIMEOUT).unwrap(),InboundProgress::Pending);
+        events.lock().unwrap().push("partial_returned");
+        device.inject(&l3(local,peer,b"reverse")).unwrap();
+        assert_eq!(path.step_outbound_batch(1,14000).unwrap(),1);
+        events.lock().unwrap().push("reverse_committed");
+        assert_eq!(path.step_inbound_progress(IO_TIMEOUT).unwrap(),
+            InboundProgress::Packet(l3(peer,local,b"withheld-tail").len()));
+        assert_eq!(host.read_packet().unwrap().unwrap(),l3(peer,local,b"withheld-tail"));
+        events.lock().unwrap().push("packet_delivered");
+        assert_eq!(path.stats().inbound_packets,1);
+        assert_eq!(path.stats().outbound_packets,1);
+        path.close_gracefully();
+    }
+    let t=Temp::new(); setup(&t);
+    for paused_server in [false,true] {
+        for split in [1,2,34] {
+            let (client_side,server_side)=sides(&t);
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=listener.local_addr().unwrap();
+            let events=Arc::new(Mutex::new(vec![]));
+            let server_events=events.clone();
+            let (prefix_tx,prefix_rx)=mpsc::channel();
+            let (server_tx,client_rx)=mpsc::channel();
+            let server=thread::spawn(move || {
+                let tcp=bounded_accept(&listener).unwrap();
+                let mut accepted=LinkServer::new(server_side.hop).accept_tls_stream(tcp,
+                    &ShortAcceptor{inner:server_side.outer,chunk:257},
+                    policy(server_side.local,server_side.peer),IO_TIMEOUT,&admission()).unwrap();
+                let circuit=accept_e2e(&mut accepted.session,&server_side.e2e,server_side.peer).unwrap();
+                if paused_server { receiver(circuit,[10,20,1,1],[10,20,1,2],prefix_rx,server_events); }
+                else { sender(circuit,[10,20,1,1],[10,20,1,2],split,Trace{events:server_events,prefix:server_tx}); }
+            });
+            let link=LinkClient::new(Box::new(ShortConnector{inner:client_side.outer,chunk:257}),client_side.hop);
+            let mut hop=link.connect(&target(address,"wss.boreas.test"),
+                policy(client_side.local,client_side.peer),IO_TIMEOUT).unwrap();
+            let circuit=open_e2e(&mut hop,&client_side.e2e,client_side.peer,1).unwrap();
+            if paused_server { sender(circuit,[10,20,1,2],[10,20,1,1],split,Trace{events:events.clone(),prefix:prefix_tx}); }
+            else { receiver(circuit,[10,20,1,2],[10,20,1,1],client_rx,events.clone()); }
+            server.join().unwrap();
+            let events=events.lock().unwrap();
+            let at=|event| events.iter().position(|e| *e==event).unwrap();
+            assert!(at("prefix_sent")<at("partial_returned"));
+            assert!(at("partial_returned")<at("reverse_received"));
+            assert!(at("reverse_received")<at("tail_sent"));
+            assert_eq!(events.iter().filter(|e| **e=="packet_delivered").count(),1);
+        }
+    }
+}
