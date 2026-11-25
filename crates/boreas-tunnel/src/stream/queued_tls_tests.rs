@@ -303,3 +303,109 @@ fn websocket_frame_spanning_complete_tls_records_yields_for_reverse_both_roles()
         }
     }
 }
+
+#[test]
+fn repeated_tls_want_write_keeps_original_buffer_and_acknowledges_exactly_once() {
+    for reverse_roles in [false, true] {
+        let (a, b) = pair();
+        let (mut sender, mut receiver) = if reverse_roles { (b, a) } else { (a, b) };
+        sender.enable_progress().unwrap();
+        receiver.enable_progress().unwrap();
+        *sender.transport_mut().limit.lock().unwrap() = 0;
+        let payload = vec![0x76; QUEUE_BYTES];
+        assert_eq!(
+            sender.write(&payload).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let ptr = sender.plain.as_ref().unwrap().write.as_ptr();
+        let deadline = sender.plain.as_ref().unwrap().deadline;
+        assert!(deadline.is_some());
+        for _ in 0..4 {
+            pump(&mut sender, &mut receiver);
+            assert_eq!(
+                sender.write(&payload).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let p = sender.plain.as_ref().unwrap();
+            assert_eq!(p.write.as_ptr(), ptr);
+            assert_eq!(p.deadline, deadline);
+            assert_eq!(&p.write[..], payload);
+            assert!(matches!(p.write_state, WriteState::Waiting(QUEUE_BYTES)));
+        }
+        *sender.transport_mut().limit.lock().unwrap() = usize::MAX;
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut acknowledged = false;
+        let mut received = Vec::new();
+        let mut out = [0; QUEUE_BYTES];
+        while !acknowledged || received.len() < payload.len() {
+            pump(&mut sender, &mut receiver);
+            if !acknowledged {
+                match sender.write(&payload) {
+                    Ok(n) => {
+                        assert_eq!(n, payload.len());
+                        acknowledged = true;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    other => panic!("pending write: {other:?}"),
+                }
+            }
+            match receiver.read(&mut out) {
+                Ok(n) => received.extend_from_slice(&out[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                other => panic!("pending read: {other:?}"),
+            }
+            assert!(Instant::now() < until);
+        }
+        assert_eq!(received, payload);
+        assert!(matches!(
+            sender.plain.as_ref().unwrap().write_state,
+            WriteState::Empty
+        ));
+        for _ in 0..4 {
+            pump(&mut sender, &mut receiver);
+        }
+        assert_eq!(
+            receiver.read(&mut out).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn permanently_blocked_ciphertext_output_expires_original_queue_deadline() {
+    let (mut sender, _receiver) = pair();
+    sender.enable_progress().unwrap();
+    *sender.transport_mut().limit.lock().unwrap() = 0;
+    sender.write_all(b"queued").unwrap();
+    let deadline = sender
+        .ssl
+        .get_ref()
+        .buffers
+        .as_ref()
+        .unwrap()
+        .output_deadline;
+    for _ in 0..4 {
+        sender.progress_io().unwrap();
+        assert_eq!(
+            sender
+                .ssl
+                .get_ref()
+                .buffers
+                .as_ref()
+                .unwrap()
+                .output_deadline,
+            deadline
+        );
+    }
+    sender
+        .ssl
+        .get_mut()
+        .buffers
+        .as_mut()
+        .unwrap()
+        .output_deadline = Some(Instant::now());
+    assert_eq!(
+        sender.progress_io().unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+}
