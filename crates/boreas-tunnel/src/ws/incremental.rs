@@ -14,6 +14,8 @@ impl Incoming {
     pub(super) fn new(payload: Vec<u8>) -> Self {
         Self { head:[0;14],have:0,need:2,parsed:None,payload,body_have:0 }
     }
+    pub(super) fn started(&self)->bool {self.have>0 || self.parsed.is_some()}
+    pub(super) fn into_storage(self)->Vec<u8> {self.payload}
     fn header(&mut self, role: WsRole, limits: &WsLimits) -> Result<bool,WsError> {
         if self.have<2 { return Ok(false); }
         let fin=self.head[0]&0x80!=0;

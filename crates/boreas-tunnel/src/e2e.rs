@@ -414,6 +414,7 @@ impl<'a> CircuitStream<'a> {
         result
     }
 
+    #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn send_close_until(&mut self,until:Instant)->io::Result<()> {
         loop {
             match self.send_close() {

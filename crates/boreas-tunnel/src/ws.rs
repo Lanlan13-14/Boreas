@@ -227,6 +227,7 @@ pub struct WsStream<T> {
     receive_turn: Option<ReceiveTurn>,
     write_pos: usize,
     write_active: bool,
+    write_deadline: Option<Instant>,
     write_payload_len: usize,
     write_opcode: OpCode,
     progress_enabled: bool,
@@ -311,7 +312,7 @@ impl<T: Read + Write> WsStream<T> {
             pending: Vec::new(),
             pending_pos: 0,
             receive_turn: None,
-            write_pos:0, write_active:false, write_payload_len:0,
+            write_pos:0, write_active:false, write_deadline:None, write_payload_len:0,
             write_opcode:OpCode::Binary, progress_enabled:false, control_reply:None,
             message: MessageState::default(),
             close_sent: false,
@@ -328,9 +329,25 @@ impl<T: Read + Write> WsStream<T> {
             self.write_pos=0;
             self.write_payload_len=payload.len();
             self.write_opcode=opcode;
+            self.write_deadline=Some(Instant::now()+self.limits.message_deadline);
         } else if self.write_opcode!=opcode || self.write_payload_len!=payload.len() {
             return Err(WsError::Poisoned);
         }
+        self.pump_wire_frame()?;
+        self.write_active=false;
+        self.write_pos=0;
+        self.write_deadline=None;
+        #[cfg(any(test, feature = "record-diagnostics"))]
+        if opcode==OpCode::Binary {
+            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::WebSocket,payload);
+        }
+        Ok(())
+    }
+
+    // Progress the original encoded frame without acknowledging a different
+    // caller. In particular a queued Pong cannot replace a pending Binary.
+    fn pump_wire_frame(&mut self)->Result<(),WsError> {
+        if self.write_deadline.is_some_and(|d|Instant::now()>=d) {return Err(WsError::Timeout);}
         while self.write_pos<self.write_buf.len() {
             match self.io.write(&self.write_buf[self.write_pos..]) {
                 Ok(0)=>return Err(WsError::Io(io::ErrorKind::WriteZero)),
@@ -342,12 +359,7 @@ impl<T: Read + Write> WsStream<T> {
         self.io.flush().map_err(|e|if e.kind()==io::ErrorKind::WouldBlock {
             WsError::Io(io::ErrorKind::WouldBlock)
         } else {map_io(e)})?;
-        self.write_active=false;
-        self.write_pos=0;
-        #[cfg(any(test, feature = "record-diagnostics"))]
-        if opcode==OpCode::Binary {
-            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::WebSocket,payload);
-        }
+        if self.write_deadline.is_some_and(|d|Instant::now()>=d) {return Err(WsError::Timeout);}
         Ok(())
     }
 
@@ -395,6 +407,9 @@ impl<T: Read + Write> WsStream<T> {
         let mut payload = std::mem::take(&mut self.pending);
         loop {
             if let Some((opcode,body))=&self.control_reply {
+                if self.write_active && self.write_opcode==OpCode::Binary {
+                    return Err(WsError::Io(io::ErrorKind::WouldBlock));
+                }
                 let (opcode,body)=(*opcode,body.clone());
                 self.send_frame(opcode,&body)?;
                 self.control_reply=None;
@@ -474,7 +489,27 @@ impl<T: crate::stream::Duplex> WsStream<T> {
         self.io.wait_progress(timeout,write)
     }
     pub(crate) fn progress_transport_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
-        self.io.progress_io()
+        if self.failed {return Err(poisoned());}
+        let mut result=self.io.progress_io()?;
+        let before=self.write_pos;
+        let operation=if self.write_active && self.write_opcode==OpCode::Binary {
+            self.pump_wire_frame()
+        } else if let Some((opcode,body))=&self.control_reply {
+            let (opcode,body)=(*opcode,body.clone());
+            self.send_frame(opcode,&body).map(|()| {
+                self.control_reply=None;
+                if opcode==OpCode::Close {
+                    self.close_sent=true;self.close_received=true;self.receive_turn=None;
+                }
+            })
+        } else {Ok(())};
+        match operation {
+            Ok(())=>{},
+            Err(WsError::Io(io::ErrorKind::WouldBlock))=>{},
+            Err(error)=>{self.failed=true;return Err(io::Error::new(io::ErrorKind::InvalidData,error));},
+        }
+        result.advanced|=self.write_pos!=before;
+        Ok(result)
     }
 
     pub fn has_buffered_input(&self) -> bool {
@@ -534,6 +569,15 @@ impl<T: Read + Write> Read for WsStream<T> {
                 Ok(true) => {}
                 Ok(false) => return Ok(0),
                 Err(WsError::Io(io::ErrorKind::WouldBlock)) => {
+                    // Starting an empty nonblocking read is not the beginning
+                    // of a peer frame. Do not expire genuinely idle links.
+                    let idle=self.receive_turn.as_ref().is_some_and(|turn|
+                        turn.frames==1 && turn.controls==0
+                            && turn.incoming.as_ref().is_some_and(|incoming|!incoming.started()));
+                    if idle && let Some(turn)=self.receive_turn.take()
+                        && let Some(incoming)=turn.incoming {
+                        self.pending=incoming.into_storage();self.pending.clear();
+                    }
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
                 Err(error) => {
@@ -568,7 +612,9 @@ impl<T: Read + Write> Write for WsStream<T> {
                 "websocket already closed",
             ));
         }
-        if self.control_reply.is_some() {return Err(io::ErrorKind::WouldBlock.into());}
+        if self.control_reply.is_some() && !(self.write_active && self.write_opcode==OpCode::Binary) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let take = buf.len().min(self.limits.max_frame_payload);
         if let Err(error) = self.send_frame(OpCode::Binary, &buf[..take]) {
             if error==WsError::Io(io::ErrorKind::WouldBlock) {

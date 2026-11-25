@@ -23,7 +23,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boreas_crypto::backend::{BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector};
 use boreas_crypto::{NodeRole, Policy, PolicyError, Suite};
