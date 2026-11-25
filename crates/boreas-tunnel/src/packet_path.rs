@@ -1218,6 +1218,27 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         let Some(circuit) = self.circuit.as_mut() else {
             return Err(PacketPathError::Poisoned);
         };
+        let mut interrupts = 0;
+        loop {
+            match circuit.fill_prefetched_plaintext() {
+                crate::e2e::PrefetchFill::Disabled => return self.step_inbound(),
+                crate::e2e::PrefetchFill::CleanEof => {
+                    self.close();
+                    return Ok(None);
+                }
+                crate::e2e::PrefetchFill::Error(error)
+                    if error.kind() == io::ErrorKind::Interrupted => {
+                        interrupts += 1;
+                        if interrupts == MAX_INTERRUPT_RETRIES {
+                            return Err(self.fail(circuit_io(error)));
+                        }
+                    }
+                crate::e2e::PrefetchFill::Error(error) => {
+                    return Err(self.fail(circuit_io(error)));
+                }
+                crate::e2e::PrefetchFill::HasBytes => break,
+            }
+        }
         let result = circuit
             .prefetched_plaintext()
             .and_then(|bytes| deliver_prefetched(self.io, &self.policy, bytes));

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "prefetch_refill_tests.rs"]
+mod prefetch_refill_tests;
 use std::{borrow::Cow, collections::VecDeque};
 
 #[derive(Clone)]

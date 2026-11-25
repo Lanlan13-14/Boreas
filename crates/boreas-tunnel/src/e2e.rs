@@ -659,20 +659,35 @@ impl ReadAhead {
         self.start < self.end
     }
 
-    fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
+    /// Refill only an empty buffer, using exactly one original source read.
+    /// Partial L3 frames stay on this same cursor for the bounded legacy reader.
+    fn fill_once(&mut self, source: &mut dyn Read) -> io::Result<bool> {
         if !self.pending() {
             self.start = 0;
             self.end = 0;
             self.end = source.read(&mut self.bytes)?;
         }
+        Ok(self.pending())
+    }
+
+    fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        self.fill_once(source)?;
         let len = (self.end - self.start).min(out.len());
         out[..len].copy_from_slice(&self.bytes[self.start..self.start + len]);
         self.start += len;
         Ok(len)
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum PrefetchFill {
+    Disabled,
+    HasBytes,
+    CleanEof,
+    Error(io::Error),
 }
 
 // Application confirmation inside E2E TLS, not a cryptographic handshake.
@@ -908,6 +923,19 @@ impl<'a> E2eCircuit<'a> {
             || self.stream.has_buffered_input()
     }
 
+    /// Called only after the owner has selected an inbound turn. It never
+    /// fills a nonempty buffer or treats an incomplete prefix as clean EOF.
+    pub(crate) fn fill_prefetched_plaintext(&mut self) -> PrefetchFill {
+        let Some(buffer) = self.read_ahead.as_mut() else {
+            return PrefetchFill::Disabled;
+        };
+        match buffer.fill_once(self.stream.as_mut()) {
+            Ok(true) => PrefetchFill::HasBytes,
+            Ok(false) => PrefetchFill::CleanEof,
+            Err(error) => PrefetchFill::Error(error),
+        }
+    }
+
     /// Plaintext already in the optional read-ahead buffer. Lower-layer
     /// readiness alone does not guarantee that an entire L3 frame is ready.
     pub(crate) fn prefetched_plaintext(&self) -> Option<&[u8]> {
@@ -1004,6 +1032,31 @@ impl<'a> E2eCircuit<'a> {
     #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn is_private_dns_only(&self) -> bool {
         self.private_dns_only
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_plaintext_circuit(
+    stream: Box<dyn E2eStream>,
+    local: PeerIdentity,
+    peer: PeerIdentity,
+) -> E2eCircuit<'static> {
+    // In-memory ownership/error tests only; never a production auth entry.
+    let tls = crate::tls::InnerTlsSession::test_only(peer, crate::tls::strict_test_negotiated());
+    E2eCircuit {
+        stream,
+        token: VerifiedE2eSession::from_verified_e2e_tls(
+            &tls, peer, MessageSuite::Pq768, false,
+        ).unwrap(),
+        info: E2eInfo {
+            circuit_id: [0x11; 16], path_hops: 1,
+            role: CircuitRole::Initiator, tls_role: CircuitTlsRole::Client, peer,
+        },
+        local,
+        mtu_cap: 1500,
+        l3_profile: E2eL3Profile::SINGLE_LANE,
+        private_dns_only: false,
+        read_ahead: None,
     }
 }
 
