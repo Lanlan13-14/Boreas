@@ -214,19 +214,21 @@ fn prefetched_dns_checks_current_lease_and_matching_transaction_at_delivery() {
                 crate::e2e::PrefetchFill::HasBytes));
             // Revoke after bytes arrived but before the dispatcher can publish.
             live.store(!expired, Ordering::SeqCst);
-            let step = |path: &mut PacketPath<'_, E2eCircuit<'_>, MatrixIo>| {
+            fn step<'a>(path: &mut PacketPath<'a, E2eCircuit<'a>, MatrixIo>, optimized: bool)
+                -> Result<Option<usize>, PacketPathError>
+            {
                 if optimized { path.step_inbound_prefetched() } else { path.step_inbound() }
-            };
+            }
             if expired {
-                assert_eq!(step(&mut path), Err(PacketPathError::DnsAuthorizationLost));
+                assert_eq!(step(&mut path, optimized), Err(PacketPathError::DnsAuthorizationLost));
                 assert!(io.writes.borrow().is_empty());
                 assert!(path.circuit.is_none());
             } else {
-                assert_eq!(step(&mut path), Ok(Some(wrong.len())));
+                assert_eq!(step(&mut path, optimized), Ok(Some(wrong.len())));
                 assert!(io.writes.borrow().is_empty());
-                assert_eq!(step(&mut path), Ok(Some(valid.len())));
+                assert_eq!(step(&mut path, optimized), Ok(Some(valid.len())));
                 assert_eq!(io.writes.borrow().as_slice(), std::slice::from_ref(&valid));
-                assert_eq!(step(&mut path), Ok(Some(valid.len())));
+                assert_eq!(step(&mut path, optimized), Ok(Some(valid.len())));
                 assert_eq!(io.writes.borrow().len(), 1); // replay not published twice
             }
         }
