@@ -290,6 +290,10 @@ impl<'a> CircuitStream<'a> {
                 if self.inbound_pos == self.inbound.len() {
                     self.inbound.clear();
                     self.inbound_pos = 0;
+                    // No outstanding reader can name this owned Vec after the
+                    // copy above. Transfer, never clone, its real capacity.
+                    let consumed = std::mem::take(&mut self.inbound);
+                    self.session.recycle_relay_body(consumed);
                 }
                 return Ok(take);
             }

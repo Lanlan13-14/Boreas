@@ -11,6 +11,8 @@ pub mod network_policy;
 pub mod objects;
 pub mod revocation;
 pub mod session_auth;
+#[cfg(test)]
+mod recycle_tests;
 
 use std::fmt;
 
@@ -144,6 +146,22 @@ impl FrameDecoder {
     pub fn buffered_len(&self) -> usize {
         self.header_len + self.body.len()
     }
+    /// Capacity retained by the incomplete body or the single recycled slot.
+    /// Caller-held Frames are intentionally not counted here.
+    pub fn body_capacity(&self) -> usize { self.body.capacity() }
+
+    /// Internal transport ownership seam. Only an empty, fully consumed body
+    /// is accepted, within the caller's remaining capacity budget. This cannot
+    /// decode/publish a Frame or replace bytes that still have an owner.
+    #[doc(hidden)]
+    pub fn recycle_empty_body(&mut self, body: Vec<u8>, available_capacity: usize) -> bool {
+        if self.failed || !body.is_empty() || self.body.capacity() != 0
+            || body.capacity() > available_capacity
+        { return false; }
+        self.body = body;
+        true
+    }
+
     pub fn is_failed(&self) -> bool {
         self.failed
     }
@@ -151,7 +169,7 @@ impl FrameDecoder {
         self.failed = true;
         self.header_len = 0;
         self.header = None;
-        self.body.clear();
+        self.body = Vec::new();
         Err(e)
     }
     pub fn feed(&mut self, input: &[u8]) -> Result<Vec<Frame>, Error> {
@@ -208,8 +226,10 @@ impl FrameDecoder {
                 return self.fail(Error::BufferLimit);
             }
             let body = if self.body.is_empty() && take == body_len {
-                // The complete body is already contiguous in the input.
-                input[..take].to_vec()
+                // Copy once into the unique recycled allocation if available.
+                // A contiguous input is not claimed to be zero-copy.
+                self.body.extend_from_slice(&input[..take]);
+                std::mem::take(&mut self.body)
             } else {
                 let received = self.body.len() + take;
                 if received > self.body.capacity() {

@@ -221,9 +221,21 @@ impl FrameIo {
         }
     }
 
+    /// Return ownership only after the circuit consumed the last byte. Pending
+    /// Frames remain exclusive owners; capacity, not logical length, is charged
+    /// against the existing receive quota. There is no second spare slot.
+    fn recycle_relay_body(&mut self, body: Vec<u8>) -> bool {
+        let used = self.pending.iter().fold(self.decoder.body_capacity(), |used, frame| {
+            used.saturating_add(frame.body.capacity())
+        });
+        self.decoder.recycle_empty_body(body, MAX_PENDING_BYTES.saturating_sub(used))
+    }
+
     fn poison(&mut self) {
         self.failed = true;
         self.pending = Vec::new();
+        // Drop all retained receive storage, including a recycled empty body.
+        self.decoder = FrameDecoder::new(FRAME_BUFFER_LIMIT);
     }
 
     fn has_buffered_input(&self) -> bool {
@@ -321,6 +333,9 @@ impl FrameIo {
             // byte limit alone does not bound queued frame metadata.
             if self.pending.len() > MAX_PENDING_FRAMES
                 || self.pending.iter().map(|frame| frame.body.len()).sum::<usize>() > MAX_PENDING_BYTES
+                || self.pending.iter().fold(self.decoder.body_capacity(), |used, frame| {
+                    used.saturating_add(frame.body.capacity())
+                }) > MAX_PENDING_BYTES
             {
                 self.poison();
                 return Err(TunnelError::FrameQuota);
@@ -448,6 +463,11 @@ impl EstablishedSession {
             return Err(error.into());
         }
         self.io.send_buffered()
+    }
+
+    pub(crate) fn recycle_relay_body(&mut self, body: Vec<u8>) -> bool {
+        if self.io.failed { return false; }
+        self.io.recycle_relay_body(body)
     }
 
     /// Receive one application frame and apply the frame-level state machine.
@@ -737,6 +757,30 @@ mod tests {
         let mut io = FrameIo::new(Box::new(std::io::Cursor::new(batch.repeat(MAX_PENDING_FRAMES))));
         assert!(matches!(io.recv(), Err(TunnelError::FrameQuota)));
         assert!(!io.has_buffered_input());
+        assert!(matches!(io.recv(), Err(TunnelError::Poisoned)));
+    }
+
+    #[test]
+    fn recycled_slot_charges_real_capacity_and_preserves_pending_owners() {
+        let mut io = FrameIo::new(Box::new(std::io::Cursor::new(Vec::new())));
+        let pending = Frame {
+            header: AppHeader { proto_major: PROTO_MAJOR, kind: Kind::RelayCircuit,
+                flags: 0, body_len: 1 },
+            body: { let mut body = Vec::with_capacity(MAX_PENDING_BYTES - 16384);
+                body.push(0xa5); body },
+        };
+        let ptr = pending.body.as_ptr();
+        io.pending.push(pending);
+        assert!(!io.recycle_relay_body(Vec::with_capacity(16385)));
+        assert_eq!(io.decoder.body_capacity(), 0);
+        assert!(io.recycle_relay_body(Vec::with_capacity(16384)));
+        assert_eq!(io.pending[0].body.as_ptr(), ptr);
+        assert_eq!(io.pending[0].body, [0xa5]);
+        assert_eq!(io.pending[0].body.capacity() + io.decoder.body_capacity(), MAX_PENDING_BYTES);
+        assert!(!io.recycle_relay_body(Vec::with_capacity(1)));
+        io.poison();
+        assert!(io.pending.is_empty());
+        assert_eq!(io.decoder.body_capacity(), 0);
         assert!(matches!(io.recv(), Err(TunnelError::Poisoned)));
     }
 
