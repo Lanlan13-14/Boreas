@@ -668,13 +668,19 @@ struct ReadAhead {
     // Production uses a live admission guard, released with this allocation.
     _credit: Option<ByteCredit>,
     partial_deadline: Option<Instant>,
+    #[cfg(feature = "openssl-inner-tls")]
     progress_credit: Option<ByteCredit>,
+    #[cfg(feature = "openssl-inner-tls")]
     progress_enabled: bool,
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None, progress_credit:None, progress_enabled:false }
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None,
+            #[cfg(feature = "openssl-inner-tls")]
+            progress_credit:None,
+            #[cfg(feature = "openssl-inner-tls")]
+            progress_enabled:false }
     }
 
     fn pending(&self) -> bool {

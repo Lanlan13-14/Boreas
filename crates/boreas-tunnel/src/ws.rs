@@ -322,7 +322,8 @@ impl<T: Read + Write> WsStream<T> {
 
     fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsError> {
         if !self.write_active {
-            encode_frame_into(self.role == WsRole::Client, true, opcode, payload, &mut self.write_buf)?;
+            let frame_len=encode_frame_into(self.role == WsRole::Client, true, opcode, payload, &mut self.write_buf)?.len();
+            self.write_buf.truncate(frame_len);
             self.write_active=true;
             self.write_pos=0;
             self.write_payload_len=payload.len();

@@ -1,6 +1,7 @@
 //! Test-only bounded short-I/O seam ABOVE verified outer TLS. No plaintext or
 //! alternate authentication entry point exists in production.
 use super::*;
+use std::io;
 use boreas_tun::{PacketIo, VirtualTun};
 use boreas_tunnel::{
     packet_path::PacketPath,
