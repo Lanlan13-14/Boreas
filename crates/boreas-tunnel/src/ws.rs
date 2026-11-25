@@ -467,6 +467,12 @@ impl<T: crate::stream::Duplex> WsStream<T> {
         self.progress_enabled=self.io.enable_progress()?;
         Ok(self.progress_enabled)
     }
+    pub(crate) fn transport_output_pending(&self)->bool {
+        self.write_pos.is_some() || self.control_reply.is_some() || self.io.has_pending_output()
+    }
+    pub(crate) fn wait_transport_progress(&self,timeout:Duration,write:bool)->io::Result<()> {
+        self.io.wait_progress(timeout,write)
+    }
     pub(crate) fn progress_transport_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
         self.io.progress_io()
     }

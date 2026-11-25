@@ -385,6 +385,12 @@ impl EstablishedSession {
         self.io.progress_enabled=self.io.stream.enable_progress()?;
         Ok(self.io.progress_enabled)
     }
+    pub(crate) fn output_pending(&self)->bool {
+        self.io.write_cursor.is_some() || self.io.stream.has_pending_output()
+    }
+    pub(crate) fn wait_progress(&self,timeout:std::time::Duration,write:bool)->io::Result<()> {
+        self.io.stream.wait_progress(timeout,write)
+    }
     pub(crate) fn progress_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
         self.io.stream.progress_io()
     }

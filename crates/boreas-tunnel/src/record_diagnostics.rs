@@ -200,6 +200,10 @@ impl crate::stream::Duplex for Socket {
         Ok(crate::stream::ProgressIo {read:true,..Default::default()})
     }
     fn is_raw_socket(&self) -> bool {true}
+    fn wait_progress(&self,timeout:std::time::Duration,write:bool)->std::io::Result<()> {
+        crate::stream::Duplex::wait_progress(&self.0,timeout,write)
+    }
+
 
     fn has_buffered_input(&self) -> bool {
         false

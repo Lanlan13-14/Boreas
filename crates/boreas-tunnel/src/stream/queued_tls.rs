@@ -166,6 +166,29 @@ impl<S:Duplex> QueuedTls<S> {
     pub(crate) fn close_notify(&mut self)->io::Result<()> {
         self.ssl.shutdown().map(|_|()).map_err(tls_error)
     }
+    pub(crate) fn progress_is_active(&self)->bool {self.plain.is_some()}
+    pub(crate) fn close_notify_until(&mut self,until:Instant)->io::Result<()> {
+        loop {
+            match self.close_notify() {
+                Ok(())=>break,
+                Err(error) if error.kind()==io::ErrorKind::WouldBlock=>{},
+                Err(error)=>return Err(error),
+            }
+            let progress=self.progress_io()?;
+            let remaining=until.saturating_duration_since(Instant::now());
+            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
+            if !progress.advanced {self.wait_progress(remaining,progress.write)?;}
+        }
+        while self.has_pending_output() {
+            let progress=self.progress_io()?;
+            let remaining=until.saturating_duration_since(Instant::now());
+            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
+            if !progress.advanced && self.has_pending_output() {
+                self.wait_progress(remaining,progress.write)?;
+            }
+        }
+        Ok(())
+    }
 }
 impl<S:Duplex> Read for QueuedTls<S> {
     fn read(&mut self,out:&mut[u8])->io::Result<usize> {
@@ -211,6 +234,11 @@ impl<S:Duplex> Write for QueuedTls<S> {
     }
 }
 impl<S:Duplex> Duplex for QueueIo<S> {
+    fn has_pending_output(&self)->bool {self.output_pending() || self.inner.has_pending_output()}
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {
+        self.inner.wait_progress(timeout,write)
+    }
+
     fn has_buffered_input(&self)->bool {self.input_ready()||self.inner.has_buffered_input()}
     fn set_io_timeout(&self,timeout:Option<Duration>)->io::Result<()> {self.inner.set_io_timeout(timeout)}
     fn clear_handshake_deadline(&self)->io::Result<()> {self.inner.clear_handshake_deadline()}
@@ -218,6 +246,14 @@ impl<S:Duplex> Duplex for QueueIo<S> {
     fn progress_io(&mut self)->io::Result<ProgressIo> {self.pump()}
 }
 impl<S:Duplex> Duplex for QueuedTls<S> {
+    fn has_pending_output(&self)->bool {
+        self.plain.as_ref().is_some_and(|p|matches!(p.write_state,WriteState::Waiting(_)))
+            || self.ssl.get_ref().has_pending_output()
+    }
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {
+        self.ssl.get_ref().wait_progress(timeout,write)
+    }
+
     fn has_buffered_input(&self)->bool {
         self.plain.as_ref().is_some_and(|p|p.read_pos<p.read_len||p.read_closed)
             || self.ssl.ssl().pending()>0 || self.ssl.get_ref().has_buffered_input()

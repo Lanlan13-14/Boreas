@@ -247,6 +247,10 @@ impl<'a> CircuitStream<'a> {
     pub(crate) fn enable_session_progress(&mut self) -> io::Result<bool> {
         self.session.enable_progress()
     }
+    pub(crate) fn session_output_pending(&self)->bool {self.session.output_pending()}
+    pub(crate) fn wait_session_progress(&self,timeout:std::time::Duration,write:bool)->io::Result<()> {
+        self.session.wait_progress(timeout,write)
+    }
     pub(crate) fn progress_session_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
         self.session.progress_io()
     }
@@ -404,8 +408,33 @@ impl<'a> CircuitStream<'a> {
     pub(crate) fn send_close(&mut self) -> Result<(), TunnelError> {
         let body = encode_close(self.circuit_id)?;
         let result = self.session.send_control(ControlType::CircuitClose, &body);
-        self.closed = true;
+        if !matches!(&result,Err(TunnelError::Io(io::ErrorKind::WouldBlock))) {
+            self.closed = true;
+        }
         result
+    }
+
+    pub(crate) fn send_close_until(&mut self,until:Instant)->io::Result<()> {
+        loop {
+            match self.send_close() {
+                Ok(())=>break,
+                Err(TunnelError::Io(io::ErrorKind::WouldBlock))=>{},
+                Err(error)=>return Err(io::Error::other(error)),
+            }
+            let progress=self.session.progress_io()?;
+            let remaining=until.saturating_duration_since(Instant::now());
+            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
+            if !progress.advanced {self.session.wait_progress(remaining,progress.write)?;}
+        }
+        while self.session.output_pending() {
+            let progress=self.session.progress_io()?;
+            let remaining=until.saturating_duration_since(Instant::now());
+            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
+            if !progress.advanced && self.session.output_pending() {
+                self.session.wait_progress(remaining,progress.write)?;
+            }
+        }
+        Ok(())
     }
 }
 

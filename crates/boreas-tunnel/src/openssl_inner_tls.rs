@@ -224,7 +224,14 @@ impl E2eTlsBackend for OpenSslE2eBackend {
 }
 
 impl E2eStream for crate::stream::queued_tls::QueuedTls<CircuitStream<'_>> {
-    fn close_stream(&mut self) -> io::Result<()> { self.close_notify() }
+    fn close_stream(&mut self) -> io::Result<()> {
+        if !self.progress_is_active() {return self.close_notify();}
+        // One absolute existing application-I/O budget for the full ordered
+        // TLS notification and circuit close, including every lower queue.
+        let until=Instant::now()+Duration::from_secs(30);
+        self.close_notify_until(until)?;
+        self.transport_mut().send_close_until(until)
+    }
     fn read_with_authenticated_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.read_authenticated(out)
     }
