@@ -1723,20 +1723,17 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     fn resume_outbound_pending(&mut self) -> Result<usize,PacketPathError> {
         self.check_open()?;
         let Some((mut cursor,used,count,bytes,dns))=self.outbound_pending else {return Ok(0);};
-        #[cfg(feature="openssl-inner-tls")]
-        {
-            if dns && let Some(lease)=self.edge_dns.as_ref() {
-                lease.check().map_err(|error|self.fail(error))?;
-            }
-            if let Some(lease)=self.private_dns.as_mut() {
-                lease.live_utc().map_err(|error|self.fail(error))?;
-            }
-        }
         #[cfg(not(feature="openssl-inner-tls"))]
         let _=dns;
-        let circuit=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?;
         let mut interrupts=0;
         loop {
+            #[cfg(feature="openssl-inner-tls")]
+            {
+                let authorized=self.edge_dns.as_ref().filter(|_|dns).map_or(Ok(()),EdgeDns::check)
+                    .and_then(|()|self.private_dns.as_mut().map_or(Ok(()),|lease|lease.live_utc().map(|_|())));
+                if let Err(error)=authorized {return Err(self.fail(error));}
+            }
+            let circuit=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?;
             let result=if cursor<used {
                 circuit.write(&self.outbound_inline[cursor..used]).map(Some)
             } else {circuit.flush().map(|()|None)};

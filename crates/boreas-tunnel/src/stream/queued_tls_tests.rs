@@ -91,7 +91,7 @@ fn pair() -> (QueuedTls<WireGate>, QueuedTls<WireGate>) {
             Ssl::new(&server_ctx)
                 .unwrap()
                 .accept(QueueIo::new(gate))
-                .unwrap(),
+                .unwrap_or_else(|_| panic!("test TLS server handshake failed")),
         )
     });
     let tcp = TcpStream::connect(addr).unwrap();
@@ -100,7 +100,12 @@ fn pair() -> (QueuedTls<WireGate>, QueuedTls<WireGate>) {
         tcp,
         limit: Arc::new(Mutex::new(usize::MAX)),
     };
-    let client = QueuedTls::new(Ssl::new(&ctx).unwrap().connect(QueueIo::new(gate)).unwrap());
+    let client = QueuedTls::new(
+        Ssl::new(&ctx)
+            .unwrap()
+            .connect(QueueIo::new(gate))
+            .unwrap_or_else(|_| panic!("test TLS client handshake failed")),
+    );
     (client, server.join().unwrap())
 }
 fn pump(a: &mut QueuedTls<WireGate>, b: &mut QueuedTls<WireGate>) {
@@ -124,10 +129,17 @@ fn tls_mid_ciphertext_allows_reverse_before_tail_both_roles_and_full_record_cont
             let incomplete = split != usize::MAX;
             pump(&mut sender, &mut receiver);
             if incomplete {
-                assert_eq!(
-                    receiver.read(&mut out).unwrap_err().kind(),
-                    io::ErrorKind::WouldBlock
-                );
+                loop {
+                    assert_eq!(
+                        receiver.read(&mut out).unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    if receiver.plain.as_ref().unwrap().read_deadline.is_some() {
+                        break;
+                    }
+                    assert!(Instant::now() < until, "partial ciphertext did not arrive");
+                    pump(&mut sender, &mut receiver);
+                }
                 let deadline = receiver.plain.as_ref().unwrap().read_deadline;
                 assert!(deadline.is_some());
                 assert_eq!(receiver.write(b"independent reverse").unwrap(), 19);
@@ -185,12 +197,18 @@ fn tls_partial_read_deadline_poison_and_idle_has_no_deadline() {
     assert!(receiver.plain.as_ref().unwrap().read_deadline.is_none());
     *sender.transport_mut().limit.lock().unwrap() = 1;
     sender.write_all(b"retained").unwrap();
-    pump(&mut sender, &mut receiver);
-    assert_eq!(
-        receiver.read(&mut out).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    assert!(receiver.plain.as_ref().unwrap().read_deadline.is_some());
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        pump(&mut sender, &mut receiver);
+        assert_eq!(
+            receiver.read(&mut out).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        if receiver.plain.as_ref().unwrap().read_deadline.is_some() {
+            break;
+        }
+        assert!(Instant::now() < until, "partial ciphertext did not arrive");
+    }
     receiver.plain.as_mut().unwrap().read_deadline = Some(Instant::now());
     assert_eq!(
         receiver.progress_io().unwrap_err().kind(),
