@@ -1041,11 +1041,13 @@ jobs:
         timeout-minutes: 3
         env:
           BOREAS_NETNS_PRIVATE_DNS: '1'
+          BOREAS_DIAGNOSTIC_TIMING: '1'
         run: |
           set -euo pipefail
           sudo -E timeout --kill-after=5s 120s bash tools/release/netns_daemon_smoke.sh \
             hop-node-linux/boreas-linux-x86_64-musl-pq768 \
             2>&1 | tee rust-tls-private-dns.log
+          grep -Fx 'private_dns_prefetch=both_real_daemon_roles_selected_after_binding' rust-tls-private-dns.log
           grep -Fx 'private_dns=verified_signed_a_nxdomain_and_out_of_scope_drop' rust-tls-private-dns.log
           grep -Fx 'private_dns_rrset=verified_complete_a_and_tc_without_partial_answers' rust-tls-private-dns.log
           grep -Fx 'private_dns_tcp=verified_split_prefix_pipelining_full_rrset_and_fin' rust-tls-private-dns.log

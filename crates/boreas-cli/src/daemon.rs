@@ -3935,9 +3935,17 @@ mod linux_daemon {
         .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
         // No business bytes have been read. All role, replica and DNS lease
         // construction above is final; per-packet DNS authority remains live.
-        let _read_ahead_enabled = path.configure_direct_read_ahead(
+        let read_ahead_enabled = path.configure_direct_read_ahead(
             tun.raw_fd().is_some(), replica_epoch.is_some(), buffer_admission,
         );
+        if diagnostic_timing_enabled() {
+            let role = match local_e2e.role {
+                NodeRole::Edge => "edge", NodeRole::Core => "core", _ => "other",
+            };
+            eprintln!("boreas-direct-prefetch role={role} enabled={} dns={} replica={} real_tun={}",
+                u8::from(read_ahead_enabled), u8::from(private_dns.is_some()),
+                u8::from(replica_epoch.is_some()), u8::from(tun.raw_fd().is_some()));
+        }
         let _dns_interrupt = if let (Some(dns), Some((lease, sequence))) = (private_dns, &dns_lease)
         {
             let fd = duplicate_shutdown_fd(sock_fd)
