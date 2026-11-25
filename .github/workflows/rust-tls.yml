@@ -893,7 +893,7 @@ jobs:
           retention-days: 14
       - name: Build the mesh netns test and its debug daemon once
         id: mesh_build
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
         timeout-minutes: 5
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -924,7 +924,7 @@ jobs:
           retention-days: 14
       - name: Package the verified OpenSSL runtime
         id: acceptance_package
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-tcpv4-gso' || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime'))) }}
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && ((github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-tcpv4-gso' || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime'))) }}
         run: |
           set -euo pipefail
           mkdir -p acceptance-runtime
@@ -971,14 +971,14 @@ jobs:
     needs: openssl-rust-mtls
     # Build failures still fail the workflow, but a failed mesh compile must
     # not suppress the other fixtures if the verified runtime was uploaded.
-    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         case: ${{ fromJSON(
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh","multi_active"]' ||
+          (github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh","multi_active"]' ||
           (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh"]' ||
           github.ref == 'refs/heads/test/v111-dns-public-forwarding' && '["public_dns"]' ||
           github.ref == 'refs/heads/test/v111-mesh-runtime' && '["mesh"]' ||
@@ -1161,7 +1161,7 @@ jobs:
   serial-performance:
     name: Isolated serial netns performance
     needs: openssl-rust-mtls
-    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso')) }}
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && ((github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -1207,7 +1207,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
         id: perf_toolchain
       - name: Record performance runner and exact binary
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane'))) }}
         run: |
           set -euo pipefail
           {
@@ -1221,7 +1221,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples
         id: candidate_delayed
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane'))) }}
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
@@ -1312,7 +1312,7 @@ jobs:
       - name: Measure explicitly enabled TCPv4 GSO over real TUN and strict E2E
         id: acceptance_gso
         # This profile never replaces the earlier default-profile gates.
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || ((github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
         timeout-minutes: 5
         env:
           BOREAS_NETNS_TCPV4_GSO: '1'
@@ -1348,7 +1348,7 @@ jobs:
   mandatory-acceptance:
     name: Mandatory real-device acceptance
     needs: [functional-netns, serial-performance]
-    if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/fix/pre8-data-plane')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
