@@ -912,6 +912,11 @@ fn read_packet_frame_into<C: Read + ?Sized>(
     Ok(true)
 }
 
+/// Result of a bounded direct-plaintext ingress turn. Pending is NOT EOF:
+/// no packet was published and the owner must service the opposite direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundProgress { Packet(usize), Pending, Closed }
+
 /// A single-owner adapter between one host-side packet endpoint and one
 /// established E2E circuit.
 ///
@@ -1237,6 +1242,58 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             circuit.direct_read_ahead_eligible(real_tun, replica_epoch)
                 && circuit.enable_direct_read_ahead_admitted(admission)
         })
+    }
+
+    /// One plaintext continuation per event-loop turn. This repairs the L3
+    /// prefix/body completion boundary, not incomplete records below E2E TLS.
+    /// All complete packets still traverse the existing DNS/host dispatcher.
+    pub fn step_inbound_progress(&mut self, timeout: std::time::Duration)
+        -> Result<InboundProgress, PacketPathError>
+    {
+        self.check_open()?;
+        #[cfg(feature = "openssl-inner-tls")]
+        if self.dns_replica_only {
+            return self.step_inbound().map(|packet| packet.map_or(InboundProgress::Closed, InboundProgress::Packet));
+        }
+        let mut interrupts = 0;
+        loop {
+            let Some(circuit) = self.circuit.as_mut() else { return Err(PacketPathError::Poisoned); };
+            match circuit.progress_plaintext_frame(self.policy.mtu(), timeout) {
+                Ok(crate::e2e::PlaintextProgress::Pending) => return Ok(InboundProgress::Pending),
+                Ok(crate::e2e::PlaintextProgress::Closed) => {
+                    self.close(); return Ok(InboundProgress::Closed);
+                }
+                Ok(crate::e2e::PlaintextProgress::Ready | crate::e2e::PlaintextProgress::Disabled) => {
+                    return self.step_inbound_prefetched().map(|packet|
+                        packet.map_or(InboundProgress::Closed, InboundProgress::Packet));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts += 1;
+                    if interrupts == MAX_INTERRUPT_RETRIES {
+                        return Err(self.fail(circuit_io(error)));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(self.fail(PacketPathError::TruncatedFrame));
+                }
+                Err(error) => return Err(self.fail(circuit_io(error))),
+            }
+        }
+    }
+
+    /// Partial L3 bytes are not readiness for another socket read. Full frames
+    /// remain immediately actionable; lower-layer pending bytes still count.
+    pub fn has_progress_input(&self) -> bool {
+        self.prefetched_frame_ready() == Some(true)
+            || self.circuit.as_ref().is_some_and(E2eCircuit::has_transport_buffered_input)
+    }
+
+    /// Called even when no new socket event arrives: slow trickles do not
+    /// renew the deadline and cannot retain a partial frame indefinitely.
+    pub fn check_inbound_progress_deadline(&mut self) -> Result<(), PacketPathError> {
+        let expired = self.circuit.as_ref().is_some_and(E2eCircuit::plaintext_deadline_expired);
+        if expired { return Err(self.fail(PacketPathError::CircuitIo(io::ErrorKind::TimedOut))); }
+        Ok(())
     }
 
     /// Whether inbound bytes are buffered above the raw outer TCP socket.

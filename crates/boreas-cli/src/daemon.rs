@@ -278,7 +278,7 @@ mod linux_daemon {
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
         failover,
-        packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
+        packet_path::{InboundProgress, PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
         resource::{Admission, Limits},
         session::{EstablishedSession, SessionPolicy},
     };
@@ -4103,6 +4103,13 @@ mod linux_daemon {
                 return Err("daemon: private DNS authorization lost (fail-closed)".into());
             }
 
+            if let Err(error) = path.check_inbound_progress_deadline() {
+                break 'outer PathStop::Failed {
+                    kind: path_failure_kind(&error),
+                    reason: format!("inbound partial frame deadline: {error:?}"),
+                };
+            }
+
             // Standby maintenance is one non-blocking transport poll plus, at
             // most, one background dial. It never blocks this loop and never
             // touches the active circuit; it is not a ProbePing exchange.
@@ -4265,7 +4272,7 @@ mod linux_daemon {
             // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
             // FrameIo and CircuitStream can all hold bytes after an earlier read.
             // Drain up to MAX_INBOUND_BATCH_PACKETS buffered/ready frames per turn.
-            let mut buffered = path.has_buffered_input();
+            let mut buffered = path.has_progress_input();
             let mut socket_ready = if buffered {
                 false
             } else if let Some(ready) = &preflight
@@ -4300,7 +4307,7 @@ mod linux_daemon {
                     }
                 }
                 if step > 0 {
-                    buffered = path.has_buffered_input();
+                    buffered = path.has_progress_input();
                     socket_ready = if buffered {
                         // Lower TLS layers can have bytes without a complete
                         // packet above them. On the direct prefetch path, let
@@ -4331,10 +4338,18 @@ mod linux_daemon {
                 } else if !buffered && !socket_ready {
                     break;
                 }
-                let result = if let Some(timing) = &mut io_timing {
-                    timing.inbound_step(buffered, tun_fd, || path.step_inbound_prefetched())
+                let progress = if let Some(timing) = &mut io_timing {
+                    timing.inbound_step(buffered, tun_fd, || path.step_inbound_progress(PATH_IO_TIMEOUT))
                 } else {
-                    path.step_inbound_prefetched()
+                    path.step_inbound_progress(PATH_IO_TIMEOUT)
+                };
+                // Pending is a scheduling yield, not EOF and not a successful
+                // packet. The next outer turn services TUN and policy first.
+                let result = match progress {
+                    Ok(InboundProgress::Pending) => break,
+                    Ok(InboundProgress::Closed) => Ok(None),
+                    Ok(InboundProgress::Packet(length)) => Ok(Some(length)),
+                    Err(error) => Err(error),
                 };
                 match result {
                     Ok(Some(_len)) => {
@@ -4372,7 +4387,7 @@ mod linux_daemon {
                     counters.tx_bytes.store(stats.outbound_bytes, Ordering::Relaxed);
                 }
             }
-            buffered = path.has_buffered_input();
+            buffered = path.has_progress_input();
 
             if !made_progress && !buffered {
                 if send_deferred {

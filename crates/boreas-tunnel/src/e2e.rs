@@ -654,11 +654,12 @@ struct ReadAhead {
     end: usize,
     // Production uses a live admission guard, released with this allocation.
     _credit: Option<ByteCredit>,
+    partial_deadline: Option<Instant>,
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None }
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None }
     }
 
     fn pending(&self) -> bool {
@@ -676,6 +677,22 @@ impl ReadAhead {
         Ok(self.pending())
     }
 
+    /// Extend a retained partial L3 frame once, in the existing allocation.
+    /// No byte is consumed until the packet owner commits successful delivery.
+    fn extend_once(&mut self, source: &mut dyn Read) -> io::Result<usize> {
+        if self.start != 0 {
+            self.bytes.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        if self.end == self.bytes.len() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let read = source.read(&mut self.bytes[self.end..])?;
+        self.end += read;
+        Ok(read)
+    }
+
     fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -687,6 +704,9 @@ impl ReadAhead {
         Ok(len)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaintextProgress { Disabled, Ready, Pending, Closed }
 
 #[derive(Debug)]
 pub(crate) enum PrefetchFill {
@@ -927,6 +947,63 @@ impl<'a> E2eCircuit<'a> {
     pub fn has_buffered_input(&self) -> bool {
         self.read_ahead.as_ref().is_some_and(ReadAhead::pending)
             || self.stream.has_buffered_input()
+    }
+
+    pub(crate) fn plaintext_deadline_expired(&self) -> bool {
+        self.read_ahead.as_ref().and_then(|buffer| buffer.partial_deadline)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Inbound readiness below retained incomplete L3 plaintext. A partial
+    /// prefix/body alone must not make the daemon busy-poll this connection.
+    pub(crate) fn has_transport_buffered_input(&self) -> bool {
+        self.stream.has_buffered_input()
+    }
+
+    /// Continue exactly one plaintext fill. The caller distinguishes Pending
+    /// from EOF and returns to its outbound/policy turn between partial fills.
+    /// This does not make the underlying synchronous TLS read nonblocking.
+    pub(crate) fn progress_plaintext_frame(&mut self, mtu: usize, timeout: std::time::Duration)
+        -> io::Result<PlaintextProgress>
+    {
+        let Some(buffer) = self.read_ahead.as_mut() else {
+            return Ok(PlaintextProgress::Disabled);
+        };
+        if buffer.partial_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let complete = |bytes: &[u8]| {
+            let [hi, lo, rest @ ..] = bytes else { return false; };
+            let length = usize::from(u16::from_be_bytes([*hi, *lo]));
+            length == 0 || length > mtu || rest.len() >= length
+        };
+        if complete(&buffer.bytes[buffer.start..buffer.end]) {
+            buffer.partial_deadline = None;
+            return Ok(PlaintextProgress::Ready);
+        }
+        let was_partial = buffer.pending();
+        let read = if was_partial {
+            buffer.extend_once(self.stream.as_mut())?
+        } else {
+            buffer.start = 0;
+            buffer.end = 0;
+            buffer.fill_once(self.stream.as_mut())?;
+            buffer.end
+        };
+        if buffer.partial_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if read == 0 {
+            return if was_partial { Err(io::ErrorKind::UnexpectedEof.into()) }
+                else { Ok(PlaintextProgress::Closed) };
+        }
+        if complete(&buffer.bytes[buffer.start..buffer.end]) {
+            buffer.partial_deadline = None;
+            Ok(PlaintextProgress::Ready)
+        } else {
+            buffer.partial_deadline.get_or_insert_with(|| Instant::now() + timeout);
+            Ok(PlaintextProgress::Pending)
+        }
     }
 
     /// Called only after the owner has selected an inbound turn. It never
