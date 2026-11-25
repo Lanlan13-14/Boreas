@@ -235,10 +235,9 @@ impl E2eStream for crate::stream::queued_tls::QueuedTls<CircuitStream<'_>> {
     }
     #[cfg(target_os = "linux")]
     fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
-        use std::io::Read;
         let mut byte=[0];
-        match self.read(&mut byte) {
-            Err(error) if error.kind()==io::ErrorKind::UnexpectedEof=>self.transport_mut().wait_close(),
+        match self.read_authenticated(&mut byte) {
+            Ok(0)=>self.transport_mut().wait_close(),
             Err(error)=>Err(error.into()),
             Ok(_)=>Err(crate::CircuitReject::UnexpectedFrame.into()),
         }
