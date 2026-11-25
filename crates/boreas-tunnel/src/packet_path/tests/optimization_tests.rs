@@ -1,6 +1,8 @@
 use super::*;
 #[path = "prefetch_refill_tests.rs"]
 mod prefetch_refill_tests;
+#[path = "progress_boundary_tests.rs"]
+mod progress_boundary_tests;
 use std::{borrow::Cow, collections::VecDeque};
 
 #[derive(Clone)]
