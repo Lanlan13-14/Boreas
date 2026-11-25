@@ -18,6 +18,7 @@ This is a working record, **not a completion or performance claim**.
 - Actions `45626408835` @ `d33c733`: integration **failed** to compile newly added event-order fixture: AuthorizedEndpoints was moved across split iterations. Local source now constructs a new unique binding per split; not yet revalidated.
 - Quick checks `45626415465`: strict Clippy **failed** on three test-only helpers enabled in default builds although their callers require the backend. Local cfg now matches callers; no lint suppression added. Default unit tests (including protocol recycle tests) ran separately; final exact counts must be read from logs.
 - Security `45626407559` and real TUN `45626407530`: success on `d33c733`.
+- `76c9500`: default Linux/Windows strict Clippy + workspace tests `45627616094`, dependency `45627605235`, real TUN `45627605146`: **success**. Protocol recycled-owner tests pass on both platforms. Integration `45627608647` base job: **success**, including tunnel/CLI/DNS/backend tests and the synchronous-L3 barrier regression (stall reproduced). All six real functional cases (public/private DNS, replicas, pool cutover, mesh, multi-active) **success**. Serial/aggregate performance still running when this entry was written; not yet a full-run pass.
 
 Full main acceptance allowlists include `fix/pre8-data-plane` (`7dfe368`), without changing thresholds, timeouts or cases. Do not treat skipped downstream netns/performance jobs after compile failure as passed.
 

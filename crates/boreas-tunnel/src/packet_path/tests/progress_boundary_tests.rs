@@ -48,7 +48,8 @@ fn synchronous_l3_partial_prefix_and_body_prevent_next_outbound_turn() {
         let incoming = ipv4(facts.peer.vip.octets(), facts.local.vip.octets(), b"inbound");
         let outgoing = ipv4(facts.local.vip.octets(), facts.peer.vip.octets(), b"outbound");
         let wire = encode_packet_frame(&incoming, DEFAULT_MTU).unwrap();
-        for split in [1, 2, wire.len()-1] {
+        for (split, optimized) in [1, 2, wire.len()-1].into_iter()
+            .flat_map(|split| [(split, false), (split, true)]) {
             let (waiting, wait) = mpsc::channel();
             let (release, released) = mpsc::channel();
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -60,9 +61,19 @@ fn synchronous_l3_partial_prefix_and_body_prevent_next_outbound_turn() {
             let thread = std::thread::spawn(move || {
                 let circuit = PausedRead { bytes: io::Cursor::new(bytes), split,
                     waiting: Some(waiting), release: released, events: driver_events };
-                let mut path = PacketPath::try_new(&device, circuit, endpoints, DEFAULT_MTU).unwrap();
-                assert_eq!(path.step_inbound().unwrap(), Some(incoming_len));
-                assert_eq!(path.step_outbound_batch(1,16000).unwrap(), 1);
+                if optimized {
+                    let mut circuit = crate::e2e::test_plaintext_circuit(
+                        Box::new(circuit), local, peer,
+                    );
+                    circuit.enable_direct_read_ahead();
+                    let mut path = PacketPath::try_new(&device, circuit, endpoints, DEFAULT_MTU).unwrap();
+                    assert_eq!(path.step_inbound_prefetched().unwrap(), Some(incoming_len));
+                    assert_eq!(path.step_outbound_batch(1,16000).unwrap(), 1);
+                } else {
+                    let mut path = PacketPath::try_new(&device, circuit, endpoints, DEFAULT_MTU).unwrap();
+                    assert_eq!(path.step_inbound().unwrap(), Some(incoming_len));
+                    assert_eq!(path.step_outbound_batch(1,16000).unwrap(), 1);
+                }
             });
             wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             host.write_packet(&outgoing).unwrap();
