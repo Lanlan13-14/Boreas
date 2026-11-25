@@ -3119,7 +3119,8 @@ mod tests {
         let fixture=fixture_at(1_000_000);let now=1_500_000_000;let mtu=1280;
         for revoke in [false,true] {
             let live=Arc::new(AtomicBool::new(true));let gate=live.clone();
-            let (peer,service)=signed_packet_binding(&fixture,mtu,Box::new(move||gate.load(Ordering::SeqCst)));
+            let gate:DnsLiveness<'_>=Box::new(move||gate.load(Ordering::SeqCst));
+            let (peer,service)=signed_packet_binding(&fixture,mtu,gate);
             let endpoints=AuthorizedEndpoints::bind([0x11;16],1,peer,fixture.local,1500).unwrap();
             let (device,_host)=VirtualTun::try_pair(4,4,mtu).unwrap();
             let query=udp_datagram([10,20,1,2],[10,20,0,53],40_000,53,&dns_query("host.b.example",1),true);
