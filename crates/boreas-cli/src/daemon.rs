@@ -3940,7 +3940,7 @@ mod linux_daemon {
         );
         if diagnostic_timing_enabled() {
             let role = match local_e2e.role {
-                NodeRole::Edge => "edge", NodeRole::Core => "core", _ => "other",
+                boreas_crypto::NodeRole::Edge => "edge", boreas_crypto::NodeRole::Core => "core", _ => "other",
             };
             eprintln!("boreas-direct-prefetch role={role} enabled={} dns={} replica={} real_tun={}",
                 u8::from(read_ahead_enabled), u8::from(private_dns.is_some()),
