@@ -318,7 +318,11 @@ impl FrameIo {
         if result.is_ok() {
             crate::record_diagnostics::observe(crate::record_diagnostics::Layer::Frame, &self.write_buf);
         }
-        result.map_err(TunnelError::from)
+        result.map_err(|error| {
+            if self.progress_enabled && error.kind()==io::ErrorKind::WouldBlock {
+                TunnelError::Io(io::ErrorKind::WouldBlock)
+            } else { TunnelError::from(error) }
+        })
     }
 
     fn recv(&mut self) -> Result<Frame, TunnelError> {
@@ -332,7 +336,7 @@ impl FrameIo {
             let read = match self.stream.read(&mut self.buffer) {
                 Ok(read) => read,
                 Err(error) if self.progress_enabled && error.kind()==io::ErrorKind::WouldBlock => {
-                    return Err(error.into());
+                    return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
                 }
                 Err(error) => {
                     self.poison();
@@ -764,6 +768,30 @@ mod tests {
             },
             record,
         )
+    }
+
+    #[test]
+    fn application_pending_is_not_handshake_timeout_or_terminal_poison() {
+        struct Blocked;
+        impl Read for Blocked {
+            fn read(&mut self,_:&mut[u8])->io::Result<usize>{Err(io::ErrorKind::WouldBlock.into())}
+        }
+        impl Write for Blocked {
+            fn write(&mut self,_:&[u8])->io::Result<usize>{Err(io::ErrorKind::WouldBlock.into())}
+            fn flush(&mut self)->io::Result<()>{Err(io::ErrorKind::WouldBlock.into())}
+        }
+        impl Duplex for Blocked {fn has_buffered_input(&self)->bool{false}}
+        let mut io=FrameIo::new(Box::new(Blocked));
+        io.progress_enabled=true;
+        io.write_buf=vec![1,2,3];
+        for _ in 0..3 {
+            assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            assert_eq!(io.send_buffered(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            assert!(!io.failed);
+            assert_eq!(io.write_buf,[1,2,3]);
+            assert_eq!(io.write_cursor,Some(0));
+        }
+        assert_eq!(TunnelError::from(io::Error::from(io::ErrorKind::WouldBlock)),TunnelError::Timeout);
     }
 
     #[test]
