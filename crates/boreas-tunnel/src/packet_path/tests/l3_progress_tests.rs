@@ -26,7 +26,9 @@ impl Write for SplitPlaintext {
     }
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
-impl crate::stream::Duplex for SplitPlaintext {}
+impl crate::stream::Duplex for SplitPlaintext {
+    fn has_buffered_input(&self) -> bool { false }
+}
 impl crate::e2e::E2eStream for SplitPlaintext {
     fn close_stream(&mut self) -> io::Result<()> { Ok(()) }
 }
