@@ -15,12 +15,10 @@ struct PausedRead {
 impl Read for PausedRead {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let position = self.bytes.position() as usize;
-        if position >= self.split {
-            if let Some(waiting) = self.waiting.take() {
-                self.events.lock().unwrap().push(Event::PartialRead);
-                waiting.send(()).unwrap();
-                self.release.recv().unwrap();
-            }
+        if position >= self.split && let Some(waiting) = self.waiting.take() {
+            self.events.lock().unwrap().push(Event::PartialRead);
+            waiting.send(()).unwrap();
+            self.release.recv().unwrap();
         }
         let available = if position < self.split { self.split - position } else { out.len() };
         let count = out.len().min(available);
@@ -46,9 +44,9 @@ fn synchronous_l3_partial_prefix_and_body_prevent_next_outbound_turn() {
         let (local, peer) = if reversed {
             (identity(0x0209, NodeRole::Edge), identity(0x0201, NodeRole::Core))
         } else { (identity(0x0201, NodeRole::Core), identity(0x0209, NodeRole::Edge)) };
-        let endpoints = endpoints(local, peer);
-        let incoming = ipv4(endpoints.peer.vip.octets(), endpoints.local.vip.octets(), b"inbound");
-        let outgoing = ipv4(endpoints.local.vip.octets(), endpoints.peer.vip.octets(), b"outbound");
+        let facts = endpoints(local, peer);
+        let incoming = ipv4(facts.peer.vip.octets(), facts.local.vip.octets(), b"inbound");
+        let outgoing = ipv4(facts.local.vip.octets(), facts.peer.vip.octets(), b"outbound");
         let wire = encode_packet_frame(&incoming, DEFAULT_MTU).unwrap();
         for split in [1, 2, wire.len()-1] {
             let (waiting, wait) = mpsc::channel();
@@ -58,6 +56,7 @@ fn synchronous_l3_partial_prefix_and_body_prevent_next_outbound_turn() {
             let (device, host) = boreas_tun::VirtualTun::try_pair(4,4,DEFAULT_MTU).unwrap();
             let bytes = wire.clone();
             let incoming_len = incoming.len();
+            let endpoints = endpoints(local, peer);
             let thread = std::thread::spawn(move || {
                 let circuit = PausedRead { bytes: io::Cursor::new(bytes), split,
                     waiting: Some(waiting), release: released, events: driver_events };

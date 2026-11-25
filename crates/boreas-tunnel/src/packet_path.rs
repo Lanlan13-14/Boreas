@@ -867,7 +867,7 @@ fn deliver_prefetched_classified<P: PacketIo + ?Sized>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openssl-inner-tls"))]
 fn deliver_prefetched<P: PacketIo + ?Sized>(
     io: &P, policy: &PointToPoint, bytes: &[u8],
 ) -> Option<Result<(usize, usize), PacketPathError>> {

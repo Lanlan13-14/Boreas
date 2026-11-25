@@ -973,7 +973,7 @@ impl<'a> E2eCircuit<'a> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "openssl-inner-tls"))]
     pub(crate) fn disable_read_ahead_for_test(&mut self) { self.read_ahead = None; }
 
     /// Policy shared by the daemon assembly and its tests. DNS configuration
@@ -1065,7 +1065,7 @@ impl<'a> E2eCircuit<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openssl-inner-tls"))]
 pub(crate) fn test_plaintext_circuit(
     stream: Box<dyn E2eStream>,
     local: PeerIdentity,
