@@ -54,16 +54,7 @@ impl Incoming {
     {
         loop {
             if Instant::now()>=deadline {return Err(WsError::Timeout);}
-            if self.parsed.is_none() {
-                if self.header(role,limits)? {continue;}
-                let n=match io.read(&mut self.head[self.have..self.need]) {
-                    Err(e) if e.kind()==io::ErrorKind::WouldBlock=>return Err(WsError::Io(io::ErrorKind::WouldBlock)),
-                    result=>result.map_err(map_io)?,
-                };
-                if n==0 {return Err(WsError::Closed);}
-                self.have+=n;
-            } else {
-                let (fin,opcode,length,mask)=self.parsed.expect("checked above");
+            if let Some((fin,opcode,length,mask)) = self.parsed {
                 if self.body_have==length {
                     if let Some(mask)=mask {unmask_payload(&mut self.payload,mask);}
                     if Instant::now()>=deadline {return Err(WsError::Timeout);}
@@ -83,6 +74,14 @@ impl Incoming {
                 if n==0 {return Err(WsError::Closed);}
                 self.body_have+=n;
                 self.payload.truncate(self.body_have);
+            } else {
+                if self.header(role,limits)? {continue;}
+                let n=match io.read(&mut self.head[self.have..self.need]) {
+                    Err(e) if e.kind()==io::ErrorKind::WouldBlock=>return Err(WsError::Io(io::ErrorKind::WouldBlock)),
+                    result=>result.map_err(map_io)?,
+                };
+                if n==0 {return Err(WsError::Closed);}
+                self.have+=n;
             }
             if Instant::now()>=deadline {return Err(WsError::Timeout);}
         }
