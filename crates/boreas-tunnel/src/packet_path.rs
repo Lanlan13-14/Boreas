@@ -1751,6 +1751,12 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
                 Err(e)=>return Err(self.fail(circuit_io(e))),
             }
         }
+        #[cfg(feature="openssl-inner-tls")]
+        {
+            let authorized=self.edge_dns.as_ref().filter(|_|dns).map_or(Ok(()),EdgeDns::check)
+                .and_then(|()|self.private_dns.as_mut().map_or(Ok(()),|lease|lease.live_utc().map(|_|())));
+            if let Err(error)=authorized {return Err(self.fail(error));}
+        }
         self.outbound_pending=None;
         self.stats.outbound_packets=self.stats.outbound_packets.saturating_add(count as u64);
         self.stats.outbound_bytes=self.stats.outbound_bytes.saturating_add(bytes);
@@ -3091,6 +3097,55 @@ mod tests {
                         assert!(host.read_packet().unwrap().is_none());
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn queued_private_dns_short_write_retains_owner_and_revocation_drops_it() {
+        use crate::dns_packet_service::tests::signed_packet_binding;
+        use crate::dns_runtime::tests::{dns_query,fixture_at,udp_datagram};
+        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+        struct PendingDns {input:InboundSource,output:OutboundSink,left:Rc<Cell<usize>>}
+        impl Read for PendingDns {fn read(&mut self,out:&mut[u8])->io::Result<usize>{self.input.read(out)}}
+        impl Write for PendingDns {
+            fn write(&mut self,bytes:&[u8])->io::Result<usize>{
+                if self.left.get()==0{return Err(io::ErrorKind::WouldBlock.into());}
+                let n=bytes.len().min(self.left.get());self.left.set(self.left.get()-n);self.output.write(&bytes[..n])
+            }
+            fn flush(&mut self)->io::Result<()>{Ok(())}
+        }
+        let fixture=fixture_at(1_000_000);let now=1_500_000_000;let mtu=1280;
+        for revoke in [false,true] {
+            let live=Arc::new(AtomicBool::new(true));let gate=live.clone();
+            let (peer,service)=signed_packet_binding(&fixture,mtu,Box::new(move||gate.load(Ordering::SeqCst)));
+            let endpoints=AuthorizedEndpoints::bind([0x11;16],1,peer,fixture.local,1500).unwrap();
+            let (device,_host)=VirtualTun::try_pair(4,4,mtu).unwrap();
+            let query=udp_datagram([10,20,1,2],[10,20,0,53],40_000,53,&dns_query("host.b.example",1),true);
+            let (output,written)=OutboundSink::new();let left=Rc::new(Cell::new(1));
+            let circuit=PendingDns{input:InboundSource::new(encode_packet_frame(&query,mtu).unwrap()),output,left:left.clone()};
+            let mut path=PacketPath::try_new(&device,circuit,endpoints,mtu).unwrap();
+            path.queued_progress=true;
+            path.private_dns=Some(PrivateDns{service,tcp:false,deferred:true,utc:Box::new(move||Some(now))});
+            assert_eq!(path.step_inbound().unwrap(),Some(query.len()));
+            assert_eq!(path.step_private_dns(4).unwrap(),0);assert!(path.has_pending_output());
+            assert_eq!(written.borrow().len(),1);
+            assert_eq!(path.step_private_dns(4).unwrap(),0);assert_eq!(written.borrow().len(),1);
+            if revoke {live.store(false,Ordering::SeqCst);}
+            left.set(usize::MAX);
+            let result=path.step_outbound_batch(4,14000);
+            if revoke {
+                assert_eq!(result,Err(PacketPathError::DnsAuthorizationLost));
+                assert_eq!(written.borrow().len(),1);assert!(path.circuit.is_none());assert!(!path.has_pending_output());
+                assert_eq!(path.stats().outbound_packets,0);
+            } else {
+                assert_eq!(result,Ok(1));assert!(!path.has_pending_output());
+                let wire=written.borrow();let reply=decode_packet_frame(&wire,mtu).unwrap();
+                assert_eq!(&reply[12..16],&[10,20,0,53]);assert_eq!(&reply[16..20],&[10,20,1,2]);
+                assert_eq!(path.stats().outbound_packets,1);
+                assert_eq!(wire.len(),reply.len()+FRAME_PREFIX_LEN);drop(wire);
+                assert_eq!(path.step_private_dns(4).unwrap(),0);
             }
         }
     }
