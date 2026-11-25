@@ -191,19 +191,24 @@ fn checked(c: &mut Command) {
 struct Network {
     names: [String; 4],
     bridge: String,
+    hosts: [String; 4],
 }
 impl Network {
     fn setup() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_NETWORK: AtomicUsize = AtomicUsize::new(0);
         let p = std::process::id();
+        let generation = NEXT_NETWORK.fetch_add(1, Ordering::Relaxed);
         let network = Self {
-            names: std::array::from_fn(|i| format!("bmesh-{p}-{i}")),
-            bridge: format!("bm{p}"),
+            names: std::array::from_fn(|i| format!("bmesh-{p}-{generation}-{i}")),
+            bridge: format!("bm{p:x}{generation:x}"),
+            hosts: std::array::from_fn(|i| format!("bv{p:x}{generation:x}{i}")),
         };
         checked(Command::new("ip").args(["link", "add", &network.bridge, "type", "bridge"]));
         checked(Command::new("ip").args(["link", "set", &network.bridge, "up"]));
         for (i, namespace) in network.names.iter().enumerate() {
             checked(Command::new("ip").args(["netns", "add", namespace]));
-            let host = format!("bv{p}{i}");
+            let host = network.hosts[i].clone();
             checked(Command::new("ip").args([
                 "link", "add", &host, "type", "veth", "peer", "name", "underlay", "netns",
                 namespace,
@@ -259,6 +264,11 @@ impl Network {
 }
 impl Drop for Network {
     fn drop(&mut self) {
+        // Deleting a named namespace alone does not remove its veth while a
+        // child still holds the namespace. Explicitly remove owned host ends.
+        for host in &self.hosts {
+            let _ = Command::new("ip").args(["link", "del", host]).output();
+        }
         for ns in &self.names {
             let _ = Command::new("ip").args(["netns", "del", ns]).output();
         }
