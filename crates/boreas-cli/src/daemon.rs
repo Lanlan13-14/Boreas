@@ -278,7 +278,7 @@ mod linux_daemon {
         PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
         failover,
-        packet_path::{InboundProgress, PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
+        packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
         resource::{Admission, Limits},
         session::{EstablishedSession, SessionPolicy},
     };
@@ -2714,7 +2714,6 @@ mod linux_daemon {
         Read,
         SendPreflight,
         SendDeferred,
-        ProgressWrite,
     }
 
     #[derive(Debug, Default)]
@@ -2750,7 +2749,6 @@ mod linux_daemon {
         }
         let (socket_events, tun_events) = match mode {
             PathPoll::Read => (libc::POLLIN, libc::POLLIN),
-            PathPoll::ProgressWrite => (libc::POLLIN | libc::POLLOUT, 0),
             PathPoll::SendPreflight => (libc::POLLIN | libc::POLLOUT, libc::POLLIN),
             // Keep the TUN fd in the poll set: HUP/ERR/NVAL still surface
             // with events=0, but an already queued packet won't wake us.
@@ -3282,7 +3280,6 @@ mod linux_daemon {
             counters,
             private_dns,
             replica_epoch,
-            &admission,
         );
 
         counters.connected.store(false, Ordering::SeqCst);
@@ -3366,12 +3363,6 @@ mod linux_daemon {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
         let outer_conn = direct_outer_connector(mat_dir)?;
         let budget = Arc::new(ConnectionBudget::new());
-        // Same bounded byte ledger for the active path across promotions;
-        // optional read-ahead credits are released with their owning circuit.
-        let buffer_admission = Admission::new(Limits {
-            handshakes_global: 8, authenticated_global: 8,
-            authenticated_per_peer: 2, bytes_global: 16 * 1024 * 1024,
-        });
         let link_client = LinkClient::new(
             Box::new(outer_conn),
             Box::new(OpenSslInnerConnector::new(
@@ -3562,7 +3553,6 @@ mod linux_daemon {
                     counters,
                     private_dns,
                     None,
-                    &buffer_admission,
                 );
                 counters.connected.store(false, Ordering::SeqCst);
                 counters.outbound_upstreams.store(0, Ordering::SeqCst);
@@ -3826,7 +3816,7 @@ mod linux_daemon {
         mode_name: &str,
         sock_fd: i32,
         tun: &TunEndpoint,
-        e2e: E2eCircuit<'_>,
+        mut e2e: E2eCircuit<'_>,
         mtu: usize,
         status_path: &Path,
         policy_window: PolicyWindow,
@@ -3839,8 +3829,10 @@ mod linux_daemon {
         counters: &Arc<LiveCounters>,
         private_dns: Option<&PinnedDns>,
         replica_epoch: Option<private_dns_replica::Epoch>,
-        buffer_admission: &Admission,
     ) -> Result<PathReport, String> {
+        if private_dns.is_none() && tun.raw_fd().is_some() {
+            e2e.enable_direct_read_ahead();
+        }
         let local_e2e = e2e.local();
         let peer_e2e = e2e.info().peer;
         let endpoints = [
@@ -3935,19 +3927,6 @@ mod linux_daemon {
             PacketPath::try_new_over_e2e(tun.packet_io(), e2e, mtu)
         }
         .map_err(|e| format!("daemon {mode_name}: PacketPath bind rejected: {e:?}"))?;
-        // No business bytes have been read. All role, replica and DNS lease
-        // construction above is final; per-packet DNS authority remains live.
-        let read_ahead_enabled = path.configure_direct_read_ahead(
-            tun.raw_fd().is_some(), replica_epoch.is_some(), buffer_admission,
-        );
-        if diagnostic_timing_enabled() {
-            let role = match local_e2e.role {
-                boreas_crypto::NodeRole::Edge => "edge", boreas_crypto::NodeRole::Core => "core", _ => "other",
-            };
-            eprintln!("boreas-direct-prefetch role={role} enabled={} dns={} replica={} real_tun={}",
-                u8::from(read_ahead_enabled), u8::from(private_dns.is_some()),
-                u8::from(replica_epoch.is_some()), u8::from(tun.raw_fd().is_some()));
-        }
         let _dns_interrupt = if let (Some(dns), Some((lease, sequence))) = (private_dns, &dns_lease)
         {
             let fd = duplicate_shutdown_fd(sock_fd)
@@ -4039,8 +4018,6 @@ mod linux_daemon {
             counters.connected.store(true, Ordering::SeqCst);
         }
 
-        let queued_progress = path.configure_queued_progress(buffer_admission)
-            .map_err(|error|format!("daemon: progress activation: {error:?}"))?;
         let mut io_timing = diagnostic_timing_enabled().then(PathIoTiming::default);
         let mut last_dropped = 0u64;
         let tun_fd = tun.raw_fd();
@@ -4050,7 +4027,7 @@ mod linux_daemon {
         let protect_send = gso_may_have_pending || (tun_fd.is_some() && private_dns.is_none());
         let mut send_deferred_since = None;
         let dns_deferred_core = mode_name == "serve"
-            && private_dns.is_some_and(|dns| queued_progress || dns.tcp || dns.public);
+            && private_dns.is_some_and(|dns| dns.tcp || dns.public);
         // Only emit a promotable authenticated close while authorization
         // is still current. Re-read durable status/revocation and the pin
         // in the branch that actually sends close_notify.
@@ -4107,17 +4084,6 @@ mod linux_daemon {
                 return Err("daemon: private DNS authorization lost (fail-closed)".into());
             }
 
-            if let Err(error) = path.check_inbound_progress_deadline() {
-                break 'outer PathStop::Failed {
-                    kind: path_failure_kind(&error),
-                    reason: format!("inbound partial frame deadline: {error:?}"),
-                };
-            }
-
-            let transport_progress=if queued_progress {
-                path.progress_transport().map_err(|error|format!("daemon: transport progress: {error:?}"))?
-            } else {boreas_tunnel::stream::ProgressIo::default()};
-
             // Standby maintenance is one non-blocking transport poll plus, at
             // most, one background dial. It never blocks this loop and never
             // touches the active circuit; it is not a ProbePing exchange.
@@ -4141,7 +4107,7 @@ mod linux_daemon {
             let batch_read_threshold = SINGLE_RECORD_BATCH
                 - (mtu + boreas_tunnel::packet_path::FRAME_PREFIX_LEN - 1);
             const MAX_INBOUND_BATCH_PACKETS: usize = 32;
-            let mut made_progress = transport_progress.advanced;
+            let mut made_progress = false;
             let remaining_budget = max_packets
                 .map(|limit| {
                     let stats = path.stats();
@@ -4182,7 +4148,7 @@ mod linux_daemon {
             // When both sides write into full receive windows, neither can
             // reach the inbound turn. Leave packets in the host queue before
             // framing/encrypting them so the inbound path still makes progress.
-            let preflight = if protect_send && !queued_progress {
+            let preflight = if protect_send {
                 Some(poll_io(sock_fd, tun_fd, PathPoll::SendPreflight, Duration::ZERO)?)
             } else {
                 None
@@ -4280,7 +4246,7 @@ mod linux_daemon {
             // Raw TCP readiness alone is insufficient: OpenSSL, WebSocket,
             // FrameIo and CircuitStream can all hold bytes after an earlier read.
             // Drain up to MAX_INBOUND_BATCH_PACKETS buffered/ready frames per turn.
-            let mut buffered = path.has_progress_input();
+            let mut buffered = path.has_buffered_input();
             let mut socket_ready = if buffered {
                 false
             } else if let Some(ready) = &preflight
@@ -4315,7 +4281,7 @@ mod linux_daemon {
                     }
                 }
                 if step > 0 {
-                    buffered = path.has_progress_input();
+                    buffered = path.has_buffered_input();
                     socket_ready = if buffered {
                         // Lower TLS layers can have bytes without a complete
                         // packet above them. On the direct prefetch path, let
@@ -4346,18 +4312,10 @@ mod linux_daemon {
                 } else if !buffered && !socket_ready {
                     break;
                 }
-                let progress = if let Some(timing) = &mut io_timing {
-                    timing.inbound_step(buffered, tun_fd, || path.step_inbound_progress(PATH_IO_TIMEOUT))
+                let result = if let Some(timing) = &mut io_timing {
+                    timing.inbound_step(buffered, tun_fd, || path.step_inbound_prefetched())
                 } else {
-                    path.step_inbound_progress(PATH_IO_TIMEOUT)
-                };
-                // Pending is a scheduling yield, not EOF and not a successful
-                // packet. The next outer turn services TUN and policy first.
-                let result = match progress {
-                    Ok(InboundProgress::Pending) => break,
-                    Ok(InboundProgress::Closed) => Ok(None),
-                    Ok(InboundProgress::Packet(length)) => Ok(Some(length)),
-                    Err(error) => Err(error),
+                    path.step_inbound_prefetched()
                 };
                 match result {
                     Ok(Some(_len)) => {
@@ -4395,7 +4353,7 @@ mod linux_daemon {
                     counters.tx_bytes.store(stats.outbound_bytes, Ordering::Relaxed);
                 }
             }
-            buffered = path.has_progress_input();
+            buffered = path.has_buffered_input();
 
             if !made_progress && !buffered {
                 if send_deferred {
@@ -4411,11 +4369,7 @@ mod linux_daemon {
                     // One wait on both sources: an outbound packet arriving on
                     // the TUN wakes the loop immediately, and a TUN HUP/ERR is
                     // fail-closed inside `poll_io` instead of idling forever.
-                    let mode=if queued_progress && transport_progress.write {
-                        PathPoll::ProgressWrite
-                    } else {PathPoll::Read};
-                    let host_fd=if queued_progress && path.has_pending_output() {None}else{tun_fd};
-                    poll_io(sock_fd, host_fd, mode, IDLE_POLL_TIMEOUT)?;
+                    poll_io(sock_fd, tun_fd, PathPoll::Read, IDLE_POLL_TIMEOUT)?;
                 }
             }
         };

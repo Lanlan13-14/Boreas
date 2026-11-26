@@ -1210,19 +1210,6 @@ if [[ "$PUBLIC_DNS" != 0 ]]; then
 fi
 
 if [[ "$PRIVATE_DNS" == 1 ]]; then
-  if [[ "${BOREAS_DIAGNOSTIC_TIMING:-}" == 1 ]]; then
-    for role in core edge; do
-      expected="boreas-direct-prefetch role=$role enabled=1 dns=1 replica=0 real_tun=1"
-      # Assert the actual bound daemon path, not a separately tested predicate.
-      if [[ "$(<"$WORK/$role.err")" != *"$expected"* ]]; then
-        echo "ERROR: mixed DNS ordinary prefetch not selected for $role" >&2
-        report_failure_evidence
-        exit 1
-      fi
-      printf '%s\n' "$expected"
-    done
-    echo 'private_dns_prefetch=both_real_daemon_roles_selected_after_binding'
-  fi
   if ! ip netns exec "$EDGE_NS" python3 "$DNS_FIXTURE" probe; then
     report_failure_evidence
     exit 1

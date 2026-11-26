@@ -56,7 +56,7 @@ use crate::relay::{
     CircuitId, Direction, HopSessionToken, MAX_RELAY_HOPS, NodeRef, RelayTable, Segment,
     VerifiedE2eSession,
 };
-use crate::resource::{Admission, ByteCredit};
+use crate::resource::Admission;
 use crate::runtime::{DiagnosticTimer, diagnostic_timing_enabled};
 use crate::session::EstablishedSession;
 use crate::stream::Duplex;
@@ -244,17 +244,6 @@ impl<'a> CircuitStream<'a> {
     }
 
     /// Whether a previous read left bytes above the raw hop socket.
-    pub(crate) fn enable_session_progress(&mut self) -> io::Result<bool> {
-        self.session.enable_progress()
-    }
-    pub(crate) fn session_output_pending(&self)->bool {self.session.output_pending()}
-    pub(crate) fn wait_session_progress(&self,timeout:std::time::Duration,write:bool)->io::Result<()> {
-        self.session.wait_progress(timeout,write)
-    }
-    pub(crate) fn progress_session_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
-        self.session.progress_io()
-    }
-
     pub fn has_buffered_input(&self) -> bool {
         self.inbound_pos < self.inbound.len() || self.session.has_buffered_input()
     }
@@ -301,10 +290,6 @@ impl<'a> CircuitStream<'a> {
                 if self.inbound_pos == self.inbound.len() {
                     self.inbound.clear();
                     self.inbound_pos = 0;
-                    // No outstanding reader can name this owned Vec after the
-                    // copy above. Transfer, never clone, its real capacity.
-                    let consumed = std::mem::take(&mut self.inbound);
-                    self.session.recycle_relay_body(consumed);
                 }
                 return Ok(take);
             }
@@ -408,34 +393,8 @@ impl<'a> CircuitStream<'a> {
     pub(crate) fn send_close(&mut self) -> Result<(), TunnelError> {
         let body = encode_close(self.circuit_id)?;
         let result = self.session.send_control(ControlType::CircuitClose, &body);
-        if !matches!(&result,Err(TunnelError::Io(io::ErrorKind::WouldBlock))) {
-            self.closed = true;
-        }
+        self.closed = true;
         result
-    }
-
-    #[cfg(feature = "openssl-inner-tls")]
-    pub(crate) fn send_close_until(&mut self,until:Instant)->io::Result<()> {
-        loop {
-            match self.send_close() {
-                Ok(())=>break,
-                Err(TunnelError::Io(io::ErrorKind::WouldBlock))=>{},
-                Err(error)=>return Err(io::Error::other(error)),
-            }
-            let progress=self.session.progress_io()?;
-            let remaining=until.saturating_duration_since(Instant::now());
-            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
-            if !progress.advanced {self.session.wait_progress(remaining,progress.write)?;}
-        }
-        while self.session.output_pending() {
-            let progress=self.session.progress_io()?;
-            let remaining=until.saturating_duration_since(Instant::now());
-            if remaining.is_zero(){return Err(io::ErrorKind::TimedOut.into());}
-            if !progress.advanced && self.session.output_pending() {
-                self.session.wait_progress(remaining,progress.write)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -452,20 +411,14 @@ impl Drop for CircuitStream<'_> {
 impl Read for CircuitStream<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.read_bytes(out)
-            .map_err(|error| match error {
-                TunnelError::Io(error)=>error.into(),
-                error=>io::Error::new(io::ErrorKind::InvalidData,error),
-            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
 
 impl Write for CircuitStream<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)
-            .map_err(|error| match error {
-                TunnelError::Io(error)=>error.into(),
-                error=>io::Error::new(io::ErrorKind::InvalidData,error),
-            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -695,76 +648,31 @@ struct ReadAhead {
     bytes: Box<[u8]>,
     start: usize,
     end: usize,
-    // Production uses a live admission guard, released with this allocation.
-    _credit: Option<ByteCredit>,
-    partial_deadline: Option<Instant>,
-    #[cfg(feature = "openssl-inner-tls")]
-    progress_credit: Option<ByteCredit>,
-    #[cfg(feature = "openssl-inner-tls")]
-    progress_enabled: bool,
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0, _credit: None, partial_deadline: None,
-            #[cfg(feature = "openssl-inner-tls")]
-            progress_credit:None,
-            #[cfg(feature = "openssl-inner-tls")]
-            progress_enabled:false }
+        Self { bytes: vec![0; READ_AHEAD_BYTES].into_boxed_slice(), start: 0, end: 0 }
     }
 
     fn pending(&self) -> bool {
         self.start < self.end
     }
 
-    /// Refill only an empty buffer, using exactly one original source read.
-    /// Partial L3 frames stay on this same cursor for the bounded legacy reader.
-    fn fill_once(&mut self, source: &mut dyn Read) -> io::Result<bool> {
+    fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         if !self.pending() {
             self.start = 0;
             self.end = 0;
             self.end = source.read(&mut self.bytes)?;
         }
-        Ok(self.pending())
-    }
-
-    /// Extend a retained partial L3 frame once, in the existing allocation.
-    /// No byte is consumed until the packet owner commits successful delivery.
-    fn extend_once(&mut self, source: &mut dyn Read) -> io::Result<usize> {
-        if self.start != 0 {
-            self.bytes.copy_within(self.start..self.end, 0);
-            self.end -= self.start;
-            self.start = 0;
-        }
-        if self.end == self.bytes.len() {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        let read = source.read(&mut self.bytes[self.end..])?;
-        self.end += read;
-        Ok(read)
-    }
-
-    fn read(&mut self, source: &mut dyn Read, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        self.fill_once(source)?;
         let len = (self.end - self.start).min(out.len());
         out[..len].copy_from_slice(&self.bytes[self.start..self.start + len]);
         self.start += len;
         Ok(len)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlaintextProgress { Disabled, Ready, Pending, Closed }
-
-#[derive(Debug)]
-pub(crate) enum PrefetchFill {
-    Disabled,
-    HasBytes,
-    CleanEof,
-    Error(io::Error),
 }
 
 // Application confirmation inside E2E TLS, not a cryptographic handshake.
@@ -1000,76 +908,6 @@ impl<'a> E2eCircuit<'a> {
             || self.stream.has_buffered_input()
     }
 
-    pub(crate) fn plaintext_deadline_expired(&self) -> bool {
-        self.read_ahead.as_ref().and_then(|buffer| buffer.partial_deadline)
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    /// Inbound readiness below retained incomplete L3 plaintext. A partial
-    /// prefix/body alone must not make the daemon busy-poll this connection.
-    pub(crate) fn has_transport_buffered_input(&self) -> bool {
-        self.stream.has_buffered_input()
-    }
-
-    /// Continue exactly one plaintext fill. The caller distinguishes Pending
-    /// from EOF and returns to its outbound/policy turn between partial fills.
-    /// This does not make the underlying synchronous TLS read nonblocking.
-    pub(crate) fn progress_plaintext_frame(&mut self, mtu: usize, timeout: std::time::Duration)
-        -> io::Result<PlaintextProgress>
-    {
-        let Some(buffer) = self.read_ahead.as_mut() else {
-            return Ok(PlaintextProgress::Disabled);
-        };
-        if buffer.partial_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        let complete = |bytes: &[u8]| {
-            let [hi, lo, rest @ ..] = bytes else { return false; };
-            let length = usize::from(u16::from_be_bytes([*hi, *lo]));
-            length == 0 || length > mtu || rest.len() >= length
-        };
-        if complete(&buffer.bytes[buffer.start..buffer.end]) {
-            buffer.partial_deadline = None;
-            return Ok(PlaintextProgress::Ready);
-        }
-        let was_partial = buffer.pending();
-        let read = if was_partial {
-            buffer.extend_once(self.stream.as_mut())?
-        } else {
-            buffer.start = 0;
-            buffer.end = 0;
-            buffer.fill_once(self.stream.as_mut())?;
-            buffer.end
-        };
-        if buffer.partial_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        if read == 0 {
-            return if was_partial { Err(io::ErrorKind::UnexpectedEof.into()) }
-                else { Ok(PlaintextProgress::Closed) };
-        }
-        if complete(&buffer.bytes[buffer.start..buffer.end]) {
-            buffer.partial_deadline = None;
-            Ok(PlaintextProgress::Ready)
-        } else {
-            buffer.partial_deadline.get_or_insert_with(|| Instant::now() + timeout);
-            Ok(PlaintextProgress::Pending)
-        }
-    }
-
-    /// Called only after the owner has selected an inbound turn. It never
-    /// fills a nonempty buffer or treats an incomplete prefix as clean EOF.
-    pub(crate) fn fill_prefetched_plaintext(&mut self) -> PrefetchFill {
-        let Some(buffer) = self.read_ahead.as_mut() else {
-            return PrefetchFill::Disabled;
-        };
-        match buffer.fill_once(self.stream.as_mut()) {
-            Ok(true) => PrefetchFill::HasBytes,
-            Ok(false) => PrefetchFill::CleanEof,
-            Err(error) => PrefetchFill::Error(error),
-        }
-    }
-
     /// Plaintext already in the optional read-ahead buffer. Lower-layer
     /// readiness alone does not guarantee that an entire L3 frame is ready.
     pub(crate) fn prefetched_plaintext(&self) -> Option<&[u8]> {
@@ -1099,46 +937,6 @@ impl<'a> E2eCircuit<'a> {
         {
             self.read_ahead = Some(ReadAhead::new());
         }
-    }
-
-    #[cfg(all(test, feature = "openssl-inner-tls"))]
-    pub(crate) fn disable_read_ahead_for_test(&mut self) { self.read_ahead = None; }
-
-    /// Policy shared by the daemon assembly and its tests. DNS configuration
-    /// is deliberately absent: it changes per-packet classification, not EOF.
-    pub fn direct_read_ahead_eligible(&self, real_tun: bool, replica_epoch: bool) -> bool {
-        real_tun && !replica_epoch && self.l3_profile == E2eL3Profile::SINGLE_LANE
-            && !self.private_dns_only
-            && matches!(self.local.role, NodeRole::Edge | NodeRole::Core)
-            && matches!(self.info.peer.role, NodeRole::Edge | NodeRole::Core)
-    }
-
-    /// Reserve before allocating. Exhaustion disables only this optimization;
-    /// it never rejects otherwise legal business or weakens authorization.
-    pub fn enable_direct_read_ahead_admitted(&mut self, admission: &Admission) -> bool {
-        if !self.direct_read_ahead_eligible(true, false) { return false; }
-        if self.read_ahead.is_some() { return true; }
-        let Ok(credit) = admission.reserve_bytes(READ_AHEAD_BYTES) else { return false; };
-        let mut buffer = ReadAhead::new();
-        buffer._credit = Some(credit);
-        self.read_ahead = Some(buffer);
-        true
-    }
-
-    #[cfg(feature = "openssl-inner-tls")]
-    pub(crate) fn enable_queued_progress(&mut self, admission:&Admission) -> io::Result<bool> {
-        let Some(buffer)=&mut self.read_ahead else {return Ok(false);};
-        if buffer.progress_enabled {return Ok(true);}
-        let Ok(credit)=admission.reserve_bytes(3*crate::stream::queued_tls::TLS_PROGRESS_BYTES) else {
-            return Ok(false);
-        };
-        if !self.stream.enable_progress()? {return Ok(false);}
-        buffer.progress_credit=Some(credit);
-        buffer.progress_enabled=true;
-        Ok(true)
-    }
-    pub(crate) fn progress_transport(&mut self) -> io::Result<crate::stream::ProgressIo> {
-        self.stream.progress_io()
     }
 
     pub fn info(&self) -> E2eInfo {
@@ -1206,31 +1004,6 @@ impl<'a> E2eCircuit<'a> {
     #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn is_private_dns_only(&self) -> bool {
         self.private_dns_only
-    }
-}
-
-#[cfg(all(test, feature = "openssl-inner-tls"))]
-pub(crate) fn test_plaintext_circuit(
-    stream: Box<dyn E2eStream>,
-    local: PeerIdentity,
-    peer: PeerIdentity,
-) -> E2eCircuit<'static> {
-    // In-memory ownership/error tests only; never a production auth entry.
-    let tls = crate::tls::InnerTlsSession::test_only(peer, crate::tls::strict_test_negotiated());
-    E2eCircuit {
-        stream,
-        token: VerifiedE2eSession::from_verified_e2e_tls(
-            &tls, peer, MessageSuite::Pq768, false,
-        ).unwrap(),
-        info: E2eInfo {
-            circuit_id: [0x11; 16], path_hops: 1,
-            role: CircuitRole::Initiator, tls_role: CircuitTlsRole::Client, peer,
-        },
-        local,
-        mtu_cap: 1500,
-        l3_profile: E2eL3Profile::SINGLE_LANE,
-        private_dns_only: false,
-        read_ahead: None,
     }
 }
 
