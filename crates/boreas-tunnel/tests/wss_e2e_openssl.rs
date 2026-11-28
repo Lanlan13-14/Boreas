@@ -1,9 +1,10 @@
 #![cfg(feature = "openssl-inner-tls")]
 
 //! Real loopback TCP -> public-certificate outer TLS -> RFC6455 h1 -> pq768
-//! hop mTLS -> SessionHello/Accept -> circuit -> pq768 E2E TLS -> encrypted
-//! candidate confirmation -> business stream. Loopback-origin evidence only;
-//! not CDN support or independent implementation interop.
+//! authenticated raw-key hop -> SessionHello/Accept -> circuit -> pq768 raw-key
+//! E2E -> encrypted candidate confirmation -> business stream. The hop/E2E
+//! peer keys come from verified signed identities, not X.509 trust anchors.
+//! Loopback-origin evidence only; not CDN support or independent interop.
 use boreas_crypto::{
     Policy,
     backend::PemIdentity,
@@ -11,7 +12,7 @@ use boreas_crypto::{
 };
 use boreas_pki::NodeRole as PkiNodeRole;
 use boreas_pki::management::{
-    IdentityAuthority, IdentityTemplate, IssuerScope, ManagementTrust, VerifiedObject,
+    IdentityAuthority, IdentityTemplate, IssuerRecord, IssuerScope, ManagementTrust, VerifiedObject,
 };
 use boreas_pki::{VerifiedNetworkContext, verify_network_policy};
 use boreas_proto::{
@@ -523,13 +524,13 @@ fn pem(t: &Temp, leaf: &str, ca: &str) -> PemIdentity {
     }
 }
 
-fn verified_identity(
+fn signed_identity_fixture(
     t: &Temp,
     leaf: &str,
     node: u16,
     generation: u64,
     role: ObjectRole,
-) -> VerifiedObject {
+) -> (boreas_proto::messages::SignedObject, IssuerRecord) {
     let cert = X509::from_pem(&read(t, &format!("{leaf}.pem"))).expect("parse ML-DSA leaf");
     let mldsa = cert
         .public_key()
@@ -588,10 +589,20 @@ fn verified_identity(
     let signed = authority
         .sign_node_identity(body)
         .expect("dual-sign NodeIdentity");
+    let issuer = authority.issuer_record(scope).expect("issuer record");
+    (signed, issuer)
+}
+
+fn verified_identity(
+    t: &Temp,
+    leaf: &str,
+    node: u16,
+    generation: u64,
+    role: ObjectRole,
+) -> VerifiedObject {
+    let (signed, issuer) = signed_identity_fixture(t, leaf, node, generation, role);
     let mut trust = ManagementTrust::new(NET);
-    trust
-        .add_issuer(authority.issuer_record(scope).expect("issuer record"))
-        .expect("provision test authority");
+    trust.add_issuer(issuer).expect("provision test authority");
     trust
         .verify_and_authorize(&signed.encode().expect("encode signed object"), 2_000_000)
         .expect("ManagementTrust verifies signature, scope, sequence and time")
@@ -641,6 +652,61 @@ fn extractor(a: &VerifiedObject, b: &VerifiedObject) -> Arc<PkiIdentityExtractor
         ])
         .expect("unique trusted SPKIs"),
     )
+}
+
+#[test]
+fn signed_identity_requires_trusted_issuer_and_both_original_signatures() {
+    use boreas_pki::management::Error;
+
+    let t = Temp::new();
+    setup(&t);
+    let (signed, issuer) = signed_identity_fixture(&t, "edge", 2, 4, ObjectRole::Edge);
+    let verify = |candidate: &boreas_proto::messages::SignedObject, trusted: bool| {
+        let mut trust = ManagementTrust::new(NET);
+        if trusted {
+            trust.add_issuer(issuer.clone()).unwrap();
+        }
+        trust.verify_and_authorize(&candidate.encode().unwrap(), 2_000_000)
+    };
+    let original = verify(&signed, true).expect("original dual-signed identity is valid");
+    assert_eq!(original.raw_tbs(), signed.raw_tbs.as_slice());
+    assert_eq!(original.raw_signed_object(), signed.encode().unwrap().as_slice());
+    let ObjectBody::NodeIdentity(body) = &original.object().body else {
+        panic!("expected NodeIdentity");
+    };
+    let edge_key = X509::from_pem(&read(&t, "edge.pem"))
+        .unwrap()
+        .public_key()
+        .unwrap()
+        .raw_public_key()
+        .unwrap();
+    assert_eq!(body.identity_pub_mldsa, edge_key);
+    assert!(matches!(verify(&signed, false), Err(Error::UnknownIssuer)));
+
+    let mut bad_ed = signed.clone();
+    bad_ed.signers[0].ed25519[0] ^= 1;
+    assert!(matches!(verify(&bad_ed, true), Err(Error::InvalidEd25519Signature)));
+
+    let mut bad_ml = signed.clone();
+    bad_ml.signers[0].mldsa[0] ^= 1;
+    assert!(matches!(verify(&bad_ml, true), Err(Error::InvalidMlDsaSignature)));
+
+    // An otherwise well-formed NodeIdentity with a different key cannot reuse
+    // the original signatures, even when it claims the same node and generation.
+    let (other, _) = signed_identity_fixture(&t, "unknown", 2, 4, ObjectRole::Edge);
+    let other_object = boreas_proto::objects::decode_tbs(&other.raw_tbs).unwrap();
+    let ObjectBody::NodeIdentity(other_body) = other_object.body else {
+        panic!("expected alternate NodeIdentity");
+    };
+    let mut object = boreas_proto::objects::decode_tbs(&signed.raw_tbs).unwrap();
+    let ObjectBody::NodeIdentity(ref mut original_body) = object.body else {
+        panic!("expected NodeIdentity");
+    };
+    assert_ne!(original_body.identity_pub_mldsa, other_body.identity_pub_mldsa);
+    original_body.identity_pub_mldsa = other_body.identity_pub_mldsa;
+    let mut swapped_tbs = signed.clone();
+    swapped_tbs.raw_tbs = boreas_proto::objects::encode_tbs(&object).unwrap();
+    assert!(matches!(verify(&swapped_tbs, true), Err(Error::InvalidEd25519Signature)));
 }
 
 #[test]
@@ -1091,23 +1157,32 @@ fn outer_wrong_name_and_untrusted_ca_are_rejected() {
 }
 
 #[test]
-fn inner_wrong_ca_is_rejected_without_hop_only_fallback() {
+fn inner_untrusted_key_is_rejected_without_hop_only_fallback() {
     let t = Temp::new();
     setup(&t);
+    make_leaf(
+        &t,
+        "rogue",
+        "rogue-edge",
+        KeyAlg::MlDsa65,
+        LeafSpec {
+            cn: "edge.boreas.test",
+            eku: "clientAuth,serverAuth",
+            san: "DNS:edge.boreas.test",
+            serial: "301",
+        },
+    );
     let (mut client_side, server_side) = sides(&t);
     let obj_edge = verified_identity(&t, "edge", 2, 4, ObjectRole::Edge);
     let obj_core = verified_identity(&t, "core", 1, 9, ObjectRole::Core);
-    let rogue = PemIdentity {
-        trust_anchor_pem: read(&t, "rogue-ca.pem"),
-        ..pem(&t, "edge", "id")
-    };
+    // The rogue certificate/CA is not passed to PqWg: only its distinct
+    // private key and the resolver's previously verified identities matter.
+    let trusted = PqWgIdentity::from_private_key_pem(&read(&t, "edge.key")).unwrap();
+    let rogue = PqWgIdentity::from_private_key_pem(&read(&t, "rogue-edge.key")).unwrap();
+    assert_ne!(trusted.spki_hash(), rogue.spki_hash());
     client_side.hop = Box::new(
-        PqWgInnerConnector::new(
-            PqWgIdentity::from_private_key_pem(&rogue.private_key_pem).unwrap(),
-            Policy::production_default(),
-            extractor(&obj_edge, &obj_core),
-        )
-        .unwrap(),
+        PqWgInnerConnector::new(rogue, Policy::production_default(), extractor(&obj_edge, &obj_core))
+            .unwrap(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1118,9 +1193,40 @@ fn inner_wrong_ca_is_rejected_without_hop_only_fallback() {
         policy(client_side.local, client_side.peer),
         IO_TIMEOUT,
     );
-    let server_result = server.join().expect("join inner TLS server");
-    assert!(client_result.is_err());
-    assert!(server_result.is_err());
+    let server_result = server.join().expect("join PQ hop server");
+    assert!(client_result.is_err(), "untrusted key must not yield a session");
+    assert_eq!(
+        server_result,
+        Err("InnerTls(\"pq-wg handshake\")".to_owned()),
+        "the acceptor must reject during the PQ handshake, not at outer TLS or SessionHello"
+    );
+}
+
+#[test]
+fn inner_untrusted_server_key_is_rejected_by_client() {
+    let t = Temp::new();
+    setup(&t);
+    let (client_side, mut server_side) = sides(&t);
+    let obj_edge = verified_identity(&t, "edge", 2, 4, ObjectRole::Edge);
+    let obj_core = verified_identity(&t, "core", 1, 9, ObjectRole::Core);
+    let trusted = PqWgIdentity::from_private_key_pem(&read(&t, "core.key")).unwrap();
+    let rogue = PqWgIdentity::from_private_key_pem(&read(&t, "unknown.key")).unwrap();
+    assert_ne!(trusted.spki_hash(), rogue.spki_hash());
+    server_side.hop = Box::new(
+        PqWgInnerAcceptor::new(rogue, Policy::production_default(), extractor(&obj_edge, &obj_core))
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || accept_session(&listener, server_side).map(|_| ()));
+    let client = LinkClient::new(Box::new(client_side.outer), client_side.hop);
+    let result = client.connect(
+        &target(address, "wss.boreas.test"),
+        policy(client_side.local, client_side.peer),
+        IO_TIMEOUT,
+    );
+    assert!(matches!(result, Err(boreas_tunnel::TunnelError::InnerTls("pq-wg handshake"))));
+    assert!(server.join().expect("join PQ hop server").is_err());
 }
 
 #[test]
@@ -1130,6 +1236,8 @@ fn valid_ca_unknown_certificate_identity_is_rejected() {
     let (mut client_side, server_side) = sides(&t);
     let obj_edge = verified_identity(&t, "edge", 2, 4, ObjectRole::Edge);
     let obj_core = verified_identity(&t, "core", 1, 9, ObjectRole::Core);
+    // Inner PQ-WG uses the raw key from the signed identity; the certificate's
+    // CA is not sent or checked at this layer.
     let unknown = pem(&t, "unknown", "id");
     client_side.hop = Box::new(
         PqWgInnerConnector::new(
@@ -1152,7 +1260,7 @@ fn valid_ca_unknown_certificate_identity_is_rejected() {
     assert!(result.is_err());
     assert!(
         server_result.is_err(),
-        "valid CA chain without authorized identity SPKI must not produce a session"
+        "a key from a valid CA certificate without an authorized signed identity must not produce a session"
     );
 }
 

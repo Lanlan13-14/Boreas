@@ -256,6 +256,9 @@ jobs:
           cargo test --locked -p boreas-tunnel --features openssl-inner-tls \
             -- --test-threads=4 --show-output 2>&1 | tee rust-tls-tunnel-tests.log
           for test in \
+            'inner_untrusted_key_is_rejected_without_hop_only_fallback' \
+            'inner_untrusted_server_key_is_rejected_by_client' \
+            'signed_identity_requires_trusted_issuer_and_both_original_signatures' \
             'circuit_pool::retirement_tests::two_endpoints_wrap_data_half_close_and_retry_without_rebinding' \
             'circuit_pool::retirement_tests::wrong_lane_corrupt_fin_invalid_ack_and_reset_do_not_retire' \
             'circuit_pool::retirement_tests::bounded_guard_pressure_never_evicts_and_recovers_on_expiry' \

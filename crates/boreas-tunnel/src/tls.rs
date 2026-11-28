@@ -163,10 +163,13 @@ impl InnerTlsSession {
 
     pub fn is_tls_free(&self) -> bool {
         #[cfg(feature = "openssl-inner-tls")]
-        if matches!(self.security, SessionSecurity::PqWg(_)) {
-            return true;
+        {
+            matches!(self.security, SessionSecurity::PqWg(_))
         }
-        false
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        {
+            false
+        }
     }
 
     #[cfg(test)]
