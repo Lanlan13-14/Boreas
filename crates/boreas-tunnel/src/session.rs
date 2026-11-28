@@ -300,10 +300,11 @@ impl FrameIo {
             let mut cursor=self.write_cursor.unwrap_or(0);
             loop {
                 if cursor==self.write_buf.len() {
-                    match self.stream.flush() {
-                        Ok(())=>{self.write_cursor=None;break Ok(());},
-                        Err(e)=>{self.write_cursor=Some(cursor);break Err(e);},
-                    }
+                    // Once the full frame is accepted, lower layers own the
+                    // bounded ciphertext and progress_io drains it. Do not
+                    // force a socket flush for every application frame.
+                    self.write_cursor=None;
+                    break Ok(());
                 }
                 match self.stream.write(&self.write_buf[cursor..]) {
                     Ok(0)=>break Err(io::ErrorKind::WriteZero.into()),

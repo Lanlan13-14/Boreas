@@ -1317,7 +1317,7 @@ impl<S> PqWgStream<S> {
 impl<S: Read + Write> PqWgStream<S> {
     /// Attempt to send any buffered record; retry on WouldBlock or TimedOut.
     pub fn flush_pending_output(&mut self) -> io::Result<()> {
-        self.flush()
+        self.drain_tx()
     }
 
     fn drain_tx(&mut self) -> io::Result<()> {
