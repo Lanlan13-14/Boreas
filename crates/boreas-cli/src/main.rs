@@ -2961,9 +2961,10 @@ uplinks = ["wss://hub-us-c.example.net"]
         use std::cell::RefCell;
         use std::io::BufReader;
 
-        // Entry 6 (security mode / revoke) and entry 9 (uninstall) must both
-        // stop at a refusal screen and never reach the effect handler.
-        for entry in ["6", "9"] {
+        // Entry 9 (uninstall) must stop at a refusal screen and never reach
+        // the effect handler. Entry 6 now performs read-only inspection and
+        // its distinct behavior is covered by the inspection tests.
+        for entry in ["9"] {
             let performed = RefCell::new(Vec::new());
             let mut state = ConsoleState::new(Lang::En, false);
             let input = format!("{entry}\n\nq\n");
