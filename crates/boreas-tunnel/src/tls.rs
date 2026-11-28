@@ -17,9 +17,10 @@
 //! feature; the default build has no backend at all and fails closed.
 
 use boreas_crypto::{
-    ExpectedPeer, NegotiatedParameters, NodeRole, Policy, PqWgParameters, PresentedPeer,
-    Suite as CryptoSuite,
+    ExpectedPeer, NegotiatedParameters, NodeRole, Policy, PresentedPeer, Suite as CryptoSuite,
 };
+#[cfg(feature = "openssl-inner-tls")]
+use boreas_crypto::PqWgParameters;
 #[cfg(feature = "openssl-inner-tls")]
 use boreas_pki::VerifiedNetworkContext;
 use boreas_proto::messages::Suite as MessageSuite;
@@ -129,6 +130,8 @@ impl PeerIdentity {
 enum SessionSecurity {
     #[cfg(feature = "openssl-inner-tls")]
     PqWg(PqWgParameters),
+    // Only synthetic unit-test sessions can carry legacy TLS parameters.
+    #[cfg_attr(not(test), allow(dead_code))]
     Tls(NegotiatedParameters),
 }
 

@@ -1405,9 +1405,8 @@ impl<S: Read + Write> PqWgStream<S> {
             }
         }
 
-        let counter = self.recv_usage.charge(payload_len, record_type == RECORD_DATA).map_err(|err| {
+        let counter = self.recv_usage.charge(payload_len, record_type == RECORD_DATA).inspect_err(|_| {
             self.failed = true;
-            err
         })?;
         let (aad, ct_and_tag) = self.rx_raw[..total_len].split_at(RECORD_HEADER_LEN);
         let plain_len = aead_open_into(

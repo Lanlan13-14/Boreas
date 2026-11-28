@@ -2,6 +2,7 @@
 
 use super::*;
 use boreas_tunnel::{
+    OpenSslOuterTlsAcceptor,
     circuit::{CircuitId, HARD_PAIR_CAP},
     circuit_pool::{CircuitPool, MAX_TRACKED_FLOWS, PoolError},
     csprng::random_array,

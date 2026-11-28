@@ -364,8 +364,9 @@ fn strict_pq768_signed_adjacency_only_falls_back_before_authentication() {
         assert_eq!(reply.signed_lsa, f.node(1).lsa);
     });
 
-    // A certificate for Core 3 is valid under the same certificate CA and the
-    // correct outer SAN, but is not the signed SPKI expected for Core 2.
+    // The wrong Core 3 SPKI is rejected during the PQ-WG handshake, before
+    // a verified peer reaches the post-handshake identity mapping step.
+    // The public WSS certificate and SAN remain valid.
     let (wrong, wrong_locator) = listener();
     let (unused, unused_locator) = listener();
     unused.set_nonblocking(true).unwrap();
@@ -387,7 +388,7 @@ fn strict_pq768_signed_adjacency_only_falls_back_before_authentication() {
         assert_eq!(
             result,
             Err(Error::Transport(TunnelError::InnerTls(
-                "peer identity mapping"
+                "pq-wg handshake"
             )))
         );
         assert!(responder.join().unwrap().is_err());
@@ -934,7 +935,7 @@ fn verified_graph_does_not_fallback_after_wrong_first_hop_spki() {
         assert_eq!(
             result,
             Err(Error::Transport(TunnelError::InnerTls(
-                "peer identity mapping"
+                "pq-wg handshake"
             )))
         );
         assert!(responder.join().unwrap().is_err());
