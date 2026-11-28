@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [main, 'work/v111-handoff', 'fix/v111-integration', 'fix/v111-release-blockers', 'test/v111-*']
+    branches: [main, 'work/v111-handoff', 'fix/v111-integration', 'fix/v111-release-blockers', 'test/v111-*', 'feat/pq-wg-transport']
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
