@@ -170,6 +170,10 @@ pub(super) fn run(run: Run<'_>) -> Result<(), String> {
     )
     .map_err(|_| "daemon: private DNS pq-wg inner connector setup failed".to_string())?;
     let client = run.transport.link_client(run.mat_dir, Box::new(inner))?;
+    // Replica paths retain their separate admission and fail-closed checks.
+    let buffer_admission = boreas_tunnel::resource::Admission::new(boreas_tunnel::resource::Limits {
+        handshakes_global: 0, authenticated_global: 0, authenticated_per_peer: 0, bytes_global: 0,
+    });
     let mut ordinal = 0;
     let mut packets_before = 0u64;
     let deadline = run.max_seconds.map(|seconds| {
@@ -225,7 +229,7 @@ pub(super) fn run(run: Run<'_>) -> Result<(), String> {
         let report = drive_business_path(
             "connect", fd, run.tun, e2e, run.mtu, run.status_path, run.policy_window,
             Arc::clone(&run.store), run.max_packets, packets_before, deadline, None,
-            None, run.counters, Some(run.dns), Some(epoch),
+            None, run.counters, Some(run.dns), Some(epoch), &buffer_admission,
         );
         run.counters.connected.store(false, super::Ordering::SeqCst);
         run.counters.outbound_upstreams.store(0, super::Ordering::SeqCst);

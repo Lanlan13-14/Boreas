@@ -200,9 +200,8 @@ fn fragmented_message_limit_still_fails_closed_after_large_frame() {
     }
 }
 
-// WsStream is a blocking adapter, not a resumable nonblocking frame parser.
-// A partial frame followed by WouldBlock must still fail closed rather than
-// exposing partial data or incorrectly starting a new frame on retry.
+// A partial frame keeps its cursor on WouldBlock and never exposes old
+// high-water storage. Reverse-direction writes remain independently usable.
 struct BlockAfterInput {
     input: Cursor<Vec<u8>>,
 }
@@ -218,7 +217,7 @@ impl Write for BlockAfterInput {
 }
 
 #[test]
-fn partial_frame_then_would_block_remains_terminal_without_leaking_storage() {
+fn partial_frame_then_would_block_resumes_without_leaking_storage() {
     for masked in [false, true] {
         let role = if masked { WsRole::Server } else { WsRole::Client };
         let mut wire = encoded(masked, OpCode::Binary, &[0x5a; 64]);
@@ -232,9 +231,12 @@ fn partial_frame_then_would_block_remains_terminal_without_leaking_storage() {
         let mut out = [0; 64];
         assert_eq!(stream.read(&mut out).unwrap(), 64);
         out.fill(0xd2);
-        assert!(stream.read(&mut out).is_err());
+        assert_eq!(stream.read(&mut out).unwrap_err().kind(), io::ErrorKind::WouldBlock);
         assert_eq!(out, [0xd2; 64]);
-        assert!(stream.read(&mut out).is_err());
-        assert!(stream.write(b"later").is_err());
+        assert_eq!(stream.read(&mut out).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(stream.write(b"later").unwrap(), 5);
+        stream.io.input.get_mut().push(*partial.last().unwrap());
+        assert_eq!(stream.read(&mut out).unwrap(), 6);
+        assert_eq!(&out[..6], b"abcdef");
     }
 }
