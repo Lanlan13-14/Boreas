@@ -209,6 +209,7 @@ impl<S> QueuedTls<S> {
             failed: false,
         }
     }
+    #[cfg(test)]
     pub(crate) fn transport_mut(&mut self) -> &mut S {
         &mut self.ssl.get_mut().inner
     }
@@ -312,55 +313,6 @@ impl<S: Duplex> QueuedTls<S> {
                 Err(tls_error(e))
             }
         }
-    }
-    pub(crate) fn read_authenticated(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.plain.is_none() {
-            return match self.ssl.ssl_read(out) {
-                Ok(0) if !out.is_empty() => Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => Ok(n),
-                Err(e) if e.code() == ErrorCode::ZERO_RETURN => Ok(0),
-                Err(e) => Err(tls_error(e)),
-            };
-        }
-        let n = self.read(out)?;
-        if n == 0 && !out.is_empty() && !self.plain.as_ref().expect("active").authenticated_eof {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        Ok(n)
-    }
-    pub(crate) fn close_notify(&mut self) -> io::Result<()> {
-        self.ssl.shutdown().map(|_| ()).map_err(tls_error)
-    }
-    pub(crate) fn progress_is_active(&self) -> bool {
-        self.plain.is_some()
-    }
-    pub(crate) fn close_notify_until(&mut self, until: Instant) -> io::Result<()> {
-        loop {
-            match self.close_notify() {
-                Ok(()) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
-            }
-            let progress = self.progress_io()?;
-            let remaining = until.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            if !progress.advanced {
-                self.wait_progress(remaining, progress.write)?;
-            }
-        }
-        while self.has_pending_output() {
-            let progress = self.progress_io()?;
-            let remaining = until.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            if !progress.advanced && self.has_pending_output() {
-                self.wait_progress(remaining, progress.write)?;
-            }
-        }
-        Ok(())
     }
 }
 impl<S: Duplex> Read for QueuedTls<S> {

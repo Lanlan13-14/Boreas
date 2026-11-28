@@ -1100,9 +1100,6 @@ impl<'a> E2eCircuit<'a> {
         }
     }
 
-    #[cfg(all(test, feature = "openssl-inner-tls"))]
-    pub(crate) fn disable_read_ahead_for_test(&mut self) { self.read_ahead = None; }
-
     /// Policy shared by the daemon assembly and its tests. DNS configuration
     /// is deliberately absent: it changes per-packet classification, not EOF.
     pub fn direct_read_ahead_eligible(&self, real_tun: bool, replica_epoch: bool) -> bool {
@@ -1205,31 +1202,6 @@ impl<'a> E2eCircuit<'a> {
     #[cfg(feature = "openssl-inner-tls")]
     pub(crate) fn is_private_dns_only(&self) -> bool {
         self.private_dns_only
-    }
-}
-
-#[cfg(all(test, feature = "openssl-inner-tls"))]
-pub(crate) fn test_plaintext_circuit(
-    stream: Box<dyn E2eStream>,
-    local: PeerIdentity,
-    peer: PeerIdentity,
-) -> E2eCircuit<'static> {
-    // In-memory ownership/error tests only; never a production auth entry.
-    let tls = crate::tls::InnerTlsSession::test_only(peer, crate::tls::strict_test_negotiated());
-    E2eCircuit {
-        stream,
-        token: VerifiedE2eSession::from_verified_e2e_tls(
-            &tls, peer, MessageSuite::Pq768, false,
-        ).unwrap(),
-        info: E2eInfo {
-            circuit_id: [0x11; 16], path_hops: 1,
-            role: CircuitRole::Initiator, tls_role: CircuitTlsRole::Client, peer,
-        },
-        local,
-        mtu_cap: 1500,
-        l3_profile: E2eL3Profile::SINGLE_LANE,
-        private_dns_only: false,
-        read_ahead: None,
     }
 }
 
