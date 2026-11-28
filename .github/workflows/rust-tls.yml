@@ -223,7 +223,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p boreas-crypto --features openssl-backend \
-            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-tests.log
+            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-tests.log
       - name: PKI management, CSR, and signing tests with real OpenSSL
         if: always()
         timeout-minutes: 15
@@ -234,7 +234,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p boreas-pki --features openssl-backend \
-            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-pki-tests.log
+            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-pki-tests.log
           grep -Fx 'test management::tests::scoped_revocations_persist_and_invalidate_only_owned_bindings ... ok' rust-tls-pki-tests.log
       - name: Transport inner-TLS seam tests with backend feature
         if: always()
@@ -273,7 +273,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p boreas-supervisor --features openssl-backend \
-            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
+            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
       - name: CLI hop-node & daemon process tests with backend feature
         if: always()
         timeout-minutes: 15
@@ -286,7 +286,7 @@ jobs:
           cargo clippy --locked -p boreas-pki -p boreas-tunnel -p boreas-cli \
             --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
-            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-cli-tests.log
+            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-cli-tests.log
           for test in \
             'update::signed::tests::authenticates_exact_manifest_and_reports_metadata_only' \
             'update::signed::tests::requires_both_signatures_exact_bytes_and_local_root' \
@@ -971,14 +971,14 @@ jobs:
     needs: openssl-rust-mtls
     # Build failures still fail the workflow, but a failed mesh compile must
     # not suppress the other fixtures if the verified runtime was uploaded.
-    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         case: ${{ fromJSON(
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh","multi_active"]' ||
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh","multi_active"]' ||
           (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') && '["public_dns","private_dns","pool_cutover","dns_replicas","mesh"]' ||
           github.ref == 'refs/heads/test/v111-dns-public-forwarding' && '["public_dns"]' ||
           github.ref == 'refs/heads/test/v111-mesh-runtime' && '["mesh"]' ||
@@ -1161,7 +1161,7 @@ jobs:
   serial-performance:
     name: Isolated serial netns performance
     needs: openssl-rust-mtls
-    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso')) }}
+    if: ${{ !cancelled() && needs.openssl-rust-mtls.outputs.runtime_id != '' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && github.ref == 'refs/heads/test/v111-tcpv4-gso')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -1257,17 +1257,30 @@ jobs:
           BOREAS_DIAGNOSTIC_TIMING: '0'
         run: |
           set -euo pipefail
-          failed=0
+          # The three samples are independent netns fixtures, so run them
+          # concurrently instead of back to back. Each writes its own log.
+          pids=""
           for sample in 1 2 3; do
             log="rust-tls-netns-gigabit-${sample}.log"
-            if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
-              hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "$log"; then
-              printf 'sample_exit=0\n' | tee -a "$log"
-            else
-              sample_exit=$?
-              printf 'sample_exit=%s\n' "$sample_exit" | tee -a "$log"
-              failed=1
-            fi
+            (
+              if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+                hop-node-linux/boreas-linux-x86_64-musl-pq768 > "$log" 2>&1; then
+                printf 'sample_exit=0\n' >> "$log"
+              else
+                sample_exit=$?
+                printf 'sample_exit=%s\n' "$sample_exit" >> "$log"
+                exit 1
+              fi
+            ) &
+            pids="$pids $!"
+          done
+          failed=0
+          for pid in $pids; do
+            wait "$pid" || failed=1
+          done
+          for sample in 1 2 3; do
+            echo "===== gigabit sample ${sample} ====="
+            cat "rust-tls-netns-gigabit-${sample}.log"
           done
           exit "$failed"
       - name: Record one instrumented sample after a gigabit failure (diagnostic only)

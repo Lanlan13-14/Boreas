@@ -51,7 +51,10 @@ const FRAME_MAGIC: &[u8; 4] = b"BWG1";
 const MSG_INIT: u8 = 1;
 const MSG_RESP: u8 = 2;
 
-const RECORD_HEADER_LEN: usize = 1 + 8 + 4;
+// Type byte + big-endian payload length. The record counter is NOT on the
+// wire: both peers track it locally and it is the AEAD nonce, so a reordered,
+// dropped or replayed record fails authentication instead of being accepted.
+const RECORD_HEADER_LEN: usize = 1 + 4;
 const RECORD_DATA: u8 = 0x01;
 const RECORD_CLOSE: u8 = 0x02;
 const MAX_RECORD_COUNTER: u64 = 1u64 << 60;
@@ -1171,8 +1174,7 @@ impl<S: Read + Write> PqWgStream<S> {
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
         self.tx_buf[0] = record_type;
-        self.tx_buf[1..9].copy_from_slice(&counter.to_le_bytes());
-        self.tx_buf[9..13].copy_from_slice(&payload_len.to_be_bytes());
+        self.tx_buf[1..RECORD_HEADER_LEN].copy_from_slice(&payload_len.to_be_bytes());
         let (aad, rest) = self.tx_buf.split_at_mut(RECORD_HEADER_LEN);
         let written = aead_seal_into(&self.send_key, counter, aad, payload, rest).map_err(|_| {
             self.failed = true;
@@ -1257,23 +1259,21 @@ impl<S: Read + Write> PqWgStream<S> {
         }
 
         let record_type = self.rx_raw[0];
-        let counter = u64::from_le_bytes(
-            self.rx_raw[1..9]
-                .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad header"))?,
-        );
         let payload_len = u32::from_be_bytes(
-            self.rx_raw[9..13]
+            self.rx_raw[1..RECORD_HEADER_LEN]
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad header"))?,
         ) as usize;
+        // The counter never travels on the wire; the locally tracked value is
+        // what the sender sealed under, so any skipped record fails the AEAD.
+        let counter = self.recv_counter;
 
         let valid_header = match record_type {
             RECORD_DATA => payload_len > 0 && payload_len <= MAX_RECORD_PAYLOAD,
             RECORD_CLOSE => payload_len == 0,
             _ => false,
         };
-        if !valid_header || counter != self.recv_counter || self.recv_counter >= MAX_RECORD_COUNTER {
+        if !valid_header || self.recv_counter >= MAX_RECORD_COUNTER {
             self.failed = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
