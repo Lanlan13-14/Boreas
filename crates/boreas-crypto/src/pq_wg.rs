@@ -48,7 +48,7 @@ const AEAD_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const AEAD_TAG_LEN: usize = 16;
 
-const FRAME_MAGIC: &[u8; 4] = b"BWG2";
+const FRAME_MAGIC: &[u8; 4] = b"BWG3";
 const MSG_INIT: u8 = 1;
 const MSG_RESP: u8 = 2;
 
@@ -58,21 +58,24 @@ const MSG_RESP: u8 = 2;
 const RECORD_HEADER_LEN: usize = 1 + 4;
 const RECORD_DATA: u8 = 0x01;
 const RECORD_CLOSE: u8 = 0x02;
-// Per-direction key limits: at most 2^20 records, 2^30 plaintext bytes,
-// and 2^27 authenticated blocks (AAD, ciphertext and GCM length block).
-// The block cap keeps the generic quadratic GCM term on the order of 2^-74
-// per key; it is not a formal end-to-end security bound. The record cap also
-// limits online verification attempts; any authentication failure poisons the
-// stream. Data records reserve one record and two blocks for authenticated
-// close. There is no rekey or automatic stream migration: exhaustion requires
-// closing and a fresh handshake, interrupting long-lived transfers.
+const RECORD_UPDATE: u8 = 0x03;
+// Per-direction, per-epoch GCM limits. Every data record reserves one
+// empty authenticated control record (two blocks) for either update or close.
+// The quadratic GCM term is approximately 2^-74 per key, not a formal
+// multi-user or whole-session bound. Authentication failure poisons the stream.
 const MAX_RECORDS_PER_KEY: u64 = 1 << 20;
 const MAX_PLAINTEXT_BYTES_PER_KEY: u64 = 1 << 30;
 const MAX_AUTH_BLOCKS_PER_KEY: u64 = 1 << 27;
+// Limit aggregate exposure as well as individual key use. A stream may use
+// at most this many epochs in each direction; reaching it requires a new
+// handshake. The sum of per-key estimates is still not a formal proof.
+const MAX_EPOCHS_PER_DIRECTION: u64 = 1 << 20;
 
-// The BWG2 frame marker and algorithm-bound v2 transcript deliberately reject
-// legacy BWG1 ChaCha20-Poly1305 handshakes without fallback.
-const PROTOCOL_NAME: &[u8] = b"BOREAS-PQ-WG-v2-X25519-MLKEM768-MLDSA65-AES256GCM";
+// BWG3 changes both the marker and authenticated transcript: no fallback to
+// BWG1/BWG2. Each direction's keys are independently advanced by an empty,
+// old-key-authenticated UPDATE. This deterministic symmetric ratchet supplies
+// no post-compromise recovery or new forward secrecy.
+const PROTOCOL_NAME: &[u8] = b"BOREAS-PQ-WG-v3-X25519-MLKEM768-MLDSA65-AES256GCM";
 
 /// Domain-separation tag so a Hop handshake can never cross-protocol replay into E2E.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -512,7 +515,10 @@ fn derive_session_keys(
         &mut out,
     );
     zeroize(&mut ikm);
-    res.map_err(|_| PqWgError::OpenSslError)?;
+    if res.is_err() {
+        zeroize(&mut out);
+        return Err(PqWgError::OpenSslError);
+    }
 
     let mut k_i_to_r = [0u8; AEAD_KEY_LEN];
     let mut k_r_to_i = [0u8; AEAD_KEY_LEN];
@@ -743,9 +749,10 @@ impl PqWgConnector {
         let sender_index = nonzero_u32()?;
         let nonce_i = random_32()?;
 
-        // msg1_body = BWG2 | 1 | sender_index(4) | nonce_i(32) | e_i_pub(32) | ek_len(2) | ek(1184) | init_spki_hash(32)
-        let mut msg1_body =
-            Vec::with_capacity(4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN);
+        // msg1_body = BWG3 | 1 | sender_index(4) | nonce_i(32) | e_i_pub(32) | ek_len(2) | ek(1184) | init_spki_hash(32)
+        let mut msg1_body = Vec::with_capacity(
+            4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN,
+        );
         msg1_body.extend_from_slice(FRAME_MAGIC);
         msg1_body.push(MSG_INIT);
         msg1_body.extend_from_slice(&sender_index.to_be_bytes());
@@ -771,9 +778,17 @@ impl PqWgConnector {
         write_handshake_frame(&mut transport, &msg1)?;
 
         // Read Message 2:
-        // msg2_body = BWG2(4) | 2(1) | receiver_index(4) | sender_index(4) | nonce_r(32) | e_r_pub(32) | ct_len(2) | ct(1088) | resp_spki_hash(32)
+        // msg2_body = BWG3(4) | 2(1) | receiver_index(4) | sender_index(4) | nonce_r(32) | e_r_pub(32) | ct_len(2) | ct(1088) | resp_spki_hash(32)
         let msg2 = read_handshake_frame(&mut transport)?;
-        let msg2_body_len = 4 + 1 + 4 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_CT_LEN + SPKI_HASH_LEN;
+        let msg2_body_len = 4
+            + 1
+            + 4
+            + 4
+            + NONCE_BYTES_LEN
+            + X25519_PUB_LEN
+            + 2
+            + ML_KEM_768_CT_LEN
+            + SPKI_HASH_LEN;
         if msg2.len() < msg2_body_len + 2 + AEAD_TAG_LEN {
             return Err(PqWgError::Handshake);
         }
@@ -885,11 +900,7 @@ impl PqWgConnector {
         }
 
         Ok(PqWgStream::new(
-            transport,
-            k_i_to_r,
-            k_r_to_i,
-            peer_spki,
-            negotiated,
+            transport, k_i_to_r, k_r_to_i, peer_spki, negotiated, true,
         ))
     }
 }
@@ -1096,16 +1107,29 @@ impl PqWgAcceptor {
         }
 
         Ok(PqWgStream::new(
-            transport,
-            k_r_to_i,
-            k_i_to_r,
-            peer_spki,
-            negotiated,
+            transport, k_r_to_i, k_i_to_r, peer_spki, negotiated, false,
         ))
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
+struct KeyLimits {
+    records: u64,
+    bytes: u64,
+    blocks: u64,
+}
+
+impl Default for KeyLimits {
+    fn default() -> Self {
+        Self {
+            records: MAX_RECORDS_PER_KEY,
+            bytes: MAX_PLAINTEXT_BYTES_PER_KEY,
+            blocks: MAX_AUTH_BLOCKS_PER_KEY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct KeyUsage {
     records: u64,
     bytes: u64,
@@ -1114,27 +1138,79 @@ struct KeyUsage {
 
 impl KeyUsage {
     // Header AAD occupies one block, plus padded ciphertext and a length block.
-    fn charge(&mut self, payload_len: usize, is_data: bool) -> io::Result<u64> {
+    // Data must leave room for one empty control record. Calculate on a copy so
+    // a failed capacity check never consumes a nonce or changes the state.
+    fn charge(&mut self, payload_len: usize, is_data: bool, limits: KeyLimits) -> io::Result<u64> {
         let bytes = u64::try_from(payload_len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded"))?;
         let blocks = bytes.div_ceil(16).checked_add(2);
         let next_records = self.records.checked_add(1);
         let next_bytes = self.bytes.checked_add(bytes);
         let next_blocks = blocks.and_then(|n| self.blocks.checked_add(n));
-        match (next_records, next_bytes, next_blocks) {
-            (Some(records), Some(total_bytes), Some(total_blocks))
-                if records <= MAX_RECORDS_PER_KEY - u64::from(is_data)
-                    && total_bytes <= MAX_PLAINTEXT_BYTES_PER_KEY
-                    && total_blocks <= MAX_AUTH_BLOCKS_PER_KEY - 2 * u64::from(is_data) =>
+        let reserve = u64::from(is_data);
+        match (
+            next_records,
+            next_bytes,
+            next_blocks,
+            limits.records.checked_sub(reserve),
+            limits.blocks.checked_sub(2 * reserve),
+        ) {
+            (
+                Some(records),
+                Some(total_bytes),
+                Some(total_blocks),
+                Some(max_records),
+                Some(max_blocks),
+            ) if records <= max_records
+                && total_bytes <= limits.bytes
+                && total_blocks <= max_blocks =>
             {
                 self.records = records;
                 self.bytes = total_bytes;
                 self.blocks = total_blocks;
-                Ok(records) // counters start at 1 and never repeat for this key
+                Ok(records)
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pq-wg key usage exceeded",
+            )),
         }
     }
+}
+
+// Role-specific labels bind the ratchet to the wire direction, including in
+// the unlikely event that the two handshake traffic keys happen to coincide.
+fn advance_key(key: &mut [u8; AEAD_KEY_LEN], direction: u8, epoch: &mut u64) -> io::Result<()> {
+    let next = epoch
+        .checked_add(1)
+        .filter(|&next| next < MAX_EPOCHS_PER_DIRECTION)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pq-wg epoch exhausted"))?;
+    let mut info = Vec::with_capacity(48);
+    info.extend_from_slice(b"BOREAS-PQ-WG-v3-TRAFFIC-UPDATE\0");
+    info.push(direction);
+    info.extend_from_slice(&next.to_be_bytes());
+    let mut new_key = [0u8; AEAD_KEY_LEN];
+    let result = hkdf(
+        Md::sha256(),
+        key,
+        None,
+        Some(&info),
+        HkdfMode::ExtractAndExpand,
+        None,
+        &mut new_key,
+    );
+    if result.is_err() {
+        zeroize(&mut new_key);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pq-wg key update failed",
+        ));
+    }
+    zeroize(key);
+    key.copy_from_slice(&new_key);
+    zeroize(&mut new_key);
+    *epoch = next;
+    Ok(())
 }
 
 /// Authenticated WireGuard-style AES-256-GCM encrypted byte stream.
@@ -1144,6 +1220,11 @@ pub struct PqWgStream<S> {
     recv_key: [u8; AEAD_KEY_LEN],
     send_usage: KeyUsage,
     recv_usage: KeyUsage,
+    limits: KeyLimits,
+    send_epoch: u64,
+    recv_epoch: u64,
+    send_direction: u8,
+    recv_direction: u8,
     peer_spki: Vec<u8>,
     negotiated: PqWgParameters,
     // Reusable buffers to avoid per-packet heap allocations on the hot path.
@@ -1156,9 +1237,9 @@ pub struct PqWgStream<S> {
     rx_plain_pos: usize,
     rx_plain_len: usize,
     peer_closed: bool,
+    close_started: bool,
     local_closed: bool,
     failed: bool,
-    limit_reached: bool,
 }
 
 impl<S> Drop for PqWgStream<S> {
@@ -1176,6 +1257,7 @@ impl<S> PqWgStream<S> {
         recv_key: [u8; AEAD_KEY_LEN],
         peer_spki: Vec<u8>,
         negotiated: PqWgParameters,
+        is_initiator: bool,
     ) -> Self {
         Self {
             inner,
@@ -1183,6 +1265,11 @@ impl<S> PqWgStream<S> {
             recv_key,
             send_usage: KeyUsage::default(),
             recv_usage: KeyUsage::default(),
+            limits: KeyLimits::default(),
+            send_epoch: 0,
+            recv_epoch: 0,
+            send_direction: if is_initiator { 0 } else { 1 },
+            recv_direction: if is_initiator { 1 } else { 0 },
             peer_spki,
             negotiated,
             tx_buf: vec![0u8; RECORD_HEADER_LEN + MAX_RECORD_PAYLOAD + AEAD_TAG_LEN],
@@ -1194,9 +1281,9 @@ impl<S> PqWgStream<S> {
             rx_plain_pos: 0,
             rx_plain_len: 0,
             peer_closed: false,
+            close_started: false,
             local_closed: false,
             failed: false,
-            limit_reached: false,
         }
     }
 
@@ -1244,9 +1331,13 @@ impl<S: Read + Write> PqWgStream<S> {
                     return Err(io::Error::new(io::ErrorKind::WriteZero, "pq-wg transport write zero"));
                 }
                 Ok(n) => self.tx_pos += n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
-                    if !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                    if !matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) {
                         self.failed = true;
                     }
                     return Err(err);
@@ -1267,35 +1358,60 @@ impl<S: Read + Write> PqWgStream<S> {
         }
         self.drain_tx()?;
         // Reserve the nonce and budget before encryption or any transport write.
-        if record_type == RECORD_DATA && self.limit_reached {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded"));
-        }
-        let counter = match self.send_usage.charge(payload.len(), record_type == RECORD_DATA) {
-            Ok(counter) => counter,
-            Err(err) => {
-                self.limit_reached = true;
-                return Err(err);
-            }
-        };
+        let counter =
+            self.send_usage
+                .charge(payload.len(), record_type == RECORD_DATA, self.limits)?;
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
         self.tx_buf[0] = record_type;
         self.tx_buf[1..RECORD_HEADER_LEN].copy_from_slice(&payload_len.to_be_bytes());
         let (aad, rest) = self.tx_buf.split_at_mut(RECORD_HEADER_LEN);
-        let written = aead_seal_into(&self.send_key, counter, aad, payload, rest).map_err(|_| {
-            self.failed = true;
-            io::Error::new(io::ErrorKind::InvalidData, "pq-wg encrypt failed")
-        })?;
+        let written =
+            aead_seal_into(&self.send_key, counter, aad, payload, rest).map_err(|_| {
+                self.failed = true;
+                io::Error::new(io::ErrorKind::InvalidData, "pq-wg encrypt failed")
+            })?;
         self.tx_len = RECORD_HEADER_LEN + written;
         Ok(())
     }
 
+    // If data will not fit with the reserved control slot, queue UPDATE under
+    // the old key and install the new key exactly once. The queued ciphertext
+    // must drain before any new-key data can be queued, even after WouldBlock.
+    fn prepare_data(&mut self, len: usize) -> io::Result<()> {
+        let mut candidate = self.send_usage;
+        if candidate.charge(len, true, self.limits).is_ok() {
+            return Ok(());
+        }
+        // Do not emit an update if this record cannot fit even in a fresh epoch.
+        KeyUsage::default().charge(len, true, self.limits)?;
+        if self.send_epoch >= MAX_EPOCHS_PER_DIRECTION - 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pq-wg epoch exhausted",
+            ));
+        }
+        self.send_record(RECORD_UPDATE, &[])?;
+        if let Err(err) = advance_key(
+            &mut self.send_key,
+            self.send_direction,
+            &mut self.send_epoch,
+        ) {
+            self.failed = true;
+            return Err(err);
+        }
+        self.send_usage = KeyUsage::default();
+        Ok(())
+    }
+
     /// Send an authenticated close frame so the peer distinguishes planned
-    /// closure from bare transport EOF or reset.
+    /// closure from bare transport EOF or reset. Once called, further writes
+    /// are rejected, even if pending output makes close return a retryable error.
     pub fn close_notify(&mut self) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pq-wg stream poisoned"));
         }
+        self.close_started = true;
         if !self.local_closed {
             self.send_record(RECORD_CLOSE, &[])?;
             self.local_closed = true;
@@ -1318,6 +1434,9 @@ impl<S: Read + Write> PqWgStream<S> {
                 "pq-wg stream poisoned",
             ));
         }
+        // Bound work for a peer sending many authenticated updates in a row.
+        // Interrupted is retryable and lets the caller yield between batches.
+        let mut updates = 0;
         loop {
             if self.rx_plain_pos < self.rx_plain_len {
                 let avail = self.rx_plain_len - self.rx_plain_pos;
@@ -1333,7 +1452,14 @@ impl<S: Read + Write> PqWgStream<S> {
             if self.peer_closed {
                 return Ok(0);
             }
+            let old_epoch = self.recv_epoch;
             self.read_next_record()?;
+            if self.recv_epoch != old_epoch {
+                updates += 1;
+                if updates == 16 {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+            }
         }
     }
 
@@ -1348,11 +1474,12 @@ impl<S: Read + Write> PqWgStream<S> {
                     ));
                 }
                 Ok(n) => self.rx_raw_len += n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     if !matches!(
                         err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) {
                         self.failed = true;
                     }
@@ -1369,7 +1496,7 @@ impl<S: Read + Write> PqWgStream<S> {
         ) as usize;
         let valid_header = match record_type {
             RECORD_DATA => payload_len > 0 && payload_len <= MAX_RECORD_PAYLOAD,
-            RECORD_CLOSE => payload_len == 0,
+            RECORD_CLOSE | RECORD_UPDATE => payload_len == 0,
             _ => false,
         };
         if !valid_header {
@@ -1392,11 +1519,12 @@ impl<S: Read + Write> PqWgStream<S> {
                     ));
                 }
                 Ok(n) => self.rx_raw_len += n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     if !matches!(
                         err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) {
                         self.failed = true;
                     }
@@ -1405,9 +1533,21 @@ impl<S: Read + Write> PqWgStream<S> {
             }
         }
 
-        let counter = self.recv_usage.charge(payload_len, record_type == RECORD_DATA).inspect_err(|_| {
+        // Empty epochs carry no data and can never be generated by an honest
+        // sender. Reject them to prevent cheap authenticated update floods.
+        if record_type == RECORD_UPDATE && self.recv_usage.records == 0 {
             self.failed = true;
-        })?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty pq-wg epoch",
+            ));
+        }
+        let counter = self
+            .recv_usage
+            .charge(payload_len, record_type == RECORD_DATA, self.limits)
+            .inspect_err(|_| {
+                self.failed = true;
+            })?;
         let (aad, ct_and_tag) = self.rx_raw[..total_len].split_at(RECORD_HEADER_LEN);
         let plain_len = aead_open_into(
             &self.recv_key,
@@ -1433,6 +1573,18 @@ impl<S: Read + Write> PqWgStream<S> {
             self.peer_closed = true;
             return Ok(());
         }
+        if record_type == RECORD_UPDATE {
+            if let Err(err) = advance_key(
+                &mut self.recv_key,
+                self.recv_direction,
+                &mut self.recv_epoch,
+            ) {
+                self.failed = true;
+                return Err(err);
+            }
+            self.recv_usage = KeyUsage::default();
+            return Ok(());
+        }
         self.rx_plain_pos = 0;
         self.rx_plain_len = plain_len;
         Ok(())
@@ -1450,13 +1602,14 @@ impl<S: Read + Write> Write for PqWgStream<S> {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.local_closed {
+        if self.close_started {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "pq-wg stream locally closed",
             ));
         }
         let take = buf.len().min(MAX_RECORD_PAYLOAD);
+        self.prepare_data(take)?;
         self.send_record(RECORD_DATA, &buf[..take])?;
         // Once accepted, report plaintext progress even if the underlying write
         // would block: the encrypted frame remains buffered for flush/next write.
@@ -1561,8 +1714,17 @@ mod tests {
         for name in [
             &b"BOREAS-PQ-WG-v1-X25519-MLKEM768-MLDSA65-CHACHA20POLY1305"[..],
             &b"BOREAS-PQ-WG-v1-X25519-MLKEM768-MLDSA65-AES256GCM"[..],
+            &b"BOREAS-PQ-WG-v2-X25519-MLKEM768-MLDSA65-AES256GCM"[..],
         ] {
-            assert!(verify_mldsa65(identity.public_spki(), b"BOREAS-PQ-WG-INIT-SIG-v1\0", &transcript(name), &sig).is_err());
+            assert!(
+                verify_mldsa65(
+                    identity.public_spki(),
+                    b"BOREAS-PQ-WG-INIT-SIG-v1\0",
+                    &transcript(name),
+                    &sig
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1582,17 +1744,34 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
     }
     fn test_stream(wire: MemoryWire, send: [u8; 32], recv: [u8; 32]) -> PqWgStream<MemoryWire> {
-        PqWgStream::new(wire, send, recv, Vec::new(), PqWgParameters {
-            group: HybridGroup::X25519MlKem768,
-            peer_signature: IdentitySignature::MlDsa65,
-            aead: Aead::Aes256GcmSha384,
-            resumed: false,
-            zero_rtt: false,
-            tls_free: true,
-        })
+        PqWgStream::new(
+            wire,
+            send,
+            recv,
+            Vec::new(),
+            PqWgParameters {
+                group: HybridGroup::X25519MlKem768,
+                peer_signature: IdentitySignature::MlDsa65,
+                aead: Aead::Aes256GcmSha384,
+                resumed: false,
+                zero_rtt: false,
+                tls_free: true,
+            },
+            true,
+        )
     }
     fn reader_for(data: Vec<u8>, key: [u8; 32]) -> PqWgStream<MemoryWire> {
-        test_stream(MemoryWire { input: std::io::Cursor::new(data), output: Vec::new() }, [3; 32], key)
+        let mut reader = test_stream(
+            MemoryWire {
+                input: std::io::Cursor::new(data),
+                output: Vec::new(),
+            },
+            [3; 32],
+            key,
+        );
+        reader.recv_direction = 0;
+        reader.send_direction = 1;
+        reader
     }
 
     #[test]
@@ -1625,85 +1804,190 @@ mod tests {
     }
 
     #[test]
-    fn per_key_limits_fail_closed_without_nonce_reuse() {
-        assert_eq!(MAX_PLAINTEXT_BYTES_PER_KEY / MAX_RECORD_PAYLOAD as u64, 65_536);
-        // Exercise the exact byte cap with real encrypted records and authenticated close.
-        let mut byte_sender = test_stream(MemoryWire::default(), [7; 32], [3; 32]);
-        // Put the counter one maximum record below the byte limit; the last
-        // real record reaches it, the following write must not emit any bytes.
-        byte_sender.send_usage.bytes = MAX_PLAINTEXT_BYTES_PER_KEY - MAX_RECORD_PAYLOAD as u64;
-        byte_sender.write_all(&vec![0; MAX_RECORD_PAYLOAD]).unwrap();
-        assert_eq!(byte_sender.send_usage.bytes, MAX_PLAINTEXT_BYTES_PER_KEY);
-        let byte_wire_len = byte_sender.get_ref().output.len();
-        assert!(byte_sender.write_all(b"x").is_err());
-        assert_eq!(byte_sender.get_ref().output.len(), byte_wire_len);
-        byte_sender.close_notify().unwrap();
-        assert_eq!(byte_sender.get_ref().output.len(), byte_wire_len + RECORD_HEADER_LEN + AEAD_TAG_LEN);
-        let mut byte_reader = reader_for(byte_sender.get_ref().output.clone(), [7; 32]);
-        byte_reader.recv_usage.bytes = MAX_PLAINTEXT_BYTES_PER_KEY - MAX_RECORD_PAYLOAD as u64;
-        let mut byte_out = vec![1; MAX_RECORD_PAYLOAD];
-        byte_reader.read_exact(&mut byte_out).unwrap();
-        assert!(byte_out.iter().all(|byte| *byte == 0));
-        assert_eq!(byte_reader.read(&mut [0; 1]).unwrap(), 0);
-        let mut block_sender = test_stream(MemoryWire::default(), [7; 32], [3; 32]);
-        block_sender.send_usage.blocks = MAX_AUTH_BLOCKS_PER_KEY - 5;
-        block_sender.write_all(b"x").unwrap(); // 3 blocks, leaving 2 for close
-        assert_eq!(block_sender.send_usage.blocks, MAX_AUTH_BLOCKS_PER_KEY - 2);
-        let block_wire_len = block_sender.get_ref().output.len();
-        assert!(block_sender.write_all(b"x").is_err());
-        assert_eq!(block_sender.get_ref().output.len(), block_wire_len);
-        block_sender.close_notify().unwrap();
-        assert_eq!(block_sender.send_usage.blocks, MAX_AUTH_BLOCKS_PER_KEY);
-        let mut block_reader = reader_for(block_sender.get_ref().output.clone(), [7; 32]);
-        block_reader.recv_usage.blocks = MAX_AUTH_BLOCKS_PER_KEY - 5;
-        let mut block_out = [0; 1];
-        block_reader.read_exact(&mut block_out).unwrap();
-        assert_eq!(&block_out, b"x");
-        assert_eq!(block_reader.read(&mut block_out).unwrap(), 0);
-
+    fn rekey_long_stream_limits_and_directional_independence() {
         let key = [7; 32];
-        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
-        sender.send_usage.records = MAX_RECORDS_PER_KEY - 2;
-        sender.write_all(b"x").unwrap();
-        assert_eq!(sender.send_usage.records, MAX_RECORDS_PER_KEY - 1);
-        let before = sender.get_ref().output.clone();
-        assert!(sender.write_all(b"x").is_err());
-        assert_eq!(sender.get_ref().output, before);
-        assert!(sender.write(b"x").is_err());
-        sender.close_notify().unwrap();
-        assert_eq!(sender.send_usage.records, MAX_RECORDS_PER_KEY);
-        let mut reader = reader_for(sender.get_ref().output.clone(), key);
-        reader.recv_usage.records = MAX_RECORDS_PER_KEY - 2;
-        let mut got = [0; 1];
-        reader.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"x");
-        assert_eq!(reader.read(&mut got).unwrap(), 0);
-        assert_eq!(reader.recv_usage.records, MAX_RECORDS_PER_KEY);
-        assert_ne!(make_nonce(MAX_RECORDS_PER_KEY - 1), make_nonce(MAX_RECORDS_PER_KEY));
-        assert_eq!(&make_nonce(1)[..4], &[0; 4]);
-        assert_eq!(&make_nonce(1)[4..], &1u64.to_le_bytes());
-
-        for usage in [
-            KeyUsage { records: 0, bytes: MAX_PLAINTEXT_BYTES_PER_KEY, blocks: 0 },
-            KeyUsage { records: 0, bytes: 0, blocks: MAX_AUTH_BLOCKS_PER_KEY - 2 },
+        // Each case isolates one limit: two 4-byte records fit per epoch.
+        for limits in [
+            KeyLimits {
+                records: 3,
+                bytes: 100,
+                blocks: 100,
+            },
+            KeyLimits {
+                records: 100,
+                bytes: 8,
+                blocks: 100,
+            },
+            KeyLimits {
+                records: 100,
+                bytes: 100,
+                blocks: 8,
+            },
         ] {
-            let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
-            sender.send_usage = usage;
-            assert!(sender.write_all(b"x").is_err());
-            assert!(sender.get_ref().output.is_empty());
-        }
-        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
-        sender.write_all(b"x").unwrap();
-        for usage in [
-            KeyUsage { records: MAX_RECORDS_PER_KEY, bytes: 0, blocks: 0 },
-            KeyUsage { records: 0, bytes: MAX_PLAINTEXT_BYTES_PER_KEY, blocks: 0 },
-            KeyUsage { records: 0, bytes: 0, blocks: MAX_AUTH_BLOCKS_PER_KEY - 1 },
-        ] {
+            let mut sender = test_stream(MemoryWire::default(), key, [8; 32]);
+            sender.limits = limits;
+            for _ in 0..21 {
+                sender.write_all(b"test").unwrap();
+            }
+            assert_eq!(sender.send_epoch, 10);
+            assert_eq!(sender.recv_epoch, 0);
+            sender.close_notify().unwrap();
+            assert!(sender.write(b"x").is_err());
             let mut reader = reader_for(sender.get_ref().output.clone(), key);
-            reader.recv_usage = usage;
-            assert!(reader.read(&mut [0; 1]).is_err());
-            assert_eq!(reader.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            reader.limits = limits;
+            let mut plain = Vec::new();
+            reader.read_to_end(&mut plain).unwrap();
+            assert_eq!(plain, b"test".repeat(21));
+            assert_eq!(reader.recv_epoch, 10);
+            assert_eq!(reader.send_epoch, 0);
         }
+        // Reverse direction uses the responder label and does not update the
+        // opposite traffic key even when both starting traffic keys are equal.
+        let limits = KeyLimits {
+            records: 2,
+            bytes: 100,
+            blocks: 100,
+        };
+        let mut responder = reader_for(Vec::new(), key);
+        responder.send_key = key;
+        responder.limits = limits;
+        responder.write_all(b"a").unwrap();
+        responder.write_all(b"b").unwrap();
+        responder.close_notify().unwrap();
+        assert_eq!((responder.send_epoch, responder.recv_epoch), (1, 0));
+        let mut initiator = test_stream(
+            MemoryWire {
+                input: std::io::Cursor::new(responder.get_ref().output.clone()),
+                output: Vec::new(),
+            },
+            key,
+            key,
+        );
+        initiator.limits = limits;
+        let mut plain = Vec::new();
+        initiator.read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, b"ab");
+        assert_eq!((initiator.send_epoch, initiator.recv_epoch), (0, 1));
+
+        // Exact production limits: a data record leaves one close/update slot.
+        let limits = KeyLimits::default();
+        for mut usage in [
+            KeyUsage {
+                records: limits.records - 2,
+                bytes: 0,
+                blocks: 0,
+            },
+            KeyUsage {
+                records: 0,
+                bytes: limits.bytes - 1,
+                blocks: 0,
+            },
+            KeyUsage {
+                records: 0,
+                bytes: 0,
+                blocks: limits.blocks - 5,
+            },
+        ] {
+            usage.charge(1, true, limits).unwrap();
+            assert!(usage.charge(1, true, limits).is_err());
+            usage.charge(0, false, limits).unwrap();
+        }
+        // Direction labels prevent ratchet collisions even with identical input keys.
+        let (mut a, mut b, mut c) = (key, key, key);
+        let (mut ea, mut eb, mut ec) = (0, 0, 0);
+        advance_key(&mut a, 0, &mut ea).unwrap();
+        advance_key(&mut b, 1, &mut eb).unwrap();
+        advance_key(&mut c, 0, &mut ec).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, c);
+        advance_key(&mut c, 0, &mut ec).unwrap();
+        assert_ne!(a, c);
+        zeroize(&mut a);
+        zeroize(&mut b);
+        zeroize(&mut c);
+    }
+
+    #[test]
+    fn update_tamper_reorder_replay_truncation_and_exhaustion() {
+        let key = [9; 32];
+        let limits = KeyLimits {
+            records: 2,
+            bytes: 100,
+            blocks: 100,
+        };
+        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
+        sender.limits = limits;
+        sender.write_all(b"a").unwrap();
+        sender.write_all(b"b").unwrap();
+        sender.close_notify().unwrap();
+        let wire = &sender.get_ref().output;
+        let d = RECORD_HEADER_LEN + 1 + AEAD_TAG_LEN;
+        let u = RECORD_HEADER_LEN + AEAD_TAG_LEN;
+        let first = &wire[..d];
+        let update = &wire[d..d + u];
+        let rest = &wire[d + u..];
+        assert_eq!(update[0], RECORD_UPDATE);
+        let mut tampered = update.to_vec();
+        tampered[u - 1] ^= 1;
+        let mut bad_len = update.to_vec();
+        bad_len[4] = 1;
+        let mut wrong_type = update.to_vec();
+        wrong_type[0] = RECORD_CLOSE;
+        for bad in [
+            [first, &tampered, rest].concat(),
+            [first, &bad_len, rest].concat(),
+            [first, &wrong_type, rest].concat(),
+            [first, &update[..u - 1]].concat(),
+            [first, rest, update].concat(),
+            [first, update, update, rest].concat(),
+            [first, rest].concat(),
+        ] {
+            let mut reader = reader_for(bad, key);
+            reader.limits = limits;
+            let mut output = [0; 1];
+            assert_eq!(reader.read(&mut output).unwrap(), 1);
+            assert!(reader.read(&mut output).is_err());
+            assert_eq!(
+                reader.read(&mut output).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+        // Epoch exhaustion refuses a further update but leaves the reserved
+        // control record available for an authenticated close.
+        let mut exhausted = test_stream(MemoryWire::default(), key, [3; 32]);
+        exhausted.limits = limits;
+        exhausted.send_epoch = MAX_EPOCHS_PER_DIRECTION - 1;
+        exhausted.write_all(b"a").unwrap();
+        let before = exhausted.get_ref().output.len();
+        assert!(exhausted.write_all(b"b").is_err());
+        assert_eq!(exhausted.get_ref().output.len(), before);
+        exhausted.close_notify().unwrap();
+        let mut receiver = reader_for(exhausted.get_ref().output.clone(), key);
+        receiver.limits = limits;
+        let mut plain = Vec::new();
+        receiver.read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, b"a");
+
+        // Even an authenticated peer cannot use control-only epochs to force
+        // unbounded ratchet work in a single read.
+        let mut update = vec![0; RECORD_HEADER_LEN + AEAD_TAG_LEN];
+        update[0] = RECORD_UPDATE;
+        let (aad, tag) = update.split_at_mut(RECORD_HEADER_LEN);
+        aead_seal_into(&key, 1, aad, &[], tag).unwrap();
+        let mut empty_epoch = reader_for(update, key);
+        assert!(empty_epoch.read(&mut [0; 1]).is_err());
+        assert_eq!(empty_epoch.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        // A malicious authenticated update cannot exceed the receive epoch cap.
+        let mut reader = reader_for(wire.clone(), key);
+        reader.limits = limits;
+        reader.recv_epoch = MAX_EPOCHS_PER_DIRECTION - 1;
+        reader.read_exact(&mut [0; 1]).unwrap();
+        assert!(reader.read(&mut [0; 1]).is_err());
+        assert_eq!(
+            reader.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -1714,15 +1998,22 @@ mod tests {
             Arc::new(StaticSpkiResolver::default()),
             Policy::production_default(),
             PqWgLayer::Hop,
-        ).unwrap();
-        let body_len = 4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN;
+        )
+        .unwrap();
+        let body_len =
+            4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN;
         let mut body = vec![0; body_len + 2];
-        body[..4].copy_from_slice(b"BWG1");
         body[4] = MSG_INIT;
-        let mut input = (body.len() as u32).to_be_bytes().to_vec();
-        input.extend_from_slice(&body);
-        let wire = MemoryWire { input: std::io::Cursor::new(input), output: Vec::new() };
-        assert!(matches!(acceptor.accept(wire), Err(PqWgError::Handshake)));
+        for magic in [b"BWG1", b"BWG2"] {
+            body[..4].copy_from_slice(magic);
+            let mut input = (body.len() as u32).to_be_bytes().to_vec();
+            input.extend_from_slice(&body);
+            let wire = MemoryWire {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+            };
+            assert!(matches!(acceptor.accept(wire), Err(PqWgError::Handshake)));
+        }
     }
 
     #[test]
@@ -1743,8 +2034,17 @@ mod tests {
         }
         let key = [0x12; 32];
         let params = test_stream(MemoryWire::default(), key, key).negotiated();
-        let wire = ShortWriter { wire: MemoryWire::default(), blocked: false };
-        let mut sender = PqWgStream::new(wire, key, key, Vec::new(), params);
+        let wire = ShortWriter {
+            wire: MemoryWire::default(),
+            blocked: false,
+        };
+        let mut sender = PqWgStream::new(wire, key, key, Vec::new(), params, true);
+        let limits = KeyLimits {
+            records: 2,
+            bytes: 100,
+            blocks: 100,
+        };
+        sender.limits = limits;
         assert_eq!(sender.write(b"first").unwrap(), 5);
         assert!(sender.has_pending_output());
         assert_eq!(sender.write(b"second").unwrap_err().kind(), io::ErrorKind::WouldBlock);
@@ -1758,7 +2058,18 @@ mod tests {
             }
         }
         assert!(!sender.has_pending_output());
-        assert_eq!(sender.write(b"second").unwrap(), 6);
+        // UPDATE itself is partially written and never re-encrypted on retry.
+        loop {
+            sender.get_mut().blocked = false;
+            match sender.write(b"second") {
+                Ok(6) => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => (),
+                other => panic!("unexpected write result: {other:?}"),
+            }
+        }
+        assert_eq!(sender.send_epoch, 1);
+        assert_eq!(sender.close_notify().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(sender.write(b"late").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         loop {
             sender.get_mut().blocked = false;
             match sender.close_notify() {
@@ -1767,8 +2078,9 @@ mod tests {
                 Err(err) => panic!("unexpected close error: {err}"),
             }
         }
-        assert_eq!(sender.send_usage.records, 3);
+        assert_eq!(sender.send_usage.records, 2);
         let mut reader = reader_for(sender.get_ref().wire.output.clone(), key);
+        reader.limits = limits;
         let mut out = Vec::new();
         reader.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"firstsecond");
@@ -1791,7 +2103,16 @@ mod tests {
         }
         let key = [0x12; 32];
         let params = test_stream(MemoryWire::default(), key, key).negotiated();
-        let mut stream = PqWgStream::new(FragmentThenBlock { byte: Some(RECORD_DATA) }, key, key, Vec::new(), params);
+        let mut stream = PqWgStream::new(
+            FragmentThenBlock {
+                byte: Some(RECORD_DATA),
+            },
+            key,
+            key,
+            Vec::new(),
+            params,
+            true,
+        );
         let received = stream.read(&mut [0; 1]).unwrap_err();
         assert_eq!(received.kind(), io::ErrorKind::WouldBlock);
         assert!(!stream.has_buffered_input());
