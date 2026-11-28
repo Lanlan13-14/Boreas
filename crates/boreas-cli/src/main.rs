@@ -2964,7 +2964,8 @@ uplinks = ["wss://hub-us-c.example.net"]
         // Entry 9 (uninstall) must stop at a refusal screen and never reach
         // the effect handler. Entry 6 now performs read-only inspection and
         // its distinct behavior is covered by the inspection tests.
-        for entry in ["9"] {
+        {
+            let entry = "9";
             let performed = RefCell::new(Vec::new());
             let mut state = ConsoleState::new(Lang::En, false);
             let input = format!("{entry}\n\nq\n");

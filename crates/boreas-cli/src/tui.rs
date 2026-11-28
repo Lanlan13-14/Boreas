@@ -1876,7 +1876,8 @@ mod tests {
 
     #[test]
     fn console_refuses_uninstall() {
-        for entry in [9u8] {
+        {
+            let entry = 9u8;
             let mut state = ConsoleState::new(Lang::En, false);
             state.selected = entry;
             assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
