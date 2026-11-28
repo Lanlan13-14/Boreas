@@ -37,6 +37,7 @@ impl Value {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn unsigned(&self) -> Option<u64> {
         match self {
             Self::One => Some(1),
