@@ -218,6 +218,9 @@ pub struct WsStream<T> {
     read_len: usize,
     write_buf: Vec<u8>,
     pending: Vec<u8>,
+    // `pending` keeps initialized high-water storage for reuse. Only this
+    // validated prefix belongs to the current frame and may be exposed.
+    pending_len: usize,
     pending_pos: usize,
     message: MessageState,
     close_sent: bool,
@@ -297,6 +300,7 @@ impl<T: Read + Write> WsStream<T> {
             read_len: 0,
             write_buf: Vec::new(),
             pending: Vec::new(),
+            pending_len: 0,
             pending_pos: 0,
             message: MessageState::default(),
             close_sent: false,
@@ -402,19 +406,19 @@ impl<T: Read + Write> WsStream<T> {
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
                     control_frames += 1;
-                    control_bytes = control_bytes.saturating_add(frame.payload.len());
+                    control_bytes = control_bytes.saturating_add(frame.len);
                     if control_frames > MAX_CONTROL_FRAMES_PER_READ
                         || control_bytes > MAX_CONTROL_BYTES_PER_READ
                     {
                         return Err(WsError::ControlFlood);
                     }
                     match frame.opcode {
-                        OpCode::Ping => self.send_frame(OpCode::Pong, &frame.payload)?,
+                        OpCode::Ping => self.send_frame(OpCode::Pong, frame.payload())?,
                         OpCode::Close => {
                             self.close_received = true;
-                            self.respond_close(&frame.payload)?;
+                            self.respond_close(frame.payload())?;
                             self.pending = frame.payload;
-                            self.pending.clear();
+                            self.pending_len = 0;
                             return Ok(false);
                         }
                         _ => {}
@@ -422,11 +426,12 @@ impl<T: Read + Write> WsStream<T> {
                     payload = frame.payload;
                 }
                 OpCode::Binary | OpCode::Continuation => {
-                    self.track_message(frame.opcode, frame.fin, frame.payload.len())?;
-                    if frame.payload.is_empty() {
+                    self.track_message(frame.opcode, frame.fin, frame.len)?;
+                    if frame.len == 0 {
                         payload = frame.payload;
                         continue;
                     }
+                    self.pending_len = frame.len;
                     self.pending = frame.payload;
                     return Ok(true);
                 }
@@ -442,7 +447,7 @@ impl<T: crate::stream::Duplex> WsStream<T> {
     /// owner still applies the normal bounded read and protocol checks.
     pub fn has_buffered_input(&self) -> bool {
         self.read_pos < self.read_len
-            || self.pending_pos < self.pending.len()
+            || self.pending_pos < self.pending_len
             || self.io.has_buffered_input()
     }
 
@@ -480,15 +485,16 @@ impl<T: Read + Write> Read for WsStream<T> {
             return Ok(0);
         }
         loop {
-            if self.pending_pos < self.pending.len() {
-                let take = (self.pending.len() - self.pending_pos).min(out.len());
+            if self.pending_pos < self.pending_len {
+                let take = (self.pending_len - self.pending_pos).min(out.len());
                 out[..take]
                     .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + take]);
                 self.pending_pos += take;
                 return Ok(take);
             }
-            // Keep the fully consumed allocation initialized for reuse. The
-            // next validated frame replaces its logical length before exposure.
+            // Retain the initialized high-water storage but expose no bytes
+            // until the next frame has been completely read and validated.
+            self.pending_len = 0;
             self.pending_pos = 0;
             if self.close_received {
                 return Ok(0);
@@ -502,6 +508,7 @@ impl<T: Read + Write> Read for WsStream<T> {
                     // resynchronise on the same stream.
                     self.failed = true;
                     self.pending.clear();
+                    self.pending_len = 0;
                     self.pending_pos = 0;
                     self.read_buf.clear();
                     self.read_pos = 0;
@@ -583,7 +590,16 @@ impl OpCode {
 struct RawFrame {
     fin: bool,
     opcode: OpCode,
+    // Storage may retain a larger initialized high-water mark. Bytes past len
+    // are never part of this frame and must not reach the caller or control IO.
     payload: Vec<u8>,
+    len: usize,
+}
+
+impl RawFrame {
+    fn payload(&self) -> &[u8] {
+        &self.payload[..self.len]
+    }
 }
 
 /// Fill `buf`, re-checking an absolute deadline before and after every blocking
@@ -685,15 +701,22 @@ fn read_frame_into<T: Read>(
     } else {
         None
     };
-    payload.resize(payload_len, 0);
-    read_exact(io, &mut payload, deadline)?;
+    // Shrinking a frame must not discard the initialized high-water mark:
+    // otherwise every large/small alternation zero-fills that storage again.
+    // The exact validated prefix is filled before it is ever made observable.
+    if payload.len() < payload_len {
+        payload.resize(payload_len, 0);
+    }
+    let current = &mut payload[..payload_len];
+    read_exact(io, current, deadline)?;
     if let Some(mask) = mask {
-        unmask_payload(&mut payload, mask);
+        unmask_payload(current, mask);
     }
     Ok(RawFrame {
         fin,
         opcode,
         payload,
+        len: payload_len,
     })
 }
 
@@ -1472,7 +1495,7 @@ mod tests {
         )
         .expect("valid masked pong frame");
         assert_eq!(pong.opcode, OpCode::Pong);
-        assert_eq!(pong.payload, b"hi");
+        assert_eq!(pong.payload(), b"hi");
     }
 
     #[test]
@@ -1483,7 +1506,7 @@ mod tests {
         assert_eq!(stream.read(&mut out).expect("eof"), 0);
         let echoed = inbound_frame(&stream.io.output);
         assert_eq!(echoed.opcode, OpCode::Close);
-        assert_eq!(echoed.payload, [0x03, 0xe8]);
+        assert_eq!(echoed.payload(), [0x03, 0xe8]);
     }
 
     #[test]

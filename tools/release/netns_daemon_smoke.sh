@@ -4,9 +4,10 @@
 #   2. Two isolated Linux network namespaces (`boreas-core-ns`, `boreas-edge-ns`)
 #      connected by a veth pair (`192.0.2.1/24` <-> `192.0.2.2/24`)
 #   3. Real `/dev/net/tun` interfaces (`btun0`, `10.20.1.1/32` <-> `10.20.1.2/32`)
-#   4. Real `boreas daemon serve` + `boreas daemon connect` over outer TLS 1.3 +
-#      WSS + pq768 (`X25519MLKEM768` + `ML-DSA-65`) inner mTLS + `RelayCircuit` +
-#      pq768 E2E mTLS + `PacketPath`
+#   4. Real `boreas daemon serve` + `boreas daemon connect`: outer TLS 1.3 +
+#      WSS by default, or direct TCP when BOREAS_NETNS_TRANSPORT=direct, then
+#      authenticated PQ-WG hop and E2E circuits + `PacketPath`
+#      (the candidate's PQ-WG protocol is not inner TLS/mTLS).
 #   5. Real kernel ICMP latency and an 8 MiB integrity/throughput probe across
 #      the overlay + `boreas ctl status` packet counters with `0% packet loss`.
 #      These are loopback-veth development measurements, not public-path SLA.
@@ -27,6 +28,12 @@ set -euo pipefail
 BIN="${1:?usage: netns_daemon_smoke.sh <path-to-boreas-binary>}"
 BIN="$(realpath "$BIN")"
 PERF_SCRIPT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/netns_overlay_perf.py")"
+# Transport is explicit on both daemons; credential presence never selects it.
+TRANSPORT="${BOREAS_NETNS_TRANSPORT:-wss}"
+case "$TRANSPORT" in
+  wss|direct) ;;
+  *) echo 'ERROR: BOREAS_NETNS_TRANSPORT must be wss or direct' >&2; exit 1 ;;
+esac
 TUN_MTU="${BOREAS_TUN_MTU:-1360}"
 TUN_GSO_ARGS=()
 WAN_TUNED="${BOREAS_NETNS_WAN_TUNED:-0}"
@@ -75,6 +82,9 @@ case "$DNS_REPLICAS" in
 esac
 if [[ "$PUBLIC_DNS" != 0 && "$DNS_REPLICAS" != 0 ]]; then
   echo "ERROR: public forwarding and DNS replicas are separate fixtures" >&2; exit 1
+fi
+if [[ "$DNS_REPLICAS" != 0 && "$TRANSPORT" != wss ]]; then
+  echo 'ERROR: DNS replica security cases require WSS and its outer TLS credentials' >&2; exit 1
 fi
 if [[ "$ACTIVE_LANES" != 0 && ( "$PRIVATE_DNS" != 0 || ${#TUN_GSO_ARGS[@]} != 0 ||
     "${BOREAS_NETNS_MULTISTREAM:-0}" != 0 || -n "${BOREAS_NETEM_RTT_MS:-}" ||
@@ -850,12 +860,15 @@ if [[ "$PUBLIC_DNS" != 0 ]]; then
   EDGE_DNS_ARGS+=(--public-dns-client)
 fi
 
+# The test CA lasts 30 days; avoid the 720-hour node default extending past
+# its issuer because these nodes are issued after the CA.
 "$BIN" pki issue-node \
   --ca-dir "$CA_DIR" \
   --out-dir "$CORE_MAT" \
   --role core \
   --home-core 1 \
   --vip-octet 1 \
+  --validity-hours 12 \
   --outer-san "wss.boreas.test"
 
 "$BIN" pki issue-node \
@@ -863,13 +876,21 @@ fi
   --out-dir "$EDGE_MAT" \
   --role edge \
   --home-core 1 \
-  --vip-octet 2
+  --vip-octet 2 \
+  --validity-hours 12
 
 cp "$CORE_MAT/local.signed" "$EDGE_MAT/peer.signed"
 cp "$EDGE_MAT/local.signed" "$CORE_MAT/peer.signed"
 
 "$BIN" pki verify-bundle --material-dir "$CORE_MAT" --require-peer
 "$BIN" pki verify-bundle --material-dir "$EDGE_MAT" --require-peer
+
+# Keep credentials in both profiles: explicit direct must not accidentally use
+# WSS merely because outer credentials are present. WSS requires these inputs.
+test -s "$CORE_MAT/outer.pem"
+test -s "$CORE_MAT/outer.key"
+test -s "$EDGE_MAT/outer-ca.pem"
+printf 'smoke_transport=%s\n' "$TRANSPORT"
 
 cat > "$WORK/core.toml" <<EOF
 version = 2
@@ -1065,6 +1086,7 @@ start_underlay_telemetry_samplers
 # Start Core daemon inside CORE_NS (creates real /dev/net/tun `btun0`).
 mono_ms CORE_LAUNCH_MS || CORE_LAUNCH_MS=''
 run_node "$CORE_NS" "$BIN" daemon serve \
+  --transport "$TRANSPORT" \
   --config "$WORK/core.toml" \
   --material-dir "$CORE_MAT" \
   --status-state-file "$CORE_STATE/status.state" \
@@ -1116,6 +1138,7 @@ ip netns exec "$CORE_NS" ip route add 10.20.1.2/32 dev btun0
 # Start Edge daemon inside EDGE_NS (creates real /dev/net/tun `btun0` and dials 192.0.2.1:8443).
 mono_ms EDGE_LAUNCH_MS || EDGE_LAUNCH_MS=''
 run_node "$EDGE_NS" "$BIN" daemon connect \
+  --transport "$TRANSPORT" \
   --config "$WORK/edge.toml" \
   --material-dir "$EDGE_MAT" \
   --status-state-file "$EDGE_STATE/status.state" \

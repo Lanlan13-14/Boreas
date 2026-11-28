@@ -17,9 +17,9 @@ Boreas 可以把分散在不同網路的主機連成私人 IP 網路。最簡單
 
 ## TCP 直連和 WebSocket 有什麼關係？
 
-**預設入口是裸 TCP 直連：TCP 上直接承載 WireGuard 風格的無 TLS 後量子加密通道（ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305），沒有 TLS，也沒有 WebSocket。** 身分認證靠預先配置的簽章身分裡的 ML-DSA 公鑰，不靠憑證。
+**實驗分支的直連設計**：TCP 直接承載自訂、無 TLS 的加密通道，握手使用 X25519 + ML-KEM-768 和 ML-DSA-65，資料使用 AES-256-GCM。此協定借鑑 WireGuard 的設計思路，但不是 WireGuard 協定，也不與其相容；實作和安全性仍待完整測試及獨立稽核。身分認證依賴預先驗證的簽章身分中的 ML-DSA 公鑰。
 
-**WSS 只在需要時啟用。** 當材料目錄裡存在 `outer-ca.pem`（用戶端）和 `outer.pem`/`outer.key`（伺服端）時，同一條後量子通道改由 TLS 1.3 上的 WebSocket 承載。`outer-ca.pem` 可以是自建 CA，也可以是簽發伺服器憑證的公共 CA 根或中繼憑證：用戶端在它之外還信任系統自帶的公共 CA 根，因此由公共信任 CA 簽發的憑證不需要像自建憑證那樣把 CA 分發到每一端。
+**WSS 外層憑證的已知限制：** 目前雙機用戶端依 `outer-ca.pem` 是否存在選擇 WSS；沒有此檔案時會選擇直連，即使伺服器使用公共 CA 憑證亦然。因此目前尚未達成「使用公共 CA 時用戶端不需 CA 檔案」的目標。WSS 伺服端使用 `outer.pem`/`outer.key`；憑證驗證和公共 CA 信任路徑仍待修正及測試。
 
 - `--connect` 指定 Edge 能連上的 Core `IP:連接埠`，不是隧道 IP。
 - WSS 模式下 `--tls-name` 填寫憑證上的名稱；`--ws-host` 和 `--ws-path` 分別指定 WebSocket 請求的 Host 與路徑。直連模式忽略這三項。

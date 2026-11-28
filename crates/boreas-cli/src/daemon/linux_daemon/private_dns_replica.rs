@@ -7,10 +7,10 @@ use boreas_pki::{VerifiedNetworkContext, management::ManagementTrust};
 use boreas_tunnel::{dns_replica::{self, Side}, e2e::open_e2e_until};
 
 use super::{
-    AuthenticatedPeer, ClientTarget, HANDSHAKE_TIMEOUT, LinkClient, LiveCounters,
+    AuthenticatedPeer, ClientTarget, HANDSHAKE_TIMEOUT, LiveCounters,
     PATH_BACKUP, PATH_PRIMARY, PathStop, PeerIdentity, PinnedDns, PkiIdentityExtractor,
     Policy, PolicyWindow, PqWgE2eBackend, PqWgIdentity, PqWgInnerConnector, SessionPolicy,
-    StatusStore, TunEndpoint, VerifiedNodeIdentity, bound_path_io, direct_outer_connector,
+    StatusStore, TunEndpoint, VerifiedNodeIdentity, bound_path_io,
     drive_business_path, duplicate_e2e_socket, lock_mutex, may_try_backup, now_utc_us,
     print_path_summary, revocation_slots, status_gate,
     check_identity_revocations,
@@ -104,6 +104,7 @@ pub(super) struct Epoch {
 pub(super) struct Run<'a> {
     pub(super) sources: &'a Sources,
     pub(super) mat_dir: &'a Path,
+    pub(super) transport: crate::node::OuterTransport,
     pub(super) status_path: &'a Path,
     pub(super) policy_window: PolicyWindow,
     pub(super) store: Arc<Mutex<StatusStore>>,
@@ -168,11 +169,7 @@ pub(super) fn run(run: Run<'_>) -> Result<(), String> {
         run.extractor.clone(),
     )
     .map_err(|_| "daemon: private DNS pq-wg inner connector setup failed".to_string())?;
-    let client = if run.mat_dir.join("outer-ca.pem").exists() {
-        LinkClient::new(Box::new(direct_outer_connector(run.mat_dir)?), Box::new(inner))
-    } else {
-        LinkClient::new_direct(Box::new(inner))
-    };
+    let client = run.transport.link_client(run.mat_dir, Box::new(inner))?;
     let mut ordinal = 0;
     let mut packets_before = 0u64;
     let deadline = run.max_seconds.map(|seconds| {

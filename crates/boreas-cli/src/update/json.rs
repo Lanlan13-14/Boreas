@@ -5,34 +5,42 @@ use std::collections::BTreeMap;
 use super::Issue;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Value {
+pub(crate) enum Value {
     Null,
     Bool(bool),
     One,
-    Number,
+    Number(String),
     String(String),
     Array(Vec<Self>),
     Object(BTreeMap<String, Self>),
 }
 
 impl Value {
-    pub(super) fn get(&self, key: &str) -> Result<&Self, Issue> {
+    pub(crate) fn get(&self, key: &str) -> Result<&Self, Issue> {
         match self {
             Self::Object(fields) => fields.get(key).ok_or(Issue::Invalid),
             _ => Err(Issue::Invalid),
         }
     }
 
-    pub(super) fn boolean(&self) -> Option<bool> {
+    pub(crate) fn boolean(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(super) fn string(&self) -> Option<&str> {
+    pub(crate) fn string(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unsigned(&self) -> Option<u64> {
+        match self {
+            Self::One => Some(1),
+            Self::Number(raw) if raw.bytes().all(|b| b.is_ascii_digit()) => raw.parse().ok(),
             _ => None,
         }
     }
@@ -42,7 +50,7 @@ pub(super) const MAX_BYTES: usize = 1024 * 1024;
 const MAX_NODES: usize = 32_768;
 const MAX_DEPTH: usize = 32;
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Value, Issue> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<Value, Issue> {
     if bytes.len() > MAX_BYTES {
         return Err(Issue::TooLarge);
     }
@@ -176,7 +184,8 @@ impl Parser<'_> {
         Ok(if &start[..start.len() - self.rest.len()] == b"1" {
             Value::One
         } else {
-            Value::Number
+            Value::Number(std::str::from_utf8(&start[..start.len() - self.rest.len()])
+                .map_err(|_| Issue::Invalid)?.to_string())
         })
     }
 

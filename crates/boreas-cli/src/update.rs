@@ -1,7 +1,7 @@
 //! Advisory and signed discovery, plus explicit operator-only updates. The
 //! installed offline helper remains the only CLI path to service admission.
 
-mod json;
+pub(crate) mod json;
 mod offline;
 #[cfg(all(target_os = "linux", feature = "openssl-inner-tls"))]
 mod signed;
@@ -77,7 +77,7 @@ impl Source {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Issue {
+pub(crate) enum Issue {
     NoCurl,
     Timeout,
     Connect,

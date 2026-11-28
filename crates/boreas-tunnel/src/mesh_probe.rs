@@ -352,7 +352,7 @@ impl<'a> MeshProbe<'a> {
         let pq_identity = PqWgIdentity::from_private_key_pem(&pem.private_key_pem)
             .map_err(|_| Error::Identity)?;
         if extractor(&local)?
-            .resolve_spki_hash(&pq_identity.public_spki_hash())
+            .resolve_spki_hash(pq_identity.spki_hash())
             .map(|(spki, peer)| spki == pq_identity.public_spki() && peer == local.peer())
             != Some(true)
         {

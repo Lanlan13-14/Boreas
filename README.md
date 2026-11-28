@@ -17,9 +17,9 @@ Boreas 把分散在不同网络里的主机连成一个私有 IP 网络。最简
 
 ## TCP 直连和 WebSocket 是什么关系？
 
-**默认入口是裸 TCP 直连：TCP 上直接承载 WireGuard 风格的无 TLS 后量子加密通道（ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305），没有 TLS，也没有 WebSocket。** 身份认证靠预配的签名身份里的 ML-DSA 公钥，不靠证书。
+**实验分支的直连设计**：TCP 直接承载自定义、无 TLS 的加密通道，握手使用 X25519 + ML-KEM-768 和 ML-DSA-65，数据使用 AES-256-GCM。该协议借鉴 WireGuard 的设计思路，但不是 WireGuard 协议，也不与其兼容；实现和安全性尚待完整测试及独立审计。身份认证依赖预先验证的签名身份中的 ML-DSA 公钥。
 
-**WSS 只在需要时启用。** 当材料目录里存在 `outer-ca.pem`（客户端）和 `outer.pem`/`outer.key`（服务端）时，同一条后量子通道改由 TLS 1.3 上的 WebSocket 承载。`outer-ca.pem` 既可以是自建 CA，也可以是签发服务器证书的公共 CA 根或中间证书：客户端在它之外还信任系统自带的公共 CA 根，因此由公共信任 CA 签发的证书不需要像自建证书那样把 CA 分发到每一端。
+**WSS 外层证书的已知限制：** 当前双机客户端通过 `outer-ca.pem` 是否存在来选择 WSS；没有这个文件时会选择直连，即使服务器使用公共 CA 证书也是如此。因此当前实现尚未满足“使用公共 CA 时客户端无需 CA 文件”的目标。服务端 WSS 使用 `outer.pem`/`outer.key`；证书验证与公开 CA 信任路径需要后续修复和测试。
 
 - `--connect` 填 Core 可达的底层 `IP:端口`，不是隧道 IP。
 - WSS 模式下 `--tls-name` 填证书上的名称；`--ws-host` 和 `--ws-path` 分别设定 WebSocket 请求的 Host 和路径。直连模式忽略这三项。

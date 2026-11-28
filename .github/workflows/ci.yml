@@ -2,7 +2,7 @@ name: 'Quick checks / Rust tests, lint and release tools'
 
 on:
   push:
-    branches: [main, 'work/v111-handoff']
+    branches: [main, 'work/v111-handoff', 'feat/pq-wg-transport']
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'

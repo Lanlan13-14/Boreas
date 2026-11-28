@@ -45,6 +45,7 @@ pub fn run_daemon_command(args: &[String]) -> Result<(), String> {
 
 pub fn daemon_usage() -> &'static str {
     "Usage:
+  Outer transport: --transport <wss|direct> (default: wss on both ends). WSS uses OpenSSL default roots plus optional outer-ca.pem; direct has no outer TLS/WebSocket. No automatic downgrade.
   boreas daemon serve --config <FILE> --material-dir <DIR> --listen <IP:PORT> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
   boreas daemon connect --config <FILE> --material-dir <DIR> --status-state-file <ABS> --status-state-owner-uid <UID> --network-policy-tbs <FILE> --network-policy-ed25519-signature <FILE> --network-policy-mldsa65-signature <FILE> --network-root-ed25519-der <FILE> --network-root-mldsa65-der <FILE> --network-policy-state-file <ABS> --network-policy-state-owner-uid <UID> [--connect <IP:PORT>] [--tls-name <DNS>] [--ws-host <HOST:PORT>] [--ws-path </tunnel>] [--tun-name <NAME>] [--mtu <1280..1400>] [--max-packets <N>] [--max-seconds <N>] [--tun-tcpv4-gso | --virtual-tun]
   Direct IPv4 pool cutover (both roles): --pool-cutover <APPROVAL> --pool-cutover-action <check|commit|resume>.
@@ -63,6 +64,8 @@ pub fn daemon_usage() -> &'static str {
 }
 
 /// Query an active daemon control socket and parse a live [`StatusSnapshot`].
+/// The path owner check is not server authentication; a same-UID or path-race
+/// adversary can impersonate the endpoint. Treat status as operational data.
 /// Never invents state: any connection, permission, or parse error returns `Err`.
 #[cfg(unix)]
 pub fn query_control_socket(sock_path: &Path) -> Result<(StatusSnapshot, String), String> {
@@ -90,14 +93,14 @@ pub fn query_control_socket(sock_path: &Path) -> Result<(StatusSnapshot, String)
         .map_err(|_| "control socket flush failed".to_string())?;
 
     let mut line = String::new();
-    let mut reader = BufReader::new(stream.take(4096));
+    let mut reader = BufReader::new(stream.take(4097));
     reader
         .read_line(&mut line)
         .map_err(|_| "control socket read failed".to_string())?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() || !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+    if line.len() > 4096 || !line.ends_with('\n') {
         return Err("malformed control socket response".to_string());
     }
+    let trimmed = line.trim();
     let snap = parse_live_snapshot_json(trimmed)?;
     Ok((snap, trimmed.to_string()))
 }
@@ -109,19 +112,27 @@ pub fn query_control_socket(_sock_path: &Path) -> Result<(StatusSnapshot, String
 
 #[cfg(unix)]
 fn parse_live_snapshot_json(raw: &str) -> Result<StatusSnapshot, String> {
-    let node_name = json_str_field(raw, "node").unwrap_or_else(|| "(live)".to_string());
-    let version =
-        json_str_field(raw, "version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let mode_str =
-        json_str_field(raw, "security_mode").unwrap_or_else(|| "e2e-required".to_string());
-    let security_mode = match mode_str.as_str() {
-        "hop-only" => RenderSecurityMode::HopOnly,
-        _ => RenderSecurityMode::E2eRequired,
+    use crate::update::json;
+
+    // No inferred/default security or counts: a malformed or incompatible
+    // response is an unavailable snapshot, never an E2E assertion.
+    let invalid = || "malformed control socket response".to_string();
+    let root = json::parse(raw.as_bytes()).map_err(|_| invalid())?;
+    let field = |name| root.get(name).map_err(|_| invalid());
+    if field("command")?.string() != Some("ctl.status") {
+        return Err(invalid());
+    }
+    let node_name = field("node")?.string().ok_or_else(invalid)?.to_string();
+    let version = field("version")?.string().ok_or_else(invalid)?.to_string();
+    let security_mode = match field("security_mode")?.string() {
+        Some("hop-only") => RenderSecurityMode::HopOnly,
+        Some("e2e-required") => RenderSecurityMode::E2eRequired,
+        _ => return Err(invalid()),
     };
-    let inbound_on = json_bool_field(raw, "inbound_on").unwrap_or(false);
-    let inbound_connections = json_u64_field(raw, "inbound_connections").unwrap_or(0);
-    let outbound_upstreams = json_u64_field(raw, "outbound_upstreams").unwrap_or(0);
-    let connected = json_bool_field(raw, "daemon_connected").unwrap_or(false);
+    let inbound_on = field("inbound_on")?.boolean().ok_or_else(invalid)?;
+    let inbound_connections = field("inbound_connections")?.unsigned().ok_or_else(invalid)?;
+    let outbound_upstreams = field("outbound_upstreams")?.unsigned().ok_or_else(invalid)?;
+    let connected = field("daemon_connected")?.boolean().ok_or_else(invalid)?;
 
     Ok(StatusSnapshot {
         node_name,
@@ -138,36 +149,87 @@ fn parse_live_snapshot_json(raw: &str) -> Result<StatusSnapshot, String> {
     })
 }
 
+/// Packet-path byte counters reported by the control socket, if both are
+/// present and valid. Absence is unknown, never a zero traffic claim.
 #[cfg(unix)]
-fn json_str_field(raw: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = raw.find(&needle)? + needle.len();
-    let rest = &raw[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+pub fn control_byte_counters(raw: &str) -> Option<(u64, u64)> {
+    let root = crate::update::json::parse(raw.as_bytes()).ok()?;
+    Some((root.get("tx_bytes").ok()?.unsigned()?, root.get("rx_bytes").ok()?.unsigned()?))
 }
 
-#[cfg(unix)]
-fn json_bool_field(raw: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\":");
-    let start = raw.find(&needle)? + needle.len();
-    let rest = raw[start..].trim_start();
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
+#[cfg(not(unix))]
+pub fn control_byte_counters(_raw: &str) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod control_snapshot_tests {
+    use super::{parse_live_snapshot_json, RenderSecurityMode};
+
+    const VALID: &str = r#"{"command":"ctl.status","version":"0.1.0","node":"core-1","daemon_connected":true,"inbound_on":true,"inbound_connections":3,"outbound_upstreams":0,"security_mode":"hop-only"}"#;
+
+    #[test]
+    fn strict_status_preserves_reported_values_and_escaped_strings() {
+        let input = VALID.replace("core-1", r#"node\"quoted\u001b"#);
+        let snapshot = parse_live_snapshot_json(&input).unwrap();
+        assert_eq!(snapshot.node_name, "node\"quoted\u{1b}");
+        assert_eq!(snapshot.security_mode, RenderSecurityMode::HopOnly);
+        assert_eq!(snapshot.inbound_connections, 3);
+        assert_eq!(snapshot.outbound_upstreams, 0);
     }
-}
 
-#[cfg(unix)]
-fn json_u64_field(raw: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{key}\":");
-    let start = raw.find(&needle)? + needle.len();
-    let rest = raw[start..].trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u64>().ok()
+    #[test]
+    fn byte_counters_are_optional_and_never_fabricated() {
+        let live = VALID.replace("\"security_mode\":\"hop-only\"", "\"security_mode\":\"hop-only\",\"tx_bytes\":123,\"rx_bytes\":456");
+        assert_eq!(super::control_byte_counters(&live), Some((123, 456)));
+        assert_eq!(super::control_byte_counters(VALID), None);
+        assert_eq!(super::control_byte_counters(&live.replace("\"rx_bytes\":456", "\"rx_bytes\":-1")), None);
+    }
+
+    #[test]
+    fn socket_rejects_unterminated_and_oversized_responses() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        for body in [VALID.to_string(), format!("{}\n", " ".repeat(4096))] {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::path::Path::new("/tmp").join(format!("bcs-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("s");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = String::new();
+                BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                assert_eq!(request, "STATUS\n");
+                stream.write_all(body.as_bytes()).unwrap();
+            });
+            let result = super::query_control_socket(&path);
+            server.join().unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_status_instead_of_inventing_e2e() {
+        for input in [
+            "{}".to_string(),
+            VALID.replace("hop-only", "unrecognized"),
+            VALID.replace(",\"security_mode\":\"hop-only\"", ""),
+            VALID.replace("\"inbound_connections\":3", "\"inbound_connections\":3.5"),
+            VALID.replace("\"inbound_connections\":3", "\"inbound_connections\":-1"),
+            VALID.replace("\"inbound_connections\":3", "\"inbound_connections\":18446744073709551616"),
+            VALID.replace("\"inbound_on\":true", "\"inbound_on\":truefalse"),
+            VALID.replace("\"security_mode\":\"hop-only\"", "\"security_mode\":\"hop-only\",\"security_mode\":\"e2e-required\""),
+            VALID.replace("ctl.status", "other"),
+            format!("{VALID} trailing"),
+        ] {
+            assert!(parse_live_snapshot_json(&input).is_err(), "{input}");
+        }
+    }
 }
 
 pub fn run_ctl_command(args: &[String]) -> Result<(), String> {
@@ -249,7 +311,8 @@ mod linux_daemon {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use boreas_crypto::Policy;
+    use boreas_crypto::{Policy, pq_wg::PqWgIdentity};
+    use crate::node::OuterTransport;
     use boreas_pki::{
         Authority,
         authority_revocation::AuthorityRevocationTrust,
@@ -270,7 +333,7 @@ mod linux_daemon {
         linux::{LinuxTunDevice, LinuxTunError, LinuxTunQueue, TunConfig},
     };
     use boreas_tunnel::{
-        ClientTarget, LinkClient, LinkServer, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
+        ClientTarget, LinkClient, LinkServer, OpenSslOuterTlsConnector,
         PeerIdentity, PeerIdentityExtractor, PkiIdentityExtractor, PqWgE2eBackend,
         PqWgInnerAcceptor, PqWgInnerConnector, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
@@ -1115,7 +1178,8 @@ mod linux_daemon {
         /// `close()`/`Drop` and its bounded join.
         target: ClientTarget,
         mat_dir: PathBuf,
-        key_path: PathBuf,
+        transport: OuterTransport,
+        pq_identity: PqWgIdentity,
         policy: SessionPolicy,
         expected_peer: PeerIdentity,
         extractor: Arc<PkiIdentityExtractor>,
@@ -1301,31 +1365,16 @@ mod linux_daemon {
             ))
         })?;
 
-        let outer_ca_path = config.mat_dir.join("outer-ca.pem");
-        let outer = if outer_ca_path.exists() {
-            let pem = fs::read(&outer_ca_path).map_err(|_| {
-                StandbyDialFailure::Protocol("standby: cannot read outer-ca.pem".to_string())
-            })?;
-            OpenSslOuterTlsConnector::with_web_pki_and_roots(&pem).map_err(|_| {
-                StandbyDialFailure::Protocol("standby: invalid outer-ca.pem".to_string())
-            })?
-        } else {
-            OpenSslOuterTlsConnector::web_pki().map_err(|_| {
-                StandbyDialFailure::Protocol("standby: web-PKI roots unavailable".to_string())
-            })?
-        };
-        let pq_identity = PqWgIdentity::from_private_key_file(&config.key_path).map_err(|_| {
-            StandbyDialFailure::Protocol("standby: pq-wg identity setup failed".to_string())
-        })?;
         let inner = PqWgInnerConnector::new(
-            pq_identity,
+            shared.config.pq_identity.clone(),
             Policy::production_default(),
             Arc::clone(&config.extractor) as Arc<dyn PeerIdentityExtractor>,
         )
         .map_err(|_| {
             StandbyDialFailure::Protocol("standby: pq-wg inner connector setup failed".to_string())
         })?;
-        let link = LinkClient::new(Box::new(outer), Box::new(inner));
+        let link = config.transport.link_client(&config.mat_dir, Box::new(inner))
+            .map_err(StandbyDialFailure::Protocol)?;
         let tcp = link
             .connect_tcp(&config.target, HANDSHAKE_TIMEOUT)
             .map_err(|_| StandbyDialFailure::Transport)?;
@@ -1887,6 +1936,7 @@ mod linux_daemon {
             boreas_supervisor::sandbox::install_daemon()
                 .map_err(|e| format!("daemon: service network isolation setup failed: {e}"))?;
         }
+        let mut transport = None;
         let mut config_path: Option<PathBuf> = None;
         let mut material_dir: Option<PathBuf> = None;
         let mut listen_spec: Option<String> = None;
@@ -1956,6 +2006,10 @@ mod linux_daemon {
                                 _ => return Err("daemon: invalid pool cutover action".into()),
                             });
                         }
+                        "--transport" if transport.is_none() => {
+                            transport = Some(OuterTransport::parse(val).map_err(|e| format!("daemon: {e}"))?);
+                        }
+                        "--transport" => return Err("daemon: duplicate --transport".into()),
                         "--config" => config_path = Some(PathBuf::from(val)),
                         "--material-dir" => material_dir = Some(PathBuf::from(val)),
                         "--status-state-file" => {
@@ -2036,6 +2090,7 @@ mod linux_daemon {
             }
         }
 
+        let transport = transport.unwrap_or(OuterTransport::Wss);
         let plan = match (pool_approval, pool_action) {
             (None, None) => None,
             (Some(text), Some(action)) => Some(pool_cutover::Plan::parse(text, action)?),
@@ -2376,6 +2431,16 @@ mod linux_daemon {
             PqWgE2eBackend::new(pq_identity.clone(), tls_policy, extractor.clone())
                 .map_err(|_| "daemon: pq-wg E2E backend setup failed".to_string())?;
 
+        // Validate transport credentials before opening a TUN/control socket or
+        // committing offline cutover state. The actual listener/client is built
+        // again at use; a later missing/invalid file still fails closed.
+        if mode == Mode::Serve {
+            crate::node::outer_acceptor(&mat_dir, transport)
+                .map_err(|e| format!("daemon serve: {e}"))?;
+        } else if transport == OuterTransport::Wss {
+            direct_outer_connector(&mat_dir)?;
+        }
+
         // Offline admission and both durable locks precede any TUN, control
         // socket, bind or dial. Only Resume may proceed past this boundary.
         let canonical_state_dir = fs::canonicalize(&config.paths.state_dir)
@@ -2392,17 +2457,6 @@ mod linux_daemon {
         let status_path = mat_dir.join("status.signed");
         let cutover = plan.as_ref().zip(bound.as_ref());
         let mut status_store = if let Some((plan, bound)) = cutover {
-            if mode == Mode::Serve {
-                if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
-                    OpenSslOuterTlsAcceptor::from_pem_files(
-                        mat_dir.join("outer.pem"),
-                        mat_dir.join("outer.key"),
-                    )
-                    .map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?;
-                }
-            } else if mat_dir.join("outer-ca.pem").exists() {
-                direct_outer_connector(&mat_dir)?;
-            }
             if plan.action == CutoverAction::Resume {
                 // Reject a partial policy transaction before processing the
                 // status mailbox on Resume; recheck the actual sequence below.
@@ -2552,14 +2606,8 @@ mod linux_daemon {
             let endpoint = match mode {
                 Mode::Serve => {
                     let spec = listen_spec.ok_or("daemon serve: `--listen` is required")?;
-                    let outer = if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
-                        Some(OpenSslOuterTlsAcceptor::from_pem_files(
-                            mat_dir.join("outer.pem"),
-                            mat_dir.join("outer.key"),
-                        ).map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?)
-                    } else {
-                        None
-                    };
+                    let outer = crate::node::outer_acceptor(&mat_dir, transport)
+                        .map_err(|e| format!("daemon serve: {e}"))?;
                     let listener = TcpListener::bind(resolve_addr(&spec)?)
                         .map_err(|e| format!("daemon serve: cannot bind TCP listener: {e}"))?;
                     listener
@@ -2596,14 +2644,7 @@ mod linux_daemon {
                         extractor,
                     )
                     .map_err(|_| "daemon connect: pq-wg inner connector setup failed")?;
-                    let client = if mat_dir.join("outer-ca.pem").exists() {
-                        LinkClient::new(
-                            Box::new(direct_outer_connector(&mat_dir)?),
-                            Box::new(inner),
-                        )
-                    } else {
-                        LinkClient::new_direct(Box::new(inner))
-                    };
+                    let client = transport.link_client(&mat_dir, Box::new(inner))?;
                     multi_active::Endpoint::Edge(client, target)
                 }
             };
@@ -2625,11 +2666,12 @@ mod linux_daemon {
             return private_dns_replica::run(private_dns_replica::Run {
                 sources,
                 mat_dir: &mat_dir,
+                transport,
                 status_path: &status_path,
                 policy_window,
                 store: status_store,
                 extractor,
-                connector: inner_conn,
+                pq_identity,
                 backend: e2e_backend,
                 policy: session_policy,
                 tun: &tun_endpoint,
@@ -2644,6 +2686,7 @@ mod linux_daemon {
             Mode::Serve => run_serve_loop(
                 listen_spec.ok_or_else(|| "daemon serve: `--listen` is required".to_string())?,
                 &mat_dir,
+                transport,
                 &status_path,
                 policy_window,
                 status_store,
@@ -2677,12 +2720,13 @@ mod linux_daemon {
                     ws_host.as_deref(),
                     &ws_path,
                     &mat_dir,
-                    &config.identity.private_key,
+                    transport,
                     extractor,
                     &status_path,
                     policy_window,
                     status_store,
-                    inner_conn,
+                    pq_identity,
+                    tls_policy,
                     e2e_backend,
                     session_policy,
                     remote_peer,
@@ -3071,6 +3115,7 @@ mod linux_daemon {
     fn run_serve_loop(
         listen_spec: String,
         mat_dir: &Path,
+        transport: OuterTransport,
         status_path: &Path,
         policy_window: PolicyWindow,
         status_store: Arc<Mutex<StatusStore>>,
@@ -3095,14 +3140,8 @@ mod linux_daemon {
         } else {
             resolve_addr(&listen_spec)?
         };
-        let outer_acc = if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
-            Some(OpenSslOuterTlsAcceptor::from_pem_files(
-                mat_dir.join("outer.pem"),
-                mat_dir.join("outer.key"),
-            ).map_err(|_| "daemon serve: outer.pem/outer.key setup failed".to_string())?)
-        } else {
-            None
-        };
+        let outer_acc = crate::node::outer_acceptor(mat_dir, transport)
+            .map_err(|e| format!("daemon serve: {e}"))?;
         let listener = TcpListener::bind(listen_addr)
             .map_err(|_| "daemon serve: cannot bind TCP listener".to_string())?;
         listener
@@ -3301,16 +3340,7 @@ mod linux_daemon {
     }
 
     fn direct_outer_connector(mat_dir: &Path) -> Result<OpenSslOuterTlsConnector, String> {
-        let outer_ca_path = mat_dir.join("outer-ca.pem");
-        if outer_ca_path.exists() {
-            let pem = fs::read(&outer_ca_path)
-                .map_err(|_| "daemon connect: cannot read outer-ca.pem".to_string())?;
-            OpenSslOuterTlsConnector::with_root_certificates(&pem)
-                .map_err(|_| "daemon connect: invalid outer-ca.pem".to_string())
-        } else {
-            OpenSslOuterTlsConnector::web_pki()
-                .map_err(|_| "daemon connect: web-PKI roots unavailable".to_string())
-        }
+        crate::node::outer_connector(mat_dir).map_err(|e| format!("daemon connect: {e}"))
     }
 
     /// Connect, then keep business on one authenticated circuit at a time.
@@ -3343,7 +3373,7 @@ mod linux_daemon {
         ws_host_override: Option<&str>,
         ws_path: &str,
         mat_dir: &Path,
-        key_path: &Path,
+        transport: OuterTransport,
         extractor: Arc<PkiIdentityExtractor>,
         status_path: &Path,
         policy_window: PolicyWindow,
@@ -3364,20 +3394,12 @@ mod linux_daemon {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
         let budget = Arc::new(ConnectionBudget::new());
         let inner_connector = PqWgInnerConnector::new(
-            pq_identity,
+            pq_identity.clone(),
             tls_policy,
             Arc::clone(&extractor) as Arc<dyn PeerIdentityExtractor>,
         )
         .map_err(|_| "daemon connect: pq-wg inner connector setup failed".to_string())?;
-        let wss = mat_dir.join("outer-ca.pem").exists();
-        let link_client = if wss {
-            LinkClient::new(
-                Box::new(direct_outer_connector(mat_dir)?),
-                Box::new(inner_connector),
-            )
-        } else {
-            LinkClient::new_direct(Box::new(inner_connector))
-        };
+        let link_client = transport.link_client(mat_dir, Box::new(inner_connector))?;
         let endpoints = connect_endpoints(primary_spec, backup_spec);
         let mut link: Option<(usize, HopLink)> = None;
         for (index, endpoint) in endpoints.iter().enumerate() {
@@ -3469,7 +3491,8 @@ mod linux_daemon {
                     endpoint: endpoint.to_string(),
                     target,
                     mat_dir: mat_dir.to_path_buf(),
-                    key_path: key_path.to_path_buf(),
+                    transport,
+                    pq_identity: pq_identity.clone(),
                     policy: session_policy.clone(),
                     expected_peer: remote_peer,
                     extractor: Arc::clone(&extractor),

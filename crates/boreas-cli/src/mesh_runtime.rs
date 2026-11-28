@@ -603,7 +603,7 @@ mod linux {
         });
         let outer_roots = optional(&dir.join("outer-ca.pem"), MAX_PEM)?;
         let outer = || match &outer_roots {
-            Some(pem) => OpenSslOuterTlsConnector::with_root_certificates(pem),
+            Some(pem) => OpenSslOuterTlsConnector::with_web_pki_and_roots(pem),
             None => OpenSslOuterTlsConnector::web_pki(),
         };
         let mut directory_listeners = Vec::new();

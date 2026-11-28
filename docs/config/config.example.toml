@@ -11,14 +11,12 @@
 # start a daemon, open a socket, read the private-key or trust-anchor contents,
 # resolve an endpoint, authenticate a peer, or establish a session.
 #
-# Transport (material directory, not this file): the hop and E2E channels are
-# always the WireGuard-style TLS-less post-quantum handshake (ML-KEM-768 +
-# ML-DSA-65 + ChaCha20-Poly1305). Direct mode carries it on plain TCP and needs
-# no outer certificate. WSS mode is selected only when the material directory
-# contains outer-ca.pem (client) and outer.pem/outer.key (server); the client
-# trusts the platform web-PKI roots in addition to outer-ca.pem, so a
-# certificate issued by a publicly trusted CA verifies without distributing
-# that CA to every client.
+# Transport (experimental): the hop and E2E channels use a custom TLS-less
+# X25519 + ML-KEM-768 / ML-DSA-65 handshake and AES-256-GCM. Direct mode
+# carries it over TCP. Currently, the two-node client selects WSS only when
+# outer-ca.pem exists, and the server selects WSS when outer.pem and outer.key
+# both exist. Public-CA WSS without a client CA file is not yet supported in
+# this entry point. The construction and its security are not yet validated.
 
 version = 2
 

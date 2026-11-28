@@ -53,6 +53,8 @@ pub enum IdentitySignature {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Aead {
+    /// AES-256-GCM. The SHA-384 suffix identifies the TLS 1.3 ciphersuite;
+    /// in PQ-WG this denotes only AES-256-GCM (its KDF is HKDF-SHA256).
     Aes256GcmSha384,
     ChaCha20Poly1305Sha256,
     Other,
@@ -171,11 +173,11 @@ impl Policy {
             return Err(PolicyError::WrongTlsVersion);
         }
         let (group, signature) = match self.suite {
-            Suite::Pq768 => (HybridGroup::X25519MlKem768, IdentitySignature::MlDsa65),
-            Suite::Pq1024 if self.allow_pq1024 => {
-                (HybridGroup::SecP384r1MlKem1024, IdentitySignature::MlDsa87)
+            Suite::Pq768 if !self.allow_pq1024 => {
+                (HybridGroup::X25519MlKem768, IdentitySignature::MlDsa65)
             }
-            Suite::Pq1024 => return Err(PolicyError::Pq1024NotEnabled),
+            Suite::Pq1024 if !self.allow_pq1024 => return Err(PolicyError::Pq1024NotEnabled),
+            _ => return Err(PolicyError::BackendUnavailable),
         };
         if negotiated.group != group {
             return Err(PolicyError::HybridGroupRequired);
@@ -183,10 +185,7 @@ impl Policy {
         if negotiated.peer_signature != signature {
             return Err(PolicyError::WrongMlDsaAlgorithm);
         }
-        if !matches!(
-            negotiated.aead,
-            Aead::Aes256GcmSha384 | Aead::ChaCha20Poly1305Sha256
-        ) {
+        if negotiated.aead != Aead::Aes256GcmSha384 {
             return Err(PolicyError::AeadNotAllowed);
         }
         if negotiated.resumed {
@@ -430,12 +429,22 @@ mod tests {
         let valid = PqWgParameters {
             group: HybridGroup::X25519MlKem768,
             peer_signature: IdentitySignature::MlDsa65,
-            aead: Aead::ChaCha20Poly1305Sha256,
+            aead: Aead::Aes256GcmSha384,
             resumed: false,
             zero_rtt: false,
             tls_free: true,
         };
         assert_eq!(p.validate_pq_wg(valid), Ok(()));
+        for policy in [
+            Policy { suite: Suite::Pq1024, allow_pq1024: true },
+            Policy { suite: Suite::Pq768, allow_pq1024: true },
+        ] {
+            assert_eq!(policy.validate_pq_wg(valid), Err(PolicyError::BackendUnavailable));
+        }
+        assert_eq!(
+            Policy { suite: Suite::Pq1024, allow_pq1024: false }.validate_pq_wg(valid),
+            Err(PolicyError::Pq1024NotEnabled)
+        );
         assert_eq!(
             p.validate_pq_wg(PqWgParameters {
                 tls_free: false,
@@ -457,12 +466,19 @@ mod tests {
             }),
             Err(PolicyError::WrongMlDsaAlgorithm)
         );
+        for aead in [Aead::ChaCha20Poly1305Sha256, Aead::Other] {
+            assert_eq!(
+                p.validate_pq_wg(PqWgParameters { aead, ..valid }),
+                Err(PolicyError::AeadNotAllowed)
+            );
+        }
         assert_eq!(
-            p.validate_pq_wg(PqWgParameters {
-                aead: Aead::Other,
-                ..valid
-            }),
-            Err(PolicyError::AeadNotAllowed)
+            p.validate_pq_wg(PqWgParameters { resumed: true, ..valid }),
+            Err(PolicyError::ResumptionForbidden)
+        );
+        assert_eq!(
+            p.validate_pq_wg(PqWgParameters { zero_rtt: true, ..valid }),
+            Err(PolicyError::ZeroRttForbidden)
         );
     }
 }

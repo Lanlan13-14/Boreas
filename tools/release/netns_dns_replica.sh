@@ -25,7 +25,7 @@ replica_listener() {
 replica_start_core() {
   local ns="$1" tag="$2" label="$3" address="$4" vip="$5" budget="$6" objects="$7" pin="$8"
   local state="$WORK/$label-state" material="$WORK/$label-mat"
-  run_node "$ns" "$BIN" daemon serve --config "$WORK/$label.toml" --material-dir "$material" \
+  run_node "$ns" "$BIN" daemon serve --transport wss --config "$WORK/$label.toml" --material-dir "$material" \
     --status-state-file "$state/status.state" --status-state-owner-uid "$STATE_OWNER_UID" \
     --network-policy-tbs "$state/tbs.cbor" --network-policy-ed25519-signature "$state/ed25519.sig" \
     --network-policy-mldsa65-signature "$state/mldsa65.sig" --network-root-ed25519-der "$state/root-ed25519.der" \
@@ -42,7 +42,7 @@ replica_start_core() {
 
 replica_start_edge() {
   local tag="$1" tls="$2" objects="$3" pin="$4"
-  run_node "$EDGE_NS" "$BIN" daemon connect --config "$WORK/edge.toml" --material-dir "$EDGE_MAT" \
+  run_node "$EDGE_NS" "$BIN" daemon connect --transport wss --config "$WORK/edge.toml" --material-dir "$EDGE_MAT" \
     --status-state-file "$EDGE_STATE/status.state" --status-state-owner-uid "$STATE_OWNER_UID" \
     "${EDGE_POLICY_ARGS[@]}" --private-dns-only --private-dns-dir "$objects" --private-dns-pin "$pin" \
     --connect 192.0.2.1:8443 --tls-name "$tls" --ws-host wss.boreas.test:8443 \
@@ -113,7 +113,7 @@ dns_replica_matrix() {
   replica_new_pins
 
   "$BIN" pki issue-node --ca-dir "$CA_DIR" --out-dir "$BACKUP_MAT" \
-    --role core --home-core 2 --vip-octet 1 --outer-san wss.boreas.test
+    --role core --home-core 2 --vip-octet 1 --validity-hours 12 --outer-san wss.boreas.test
   cp -- "$EDGE_MAT/local.signed" "$BACKUP_MAT/peer.signed"
   "$BIN" pki verify-bundle --material-dir "$BACKUP_MAT" --require-peer
   mkdir -m 0700 "$WORK/backup-state"

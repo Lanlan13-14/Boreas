@@ -44,6 +44,12 @@ BOREAS_LISTEN=${BOREAS_LISTEN:-}
 BOREAS_CONNECT=${BOREAS_CONNECT:-}
 BOREAS_TLS_NAME=${BOREAS_TLS_NAME:-}
 BOREAS_WS_HOST=${BOREAS_WS_HOST:-}
+# Explicit selection; never infer transport from certificate file presence.
+BOREAS_TRANSPORT=${BOREAS_TRANSPORT:-wss}
+case "$BOREAS_TRANSPORT" in
+  wss|direct) : ;;
+  *) die "BOREAS_TRANSPORT must be wss or direct: $BOREAS_TRANSPORT" ;;
+esac
 
 # Canonical dotted-quad only: no leading zeros (inet_pton would read 010 as
 # octal, so accepting it would mean validating something other than what `ip`
@@ -193,7 +199,7 @@ case "$BOREAS_ROLE" in
       --network-root-ed25519-der "$ROOT_ED_DER" \
       --network-root-mldsa65-der "$ROOT_PQ_DER" \
       --network-policy-state-file "$STATE/policy.state" --network-policy-state-owner-uid 0 \
-      --listen "$BOREAS_LISTEN" --tun-name "$TUN" --mtu "$MTU"
+      --listen "$BOREAS_LISTEN" --tun-name "$TUN" --mtu "$MTU" --transport "$BOREAS_TRANSPORT"
     ;;
   edge)
     [ -n "$BOREAS_CONNECT" ] || die 'set BOREAS_CONNECT=IPv4:port for the edge role'
@@ -217,7 +223,7 @@ case "$BOREAS_ROLE" in
       --network-root-ed25519-der "$ROOT_ED_DER" \
       --network-root-mldsa65-der "$ROOT_PQ_DER" \
       --network-policy-state-file "$STATE/policy.state" --network-policy-state-owner-uid 0 \
-      --tun-name "$TUN" --mtu "$MTU"
+      --tun-name "$TUN" --mtu "$MTU" --transport "$BOREAS_TRANSPORT"
     ;;
 esac
 

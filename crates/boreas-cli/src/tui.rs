@@ -19,7 +19,7 @@
 use std::fmt::{Display, Formatter};
 
 use crate::i18n::{Lang, Msg, text};
-use crate::render::{BOX_WIDTH, display_width};
+use crate::render::{BOX_WIDTH, SecurityMode, display_width};
 use crate::update::{self, Channel, localized};
 
 /// Inner content width of the boxed screen: total minus the two border
@@ -321,7 +321,7 @@ fn hint_line(lang: Lang) -> String {
 /// Latin tokens (`Enrollment`, `DirectGrant`, `e2e-required`, `supervisor`)
 /// stay untranslated, matching §10.4.1.
 fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
-    match (lang, index) {
+    let (title, detail) = match (lang, index) {
         (Lang::ZhCn, 1) => (
             "实时链路遥测",
             "内外层 KEX / 证书新鲜度 / RTT / 电路与窗口信用",
@@ -422,7 +422,37 @@ fn entry_copy(lang: Lang, index: u8) -> (&'static str, &'static str) {
             "Revoke lease or purge owned TUN, rules & files",
         ),
         _ => ("", ""),
-    }
+    };
+    // The historical oracle is retained for renderer regression tests. Real
+    // screens describe only capabilities actually wired in this build.
+    let actual = match (lang, index) {
+        (Lang::En, 1) => "Socket status and byte counters; other telemetry unknown",
+        (Lang::En, 2) => "Read-only local identity configuration",
+        (Lang::En, 3) => "Read-only local uplink configuration",
+        (Lang::En, 4) => "Read-only local route and DNS configuration",
+        (Lang::En, 5) => "Not implemented",
+        (Lang::En, 6) => "Read-only policy; no mode change or revocation",
+        (Lang::En, 8) => "Service status/start/stop and config wizard",
+        (Lang::En, 9) => "Unavailable; no uninstall or lease revocation",
+        (Lang::ZhCn, 1) => "管理套接字状态与字节计数；其他遥测未知",
+        (Lang::ZhCn, 2) => "只读本地身份配置",
+        (Lang::ZhCn, 3) => "只读本地上行配置",
+        (Lang::ZhCn, 4) => "只读本地路由和 DNS 配置",
+        (Lang::ZhCn, 5) => "尚未实现",
+        (Lang::ZhCn, 6) => "只读策略；不改模式或吊销",
+        (Lang::ZhCn, 8) => "服务状态、启停及配置向导",
+        (Lang::ZhCn, 9) => "不可用；不卸载或撤销租约",
+        (Lang::ZhTw, 1) => "管理套接字狀態與位元組計數；其他遙測未知",
+        (Lang::ZhTw, 2) => "唯讀本機身分設定",
+        (Lang::ZhTw, 3) => "唯讀本機上行設定",
+        (Lang::ZhTw, 4) => "唯讀本機路由和 DNS 設定",
+        (Lang::ZhTw, 5) => "尚未實作",
+        (Lang::ZhTw, 6) => "唯讀策略；不改模式或撤銷",
+        (Lang::ZhTw, 8) => "服務狀態、啟停及設定精靈",
+        (Lang::ZhTw, 9) => "無法使用；不解除安裝或撤銷租約",
+        _ => detail,
+    };
+    (title, actual)
 }
 
 /// Narrow-terminal degradation: a status line plus the nine entries, no
@@ -625,6 +655,8 @@ pub enum ConsoleEffect {
     RefreshStatus,
     /// Query the control socket and open the telemetry result screen.
     Telemetry,
+    /// Inspect a validated local configuration, not runtime state.
+    Inspect(crate::console_inspect::Section),
     ServiceStatus,
     ServiceStart,
     ServiceStop,
@@ -653,6 +685,8 @@ pub struct ConsoleState {
     /// `true` when the last control-socket query succeeded.
     pub live: bool,
     pub node_name: String,
+    /// Last successfully reported mode, or unknown after a failed query.
+    pub security_mode: Option<SecurityMode>,
     /// Unit name shown on the confirm screen; empty when it could not be
     /// resolved, which the screen reports rather than inventing a name.
     pub service_name: String,
@@ -686,6 +720,7 @@ impl ConsoleState {
             pending: None,
             live,
             node_name: String::new(),
+            security_mode: None,
             service_name: String::new(),
             narrow: false,
             no_color: false,
@@ -739,12 +774,17 @@ impl ConsoleState {
         }
     }
 
-    /// Entry dispatch. 6 and 9 are refused because this build must not
-    /// change the security mode, revoke, or uninstall.
+    /// Configuration inspection is read-only; unavailable destructive actions
+    /// remain refused. Config values never attest to running state.
     fn open_selected(&mut self) -> ConsoleEffect {
+        use crate::console_inspect::Section;
         match self.selected {
             1 => ConsoleEffect::Telemetry,
-            6 | 9 => self.notice(vec![text(self.lang, Msg::NoticeRefused).to_string()]),
+            2 => ConsoleEffect::Inspect(Section::Identity),
+            3 => ConsoleEffect::Inspect(Section::Uplinks),
+            4 => ConsoleEffect::Inspect(Section::RoutesDns),
+            6 => ConsoleEffect::Inspect(Section::Security),
+            9 => self.notice(vec![text(self.lang, Msg::NoticeRefused).to_string()]),
             7 => {
                 self.view = ConsoleView::Update;
                 self.notice_rows.clear();
@@ -1009,6 +1049,13 @@ impl ConsoleState {
     pub fn menu_model(&self, version: &str) -> MenuModel {
         let mut model = MenuModel::offline(version, self.lang);
         model.node_name = self.node_name.clone();
+        model.mode_label = match self.security_mode {
+            Some(SecurityMode::HopOnly) => "! PLAINTEXT AT CORE".to_string(),
+            Some(SecurityMode::E2eRequired) => "e2e-required (policy)".to_string(),
+            None => "unknown".to_string(),
+        };
+        model.tun_label = "unknown".to_string();
+        model.inbound_label = "unknown".to_string();
         model.selected = self.selected;
         model.narrow = self.narrow;
         model.no_color = self.no_color;
@@ -1126,9 +1173,9 @@ impl ConsoleState {
 /// §10.4 requires the screen to say so instead of implying a graceful pause.
 fn config_wizard_title(lang: Lang) -> &'static str {
     match lang {
-        Lang::ZhCn => "配置检查与说明（只读）",
-        Lang::ZhTw => "設定檢查與說明（唯讀）",
-        Lang::En => "Config check & guide (read-only)",
+        Lang::ZhCn => "配置检查与端点候选",
+        Lang::ZhTw => "設定檢查與端點候選",
+        Lang::En => "Config check & endpoint candidate",
     }
 }
 
@@ -1497,10 +1544,13 @@ mod tests {
         }
     }
 
+    // Menu descriptions reflect the implemented build, not the historical
+    // example's aspirational capabilities.
     #[test]
-    fn zh_cn_plan_skeleton_matches_the_oracle() {
+    fn zh_cn_plan_skeleton_has_current_honest_labels() {
         let rendered = render_menu(&plan_zh()).expect("plan model");
-        assert_eq!(rendered, ZH_CN_ORACLE);
+        assert!(rendered.contains("只读本地身份配置"));
+        assert!(rendered.contains("尚未实现"));
         assert_boxed(&rendered);
     }
 
@@ -1675,6 +1725,27 @@ mod tests {
     // --- line-mode console ---
 
     #[test]
+    fn live_policy_and_hop_warning_persist_on_all_screens() {
+        use crate::render::SecurityMode;
+        for lang in [Lang::ZhCn, Lang::ZhTw, Lang::En] {
+            for narrow in [false, true] {
+                let mut state = ConsoleState::new(lang, true);
+                state.narrow = narrow;
+                state.security_mode = Some(SecurityMode::HopOnly);
+                for view in [ConsoleView::Menu, ConsoleView::Service, ConsoleView::Update, ConsoleView::Notice, ConsoleView::ConfigWizard] {
+                    state.view = view;
+                    let screen = state.screen("test").unwrap();
+                    assert!(screen.contains("PLAINTEXT AT CORE"), "{lang:?}/{view:?}: {screen}");
+                }
+                state.security_mode = Some(SecurityMode::E2eRequired);
+                assert!(state.screen("test").unwrap().contains("e2e-required (policy)"));
+                state.security_mode = None;
+                assert!(state.screen("test").unwrap().contains("unknown"));
+            }
+        }
+    }
+
+    #[test]
     fn config_wizard_is_reachable_and_stays_read_only() {
         let mut state = ConsoleState::new(Lang::En, false);
         state.selected = 8;
@@ -1682,7 +1753,7 @@ mod tests {
         assert_eq!(state.apply("4"), ConsoleEffect::ConfigWizard);
         assert_eq!(state.view, ConsoleView::ConfigWizard);
         let screen = state.screen("test").unwrap();
-        assert!(screen.contains("Config check & guide (read-only)"));
+        assert!(screen.contains("Config check & endpoint candidate"));
         assert!(screen.contains("primary/backup"));
         assert_eq!(state.apply("2"), ConsoleEffect::None);
         assert_eq!(state.view, ConsoleView::Notice);
@@ -1786,22 +1857,26 @@ mod tests {
         assert_eq!(state.apply(""), ConsoleEffect::None);
         assert_eq!(state.view, ConsoleView::Service);
 
-        for entry in [2u8, 3, 4, 5] {
+        for (entry, section) in [
+            (2, crate::console_inspect::Section::Identity),
+            (3, crate::console_inspect::Section::Uplinks),
+            (4, crate::console_inspect::Section::RoutesDns),
+            (6, crate::console_inspect::Section::Security),
+        ] {
             let mut state = ConsoleState::new(Lang::En, false);
             state.selected = entry;
-            assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");
-            assert_eq!(state.view, ConsoleView::Notice, "entry {entry}");
-            assert!(
-                state.notice_rows[0].contains("Not implemented"),
-                "entry {entry}: {:?}",
-                state.notice_rows
-            );
+            assert_eq!(state.apply(""), ConsoleEffect::Inspect(section));
         }
+        let mut state = ConsoleState::new(Lang::En, false);
+        state.selected = 5;
+        assert_eq!(state.apply(""), ConsoleEffect::None);
+        assert_eq!(state.view, ConsoleView::Notice);
+        assert!(state.notice_rows[0].contains("Not implemented"));
     }
 
     #[test]
-    fn console_refuses_mode_change_and_uninstall() {
-        for entry in [6u8, 9] {
+    fn console_refuses_uninstall() {
+        for entry in [9u8] {
             let mut state = ConsoleState::new(Lang::En, false);
             state.selected = entry;
             assert_eq!(state.apply(""), ConsoleEffect::None, "entry {entry}");

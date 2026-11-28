@@ -26,21 +26,122 @@ pub use mesh_probe::SYNTAX as MESH_PROBE_SYNTAX;
 mod mesh_runtime;
 pub use mesh_runtime::SYNTAX as MESH_RUNTIME_SYNTAX;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OuterTransport {
+    Wss,
+    Direct,
+}
+
+impl OuterTransport {
+    #[cfg(feature = "openssl-inner-tls")]
+    pub(crate) fn link_client(
+        self,
+        dir: &Path,
+        inner: Box<dyn boreas_tunnel::InnerTlsConnector>,
+    ) -> Result<boreas_tunnel::LinkClient, String> {
+        match self {
+            Self::Wss => Ok(boreas_tunnel::LinkClient::new(Box::new(outer_connector(dir)?), inner)),
+            Self::Direct => Ok(boreas_tunnel::LinkClient::new_direct(inner)),
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "wss" => Ok(Self::Wss),
+            "direct" => Ok(Self::Direct),
+            _ => Err("--transport must be `wss` or `direct`".into()),
+        }
+    }
+}
+
+/// Inspect directory entries rather than following symlinks: a dangling CA or
+/// certificate symlink is configured material, not permission to downgrade.
+#[cfg(feature = "openssl-inner-tls")]
+fn material_present(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot inspect `{}`: {e}", path.display())),
+    }
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) fn outer_connector(dir: &Path) -> Result<boreas_tunnel::OpenSslOuterTlsConnector, String> {
+    use boreas_tunnel::OpenSslOuterTlsConnector;
+    let ca = dir.join("outer-ca.pem");
+    if material_present(&ca)? {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = options.open(&ca)
+            .map_err(|_| format!("error: cannot read `{}`", ca.display()))?;
+        let metadata = file.metadata().map_err(|_| format!("error: cannot stat `{}`", ca.display()))?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_OUTER_CA_FILE as u64 {
+            return Err("error: outer-ca.pem must be a non-empty regular file at most 1 MiB".into());
+        }
+        use std::io::Read;
+        let mut pem = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_OUTER_CA_FILE as u64 + 1).read_to_end(&mut pem)
+            .map_err(|_| "error: cannot read outer-ca.pem".to_string())?;
+        if pem.is_empty() || pem.len() > MAX_OUTER_CA_FILE {
+            return Err("error: outer-ca.pem exceeds size bounds".into());
+        }
+        OpenSslOuterTlsConnector::with_web_pki_and_roots(&pem)
+            .map_err(|e| format!("outer-ca.pem rejected: {e}"))
+    } else {
+        OpenSslOuterTlsConnector::web_pki()
+            .map_err(|e| format!("OpenSSL default trust paths unavailable: {e}"))
+    }
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) fn outer_acceptor(
+    dir: &Path,
+    transport: OuterTransport,
+) -> Result<Option<boreas_tunnel::OpenSslOuterTlsAcceptor>, String> {
+    let cert = dir.join("outer.pem");
+    let key = dir.join("outer.key");
+    let present = (material_present(&cert)?, material_present(&key)?);
+    if present.0 != present.1 {
+        return Err("outer.pem and outer.key must both be installed; partial credentials are rejected".into());
+    }
+    match transport {
+        OuterTransport::Direct => Ok(None),
+        OuterTransport::Wss if !present.0 => Err("WSS requires both outer.pem and outer.key".into()),
+        OuterTransport::Wss => boreas_tunnel::OpenSslOuterTlsAcceptor::from_pem_files(cert, key)
+            .map(Some)
+            .map_err(|e| format!("outer TLS acceptor rejected: {e}")),
+    }
+}
+
 pub fn run(args: &[String]) -> (u8, String, String) {
     match args.first().map(String::as_str) {
         Some("mesh-probe") => mesh_probe::run(&args[1..]),
         Some("mesh-run") => mesh_runtime::run(&args[1..]),
-        Some("serve") if args.len() == 4 => serve(&args[1], &args[2], &args[3]),
-        Some("connect") if args.len() == 5 => connect(&args[1], &args[2], &args[3], &args[4]),
+        Some("serve") if args.len() == 4 || args.len() == 6 => {
+            match node_transport(&args[4..]) {
+                Ok(mode) => serve(&args[1], &args[2], &args[3], mode),
+                Err(message) => (2, String::new(), message),
+            }
+        }
+        Some("connect") if args.len() == 5 || args.len() == 7 => {
+            match node_transport(&args[5..]) {
+                Ok(mode) => connect(&args[1], &args[2], &args[3], &args[4], mode),
+                Err(message) => (2, String::new(), message),
+            }
+        }
         Some("serve") => (
             2,
             String::new(),
-            "error: node serve <config> <listen> <material-dir>".into(),
+            "error: node serve <config> <listen> <material-dir> [--transport wss|direct]".into(),
         ),
         Some("connect") => (
             2,
             String::new(),
-            "error: node connect <config> <host:port> <tls-name> <material-dir>".into(),
+            "error: node connect <config> <host:port> <tls-name> <material-dir> [--transport wss|direct]".into(),
         ),
         Some(command) => (
             2,
@@ -52,6 +153,14 @@ pub fn run(args: &[String]) -> (u8, String, String) {
             String::new(),
             "error: node requires serve or connect".into(),
         ),
+    }
+}
+
+fn node_transport(args: &[String]) -> Result<OuterTransport, String> {
+    match args {
+        [] => Ok(OuterTransport::Wss),
+        [flag, value] if flag == "--transport" => OuterTransport::parse(value),
+        _ => Err("error: expected --transport wss|direct".into()),
     }
 }
 
@@ -67,7 +176,7 @@ fn no_backend(command: &str) -> (u8, String, String) {
 }
 
 #[cfg(not(feature = "openssl-inner-tls"))]
-fn serve(_config_path: &str, _listen: &str, _material_dir: &str) -> (u8, String, String) {
+fn serve(_config_path: &str, _listen: &str, _material_dir: &str, _transport: OuterTransport) -> (u8, String, String) {
     no_backend("serve")
 }
 
@@ -77,6 +186,7 @@ fn connect(
     _endpoint: &str,
     _tls_name: &str,
     _material_dir: &str,
+    _transport: OuterTransport,
 ) -> (u8, String, String) {
     no_backend("connect")
 }
@@ -93,6 +203,8 @@ fn valid_tls_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
 }
 
+#[cfg(feature = "openssl-inner-tls")]
+const MAX_OUTER_CA_FILE: usize = 1024 * 1024;
 #[cfg(feature = "openssl-inner-tls")]
 const MAX_MATERIAL_FILE: usize = 16 * 1024;
 #[cfg(feature = "openssl-inner-tls")]
@@ -159,7 +271,7 @@ fn prepare(config_path: &str, server: bool) -> Result<Prepared, String> {
 }
 
 #[cfg(feature = "openssl-inner-tls")]
-fn serve(config_path: &str, listen: &str, material_dir: &str) -> (u8, String, String) {
+fn serve(config_path: &str, listen: &str, material_dir: &str, transport: OuterTransport) -> (u8, String, String) {
     let prepared = match prepare(config_path, true) {
         Ok(value) => value,
         Err(message) => return (2, String::new(), message),
@@ -172,6 +284,7 @@ fn serve(config_path: &str, listen: &str, material_dir: &str) -> (u8, String, St
         &prepared,
         address,
         std::path::Path::new(material_dir),
+        transport,
     ))
 }
 
@@ -181,6 +294,7 @@ fn connect(
     endpoint: &str,
     tls_name: &str,
     material_dir: &str,
+    transport: OuterTransport,
 ) -> (u8, String, String) {
     if !valid_tls_name(tls_name) {
         return (
@@ -202,6 +316,7 @@ fn connect(
         address,
         tls_name,
         std::path::Path::new(material_dir),
+        transport,
     ))
 }
 
@@ -221,8 +336,12 @@ fn decode_net_id(text: &str) -> Result<[u8; 16], String> {
 #[cfg(feature = "openssl-inner-tls")]
 fn read_bounded(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, String> {
     let path = dir.join(name);
-    let bytes =
-        std::fs::read(&path).map_err(|_| format!("error: cannot read `{}`", path.display()))?;
+    use std::io::Read;
+    let file = std::fs::File::open(&path)
+        .map_err(|_| format!("error: cannot read `{}`", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)
+        .map_err(|_| format!("error: cannot read `{}`", path.display()))?;
     if bytes.is_empty() || bytes.len() > max {
         return Err(format!(
             "error: `{}` must be between 1 and {max} bytes",
@@ -246,6 +365,7 @@ fn serve_backend(
     prepared: &Prepared,
     address: SocketAddr,
     material_dir: &Path,
+    transport: OuterTransport,
 ) -> Result<String, String> {
     use std::sync::Arc;
     use std::time::Duration;
@@ -256,9 +376,7 @@ fn serve_backend(
     use boreas_proto::messages::{PathRole, Suite as MessageSuite};
     use boreas_tunnel::resource::{Admission, Limits};
     use boreas_tunnel::runtime::LinkServer;
-    use boreas_tunnel::{
-        OpenSslOuterTlsAcceptor, PkiIdentityExtractor, PqWgInnerAcceptor, SessionPolicy,
-    };
+    use boreas_tunnel::{PkiIdentityExtractor, PqWgInnerAcceptor, SessionPolicy};
 
     let identities = load_verified_identities(prepared, material_dir)?;
     let pq_identity = PqWgIdentity::from_private_key_file(material_dir.join("identity.key"))
@@ -271,14 +389,7 @@ fn serve_backend(
         PqWgInnerAcceptor::new(pq_identity, Policy::production_default(), extractor)
             .map_err(|error| format!("error: pq-wg acceptor rejected: {error}"))?,
     ));
-    let outer = if material_dir.join("outer.pem").exists() && material_dir.join("outer.key").exists() {
-        Some(OpenSslOuterTlsAcceptor::from_pem_files(
-            material_dir.join("outer.pem"),
-            material_dir.join("outer.key"),
-        ).map_err(|error| format!("error: outer TLS acceptor rejected: {error}"))?)
-    } else {
-        None
-    };
+    let outer = outer_acceptor(material_dir, transport)?;
     let listener = std::net::TcpListener::bind(address)
         .map_err(|error| format!("error: cannot listen on {address}: {error}"))?;
     let admission = Admission::new(Limits {
@@ -320,6 +431,7 @@ fn connect_backend(
     address: SocketAddr,
     tls_name: &str,
     material_dir: &Path,
+    transport: OuterTransport,
 ) -> Result<String, String> {
     use std::sync::Arc;
     use std::time::Duration;
@@ -328,10 +440,8 @@ fn connect_backend(
     use boreas_crypto::pq_wg::PqWgIdentity;
     use boreas_proto::SecurityMode;
     use boreas_proto::messages::{PathRole, Suite as MessageSuite};
-    use boreas_tunnel::runtime::{ClientTarget, LinkClient};
-    use boreas_tunnel::{
-        OpenSslOuterTlsConnector, PkiIdentityExtractor, PqWgInnerConnector, SessionPolicy,
-    };
+    use boreas_tunnel::runtime::ClientTarget;
+    use boreas_tunnel::{PkiIdentityExtractor, PqWgInnerConnector, SessionPolicy};
 
     let identities = load_verified_identities(prepared, material_dir)?;
     let pq_identity = PqWgIdentity::from_private_key_file(material_dir.join("identity.key"))
@@ -342,18 +452,7 @@ fn connect_backend(
     );
     let inner = PqWgInnerConnector::new(pq_identity, Policy::production_default(), extractor)
         .map_err(|error| format!("error: pq-wg connector rejected: {error}"))?;
-    let client = if material_dir.join("outer-ca.pem").exists() {
-        let outer_ca = read_bounded(material_dir, "outer-ca.pem", MAX_MATERIAL_FILE)?;
-        LinkClient::new(
-            Box::new(
-                OpenSslOuterTlsConnector::with_web_pki_and_roots(&outer_ca)
-                    .map_err(|error| format!("error: outer TLS connector rejected: {error}"))?,
-            ),
-            Box::new(inner),
-        )
-    } else {
-        LinkClient::new_direct(Box::new(inner))
-    };
+    let client = transport.link_client(material_dir, Box::new(inner))?;
     let target = ClientTarget {
         address,
         ws_host: format!("{tls_name}:{}", address.port()),
@@ -493,6 +592,10 @@ fn report(command: &str, session: &boreas_tunnel::EstablishedSession) -> String 
     )
 }
 
+#[cfg(all(test, feature = "openssl-inner-tls"))]
+#[path = "node_outer_tls_tests.rs"]
+mod outer_tls_tests;
+
 #[cfg(test)]
 mod tests {
     use super::valid_tls_name;
@@ -517,6 +620,74 @@ mod tests {
         let (code, _, stderr) = super::run(&["connect".into()]);
         assert_eq!(code, 2);
         assert!(stderr.contains("node connect <config>"));
+    }
+
+    #[test]
+    fn transport_is_explicit_or_secure_by_default() {
+        use super::{node_transport, OuterTransport};
+        assert_eq!(node_transport(&[]).unwrap(), OuterTransport::Wss);
+        assert_eq!(node_transport(&["--transport".into(), "direct".into()]).unwrap(), OuterTransport::Direct);
+        assert_eq!(node_transport(&["--transport".into(), "wss".into()]).unwrap(), OuterTransport::Wss);
+        assert!(node_transport(&["--transport".into(), "auto".into()]).is_err());
+        assert!(node_transport(&["--transport".into()]).is_err());
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn server_rejects_missing_partial_and_invalid_outer_material() {
+        use super::{outer_acceptor, outer_connector, OuterTransport};
+        use std::{fs, sync::atomic::{AtomicU64, Ordering}};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("boreas-outer-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        assert!(outer_acceptor(&dir, OuterTransport::Wss).is_err());
+        assert!(outer_acceptor(&dir, OuterTransport::Direct).unwrap().is_none());
+        fs::write(dir.join("outer.pem"), b"invalid").unwrap();
+        assert!(outer_acceptor(&dir, OuterTransport::Wss).is_err());
+        assert!(outer_acceptor(&dir, OuterTransport::Direct).is_err());
+        fs::write(dir.join("outer.key"), b"invalid").unwrap();
+        assert!(outer_acceptor(&dir, OuterTransport::Wss).is_err());
+        assert!(outer_acceptor(&dir, OuterTransport::Direct).unwrap().is_none());
+        fs::remove_file(dir.join("outer.pem")).unwrap();
+        assert!(outer_acceptor(&dir, OuterTransport::Wss).is_err());
+        assert!(outer_acceptor(&dir, OuterTransport::Direct).is_err());
+        fs::write(dir.join("outer-ca.pem"), b"invalid").unwrap();
+        assert!(outer_connector(&dir).is_err());
+        fs::remove_file(dir.join("outer-ca.pem")).unwrap();
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink("missing-ca.pem", dir.join("outer-ca.pem")).unwrap();
+            assert!(outer_connector(&dir).is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn server_rejects_mismatched_certificate_and_key() {
+        use openssl::{asn1::Asn1Time, hash::MessageDigest, pkey::PKey, rsa::Rsa, x509::{X509, X509NameBuilder}};
+        use std::{fs, sync::atomic::{AtomicU64, Ordering}};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("boreas-outer-mismatch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        let cert_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let other_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "wss.boreas.test").unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        let serial = openssl::bn::BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
+        cert.set_serial_number(&serial).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&cert_key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        cert.sign(&cert_key, MessageDigest::sha256()).unwrap();
+        fs::write(dir.join("outer.pem"), cert.build().to_pem().unwrap()).unwrap();
+        fs::write(dir.join("outer.key"), other_key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        assert!(super::outer_acceptor(&dir, super::OuterTransport::Wss).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(not(feature = "openssl-inner-tls"))]

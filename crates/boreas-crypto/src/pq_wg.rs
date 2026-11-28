@@ -4,10 +4,11 @@
 //! Noise-style PQ handshake (`X25519 + ML-KEM-768` hybrid ephemeral key
 //! agreement, mutual `ML-DSA-65` identity authentication, HKDF-SHA256 key
 //! schedule, explicit AEAD key confirmation) followed by stateless counter-nonce
-//! `ChaCha20-Poly1305` encrypted framing.
+//! `AES-256-GCM` encrypted framing.
 //!
-//! No X.509 certificate chains are exchanged on the wire, no TLS state machine
-//! or record splitting exists, and no resumption/0-RTT is permitted.
+//! No X.509 certificate chains are exchanged on the wire, and no TLS state
+//! machine or resumption/0-RTT is permitted. Plaintext writes are split into
+//! bounded authenticated records.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -18,7 +19,7 @@ use foreign_types_shared::ForeignTypeRef;
 use openssl::derive::Deriver;
 use openssl::kdf::{HkdfMode, hkdf};
 use openssl::md::Md;
-use openssl::pkey::{Id, KeyType, PKey, Private, Public};
+use openssl::pkey::{Id, KeyType, PKey, Private};
 use openssl::rand::rand_bytes;
 use openssl::sha::Sha256;
 use openssl::sign::{Signer, Verifier};
@@ -47,7 +48,7 @@ const AEAD_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const AEAD_TAG_LEN: usize = 16;
 
-const FRAME_MAGIC: &[u8; 4] = b"BWG1";
+const FRAME_MAGIC: &[u8; 4] = b"BWG2";
 const MSG_INIT: u8 = 1;
 const MSG_RESP: u8 = 2;
 
@@ -57,9 +58,21 @@ const MSG_RESP: u8 = 2;
 const RECORD_HEADER_LEN: usize = 1 + 4;
 const RECORD_DATA: u8 = 0x01;
 const RECORD_CLOSE: u8 = 0x02;
-const MAX_RECORD_COUNTER: u64 = 1u64 << 60;
+// Per-direction key limits: at most 2^20 records, 2^30 plaintext bytes,
+// and 2^27 authenticated blocks (AAD, ciphertext and GCM length block).
+// The block cap keeps the generic quadratic GCM term on the order of 2^-74
+// per key; it is not a formal end-to-end security bound. The record cap also
+// limits online verification attempts; any authentication failure poisons the
+// stream. Data records reserve one record and two blocks for authenticated
+// close. There is no rekey or automatic stream migration: exhaustion requires
+// closing and a fresh handshake, interrupting long-lived transfers.
+const MAX_RECORDS_PER_KEY: u64 = 1 << 20;
+const MAX_PLAINTEXT_BYTES_PER_KEY: u64 = 1 << 30;
+const MAX_AUTH_BLOCKS_PER_KEY: u64 = 1 << 27;
 
-const PROTOCOL_NAME: &[u8] = b"BOREAS-PQ-WG-v1-X25519-MLKEM768-MLDSA65-CHACHA20POLY1305";
+// The BWG2 frame marker and algorithm-bound v2 transcript deliberately reject
+// legacy BWG1 ChaCha20-Poly1305 handshakes without fallback.
+const PROTOCOL_NAME: &[u8] = b"BOREAS-PQ-WG-v2-X25519-MLKEM768-MLDSA65-AES256GCM";
 
 /// Domain-separation tag so a Hop handshake can never cross-protocol replay into E2E.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,12 +485,14 @@ fn x25519_shared_secret(
     Ok(ss)
 }
 
+type SessionKeys = ([u8; AEAD_KEY_LEN], [u8; AEAD_KEY_LEN], [u8; AEAD_KEY_LEN]);
+
 fn derive_session_keys(
     ck: &[u8; 32],
     h: &[u8; 32],
     ss_ecdh: &[u8; SHARED_SECRET_LEN],
     ss_pq: &[u8; SHARED_SECRET_LEN],
-) -> Result<([u8; AEAD_KEY_LEN], [u8; AEAD_KEY_LEN], [u8; AEAD_KEY_LEN]), PqWgError> {
+) -> Result<SessionKeys, PqWgError> {
     let mut ikm = [0u8; SHARED_SECRET_LEN * 2];
     ikm[..SHARED_SECRET_LEN].copy_from_slice(ss_ecdh);
     ikm[SHARED_SECRET_LEN..].copy_from_slice(ss_pq);
@@ -526,7 +541,7 @@ fn aead_seal_into(
         return Err(PqWgError::OpenSslError);
     }
     let nonce = make_nonce(counter);
-    let mut crypter = Crypter::new(Cipher::chacha20_poly1305(), Mode::Encrypt, key, Some(&nonce))
+    let mut crypter = Crypter::new(Cipher::aes_256_gcm(), Mode::Encrypt, key, Some(&nonce))
         .map_err(|_| PqWgError::OpenSslError)?;
     crypter
         .aad_update(aad)
@@ -537,6 +552,9 @@ fn aead_seal_into(
     n += crypter
         .finalize(&mut out_ct_and_tag[n..])
         .map_err(|_| PqWgError::OpenSslError)?;
+    if n != plaintext.len() {
+        return Err(PqWgError::OpenSslError);
+    }
     crypter
         .get_tag(&mut out_ct_and_tag[n..n + AEAD_TAG_LEN])
         .map_err(|_| PqWgError::OpenSslError)?;
@@ -559,20 +577,30 @@ fn aead_open_into(
     }
     let (ct, tag) = ct_and_tag.split_at(ct_len);
     let nonce = make_nonce(counter);
-    let mut crypter = Crypter::new(Cipher::chacha20_poly1305(), Mode::Decrypt, key, Some(&nonce))
+    let mut crypter = Crypter::new(Cipher::aes_256_gcm(), Mode::Decrypt, key, Some(&nonce))
         .map_err(|_| PqWgError::OpenSslError)?;
     crypter
         .aad_update(aad)
         .map_err(|_| PqWgError::OpenSslError)?;
-    let mut n = crypter
-        .update(ct, out_plaintext)
-        .map_err(|_| PqWgError::KeyConfirmation)?;
-    crypter
-        .set_tag(tag)
-        .map_err(|_| PqWgError::KeyConfirmation)?;
-    n += crypter
-        .finalize(&mut out_plaintext[n..])
-        .map_err(|_| PqWgError::KeyConfirmation)?;
+    let mut n = match crypter.update(ct, out_plaintext) {
+        Ok(n) => n,
+        Err(_) => {
+            zeroize(out_plaintext);
+            return Err(PqWgError::KeyConfirmation);
+        }
+    };
+    if crypter.set_tag(tag).is_err() {
+        zeroize(out_plaintext);
+        return Err(PqWgError::KeyConfirmation);
+    }
+    match crypter.finalize(&mut out_plaintext[n..]) {
+        Ok(final_len) => n += final_len,
+        Err(_) => {
+            // OpenSSL may have written unauthenticated plaintext during update.
+            zeroize(out_plaintext);
+            return Err(PqWgError::KeyConfirmation);
+        }
+    }
     Ok(n)
 }
 
@@ -715,7 +743,7 @@ impl PqWgConnector {
         let sender_index = nonzero_u32()?;
         let nonce_i = random_32()?;
 
-        // msg1_body = BWG1 | 1 | sender_index(4) | nonce_i(32) | e_i_pub(32) | ek_len(2) | ek(1184) | init_spki_hash(32)
+        // msg1_body = BWG2 | 1 | sender_index(4) | nonce_i(32) | e_i_pub(32) | ek_len(2) | ek(1184) | init_spki_hash(32)
         let mut msg1_body =
             Vec::with_capacity(4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN);
         msg1_body.extend_from_slice(FRAME_MAGIC);
@@ -743,7 +771,7 @@ impl PqWgConnector {
         write_handshake_frame(&mut transport, &msg1)?;
 
         // Read Message 2:
-        // msg2_body = BWG1(4) | 2(1) | receiver_index(4) | sender_index(4) | nonce_r(32) | e_r_pub(32) | ct_len(2) | ct(1088) | resp_spki_hash(32)
+        // msg2_body = BWG2(4) | 2(1) | receiver_index(4) | sender_index(4) | nonce_r(32) | e_r_pub(32) | ct_len(2) | ct(1088) | resp_spki_hash(32)
         let msg2 = read_handshake_frame(&mut transport)?;
         let msg2_body_len = 4 + 1 + 4 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_CT_LEN + SPKI_HASH_LEN;
         if msg2.len() < msg2_body_len + 2 + AEAD_TAG_LEN {
@@ -845,7 +873,7 @@ impl PqWgConnector {
         let negotiated = PqWgParameters {
             group: HybridGroup::X25519MlKem768,
             peer_signature: IdentitySignature::MlDsa65,
-            aead: Aead::ChaCha20Poly1305Sha256,
+            aead: Aead::Aes256GcmSha384,
             resumed: false,
             zero_rtt: false,
             tls_free: true,
@@ -1056,7 +1084,7 @@ impl PqWgAcceptor {
         let negotiated = PqWgParameters {
             group: HybridGroup::X25519MlKem768,
             peer_signature: IdentitySignature::MlDsa65,
-            aead: Aead::ChaCha20Poly1305Sha256,
+            aead: Aead::Aes256GcmSha384,
             resumed: false,
             zero_rtt: false,
             tls_free: true,
@@ -1077,17 +1105,51 @@ impl PqWgAcceptor {
     }
 }
 
-/// Authenticated WireGuard-style ChaCha20-Poly1305 encrypted byte stream.
+#[derive(Default)]
+struct KeyUsage {
+    records: u64,
+    bytes: u64,
+    blocks: u64,
+}
+
+impl KeyUsage {
+    // Header AAD occupies one block, plus padded ciphertext and a length block.
+    fn charge(&mut self, payload_len: usize, is_data: bool) -> io::Result<u64> {
+        let bytes = u64::try_from(payload_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded"))?;
+        let blocks = bytes.div_ceil(16).checked_add(2);
+        let next_records = self.records.checked_add(1);
+        let next_bytes = self.bytes.checked_add(bytes);
+        let next_blocks = blocks.and_then(|n| self.blocks.checked_add(n));
+        match (next_records, next_bytes, next_blocks) {
+            (Some(records), Some(total_bytes), Some(total_blocks))
+                if records <= MAX_RECORDS_PER_KEY - u64::from(is_data)
+                    && total_bytes <= MAX_PLAINTEXT_BYTES_PER_KEY
+                    && total_blocks <= MAX_AUTH_BLOCKS_PER_KEY - 2 * u64::from(is_data) =>
+            {
+                self.records = records;
+                self.bytes = total_bytes;
+                self.blocks = total_blocks;
+                Ok(records) // counters start at 1 and never repeat for this key
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded")),
+        }
+    }
+}
+
+/// Authenticated WireGuard-style AES-256-GCM encrypted byte stream.
 pub struct PqWgStream<S> {
     inner: S,
     send_key: [u8; AEAD_KEY_LEN],
     recv_key: [u8; AEAD_KEY_LEN],
-    send_counter: u64,
-    recv_counter: u64,
+    send_usage: KeyUsage,
+    recv_usage: KeyUsage,
     peer_spki: Vec<u8>,
     negotiated: PqWgParameters,
     // Reusable buffers to avoid per-packet heap allocations on the hot path.
     tx_buf: Vec<u8>,
+    tx_pos: usize,
+    tx_len: usize,
     rx_raw: Vec<u8>,
     rx_raw_len: usize,
     rx_plain: Vec<u8>,
@@ -1096,6 +1158,7 @@ pub struct PqWgStream<S> {
     peer_closed: bool,
     local_closed: bool,
     failed: bool,
+    limit_reached: bool,
 }
 
 impl<S> Drop for PqWgStream<S> {
@@ -1118,11 +1181,13 @@ impl<S> PqWgStream<S> {
             inner,
             send_key,
             recv_key,
-            send_counter: 1,
-            recv_counter: 1,
+            send_usage: KeyUsage::default(),
+            recv_usage: KeyUsage::default(),
             peer_spki,
             negotiated,
             tx_buf: vec![0u8; RECORD_HEADER_LEN + MAX_RECORD_PAYLOAD + AEAD_TAG_LEN],
+            tx_pos: 0,
+            tx_len: 0,
             rx_raw: vec![0u8; RECORD_HEADER_LEN + MAX_RECORD_PAYLOAD + AEAD_TAG_LEN],
             rx_raw_len: 0,
             rx_plain: vec![0u8; MAX_RECORD_PAYLOAD + 16],
@@ -1131,6 +1196,7 @@ impl<S> PqWgStream<S> {
             peer_closed: false,
             local_closed: false,
             failed: false,
+            limit_reached: false,
         }
     }
 
@@ -1150,12 +1216,48 @@ impl<S> PqWgStream<S> {
         &mut self.inner
     }
 
+    /// Whether an encrypted frame still needs transport write readiness/flush.
+    /// A successful `write` can leave such a frame queued after WouldBlock.
+    pub fn has_pending_output(&self) -> bool {
+        self.tx_pos < self.tx_len
+    }
+
     pub fn has_buffered_input(&self) -> bool {
-        self.rx_plain_pos < self.rx_plain_len || self.rx_raw_len > 0
+        self.rx_plain_pos < self.rx_plain_len || self.peer_closed
     }
 }
 
 impl<S: Read + Write> PqWgStream<S> {
+    /// Attempt to send any buffered record; retry on WouldBlock or TimedOut.
+    pub fn flush_pending_output(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+
+    fn drain_tx(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pq-wg stream poisoned"));
+        }
+        while self.tx_pos < self.tx_len {
+            match self.inner.write(&self.tx_buf[self.tx_pos..self.tx_len]) {
+                Ok(0) => {
+                    self.failed = true;
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "pq-wg transport write zero"));
+                }
+                Ok(n) => self.tx_pos += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    if !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                        self.failed = true;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        self.tx_pos = 0;
+        self.tx_len = 0;
+        Ok(())
+    }
+
     fn send_record(&mut self, record_type: u8, payload: &[u8]) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::new(
@@ -1163,14 +1265,18 @@ impl<S: Read + Write> PqWgStream<S> {
                 "pq-wg stream poisoned",
             ));
         }
-        if self.send_counter >= MAX_RECORD_COUNTER {
-            self.failed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pq-wg record counter exhausted",
-            ));
+        self.drain_tx()?;
+        // Reserve the nonce and budget before encryption or any transport write.
+        if record_type == RECORD_DATA && self.limit_reached {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pq-wg key usage exceeded"));
         }
-        let counter = self.send_counter;
+        let counter = match self.send_usage.charge(payload.len(), record_type == RECORD_DATA) {
+            Ok(counter) => counter,
+            Err(err) => {
+                self.limit_reached = true;
+                return Err(err);
+            }
+        };
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
         self.tx_buf[0] = record_type;
@@ -1180,24 +1286,21 @@ impl<S: Read + Write> PqWgStream<S> {
             self.failed = true;
             io::Error::new(io::ErrorKind::InvalidData, "pq-wg encrypt failed")
         })?;
-        self.send_counter += 1;
-        let total = RECORD_HEADER_LEN + written;
-        if let Err(err) = self.inner.write_all(&self.tx_buf[..total]) {
-            self.failed = true;
-            return Err(err);
-        }
+        self.tx_len = RECORD_HEADER_LEN + written;
         Ok(())
     }
 
     /// Send an authenticated close frame so the peer distinguishes planned
     /// closure from bare transport EOF or reset.
     pub fn close_notify(&mut self) -> io::Result<()> {
-        if self.local_closed || self.failed {
-            return Ok(());
+        if self.failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pq-wg stream poisoned"));
         }
-        self.local_closed = true;
-        self.send_record(RECORD_CLOSE, &[])?;
-        self.inner.flush()
+        if !self.local_closed {
+            self.send_record(RECORD_CLOSE, &[])?;
+            self.local_closed = true;
+        }
+        self.flush()
     }
 
     /// Read plaintext, returning `Ok(0)` only after an authenticated close frame.
@@ -1264,23 +1367,20 @@ impl<S: Read + Write> PqWgStream<S> {
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad header"))?,
         ) as usize;
-        // The counter never travels on the wire; the locally tracked value is
-        // what the sender sealed under, so any skipped record fails the AEAD.
-        let counter = self.recv_counter;
-
         let valid_header = match record_type {
             RECORD_DATA => payload_len > 0 && payload_len <= MAX_RECORD_PAYLOAD,
             RECORD_CLOSE => payload_len == 0,
             _ => false,
         };
-        if !valid_header || self.recv_counter >= MAX_RECORD_COUNTER {
+        if !valid_header {
             self.failed = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid pq-wg record header or counter",
+                "invalid pq-wg record header",
             ));
         }
-
+        // Reserve budget before decrypting. Transient I/O errors may resume the
+        // same buffered record, so charge only once after it is fully read.
         let total_len = RECORD_HEADER_LEN + payload_len + AEAD_TAG_LEN;
         while self.rx_raw_len < total_len {
             match self.inner.read(&mut self.rx_raw[self.rx_raw_len..total_len]) {
@@ -1305,6 +1405,10 @@ impl<S: Read + Write> PqWgStream<S> {
             }
         }
 
+        let counter = self.recv_usage.charge(payload_len, record_type == RECORD_DATA).map_err(|err| {
+            self.failed = true;
+            err
+        })?;
         let (aad, ct_and_tag) = self.rx_raw[..total_len].split_at(RECORD_HEADER_LEN);
         let plain_len = aead_open_into(
             &self.recv_key,
@@ -1318,7 +1422,6 @@ impl<S: Read + Write> PqWgStream<S> {
             io::Error::new(io::ErrorKind::InvalidData, "pq-wg record authentication failed")
         })?;
         self.rx_raw_len = 0;
-        self.recv_counter += 1;
 
         if plain_len != payload_len {
             self.failed = true;
@@ -1356,6 +1459,9 @@ impl<S: Read + Write> Write for PqWgStream<S> {
         }
         let take = buf.len().min(MAX_RECORD_PAYLOAD);
         self.send_record(RECORD_DATA, &buf[..take])?;
+        // Once accepted, report plaintext progress even if the underlying write
+        // would block: the encrypted frame remains buffered for flush/next write.
+        let _ = self.drain_tx();
         Ok(take)
     }
 
@@ -1366,7 +1472,14 @@ impl<S: Read + Write> Write for PqWgStream<S> {
                 "pq-wg stream poisoned",
             ));
         }
-        self.inner.flush()
+        self.drain_tx()?;
+        match self.inner.flush() {
+            Err(err) if !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {
+                self.failed = true;
+                Err(err)
+            }
+            result => result,
+        }
     }
 }
 
@@ -1384,7 +1497,312 @@ mod tests {
     }
 
     #[test]
+    fn aes_256_gcm_known_answer_and_negative_authentication() {
+        // NIST AES-256-GCM zero key, zero 96-bit IV, empty AAD and one zero block.
+        let key = [0u8; AEAD_KEY_LEN];
+        let mut sealed = [0u8; 32];
+        assert_eq!(aead_seal_into(&key, 0, &[], &[0; 16], &mut sealed).unwrap(), 32);
+        assert_eq!(sealed, [
+            0xce, 0xa7, 0x40, 0x3d, 0x4d, 0x60, 0x6b, 0x6e,
+            0x07, 0x4e, 0xc5, 0xd3, 0xba, 0xf3, 0x9d, 0x18,
+            0xd0, 0xd1, 0xc8, 0xa7, 0x99, 0x99, 0x6b, 0xf0,
+            0x26, 0x5b, 0x98, 0xb5, 0xd4, 0x8a, 0xb9, 0x19,
+        ]);
+        let mut plain = [0x55; 32];
+        assert_eq!(aead_open_into(&key, 0, &[], &sealed, &mut plain).unwrap(), 16);
+        assert_eq!(&plain[..16], &[0; 16]);
+        for (wrong_key, counter, aad, index) in [
+            (true, 0, &b""[..], None),
+            (false, 1, &b""[..], None),
+            (false, 0, &b"x"[..], None),
+            (false, 0, &b""[..], Some(0)),
+            (false, 0, &b""[..], Some(31)),
+        ] {
+            let mut candidate = sealed;
+            if let Some(i) = index { candidate[i] ^= 1; }
+            let candidate_key = if wrong_key { [1; 32] } else { key };
+            plain.fill(0x55);
+            assert!(aead_open_into(&candidate_key, counter, aad, &candidate, &mut plain).is_err());
+            assert_eq!(plain, [0; 32]);
+        }
+        let mut tag = [0; AEAD_TAG_LEN];
+        assert_eq!(aead_seal_into(&key, 0, &[], &[], &mut tag).unwrap(), AEAD_TAG_LEN);
+        assert_eq!(tag, [
+            0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9,
+            0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb, 0x73, 0x8b,
+        ]);
+    }
+
+    #[test]
+    fn legacy_cipher_and_protocol_version_are_rejected() {
+        let key = [0x42; AEAD_KEY_LEN];
+        let aad = b"record header";
+        let plaintext = b"legacy record";
+        let nonce = make_nonce(1);
+        let mut old = Crypter::new(Cipher::chacha20_poly1305(), Mode::Encrypt, &key, Some(&nonce)).unwrap();
+        old.aad_update(aad).unwrap();
+        let mut wire = vec![0; plaintext.len() + AEAD_TAG_LEN];
+        let mut n = old.update(plaintext, &mut wire).unwrap();
+        n += old.finalize(&mut wire[n..]).unwrap();
+        old.get_tag(&mut wire[n..n + AEAD_TAG_LEN]).unwrap();
+        let mut out = vec![0; plaintext.len() + AEAD_TAG_LEN];
+        assert!(aead_open_into(&key, 1, aad, &wire, &mut out).is_err());
+
+        // Both algorithm and version feed the transcript before the first signature.
+        let identity = test_identity(0xa1);
+        let body = b"same handshake message";
+        let transcript = |name: &[u8]| {
+            let ck = sha256_all(&[name]);
+            let h = sha256_all(&[&ck, PqWgLayer::Hop.domain_tag()]);
+            sha256_all(&[&h, body])
+        };
+        let current = transcript(PROTOCOL_NAME);
+        let sig = sign_mldsa65(&identity.inner.private_key, b"BOREAS-PQ-WG-INIT-SIG-v1\0", &current).unwrap();
+        assert!(verify_mldsa65(identity.public_spki(), b"BOREAS-PQ-WG-INIT-SIG-v1\0", &current, &sig).is_ok());
+        for name in [
+            &b"BOREAS-PQ-WG-v1-X25519-MLKEM768-MLDSA65-CHACHA20POLY1305"[..],
+            &b"BOREAS-PQ-WG-v1-X25519-MLKEM768-MLDSA65-AES256GCM"[..],
+        ] {
+            assert!(verify_mldsa65(identity.public_spki(), b"BOREAS-PQ-WG-INIT-SIG-v1\0", &transcript(name), &sig).is_err());
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryWire {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for MemoryWire {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.input.read(buf) }
+    }
+    impl Write for MemoryWire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    fn test_stream(wire: MemoryWire, send: [u8; 32], recv: [u8; 32]) -> PqWgStream<MemoryWire> {
+        PqWgStream::new(wire, send, recv, Vec::new(), PqWgParameters {
+            group: HybridGroup::X25519MlKem768,
+            peer_signature: IdentitySignature::MlDsa65,
+            aead: Aead::Aes256GcmSha384,
+            resumed: false,
+            zero_rtt: false,
+            tls_free: true,
+        })
+    }
+    fn reader_for(data: Vec<u8>, key: [u8; 32]) -> PqWgStream<MemoryWire> {
+        test_stream(MemoryWire { input: std::io::Cursor::new(data), output: Vec::new() }, [3; 32], key)
+    }
+
+    #[test]
+    fn record_tampering_wrong_key_replay_and_poisoning() {
+        let key = [9; 32];
+        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
+        sender.write_all(b"record").unwrap();
+        sender.close_notify().unwrap();
+        let record_len = RECORD_HEADER_LEN + b"record".len() + AEAD_TAG_LEN;
+        let record = sender.get_ref().output[..record_len].to_vec();
+        let full_wire = sender.get_ref().output.clone();
+        for (wire, recv_key) in [
+            ({ let mut r = full_wire.clone(); r[0] ^= 0x80; r }, key),
+            ({ let mut r = full_wire; r[4] = 7; r }, key),
+            ({ let mut r = record.clone(); r[RECORD_HEADER_LEN] ^= 1; r }, key),
+            ({ let mut r = record.clone(); let i = r.len() - 1; r[i] ^= 1; r }, key),
+            (record.clone(), [8; 32]),
+        ] {
+            let mut reader = reader_for(wire, recv_key);
+            assert!(reader.read(&mut [0; 32]).is_err());
+            assert_eq!(reader.read(&mut [0; 32]).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        }
+        let mut replayed = record.clone();
+        replayed.extend_from_slice(&record);
+        let mut reader = reader_for(replayed, key);
+        let mut out = [0; 6];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"record");
+        assert_eq!(reader.read(&mut out).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn per_key_limits_fail_closed_without_nonce_reuse() {
+        assert_eq!(MAX_PLAINTEXT_BYTES_PER_KEY / MAX_RECORD_PAYLOAD as u64, 65_536);
+        // Exercise the exact byte cap with real encrypted records and authenticated close.
+        let mut byte_sender = test_stream(MemoryWire::default(), [7; 32], [3; 32]);
+        // Put the counter one maximum record below the byte limit; the last
+        // real record reaches it, the following write must not emit any bytes.
+        byte_sender.send_usage.bytes = MAX_PLAINTEXT_BYTES_PER_KEY - MAX_RECORD_PAYLOAD as u64;
+        byte_sender.write_all(&vec![0; MAX_RECORD_PAYLOAD]).unwrap();
+        assert_eq!(byte_sender.send_usage.bytes, MAX_PLAINTEXT_BYTES_PER_KEY);
+        let byte_wire_len = byte_sender.get_ref().output.len();
+        assert!(byte_sender.write_all(b"x").is_err());
+        assert_eq!(byte_sender.get_ref().output.len(), byte_wire_len);
+        byte_sender.close_notify().unwrap();
+        assert_eq!(byte_sender.get_ref().output.len(), byte_wire_len + RECORD_HEADER_LEN + AEAD_TAG_LEN);
+        let mut byte_reader = reader_for(byte_sender.get_ref().output.clone(), [7; 32]);
+        byte_reader.recv_usage.bytes = MAX_PLAINTEXT_BYTES_PER_KEY - MAX_RECORD_PAYLOAD as u64;
+        let mut byte_out = vec![1; MAX_RECORD_PAYLOAD];
+        byte_reader.read_exact(&mut byte_out).unwrap();
+        assert!(byte_out.iter().all(|byte| *byte == 0));
+        assert_eq!(byte_reader.read(&mut [0; 1]).unwrap(), 0);
+        let mut block_sender = test_stream(MemoryWire::default(), [7; 32], [3; 32]);
+        block_sender.send_usage.blocks = MAX_AUTH_BLOCKS_PER_KEY - 5;
+        block_sender.write_all(b"x").unwrap(); // 3 blocks, leaving 2 for close
+        assert_eq!(block_sender.send_usage.blocks, MAX_AUTH_BLOCKS_PER_KEY - 2);
+        let block_wire_len = block_sender.get_ref().output.len();
+        assert!(block_sender.write_all(b"x").is_err());
+        assert_eq!(block_sender.get_ref().output.len(), block_wire_len);
+        block_sender.close_notify().unwrap();
+        assert_eq!(block_sender.send_usage.blocks, MAX_AUTH_BLOCKS_PER_KEY);
+        let mut block_reader = reader_for(block_sender.get_ref().output.clone(), [7; 32]);
+        block_reader.recv_usage.blocks = MAX_AUTH_BLOCKS_PER_KEY - 5;
+        let mut block_out = [0; 1];
+        block_reader.read_exact(&mut block_out).unwrap();
+        assert_eq!(&block_out, b"x");
+        assert_eq!(block_reader.read(&mut block_out).unwrap(), 0);
+
+        let key = [7; 32];
+        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
+        sender.send_usage.records = MAX_RECORDS_PER_KEY - 2;
+        sender.write_all(b"x").unwrap();
+        assert_eq!(sender.send_usage.records, MAX_RECORDS_PER_KEY - 1);
+        let before = sender.get_ref().output.clone();
+        assert!(sender.write_all(b"x").is_err());
+        assert_eq!(sender.get_ref().output, before);
+        assert!(sender.write(b"x").is_err());
+        sender.close_notify().unwrap();
+        assert_eq!(sender.send_usage.records, MAX_RECORDS_PER_KEY);
+        let mut reader = reader_for(sender.get_ref().output.clone(), key);
+        reader.recv_usage.records = MAX_RECORDS_PER_KEY - 2;
+        let mut got = [0; 1];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"x");
+        assert_eq!(reader.read(&mut got).unwrap(), 0);
+        assert_eq!(reader.recv_usage.records, MAX_RECORDS_PER_KEY);
+        assert_ne!(make_nonce(MAX_RECORDS_PER_KEY - 1), make_nonce(MAX_RECORDS_PER_KEY));
+        assert_eq!(&make_nonce(1)[..4], &[0; 4]);
+        assert_eq!(&make_nonce(1)[4..], &1u64.to_le_bytes());
+
+        for usage in [
+            KeyUsage { records: 0, bytes: MAX_PLAINTEXT_BYTES_PER_KEY, blocks: 0 },
+            KeyUsage { records: 0, bytes: 0, blocks: MAX_AUTH_BLOCKS_PER_KEY - 2 },
+        ] {
+            let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
+            sender.send_usage = usage;
+            assert!(sender.write_all(b"x").is_err());
+            assert!(sender.get_ref().output.is_empty());
+        }
+        let mut sender = test_stream(MemoryWire::default(), key, [3; 32]);
+        sender.write_all(b"x").unwrap();
+        for usage in [
+            KeyUsage { records: MAX_RECORDS_PER_KEY, bytes: 0, blocks: 0 },
+            KeyUsage { records: 0, bytes: MAX_PLAINTEXT_BYTES_PER_KEY, blocks: 0 },
+            KeyUsage { records: 0, bytes: 0, blocks: MAX_AUTH_BLOCKS_PER_KEY - 1 },
+        ] {
+            let mut reader = reader_for(sender.get_ref().output.clone(), key);
+            reader.recv_usage = usage;
+            assert!(reader.read(&mut [0; 1]).is_err());
+            assert_eq!(reader.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        }
+    }
+
+    #[test]
+    fn old_frame_magic_is_rejected_before_peer_lookup() {
+        let identity = test_identity(0xb1);
+        let acceptor = PqWgAcceptor::new(
+            identity,
+            Arc::new(StaticSpkiResolver::default()),
+            Policy::production_default(),
+            PqWgLayer::Hop,
+        ).unwrap();
+        let body_len = 4 + 1 + 4 + NONCE_BYTES_LEN + X25519_PUB_LEN + 2 + ML_KEM_768_EK_LEN + SPKI_HASH_LEN;
+        let mut body = vec![0; body_len + 2];
+        body[..4].copy_from_slice(b"BWG1");
+        body[4] = MSG_INIT;
+        let mut input = (body.len() as u32).to_be_bytes().to_vec();
+        input.extend_from_slice(&body);
+        let wire = MemoryWire { input: std::io::Cursor::new(input), output: Vec::new() };
+        assert!(matches!(acceptor.accept(wire), Err(PqWgError::Handshake)));
+    }
+
+    #[test]
+    fn partial_nonblocking_writes_are_resumed_without_reencrypting() {
+        struct ShortWriter { wire: MemoryWire, blocked: bool }
+        impl Read for ShortWriter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.wire.read(buf) }
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.blocked { return Err(io::ErrorKind::WouldBlock.into()); }
+                let n = buf.len().min(3);
+                self.wire.write_all(&buf[..n])?;
+                self.blocked = true;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let key = [0x12; 32];
+        let params = test_stream(MemoryWire::default(), key, key).negotiated();
+        let wire = ShortWriter { wire: MemoryWire::default(), blocked: false };
+        let mut sender = PqWgStream::new(wire, key, key, Vec::new(), params);
+        assert_eq!(sender.write(b"first").unwrap(), 5);
+        assert!(sender.has_pending_output());
+        assert_eq!(sender.write(b"second").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(sender.send_usage.records, 1);
+        loop {
+            sender.get_mut().blocked = false;
+            match sender.flush_pending_output() {
+                Ok(()) => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => (),
+                Err(err) => panic!("unexpected flush error: {err}"),
+            }
+        }
+        assert!(!sender.has_pending_output());
+        assert_eq!(sender.write(b"second").unwrap(), 6);
+        loop {
+            sender.get_mut().blocked = false;
+            match sender.close_notify() {
+                Ok(()) => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => (),
+                Err(err) => panic!("unexpected close error: {err}"),
+            }
+        }
+        assert_eq!(sender.send_usage.records, 3);
+        let mut reader = reader_for(sender.get_ref().wire.output.clone(), key);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"firstsecond");
+    }
+
+    #[test]
+    fn partial_ciphertext_is_not_reported_ready_and_failure_reaches_close() {
+        struct FragmentThenBlock { byte: Option<u8> }
+        impl Read for FragmentThenBlock {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                match self.byte.take() {
+                    Some(byte) => { out[0] = byte; Ok(1) },
+                    None => Err(io::ErrorKind::WouldBlock.into()),
+                }
+            }
+        }
+        impl Write for FragmentThenBlock {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> { Ok(buf.len()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let key = [0x12; 32];
+        let params = test_stream(MemoryWire::default(), key, key).negotiated();
+        let mut stream = PqWgStream::new(FragmentThenBlock { byte: Some(RECORD_DATA) }, key, key, Vec::new(), params);
+        let received = stream.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(received.kind(), io::ErrorKind::WouldBlock);
+        assert!(!stream.has_buffered_input());
+        stream.failed = true;
+        assert_eq!(stream.close_notify().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
     fn pq_wg_roundtrip_hop_and_e2e_and_authenticated_close() {
+        for layer in [PqWgLayer::Hop, PqWgLayer::E2e] {
         let client_id = test_identity(0x11);
         let server_id = test_identity(0x22);
         let resolver = Arc::new(StaticSpkiResolver::from_spkis(vec![
@@ -1396,14 +1814,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let srv_id = server_id.clone();
+        let expected_client_spki = client_id.public_spki().to_vec();
         let srv_res = Arc::clone(&resolver);
         let server = thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let acceptor =
-                PqWgAcceptor::new(srv_id, srv_res, Policy::production_default(), PqWgLayer::Hop)
+                PqWgAcceptor::new(srv_id, srv_res, Policy::production_default(), layer)
                     .unwrap();
             let mut stream = acceptor.accept(tcp).unwrap();
-            assert_eq!(stream.peer_spki(), client_id.public_spki());
+            assert_eq!(stream.peer_spki(), expected_client_spki);
+            assert_eq!(stream.negotiated().aead, Aead::Aes256GcmSha384);
             assert!(stream.negotiated().tls_free);
             let mut buf = vec![0u8; 40_000];
             stream.read_exact(&mut buf).unwrap();
@@ -1420,10 +1840,11 @@ mod tests {
                 server_id.public_spki().to_vec(),
             ])),
             Policy::production_default(),
-            PqWgLayer::Hop,
+            layer,
         )
         .unwrap();
         let mut stream = connector.connect(tcp).unwrap();
+        assert_eq!(stream.negotiated().aead, Aead::Aes256GcmSha384);
         assert_eq!(stream.peer_spki(), server_id.public_spki());
         let payload = vec![0x5Au8; 40_000];
         stream.write_all(&payload).unwrap();
@@ -1435,10 +1856,11 @@ mod tests {
         assert_eq!(stream.read_with_authenticated_eof(&mut eof).unwrap(), 0);
         stream.close_notify().unwrap();
         server.join().unwrap();
+        }
     }
 
     #[test]
-    fn pq_wg_rejects_cross_layer_replay_and_unknown_peer() {
+    fn pq_wg_rejects_cross_layer_replay() {
         let client_id = test_identity(0x31);
         let server_id = test_identity(0x42);
         let resolver = Arc::new(StaticSpkiResolver::from_spkis(vec![
@@ -1470,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn pq_wg_rejects_tampered_ciphertext_and_unauthenticated_eof() {
+    fn pq_wg_rejects_unauthenticated_eof() {
         let client_id = test_identity(0x51);
         let server_id = test_identity(0x62);
         let resolver = Arc::new(StaticSpkiResolver::from_spkis(vec![

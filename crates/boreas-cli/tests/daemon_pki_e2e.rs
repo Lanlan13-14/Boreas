@@ -406,11 +406,24 @@ fn spawn_serve(
     listen: &str,
     max_seconds: &str,
 ) -> std::process::Child {
+    spawn_serve_with_transport(config, mat_dir, state_dir, listen, max_seconds, "direct")
+}
+
+fn spawn_serve_with_transport(
+    config: &Path,
+    mat_dir: &Path,
+    state_dir: &Path,
+    listen: &str,
+    max_seconds: &str,
+    transport: &str,
+) -> std::process::Child {
     let owner = owner_uid(state_dir);
     Command::new(bin())
         .args([
             "daemon",
             "serve",
+            "--transport",
+            transport,
             "--config",
             config.to_str().unwrap(),
             "--material-dir",
@@ -441,11 +454,35 @@ fn spawn_connect(
     tls_name: &str,
     max_seconds: &str,
 ) -> std::process::Child {
+    spawn_connect_with_transport(config, mat_dir, state_dir, tls_name, max_seconds, "direct")
+}
+
+fn spawn_connect_with_transport(
+    config: &Path,
+    mat_dir: &Path,
+    state_dir: &Path,
+    tls_name: &str,
+    max_seconds: &str,
+    transport: &str,
+) -> std::process::Child {
+    spawn_connect_with_roots(config, mat_dir, state_dir, tls_name, max_seconds, transport, None)
+}
+
+fn spawn_connect_with_roots(
+    config: &Path, mat_dir: &Path, state_dir: &Path, tls_name: &str,
+    max_seconds: &str, transport: &str, roots: Option<&Path>,
+) -> std::process::Child {
     let owner = owner_uid(state_dir);
-    Command::new(bin())
+    let mut command = Command::new(bin());
+    if let Some(roots) = roots {
+        command.env("SSL_CERT_FILE", roots).env("SSL_CERT_DIR", state_dir.join("empty-ca-dir"));
+    }
+    command
         .args([
             "daemon",
             "connect",
+            "--transport",
+            transport,
             "--config",
             config.to_str().unwrap(),
             "--material-dir",
@@ -531,7 +568,54 @@ fn revoking_the_local_generation_closes_active_and_standby_without_promotion() {
 /// hop session on the backup ingress, and when the primary ingress dies it must
 /// rebuild the E2E circuit on the standby with both VIPs unchanged.
 #[test]
+fn wss_without_imported_ca_uses_default_roots_and_rejects_bad_names() {
+    for (trusted, name, expected) in [
+        (true, "wss.boreas.test", true),
+        (true, "wrong.boreas.test", false),
+        (false, "wss.boreas.test", false),
+    ] {
+        let pair = Pair::provision("system-roots");
+        let core_state = pair.new_state("core");
+        let edge_state = pair.new_state("edge");
+        pair.long_lived_status(&pair.core_mat);
+        pair.long_lived_status(&pair.edge_mat);
+        fs::remove_file(pair.edge_mat.join("outer-ca.pem")).unwrap();
+        fs::create_dir(edge_state.join("empty-ca-dir")).unwrap();
+        let empty = edge_state.join("empty-roots.pem");
+        fs::write(&empty, b"").unwrap();
+        let roots = if trusted { pair.ca_dir.join("outer-ca.pem") } else { empty };
+        let listen = format!("127.0.0.1:{}", free_port());
+        let core_cfg = pair.root.0.join("core.toml");
+        let edge_cfg = pair.root.0.join("edge.toml");
+        write_config(&core_cfg, "core", 1, 1, &pair.core_mat, &core_state, &listen);
+        write_config(&edge_cfg, "edge", 2, 2, &pair.edge_mat, &edge_state, &listen);
+        let mut core = spawn_serve_with_transport(&core_cfg, &pair.core_mat, &core_state, &listen, "4", "wss");
+        assert!(wait_for_status(&core_state.join("control.sock"), "\"status_fresh\":true", Duration::from_secs(10)));
+        thread::sleep(Duration::from_millis(200));
+        let edge = spawn_connect_with_roots(&edge_cfg, &pair.edge_mat, &edge_state, name, "2", "wss", Some(&roots));
+        let connected = wait_for_status(&edge_state.join("control.sock"), "\"daemon_connected\":true", Duration::from_secs(5));
+        assert_eq!(connected, expected, "trusted={trusted}, name={name}");
+        let output = edge.wait_with_output().unwrap();
+        assert_eq!(output.status.success(), expected, "edge stderr: {}", String::from_utf8_lossy(&output.stderr));
+        if !expected {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("WSS + pq768 hop session rejected"));
+            let _ = core.kill();
+        }
+        let _ = core.wait();
+    }
+}
+
+#[test]
 fn same_core_standby_path_takes_over_after_the_primary_ingress_dies() {
+    exercise_standby("direct");
+}
+
+#[test]
+fn private_ca_wss_standby_path_takes_over_after_primary_dies() {
+    exercise_standby("wss");
+}
+
+fn exercise_standby(transport: &str) {
     let pair = Pair::provision("failover");
     let core_state_a = pair.new_state("core-a");
     let core_state_b = pair.new_state("core-b");
@@ -577,8 +661,8 @@ fn same_core_standby_path_takes_over_after_the_primary_ingress_dies() {
         Some(&listen_b),
     );
 
-    let mut serve_a = spawn_serve(&core_cfg_a, &pair.core_mat, &core_state_a, &listen_a, "30");
-    let serve_b = spawn_serve(&core_cfg_b, &pair.core_mat, &core_state_b, &listen_b, "20");
+    let mut serve_a = spawn_serve_with_transport(&core_cfg_a, &pair.core_mat, &core_state_a, &listen_a, "30", transport);
+    let serve_b = spawn_serve_with_transport(&core_cfg_b, &pair.core_mat, &core_state_b, &listen_b, "20", transport);
     let sock_a = core_state_a.join("control.sock");
     let sock_b = core_state_b.join("control.sock");
     let bind_deadline = Instant::now() + Duration::from_secs(10);
@@ -594,12 +678,13 @@ fn same_core_standby_path_takes_over_after_the_primary_ingress_dies() {
     thread::sleep(Duration::from_millis(200));
 
     let edge_sock = edge_state.join("control.sock");
-    let edge = spawn_connect(
+    let edge = spawn_connect_with_transport(
         &edge_cfg,
         &pair.edge_mat,
         &edge_state,
         "wss.boreas.test",
         "20",
+        transport,
     );
     assert!(
         wait_for_status(
@@ -1173,6 +1258,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "connect",
+            "--transport",
+            "direct",
             "--config",
             edge_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1201,6 +1288,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "connect",
+            "--transport",
+            "direct",
             "--config",
             edge_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1236,6 +1325,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "connect",
+            "--transport",
+            "direct",
             "--config",
             edge_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1256,6 +1347,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "serve",
+            "--transport",
+            "direct",
             "--config",
             core_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1288,6 +1381,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "connect",
+            "--transport",
+            "direct",
             "--config",
             edge_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1381,6 +1476,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "serve",
+            "--transport",
+            "direct",
             "--config",
             core_cfg.to_str().unwrap(),
             "--material-dir",
@@ -1407,6 +1504,8 @@ fn cli_offline_pki_to_live_pq768_e2e_daemon_and_status_expiry_fail_closed() {
         .args([
             "daemon",
             "connect",
+            "--transport",
+            "direct",
             "--config",
             edge_cfg.to_str().unwrap(),
             "--material-dir",

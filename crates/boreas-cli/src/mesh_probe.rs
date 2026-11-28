@@ -257,7 +257,16 @@ pub(super) mod linux {
                     signed_identity,
                 })
                 .collect();
-            probe.select(&candidates, &OpenSslOuterTlsConnector::web_pki)
+            let ca_path = mat.join("outer-ca.pem");
+            let roots = match std::fs::symlink_metadata(&ca_path) {
+                Ok(_) => Some(read(&ca_path, 64 * 1024)?),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => return Err("mesh outer CA cannot be inspected".into()),
+            };
+            probe.select(&candidates, &|| match &roots {
+                Some(pem) => OpenSslOuterTlsConnector::with_web_pki_and_roots(pem),
+                None => OpenSslOuterTlsConnector::web_pki(),
+            })
         } else {
             let peer = read(Path::new(&rest[0]), MAX_SIGNED_OBJECT_BYTES)?;
             let address = rest[1]

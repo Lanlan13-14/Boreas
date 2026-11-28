@@ -43,13 +43,14 @@ pool_cutover_matrix() {
     --overlay-prefix 172.19.0.0/16 --sequence 2 --ttl-seconds 3600 >/dev/null
   target_policy="$(cutover_file_hash "$policy/tbs.cbor")"
 
-  # Start the old direct daemons in separate namespaces and let the genuine
-  # admission path create the policy and status floors. Edge first boot uses a
+  # Start the old daemons in separate namespaces using the selected outer
+  # transport, and let the genuine admission path create the policy and status
+  # floors. Edge first boot uses a
   # guaranteed closed peer port, and must fail at TCP, after durable admission.
-  legacy_core=(daemon serve --config "$WORK/core.toml" --material-dir "$CORE_MAT"
+  legacy_core=(daemon serve --transport "$TRANSPORT" --config "$WORK/core.toml" --material-dir "$CORE_MAT"
     --status-state-file "$CORE_STATE/status.state" --status-state-owner-uid "$STATE_OWNER_UID"
     "${legacy_core_policy[@]}" --listen 192.0.2.1:8443 --tun-name btun0 --max-seconds 30)
-  legacy_edge=(daemon connect --config "$WORK/edge.toml" --material-dir "$EDGE_MAT"
+  legacy_edge=(daemon connect --transport "$TRANSPORT" --config "$WORK/edge.toml" --material-dir "$EDGE_MAT"
     --status-state-file "$EDGE_STATE/status.state" --status-state-owner-uid "$STATE_OWNER_UID"
     "${legacy_edge_policy[@]}" --connect 192.0.2.1:8443 --tls-name wss.boreas.test --tun-name btun0)
   run_node "$EDGE_NS" "$BIN" "${legacy_edge[@]}" > "$WORK/old-edge.out" 2> "$WORK/old-edge.err" &
@@ -121,7 +122,7 @@ PY
   approval_base="1:$source_policy:$target_policy:$source_core:$source_edge:2:$root"
   for role in core edge; do
     state="$WORK/$role-state"
-    args=(--config "$WORK/$role-target.toml" --material-dir "$WORK/$role-target"
+    args=(--transport "$TRANSPORT" --config "$WORK/$role-target.toml" --material-dir "$WORK/$role-target"
       --status-state-file "$state/status.state" --status-state-owner-uid "$STATE_OWNER_UID"
       --network-policy-tbs "$state/target-tbs.cbor"
       --network-policy-ed25519-signature "$state/target-ed25519.sig"

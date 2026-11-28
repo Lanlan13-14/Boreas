@@ -17,9 +17,9 @@ Boreas connects hosts on different networks into a private IP network. Start wit
 
 ## How do direct TCP and WebSocket fit together?
 
-**The default entry is raw TCP: a WireGuard-style TLS-less post-quantum channel (ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305) carried directly on TCP, with no TLS and no WebSocket.** Authentication uses the ML-DSA public key from the provisioned signed identity, not a certificate.
+**Experimental branch, direct mode:** TCP carries a custom TLS-free channel using X25519 + ML-KEM-768 and ML-DSA-65 for the handshake, and AES-256-GCM for data. It draws inspiration from WireGuard but is not the WireGuard protocol and is not interoperable with it. The implementation and its security still require full testing and independent audit. Authentication relies on the ML-DSA public key in a previously verified signed identity.
 
-**WSS is enabled only when needed.** When the material directory contains `outer-ca.pem` (client) and `outer.pem`/`outer.key` (server), the same post-quantum channel is carried inside a WebSocket over TLS 1.3 instead. `outer-ca.pem` may be either the private provisioning CA or the root/intermediate of the public CA that issued the server certificate: the client trusts the platform web-PKI roots in addition to it, so a certificate issued by a publicly trusted CA verifies without distributing that CA to every endpoint.
+**Known WSS certificate limitation:** the current two-node client selects WSS based on the presence of `outer-ca.pem`; without that file it selects direct mode, even if the server uses a publicly trusted certificate. The goal of public-CA WSS without distributing a client CA file is not yet implemented for this entry point. The WSS server uses `outer.pem`/`outer.key`; trust behavior still requires fixes and tests.
 
 - `--connect` takes the Core's reachable `IP:port`, not its tunnel IP.
 - In WSS mode `--tls-name` is the certificate name, and `--ws-host`/`--ws-path` set the WebSocket request's Host and path. Direct mode ignores all three.

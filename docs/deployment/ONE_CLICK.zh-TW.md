@@ -1,6 +1,25 @@
 # Boreas 一鍵安裝：先預演，再啟動
 
-[简体中文](ONE_CLICK.zh-TW.md) · 繁體中文 · [English](ONE_CLICK.en.md)
+[简体中文](ONE_CLICK.md) · 繁體中文 · [English](ONE_CLICK.en.md)
+
+**本地一鍵入口（實驗分支）：**先依下文準備並獨立驗證二進位、部署工具、網路策略、pin、組態和各節點材料，再於每台 Linux 主機的已審核 checkout 根目錄執行。替換兩個佔位值，先檢查預演，再確認套用。root systemd 範本僅供開發，預設不自動啟動。
+
+```sh
+STAGE=/root/boreas-stage
+NET_ID=REPLACE_WITH_NET_ID
+DIGEST=REPLACE_WITH_TRUSTED_SHA256
+one_click() {
+  sudo sh tools/deploy/one-click.sh --stage "$STAGE" --network-id "$NET_ID" \
+    --sha256 "$DIGEST" --release local-eval-1 --service systemd \
+    --accept-legacy-service "$@"
+}
+one_click --dry-run
+# 獨立驗證全部輸入並審閱預演後：
+one_click --apply
+```
+
+若不安裝服務，將函式中的 `--service systemd --accept-legacy-service` 換成 `--service none`，然後重新預演。依第 3 節設定、啟動和驗收服務。入口呼叫既有 `install.sh`；不下載、不編譯、不簽證、不放行防火牆、不自動啟動或組網。公開 `v0.1.0-pre.3` 不相容。同源摘要不是簽名，不要用 `curl | sh`。目前實驗版 wrapper 會將 `BOREAS_TRANSPORT=wss|direct` 明確傳給相容 daemon，預設 WSS；不支援此參數的舊版二進位不相容。本範例為直接 TCP 上的私有 CA WSS；`direct` 不使用外層 TLS/WebSocket，依賴內層認證加密。公有 CA WSS 需自行安全部署 Core 憑證鏈和私鑰，Edge 可使用 OpenSSL 系統信任庫而不放 `outer-ca.pem`，或獨立配置適用的額外根。憑證申請、續期、CDN 相容性與端到端驗收均未自動化。
+
 
 執行 `tools/deploy/install.sh` 可將**已經建置並由你核對來源**的靜態 Linux 二進位檔安裝至目標主機。該腳本還會檢查組態、預置材料並切換本機版本，完成這些步驟即算完成「安裝」；它不會編譯程式、簽發憑證、自動探索對端，也不會代你放行防火牆。若需測試雙機連通，請先完成[部署教學第 1–3 節](README.zh-TW.md#workflow)。
 

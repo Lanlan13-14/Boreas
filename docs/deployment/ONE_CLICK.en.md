@@ -1,6 +1,25 @@
 # Boreas One-Click Install: Dry Run First, Then Start
 
-[简体中文](ONE_CLICK.en.md) · [繁體中文](ONE_CLICK.zh-TW.md) · English
+[简体中文](ONE_CLICK.md) · [繁體中文](ONE_CLICK.zh-TW.md) · English
+
+**Local one-click entrypoint (experimental branch):** once the independently authenticated binary, deployment tools, network policy, pins, configuration and per-node materials below are prepared, run from the audited checkout root on each Linux host. Replace both placeholders with independently verified values; inspect the plan before applying. The root systemd template is for development only and does not start automatically.
+
+```sh
+STAGE=/root/boreas-stage
+NET_ID=REPLACE_WITH_NET_ID
+DIGEST=REPLACE_WITH_TRUSTED_SHA256
+one_click() {
+  sudo sh tools/deploy/one-click.sh --stage "$STAGE" --network-id "$NET_ID" \
+    --sha256 "$DIGEST" --release local-eval-1 --service systemd \
+    --accept-legacy-service "$@"
+}
+one_click --dry-run
+# After reviewing the plan and independently authenticating all inputs:
+one_click --apply
+```
+
+For no service, replace `--service systemd --accept-legacy-service` with `--service none` in the function and repeat the dry run. Follow Section 3 to configure, start, and verify the service. This entrypoint delegates to `install.sh`; it does not download, build, issue certificates, open ports, start, or join hosts. Public `v0.1.0-pre.3` is incompatible. Same-origin checksums are not signatures; never use `curl | sh`. The current experimental wrapper explicitly passes `BOREAS_TRANSPORT=wss|direct` to a matching daemon, defaulting to WSS; an older binary without this option is incompatible. The example uses private-CA WSS over direct TCP; `direct` instead omits outer TLS/WebSocket and relies on inner authenticated encryption. For public-CA WSS, provision the Core certificate chain and key independently; Edge can use the OpenSSL system trust store without `outer-ca.pem`, or provision an appropriate additional root. Certificate issuance, renewal, CDN compatibility and end-to-end validation are not automated.
+
 
 `tools/deploy/install.sh` installs a static Linux binary that **has already been built and whose provenance you have verified**. It also checks configuration, stages materials, and switches the local active release—that completes the installation. It does not compile binaries, issue certificates, auto-discover peers, or open firewall rules for you. To verify connectivity between two hosts, complete [Deployment Tutorial Sections 1–3](README.en.md#workflow) first.
 

@@ -2,13 +2,15 @@
 
 简体中文 · [繁體中文](ONE_CLICK.zh-TW.md) · [English](ONE_CLICK.en.md)
 
-使用 `tools/deploy/install.sh` 可将一份**已经构建并由你核对来源**的静态 Linux 二进制部署到本机，同时完成配置校验、材料预置与本地活动版本切换——到此即完成“安装”。该脚本不负责编译、不签发证书、不自动发现对端，也不会代为放通防火墙。如需打通双机通信，请先完成[部署教程第 1–3 节](README.md#workflow)。
+使用 `tools/deploy/one-click.sh` 可将一份**已经构建并由你核对来源**的静态 Linux 二进制部署到本机。它是现有 `install.sh` 的固定目录便捷入口，仍由后者执行全部安全校验、材料预置和活动版本切换——到此即完成“安装”。该脚本不下载、不编译、不签发证书、不自动发现对端、不自动启动，也不会代为放通防火墙。如需打通双机通信，请先完成[部署教程第 1–3 节](README.md#workflow)。
+
+**不是免准备的一键组网**：当前实验分支没有可供本教程直接使用、已验证来源的公开一键安装包。先分别准备兼容同一修订的可信部署工具、二进制、逐机材料与独立可信 pin；不要运行 `curl | sh`，不要把同源 `SHA256SUMS` 当签名。流水线可能产生候选构建，是否存在对应成功运行、可访问资产及其真实性须独立核实；公开 `v0.1.0-pre.3` 与本安装路径不兼容。
 
 **部署路径与版本范围说明**：此处提供的 `systemd`/`procd` 均为显式启用的旧开发模板，默认以 root 运行；如果你需要经认证的发布清单、非特权运行及就绪失败回退，请改用[离线双签 systemd 路径](VERIFIED-SERVICE.md)，切勿在同一主机混装两条路径。本页面向**当前兼容开发构建**；公开版本 `v0.1.0-pre.3` 尚不包含此处所需的 daemon 策略参数。
 
 ## 1. 在 Core、Edge 各准备一份输入
 
-在每台目标机创建 `/root/boreas-stage`（root 所有，权限 `0700`），并将目录内文件设为 root 所有、权限 `0600`（候选二进制本身无需预先赋予可执行权限）。你也可以改用自己的私有绝对路径。另请准备一份已审核的源码 checkout（需包含 `tools/deploy/install.sh` 及其同目录模板），后续命令均在 checkout 根目录执行。
+在每台目标机创建 `/root/boreas-stage`（root 所有，权限 `0700`），并将目录内文件设为 root 所有、权限 `0600`（候选二进制本身无需预先赋予可执行权限）。你也可以改用自己的私有绝对路径。另请准备一份已审核的源码 checkout（需包含 `tools/deploy/one-click.sh`、`install.sh` 及同目录模板），后续命令均在 checkout 根目录执行。
 
 ```text
 /root/boreas-stage/
@@ -42,24 +44,20 @@ DIGEST=REPLACE_WITH_TRUSTED_SHA256
 RELEASE_ID=local-eval-1
 
 install_boreas() {
-  sudo sh tools/deploy/install.sh \
-    --binary "$STAGE/boreas" --sha256 "$DIGEST" --release "$RELEASE_ID" \
-    --materials "$STAGE/material" --config "$STAGE/node.toml" \
-    --policy-dir "$STAGE/policy" --network-id "$NET_ID" \
-    --network-root-ed25519-der "$STAGE/pins/root.ed25519.der" \
-    --network-root-mldsa65-der "$STAGE/pins/root.mldsa65.der" \
-    --prefix /opt/boreas "$@"
+  sudo sh tools/deploy/one-click.sh \
+    --stage "$STAGE" --network-id "$NET_ID" --sha256 "$DIGEST" \
+    --release "$RELEASE_ID" --service systemd --accept-legacy-service "$@"
 }
 
-install_boreas --service systemd --accept-legacy-service --dry-run
+install_boreas --dry-run
 ```
 
 预演过程严格只读：不会下载文件、不会写入目标路径，也不会执行候选二进制或调用服务管理器。它仅校验摘要、ELF、路径与文件来源，不能证明配置校验或策略验签一定通过。此外，`--url` 不属于本教程路线：脚本仅接受直接的 HTTPS 二进制 URL 且要求附带 `--accept-weak-https`，但仍无法验证发布签名。
 
-仅当预演输出与信任核查全部无误后，再执行正式安装。若你只需安装版本目录和命令入口、不部署系统服务，请将服务模式改为 `--service none`（预演时也应使用同一参数）。若主机上已在运行 `boreas.service`，请先规划停机并检查现有服务及路径，不要直接套用首次安装流程；旧模板也不能用于替换离线双签服务。
+仅当预演输出与信任核查全部无误后，再执行正式安装。`--apply` 是明确的变更确认；它不自动启动服务。如果只需版本目录和命令入口，请在函数中把 `--service systemd --accept-legacy-service` 替换为 `--service none`，并重新预演。自定义前缀、bindir 或评估 procd 时使用底层 `install.sh --help`，不要与双签路径混装。若主机上已在运行 `boreas.service`，请先规划停机并检查现有服务及路径，不要直接套用首次安装流程；旧模板也不能用于替换离线双签服务。
 
 ```sh
-install_boreas --service systemd --accept-legacy-service
+install_boreas --apply
 sudo cat /opt/boreas/active
 sudo /usr/local/bin/boreas doctor
 ```
@@ -92,6 +90,7 @@ sudo install -m 0600 -o root -g root /dev/null /etc/boreas/boreas.env
 Core 节点（监听端口须在云安全组及本机防火墙放行）：
 
 ```ini
+BOREAS_TRANSPORT=wss
 BOREAS_ROLE=core
 BOREAS_VIP=10.20.1.1
 BOREAS_PEER_VIP=10.20.1.2
@@ -103,6 +102,7 @@ BOREAS_MTU=1360
 Edge 节点（替换底层 IP、核对证书 SAN，不要填写隧道 VIP）：
 
 ```ini
+BOREAS_TRANSPORT=wss
 BOREAS_ROLE=edge
 BOREAS_VIP=10.20.1.2
 BOREAS_PEER_VIP=10.20.1.1
@@ -113,7 +113,9 @@ BOREAS_TUN_NAME=btun0
 BOREAS_MTU=1360
 ```
 
-参数与网络边界约束如下：VIP 必须取自签名身份中的 RFC1918 地址，不带 `/32` 后缀且不允许前导零；底层监听或拨号地址为数字 IPv4 加端口；TUN 接口名不超过 15 个字符；wrapper 允许的 MTU 范围为 `1280..1400`。不要提前创建同名接口或对端 `/32` 路由——该 wrapper 会自行创建运行资源，遇到冲突会直接拒绝启动，不会覆盖现有网络。停止服务时，wrapper 仅尝试撤除自身添加的地址与路由，不会清空路由表，也不会修改默认路由、防火墙或主机 DNS（默认部署仅添加已授权对端的 IPv4 VIP `/32` 路由，不配置任意 `/24` 路由、导出或转发）。
+参数与网络边界约束如下：VIP 必须取自签名身份中的 RFC1918 地址，不带 `/32` 后缀且不允许前导零；底层监听或拨号地址为数字 IPv4 加端口；TUN 接口名不超过 15 个字符；wrapper 允许的 MTU 范围为 `1280..1400`。本例使用私有外层 CA 与直连 WSS（即 TCP 不经过反向代理，不是 direct 传输模式）。当前实验修订的 wrapper 把 `BOREAS_TRANSPORT=wss|direct` 显式传给 daemon；省略时为 `wss`，非法值拒绝，两端须相同。**仅使用已包含并通过验证的对应 daemon 构建**；旧二进制不支持该参数，不能回退为按文件猜测模式。`direct` 无外层 TLS/WebSocket，依赖内层认证加密，须先单独评估及测试，非 CDN 流量；本教程不承诺端到端验收已完成。
+
+WSS 要求 Core 提供 `outer.pem`（服务端证书及所需中间链）和对应 `outer.key`，Edge 的 `BOREAS_TLS_NAME` 与 DNS SAN 匹配。私有 CA 由离线签发流程提供 `outer-ca.pem`；公网 CA 场景则须由管理员独立申请和安全安装证书、完整链及私钥，并按当前实现让 Edge 使用系统 OpenSSL 信任根（无需 `outer-ca.pem`）或独立配置适用信任根；选用哪一种必须核对实际二进制与目标主机信任库。**安装器不申请或续期公网证书、不配置 CDN、DNS 或 ACME**。公网 CA/CDN 必须自行核查服务器可达性、SNI/Host、WebSocket、代理超时及安全策略并完成现场验收；不要删除 CA 或关闭验证来解决错误。不要提前创建同名接口或对端 `/32` 路由——该 wrapper 会自行创建运行资源，遇到冲突会直接拒绝启动，不会覆盖现有网络。停止服务时，wrapper 仅尝试撤除自身添加的地址与路由，不会清空路由表，也不会修改默认路由、防火墙或主机 DNS（默认部署仅添加已授权对端的 IPv4 VIP `/32` 路由，不配置任意 `/24` 路由、导出或转发）。
 
 启动顺序上，请先在 Core 执行 `daemon-reload` 与 `start`，确认 Core 已成功监听 TCP 端口后，再在 Edge 执行相同两条命令。仅当[双向验收](README.md#verify-and-maintain)全部通过后，再考虑执行 `enable` 开启开机自启。
 

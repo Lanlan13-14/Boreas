@@ -35,6 +35,7 @@
 //! uninstall are refused. **G-UI is still not passed.**
 
 mod config;
+mod console_inspect;
 mod daemon;
 mod i18n;
 mod network_policy_runtime;
@@ -642,6 +643,7 @@ where
 
     let mut state = ConsoleState::new(lang, live);
     state.node_name = sanitize_line(&snapshot.node_name);
+    state.security_mode = live.then_some(snapshot.security_mode);
     state.narrow = options.narrow || narrowed_by_width;
     state.no_color = no_color_set();
     state.service_name = sanitize_line(&preview_unit(&options));
@@ -746,19 +748,19 @@ fn console_json(
     format!(
         concat!(
             "{{\"command\":\"console\",\"lang\":\"{}\",\"version\":\"{}\",",
-            "\"source\":\"{}\",\"daemon\":\"{}\",\"node_name\":\"{}\",",
+            "\"source\":\"{}\",\"daemon\":{},\"node_name\":\"{}\",",
             "\"inbound_on\":{},\"inbound_connections\":{},\"outbound_upstreams\":{},",
-            "\"security_mode\":\"{}\",\"socket\":\"{}\",\"service\":{},\"error\":{}}}"
+            "\"security_mode\":{},\"socket\":\"{}\",\"service\":{},\"error\":{}}}"
         ),
         lang.code(),
         esc(&snapshot.version),
         if live { "live" } else { "offline" },
-        daemon,
+        if live { format!("\"{daemon}\"") } else { "null".to_string() },
         esc(&sanitize_line(&snapshot.node_name)),
-        snapshot.inbound_on,
-        snapshot.inbound_connections,
-        snapshot.outbound_upstreams,
-        snapshot.security_mode.as_str(),
+        if live { snapshot.inbound_on.to_string() } else { "null".to_string() },
+        if live { snapshot.inbound_connections.to_string() } else { "null".to_string() },
+        if live { snapshot.outbound_upstreams.to_string() } else { "null".to_string() },
+        if live { format!("\"{}\"", snapshot.security_mode.as_str()) } else { "null".to_string() },
         esc(&socket.display().to_string()),
         service_field,
         error_field,
@@ -770,6 +772,7 @@ struct ConsoleOutcome {
     rows: Vec<String>,
     live: Option<bool>,
     node: Option<String>,
+    mode: Option<render::SecurityMode>,
     endpoints: Option<(String, Option<String>)>,
 }
 
@@ -779,6 +782,7 @@ impl ConsoleOutcome {
             rows,
             live: None,
             node: None,
+            mode: None,
             endpoints: None,
         }
     }
@@ -788,6 +792,7 @@ impl ConsoleOutcome {
             rows: Vec::new(),
             live: None,
             node: None,
+            mode: None,
             endpoints: None,
         }
     }
@@ -804,15 +809,19 @@ impl ConsoleIo {
     fn perform(&mut self, effect: ConsoleEffect, lang: Lang) -> ConsoleOutcome {
         match effect {
             ConsoleEffect::RefreshStatus => {
-                let (live, _snapshot, _error) = probe_status(&self.socket);
+                let (live, snapshot, _error) = probe_status(&self.socket);
                 ConsoleOutcome {
                     rows: Vec::new(),
                     live: Some(live),
-                    node: None,
+                    mode: live.then_some(snapshot.security_mode),
+                    node: Some(snapshot.node_name),
                     endpoints: None,
                 }
             }
             ConsoleEffect::Telemetry => self.telemetry(lang),
+            ConsoleEffect::Inspect(section) => ConsoleOutcome::rows(
+                console_inspect::inspect(&self.config, section, lang),
+            ),
             ConsoleEffect::ServiceStatus => self.service("status"),
             ConsoleEffect::ServiceStart => self.service("start"),
             ConsoleEffect::ServiceStop => self.service("stop"),
@@ -828,7 +837,10 @@ impl ConsoleIo {
     }
 
     fn telemetry(&self, lang: Lang) -> ConsoleOutcome {
-        let (live, snapshot, error) = probe_status(&self.socket);
+        let (live, snapshot, error, byte_counters) = match daemon::query_control_socket(&self.socket) {
+            Ok((snapshot, raw)) => (true, snapshot, None, daemon::control_byte_counters(&raw)),
+            Err(error) => (false, StatusSnapshot::offline(env!("CARGO_PKG_VERSION")), Some(error), None),
+        };
         let name = if snapshot.node_name.is_empty() {
             text(lang, Msg::UnknownNode).to_string()
         } else {
@@ -844,6 +856,25 @@ impl ConsoleIo {
                 text(lang, Msg::SrcOffline)
             }
         ));
+        if !live {
+            rows.push(format!("{}: unknown", text(lang, Msg::NodeLabel)));
+            rows.push(update::localized(
+                lang,
+                "status unavailable; counters and mode unknown",
+                "状态不可用；计数和模式未知",
+                "狀態無法取得；計數和模式未知",
+            ).to_string());
+            if let Some(error) = error {
+                rows.push(sanitize_line(&error));
+            }
+            return ConsoleOutcome {
+                rows,
+                live: Some(false),
+                mode: None,
+                node: Some(String::new()),
+                endpoints: None,
+            };
+        }
         rows.push(format!("{}: {name}", text(lang, Msg::NodeLabel)));
         rows.push(format!(
             "{}: {} / {} {}",
@@ -862,11 +893,17 @@ impl ConsoleIo {
             snapshot.outbound_upstreams,
             text(lang, Msg::UpstreamsUnit)
         ));
-        rows.push(format!(
-            "{}: {}",
-            text(lang, Msg::ModeLabel),
-            snapshot.security_mode.as_str()
-        ));
+        let mode_note = if snapshot.security_mode == render::SecurityMode::HopOnly {
+            "! PLAINTEXT AT CORE".to_string()
+        } else {
+            update::localized(
+                lang,
+                "policy only; E2E activation not reported",
+                "仅为策略；未报告端到端会话是否激活",
+                "僅為策略；未回報端對端連線是否啟用",
+            ).to_string()
+        };
+        rows.push(format!("{}: {} ({mode_note})", text(lang, Msg::ModeLabel), snapshot.security_mode.as_str()));
         rows.push(
             text(
                 lang,
@@ -877,13 +914,15 @@ impl ConsoleIo {
             )
             .to_string(),
         );
-        if let Some(error) = error {
-            rows.push(sanitize_line(&error));
+        if let Some((tx, rx)) = byte_counters {
+            rows.push(format!("TX bytes: {tx}"));
+            rows.push(format!("RX bytes: {rx}"));
         }
         rows.truncate(DETAIL_ROWS);
         ConsoleOutcome {
             rows,
             live: Some(live),
+            mode: live.then_some(snapshot.security_mode),
             node: Some(snapshot.node_name),
             endpoints: None,
         }
@@ -917,6 +956,7 @@ impl ConsoleIo {
                     endpoints: Some((parsed.uplinks.primary, parsed.uplinks.backup)),
                     live: None,
                     node: None,
+                    mode: None,
                 }
             }
             Err(error) => ConsoleOutcome::rows(vec![format!(
@@ -1275,6 +1315,7 @@ where
         }
         if let Some(live) = outcome.live {
             state.live = live;
+            state.security_mode = outcome.mode;
         }
         if let Some(node) = outcome.node {
             state.node_name = sanitize_line(&node);
@@ -1587,7 +1628,7 @@ mod tests {
         run_with_columns,
     };
     use crate::config::RuntimeCapabilities;
-    use crate::render::{BOX_WIDTH, display_width};
+    use crate::render::{self, BOX_WIDTH, display_width};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).into()).collect()
@@ -2309,6 +2350,38 @@ uplinks = ["wss://hub-us-c.example.net"]
     }
 
     #[test]
+    fn console_refresh_replaces_stale_identity_and_mode() {
+        use std::io::BufReader;
+        let mut state = ConsoleState::new(Lang::En, true);
+        state.node_name = "old".into();
+        state.security_mode = Some(render::SecurityMode::E2eRequired);
+        let mut reader = BufReader::new(&b"r\nr\nq\n"[..]);
+        let mut out = Vec::new();
+        let mut calls = 0;
+        drive_console(&mut state, &mut reader, &mut out, |effect, _| {
+            assert_eq!(effect, ConsoleEffect::RefreshStatus);
+            calls += 1;
+            if calls == 1 {
+                ConsoleOutcome {
+                    rows: vec![], live: Some(true), node: Some("new".into()),
+                    mode: Some(render::SecurityMode::HopOnly), endpoints: None,
+                }
+            } else {
+                ConsoleOutcome {
+                    rows: vec![], live: Some(false), node: Some(String::new()),
+                    mode: None, endpoints: None,
+                }
+            }
+        }).unwrap();
+        let painted = String::from_utf8(out).unwrap();
+        assert!(painted.contains("PLAINTEXT AT CORE"));
+        assert!(!state.live);
+        assert_eq!(state.security_mode, None);
+        assert!(state.node_name.is_empty());
+        assert!(state.screen("test").unwrap().contains("unknown"));
+    }
+
+    #[test]
     fn console_non_tty_is_json_and_does_not_read_any_stdin() {
         let (code, stdout, stderr) = run_console(&[], Lang::En, false, None);
         assert_eq!(code, 0);
@@ -2334,7 +2407,9 @@ uplinks = ["wss://hub-us-c.example.net"]
         assert_eq!(code, 0, "{stderr}");
         assert!(stdout.contains("\"command\":\"console\""));
         assert!(stdout.contains("\"source\":\"offline\""));
-        assert!(stdout.contains("\"daemon\":\"not_connected\""));
+        assert!(stdout.contains("\"daemon\":null"));
+        assert!(stdout.contains("\"security_mode\":null"));
+        assert!(stdout.contains("\"inbound_connections\":null"));
         assert!(
             stdout.contains("\"error\":\""),
             "the query failure must be reported, not hidden: {stdout}"
@@ -2436,6 +2511,27 @@ uplinks = ["wss://hub-us-c.example.net"]
             "the TTY path paints instead of printing JSON"
         );
         painted
+    }
+
+    #[test]
+    fn console_inspection_uses_real_validated_file_without_side_effects() {
+        let config = write_fixture("inspect", &config_source());
+        let before = std::fs::read(&config).unwrap();
+        let path = config.to_str().unwrap();
+        let painted = painted_screen(
+            &["--config", path, "--narrow"], Lang::En, Some(40),
+            b"2\n\n\n3\n\n\n4\n\n\n6\n\nq\n",
+        );
+        assert!(painted.contains("role: core"), "{painted}");
+        assert!(painted.contains("primary configured: yes"), "{painted}");
+        assert!(painted.contains("advertise routes: no"), "{painted}");
+        assert!(painted.contains("configured policy: e2e-required"), "{painted}");
+        assert!(painted.contains("E2E activation: unknown"), "{painted}");
+        assert!(!painted.contains("hub-us-c.example.net"));
+        assert!(!painted.contains("identity.key"));
+        assert!(!painted.contains('\u{1b}'));
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        std::fs::remove_file(config).unwrap();
     }
 
     #[test]
@@ -2639,6 +2735,7 @@ uplinks = ["wss://hub-us-c.example.net"]
                     rows: vec![],
                     live: None,
                     node: None,
+                    mode: None,
                     endpoints: Some(("old.example.net:443".into(), None)),
                 },
                 ConsoleEffect::ConfigWizardInput(_) => {
@@ -2963,7 +3060,7 @@ uplinks = ["wss://hub-us-c.example.net"]
             assert_eq!(request, "STATUS\n", "fixture read a partial request");
 
             let body = concat!(
-                "{\"command\":\"ctl.status\",\"node\":\"core-1\",",
+                "{\"command\":\"ctl.status\",\"version\":\"0.1.0\",\"node\":\"core-1\",",
                 "\"daemon_connected\":true,\"inbound_on\":true,",
                 "\"inbound_connections\":1,\"outbound_upstreams\":0,",
                 "\"security_mode\":\"e2e-required\"}\n"
@@ -3064,9 +3161,9 @@ uplinks = ["wss://hub-us-c.example.net"]
                 .expect("fixture reads STATUS");
             assert_eq!(request, "STATUS\n", "fixture read a partial request");
 
-            let hostile = format!("{}\u{1b}[31m", "测".repeat(200));
+            let hostile = format!("{}\\u001b[31m", "测".repeat(200));
             let body = format!(
-                "{{\"command\":\"ctl.status\",\"node\":\"{hostile}\",\
+                "{{\"command\":\"ctl.status\",\"version\":\"0.1.0\",\"node\":\"{hostile}\",\
                  \"daemon_connected\":true,\"inbound_on\":true,\
                  \"inbound_connections\":1,\"outbound_upstreams\":0,\
                  \"security_mode\":\"e2e-required\"}}\n"

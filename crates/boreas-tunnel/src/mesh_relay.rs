@@ -417,17 +417,17 @@ pub(crate) fn with_fixed_endpoint_io<T>(
             }
             // Private to this fixed-path profile; does not change the ordinary
             // circuit wire layouts/version. Not an attestation of physical route.
-            use std::io::{Read, Write};
+            use std::io::Read;
             let mut remote = [0u8; 32];
             if initiator {
-                circuit.write_all(&binding)?;
+                crate::mesh_packet::write_chunks_and_flush(&mut circuit, &[&binding])?;
             }
             circuit.read_exact(&mut remote)?;
             if remote != binding {
                 return Err(crate::SessionReject::PeerIdentityMismatch.into());
             }
             if !initiator {
-                circuit.write_all(&binding)?;
+                crate::mesh_packet::write_chunks_and_flush(&mut circuit, &[&binding])?;
             }
             let mut check = || {
                 if Instant::now() >= deadline {

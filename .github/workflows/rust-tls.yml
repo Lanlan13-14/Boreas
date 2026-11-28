@@ -109,6 +109,7 @@ jobs:
             printf 'Pinned source commit: `%s`\n' "$OPENSSL_COMMIT"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Build pinned static OpenSSL
+        id: openssl_build
         timeout-minutes: 35
         shell: bash
         run: |
@@ -152,6 +153,7 @@ jobs:
             exit 1
           fi
       - name: Refuse accidental vendored OpenSSL
+        id: no_vendored_openssl
         shell: bash
         run: |
           set -euo pipefail
@@ -160,6 +162,7 @@ jobs:
             exit 1
           fi
       - name: Assert expected OpenSSL feature flags exist
+        id: feature_preflight
         # `cargo test --all-features` silently succeeds when a feature does not
         # exist.  This preflight makes a missing pki/tunnel/supervisor feature a
         # hard failure instead of a false-green run of old tests.
@@ -223,7 +226,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p boreas-crypto --features openssl-backend \
-            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-tests.log
+            -- --test-threads="$(nproc)" --show-output 2>&1 | tee rust-tls-tests.log
       - name: PKI management, CSR, and signing tests with real OpenSSL
         if: always()
         timeout-minutes: 15
@@ -232,9 +235,9 @@ jobs:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
           OPENSSL_STATIC: '1'
         run: |
-          set -o pipefail
+          set -euo pipefail
           cargo test --locked -p boreas-pki --features openssl-backend \
-            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-pki-tests.log
+            -- --test-threads="$(nproc)" --show-output 2>&1 | tee rust-tls-pki-tests.log
           grep -Fx 'test management::tests::scoped_revocations_persist_and_invalidate_only_owned_bindings ... ok' rust-tls-pki-tests.log
       - name: Transport inner-TLS seam tests with backend feature
         if: always()
@@ -251,7 +254,7 @@ jobs:
           test -f crates/boreas-tunnel/src/openssl_inner_tls.rs
           set -o pipefail
           cargo test --locked -p boreas-tunnel --features openssl-inner-tls \
-            -- --test-threads=4 --nocapture 2>&1 | tee rust-tls-tunnel-tests.log
+            -- --test-threads=4 --show-output 2>&1 | tee rust-tls-tunnel-tests.log
           for test in \
             'circuit_pool::retirement_tests::two_endpoints_wrap_data_half_close_and_retry_without_rebinding' \
             'circuit_pool::retirement_tests::wrong_lane_corrupt_fin_invalid_ack_and_reset_do_not_retire' \
@@ -273,7 +276,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p boreas-supervisor --features openssl-backend \
-            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-supervisor-tests.log
+            -- --test-threads="$(nproc)" --show-output 2>&1 | tee rust-tls-supervisor-tests.log
       - name: CLI hop-node & daemon process tests with backend feature
         if: always()
         timeout-minutes: 15
@@ -282,11 +285,11 @@ jobs:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
           OPENSSL_STATIC: '1'
         run: |
-          set -o pipefail
+          set -euo pipefail
           cargo clippy --locked -p boreas-pki -p boreas-tunnel -p boreas-cli \
             --features boreas-cli/openssl-inner-tls --all-targets -- -D warnings
           cargo test --locked -p boreas-cli --features openssl-inner-tls \
-            -- --test-threads="$(nproc)" --nocapture 2>&1 | tee rust-tls-cli-tests.log
+            -- --test-threads="$(nproc)" --show-output 2>&1 | tee rust-tls-cli-tests.log
           for test in \
             'update::signed::tests::authenticates_exact_manifest_and_reports_metadata_only' \
             'update::signed::tests::requires_both_signatures_exact_bytes_and_local_root' \
@@ -312,11 +315,15 @@ jobs:
         if: always()
         run: python -m unittest discover -s tools/release -p 'test_network_policy_test_fixture.py'
       - name: Build Linux pq768 E2E daemon binary (glibc + static musl) & run real netns ping
-        if: success()
+        id: daemon_build
+        # Run independently of unrelated test failures once the mandatory build
+        # preflights passed. Earlier failures still fail the overall job.
+        if: ${{ !cancelled() && steps.openssl_build.outcome == 'success' && steps.no_vendored_openssl.outcome == 'success' && steps.feature_preflight.outcome == 'success' }}
         timeout-minutes: 25
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
           OPENSSL_STATIC: '1'
+          BOREAS_NETNS_TRANSPORT: wss
         run: |
           set -euo pipefail
           cargo build --locked --release -p boreas-cli --features openssl-inner-tls
@@ -367,16 +374,16 @@ jobs:
           printf '%s\n' \
             'BOREAS PQ768 E2E DAEMON PRE-RELEASE BINARIES - NOT A PRODUCTION RELEASE' \
             'Source commit: '"$GITHUB_SHA" \
-            'Feature: openssl-inner-tls (OpenSSL 4.1.0 no-quic/no-cms/no-siv; X25519MLKEM768 + ML-DSA-65)' \
+            'Feature: openssl-inner-tls (OpenSSL 4.1.1-dev no-quic/no-cms/no-siv; PQ-WG hybrid handshake)' \
             'Included binaries:' \
             '  - boreas: x86_64-unknown-linux-gnu (static libcrypto/libssl)' \
             '  - boreas-linux-x86_64-musl-pq768: fully static x86_64-unknown-linux-musl' \
-            'Verified end-to-end in CI: offline PKI -> mounted roots.cbor -> WSS + pq768 hop + pq768 E2E + real Linux netns /dev/net/tun ICMP latency and 8 MiB integrity/throughput probes.' \
+            'Verified end-to-end in CI: offline PKI -> mounted roots.cbor -> WSS + PQ-WG hop + PQ-WG E2E + real Linux netns /dev/net/tun ICMP latency and 8 MiB integrity/throughput probes.' \
             'Production gates in docs/engineering/gates.json remain OPEN; production_approved is false.' \
             > hop-node-linux/README-DEVELOPMENT.txt
           (cd hop-node-linux && sha256sum boreas boreas-linux-x86_64-musl-pq768 > SHA256SUMS)
       - name: Authenticated offline stage, real non-root systemd readiness and rollback
-        if: success()
+        if: ${{ !cancelled() && steps.daemon_build.outcome == 'success' }}
         timeout-minutes: 8
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -392,9 +399,11 @@ jobs:
             "$PWD/target/release/boreas-supervisor" "$BOREAS_OPENSSL_BIN" \
             "$RUNNER_TEMP/release-failure-ci" "$RUNNER_TEMP/release-wait-ci" 2>&1 | tee rust-tls-verified-systemd.log
       - name: Same-identity initial TCP backup E2E (closed primary, configured backup)
-        if: success()
+        if: ${{ !cancelled() && steps.daemon_build.outcome == 'success' }}
         timeout-minutes: 15
         shell: bash
+        env:
+          BOREAS_NETNS_TRANSPORT: wss
         run: |
           set -euo pipefail
           variant_dir="$(mktemp -d "$RUNNER_TEMP/initial-backup-smoke.XXXXXX")"
@@ -453,7 +462,7 @@ jobs:
         # touched here. `--virtual-tun` is used because the failure happens before
         # any business traffic; the positive smoke above still covers the real
         # netns/TUN path.
-        if: success()
+        if: ${{ !cancelled() && steps.daemon_build.outcome == 'success' }}
         timeout-minutes: 10
         shell: bash
         run: |
@@ -883,7 +892,9 @@ jobs:
           echo 'initial_backup_negative.backup_usable=control-connect-through-same-proxy-status-ok'
       - name: Upload hop-node development binary
         id: acceptance_binary
-        if: success()
+        # Its README claims only the daemon build's two netns smokes, both of
+        # which must succeed. Other test failures remain failures of this job.
+        if: ${{ !cancelled() && steps.daemon_build.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boreas-hop-node-linux-x86_64-${{ github.run_id }}
@@ -893,7 +904,7 @@ jobs:
           retention-days: 14
       - name: Build the mesh netns test and its debug daemon once
         id: mesh_build
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
+        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/test/v111-mesh-runtime') }}
         timeout-minutes: 5
         env:
           OPENSSL_DIR: ${{ github.workspace }}/.rust-tls-openssl
@@ -924,7 +935,7 @@ jobs:
           retention-days: 14
       - name: Package the verified OpenSSL runtime
         id: acceptance_package
-        if: ${{ !cancelled() && steps.acceptance_binary.outcome == 'success' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-tcpv4-gso' || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime'))) }}
+        if: ${{ !cancelled() && steps.openssl_build.outcome == 'success' && steps.acceptance_binary.outcome == 'success' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') || (github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime') || github.ref == 'refs/heads/fix/v111-release-blockers' || (github.repository == 'Lanlan13-14/Boreas' && (github.ref == 'refs/heads/test/v111-tcpv4-gso' || github.ref == 'refs/heads/test/v111-dns-public-forwarding' || github.ref == 'refs/heads/test/v111-dns-daemon' || github.ref == 'refs/heads/test/v111-dns-deployment-tcp' || github.ref == 'refs/heads/test/v111-mesh-runtime'))) }}
         run: |
           set -euo pipefail
           mkdir -p acceptance-runtime
@@ -987,6 +998,7 @@ jobs:
       OPENSSL_CONF: ${{ github.workspace }}/.rust-tls-openssl/ssl/openssl.cnf
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
+      BOREAS_NETNS_TRANSPORT: wss
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1173,6 +1185,8 @@ jobs:
       BOREAS_OPENSSL_BIN: ${{ github.workspace }}/.rust-tls-openssl/bin/openssl
       BOREAS_REQUIRE_TLS_TESTS: '1'
       BOREAS_NETNS_WAN_TUNED: '1'
+      # Existing gates measure WSS explicitly; direct is a separate profile below.
+      BOREAS_NETNS_TRANSPORT: wss
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1207,7 +1221,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable snapshot
         id: perf_toolchain
       - name: Record performance runner and exact binary
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport')) }}
         run: |
           set -euo pipefail
           {
@@ -1221,7 +1235,7 @@ jobs:
           } > rust-tls-perf-environment.txt
       - name: Check three delayed full-duplex samples
         id: candidate_delayed
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff')) }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.perf_toolchain.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/fix/v111-release-blockers' || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/v111-integration' || github.ref == 'refs/heads/test/v111-integrated-runtime' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport')) }}
         timeout-minutes: 7
         env:
           BOREAS_NETEM_RTT_MS: '200'
@@ -1257,30 +1271,41 @@ jobs:
           BOREAS_DIAGNOSTIC_TIMING: '0'
         run: |
           set -euo pipefail
-          # The three samples are independent netns fixtures, so run them
-          # concurrently instead of back to back. Each writes its own log.
-          pids=""
+          # Independent samples share CPU and bandwidth on this runner, even
+          # though their namespaces differ. Run each complete fixture serially.
+          failed=0
           for sample in 1 2 3; do
             log="rust-tls-netns-gigabit-${sample}.log"
-            (
-              if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
-                hop-node-linux/boreas-linux-x86_64-musl-pq768 > "$log" 2>&1; then
-                printf 'sample_exit=0\n' >> "$log"
-              else
-                sample_exit=$?
-                printf 'sample_exit=%s\n' "$sample_exit" >> "$log"
-                exit 1
-              fi
-            ) &
-            pids="$pids $!"
+            if sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+                hop-node-linux/boreas-linux-x86_64-musl-pq768 2>&1 | tee "$log"; then
+              printf 'sample_exit=0\n' | tee -a "$log"
+            else
+              sample_exit=$?
+              printf 'sample_exit=%s\n' "$sample_exit" | tee -a "$log"
+              failed=1
+            fi
           done
+          exit "$failed"
+      - name: Measure direct PQ-WG full-duplex throughput separately
+        id: candidate_direct
+        if: ${{ !cancelled() && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure') }}
+        timeout-minutes: 4
+        env:
+          BOREAS_NETNS_TRANSPORT: direct
+          BOREAS_MIN_THROUGHPUT_MBPS: '1000'
+          BOREAS_PERF_BYTES: '268435456'
+          BOREAS_PERF_TIMEOUT_SECONDS: '25'
+          BOREAS_NETNS_EDGE_LIFETIME_SECONDS: '33'
+          BOREAS_DIAGNOSTIC_TIMING: '0'
+        run: |
+          set -euo pipefail
           failed=0
-          for pid in $pids; do
-            wait "$pid" || failed=1
-          done
           for sample in 1 2 3; do
-            echo "===== gigabit sample ${sample} ====="
-            cat "rust-tls-netns-gigabit-${sample}.log"
+            if ! sudo -E timeout --kill-after=5s 55s bash tools/release/netns_daemon_smoke.sh \
+              hop-node-linux/boreas-linux-x86_64-musl-pq768 \
+              2>&1 | tee "rust-tls-netns-direct-${sample}.log"; then
+              failed=1
+            fi
           done
           exit "$failed"
       - name: Record one instrumented sample after a gigabit failure (diagnostic only)
@@ -1325,7 +1350,7 @@ jobs:
       - name: Measure explicitly enabled TCPv4 GSO over real TUN and strict E2E
         id: acceptance_gso
         # This profile never replaces the earlier default-profile gates.
-        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff') && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
+        if: ${{ !cancelled() && github.repository == 'Lanlan13-14/Boreas' && ((github.ref == 'refs/heads/test/v111-tcpv4-gso' && success()) || ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/work/v111-handoff' || github.ref == 'refs/heads/feat/pq-wg-transport') && (steps.candidate_gigabit.outcome == 'success' || steps.candidate_gigabit.outcome == 'failure'))) }}
         timeout-minutes: 5
         env:
           BOREAS_NETNS_TCPV4_GSO: '1'
@@ -1352,6 +1377,7 @@ jobs:
           path: |
             rust-tls-netns-delayed-*.log
             rust-tls-netns-gigabit-*.log
+            rust-tls-netns-direct-*.log
             rust-tls-gso-*.log
             rust-tls-netns-multistream.log
             rust-tls-perf-environment.txt

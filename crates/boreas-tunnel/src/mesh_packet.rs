@@ -24,6 +24,47 @@ const PROFILE: &[u8] = b"BOREAS CORE TUN 1\0";
 const CLOSE_BUDGET: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PACKET_BUFFER_BYTES: usize = 2 * (MAX_MTU + 1);
+// This synchronous path fails closed rather than retrying an interrupted
+// transport indefinitely or losing track of a partially accepted message.
+const MAX_WRITE_INTERRUPTS: u8 = 16;
+
+pub(crate) fn write_chunks_and_flush<W: Write + ?Sized>(
+    writer: &mut W,
+    chunks: &[&[u8]],
+) -> io::Result<()> {
+    for chunk in chunks {
+        let mut offset = 0;
+        let mut interrupts = 0;
+        while offset < chunk.len() {
+            match writer.write(&chunk[offset..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    offset += n;
+                    interrupts = 0;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts += 1;
+                    if interrupts >= MAX_WRITE_INTERRUPTS {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let mut interrupts = 0;
+    loop {
+        match writer.flush() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interrupts += 1;
+                if interrupts >= MAX_WRITE_INTERRUPTS {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PacketEpoch {
@@ -135,14 +176,14 @@ fn epoch(
     // mean the other side rejected the profile and cannot authorize failover.
     let profile_error = |_| TunnelError::Unsupported("Core TUN profile or MTU mismatch");
     if initiator {
-        c.write_all(&expected).map_err(profile_error)?;
+        write_chunks_and_flush(c, &[&expected]).map_err(profile_error)?;
     }
     c.read_exact(&mut received).map_err(profile_error)?;
     if received != expected {
         return Err(TunnelError::Unsupported("Core TUN profile or MTU mismatch"));
     }
     if !initiator {
-        c.write_all(&expected).map_err(profile_error)?;
+        write_chunks_and_flush(c, &[&expected]).map_err(profile_error)?;
     }
     (io.check)()?;
     let mut stats = PacketEpoch {
@@ -162,7 +203,7 @@ fn epoch(
     while Instant::now() < io.deadline {
         (io.check)()?;
         if initiator && !closing && Instant::now() >= rotate {
-            c.write_all(&[0; 2])?;
+            write_chunks_and_flush(c, &[&[0; 2]])?;
             closing = true;
         }
         let next = if initiator && !closing {
@@ -178,7 +219,7 @@ fn epoch(
             if n == 0 {
                 (io.check)()?;
                 if !initiator {
-                    c.write_all(&[0; 2])?;
+                    write_chunks_and_flush(c, &[&[0; 2]])?;
                 } else if !closing {
                     return Err(TunnelError::Unsupported("unsolicited mesh epoch end"));
                 }
@@ -208,8 +249,8 @@ fn epoch(
             };
             if policy.authorize_outbound(packet).is_ok() {
                 (io.check)()?;
-                c.write_all(&(packet.len() as u16).to_be_bytes())?;
-                c.write_all(packet)?;
+                let prefix = (packet.len() as u16).to_be_bytes();
+                write_chunks_and_flush(c, &[&prefix, packet])?;
                 stats.tx = stats.tx.saturating_add(1);
             }
         }
@@ -259,4 +300,112 @@ fn ready(
         buffered || fds[0].revents != 0,
         fds[1].revents & libc::POLLIN != 0,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct BufferedShortWriter {
+        pending: Vec<u8>,
+        wire: Vec<u8>,
+        blocked_flush: bool,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for BufferedShortWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            let count = input.len().min(2);
+            self.pending.extend_from_slice(&input[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.blocked_flush {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.wire.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_writes_are_flushed_in_order_before_success() {
+        let mut output = BufferedShortWriter::default();
+        write_chunks_and_flush(&mut output, &[b"prefix", b"payload"]).unwrap();
+        assert_eq!(output.wire.as_slice(), b"prefixpayload");
+        assert!(output.pending.is_empty());
+        assert_eq!(output.flushes, 1);
+        assert!(output.writes > 2);
+    }
+
+    #[test]
+    fn blocked_flush_does_not_report_message_delivery_or_spin() {
+        let mut output = BufferedShortWriter {
+            blocked_flush: true,
+            ..Default::default()
+        };
+        let error = write_chunks_and_flush(&mut output, &[b"first", b"last"]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(output.flushes, 1);
+        assert!(output.wire.is_empty());
+        assert_eq!(output.pending.as_slice(), b"firstlast");
+        // Retrying flush alone never duplicates the accepted plaintext.
+        output.blocked_flush = false;
+        output.flush().unwrap();
+        assert_eq!(output.wire.as_slice(), b"firstlast");
+    }
+
+    struct InterruptWriter {
+        fail_write: bool,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for InterruptWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(input.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::ErrorKind::Interrupted.into())
+        }
+    }
+
+    #[test]
+    fn repeated_interrupts_are_bounded_for_writes_and_flushes() {
+        let mut writer = InterruptWriter {
+            fail_write: true,
+            writes: 0,
+            flushes: 0,
+        };
+        assert_eq!(
+            write_chunks_and_flush(&mut writer, &[b"x"]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(writer.writes, usize::from(MAX_WRITE_INTERRUPTS));
+        assert_eq!(writer.flushes, 0);
+
+        let mut writer = InterruptWriter {
+            fail_write: false,
+            writes: 0,
+            flushes: 0,
+        };
+        assert_eq!(
+            write_chunks_and_flush(&mut writer, &[b"x"]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.flushes, usize::from(MAX_WRITE_INTERRUPTS));
+    }
 }
