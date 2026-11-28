@@ -190,7 +190,27 @@ impl PqWgE2eBackend {
 
 impl E2eStream for PqWgStream<CircuitStream<'_>> {
     fn close_stream(&mut self) -> io::Result<()> {
-        self.close_notify()
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.close_notify() {
+                Ok(()) => break,
+                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                Err(error) => return Err(error),
+            }
+            let progress = self.progress_io()?;
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+            if !progress.advanced { self.wait_progress(remaining, progress.write)?; }
+        }
+        while self.has_pending_output() {
+            let progress = self.progress_io()?;
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+            if !progress.advanced && self.has_pending_output() {
+                self.wait_progress(remaining, progress.write)?;
+            }
+        }
+        self.get_mut().send_close_until(until)
     }
 
     fn read_with_authenticated_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -728,11 +748,11 @@ impl OuterTlsConnector for OpenSslOuterTlsConnector {
         let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .connector
-            .connect(server_name, tcp)
+            .connect(server_name, crate::stream::queued_tls::QueueIo::new(tcp))
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer handshake", &error)))?;
         #[cfg(feature = "record-diagnostics")]
         eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
-        Ok(Box::new(stream))
+        Ok(Box::new(crate::stream::queued_tls::QueuedTls::new(stream)))
     }
 }
 
@@ -804,11 +824,11 @@ impl OuterTlsAcceptor for OpenSslOuterTlsAcceptor {
         let tcp = crate::record_diagnostics::Socket(tcp);
         let stream = self
             .acceptor
-            .accept(tcp)
+            .accept(crate::stream::queued_tls::QueueIo::new(tcp))
             .map_err(|error| TunnelError::InnerTls(outer_tls_reason("outer accept", &error)))?;
         #[cfg(feature = "record-diagnostics")]
         eprintln!("record_chain_tls layer=outer version={} cipher={}", stream.ssl().version_str(), stream.ssl().current_cipher().map_or("unavailable", |cipher| cipher.name()));
-        Ok(Box::new(stream))
+        Ok(Box::new(crate::stream::queued_tls::QueuedTls::new(stream)))
     }
 }
 

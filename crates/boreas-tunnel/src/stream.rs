@@ -26,8 +26,28 @@ use crate::ws::WsStream;
 /// circuit fragments. Polling only the TCP fd misses all of those cases. It is
 /// deliberately conservative for a partial frame: just like socket readiness,
 /// it permits a read attempt but does not promise that a whole frame is ready.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgressIo {
+    pub advanced: bool,
+    pub read: bool,
+    pub write: bool,
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+pub(crate) mod queued_tls;
+
 pub trait Duplex: Read + Write + Send {
     fn has_buffered_input(&self) -> bool;
+    /// Explicit activation happens only after authenticated ordinary-path bind.
+    fn enable_progress(&mut self) -> io::Result<bool> { Ok(false) }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { Ok(ProgressIo::default()) }
+    fn is_raw_socket(&self) -> bool { false }
+    fn has_pending_output(&self) -> bool { false }
+    fn wait_progress(&self, _timeout: Duration, _write: bool) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+
 
     /// Install a per-operation transport timeout for a bounded handshake.
     ///
@@ -63,6 +83,36 @@ pub trait Duplex: Read + Write + Send {
 }
 
 impl Duplex for TcpStream {
+    fn wait_progress(&self, timeout: Duration, write: bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let until=Instant::now()+timeout;
+            loop {
+                let remaining=until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+                let mut fd=libc::pollfd {fd:self.as_raw_fd(),events:libc::POLLIN | if write {libc::POLLOUT}else{0},revents:0};
+                let ms=remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+                let result=unsafe {libc::poll(&mut fd,1,ms)};
+                if result>0 {
+                    if fd.revents & libc::POLLNVAL != 0 {return Err(io::ErrorKind::InvalidInput.into());}
+                    return Ok(());
+                }
+                if result==0 {return Err(io::ErrorKind::TimedOut.into());}
+                let error=io::Error::last_os_error();
+                if error.kind()!=io::ErrorKind::Interrupted {return Err(error);}
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _=(timeout,write);Err(io::ErrorKind::Unsupported.into()) }
+    }
+
+    fn enable_progress(&mut self) -> io::Result<bool> { self.set_nonblocking(true)?; Ok(true) }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> {
+        Ok(ProgressIo { read: true, ..Default::default() })
+    }
+    fn is_raw_socket(&self) -> bool { true }
+
     fn has_buffered_input(&self) -> bool {
         false
     }
@@ -78,6 +128,13 @@ impl Duplex for TcpStream {
 }
 
 impl<T: Duplex + ?Sized> Duplex for Box<T> {
+    fn has_pending_output(&self)->bool {(**self).has_pending_output()}
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {(**self).wait_progress(timeout,write)}
+
+    fn enable_progress(&mut self) -> io::Result<bool> { (**self).enable_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { (**self).progress_io() }
+    fn is_raw_socket(&self) -> bool { (**self).is_raw_socket() }
+
     fn has_buffered_input(&self) -> bool {
         (**self).has_buffered_input()
     }
@@ -103,6 +160,12 @@ impl Duplex for Cursor<Vec<u8>> {
 }
 
 impl<T: Duplex> Duplex for WsStream<T> {
+    fn has_pending_output(&self)->bool {self.transport_output_pending()}
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {self.wait_transport_progress(timeout,write)}
+
+    fn enable_progress(&mut self) -> io::Result<bool> { self.enable_transport_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.progress_transport_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()
     }
@@ -133,6 +196,32 @@ impl<S: Duplex> Duplex for EstablishedStream<S> {
 
 #[cfg(feature = "openssl-inner-tls")]
 impl<S: Duplex> Duplex for boreas_crypto::pq_wg::PqWgStream<S> {
+    fn has_pending_output(&self) -> bool {
+        self.has_pending_output() || self.get_ref().has_pending_output()
+    }
+
+    fn wait_progress(&self, timeout: Duration, write: bool) -> io::Result<()> {
+        self.get_ref().wait_progress(timeout, write || self.has_pending_output())
+    }
+
+    fn enable_progress(&mut self) -> io::Result<bool> {
+        self.get_mut().enable_progress()
+    }
+
+    fn progress_io(&mut self) -> io::Result<ProgressIo> {
+        let mut progress = self.get_mut().progress_io()?;
+        let had_pending = self.has_pending_output();
+        if had_pending {
+            match self.flush_pending_output() {
+                Ok(()) => { progress.advanced = true; progress.write = true; }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(progress)
+    }
+
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input() || self.get_ref().has_buffered_input()
     }
@@ -147,6 +236,12 @@ impl<S: Duplex> Duplex for boreas_crypto::pq_wg::PqWgStream<S> {
 }
 
 impl Duplex for CircuitStream<'_> {
+    fn has_pending_output(&self)->bool {self.session_output_pending()}
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {self.wait_session_progress(timeout,write)}
+
+    fn enable_progress(&mut self) -> io::Result<bool> { self.enable_session_progress() }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.progress_session_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()
     }
@@ -347,6 +442,15 @@ impl<T: Duplex> Write for DeadlineIo<T> {
 }
 
 impl<T: Duplex> Duplex for DeadlineIo<T> {
+    fn has_pending_output(&self)->bool {self.inner.has_pending_output()}
+    fn wait_progress(&self,timeout:Duration,write:bool)->io::Result<()> {self.inner.wait_progress(timeout,write)}
+
+    fn enable_progress(&mut self) -> io::Result<bool> {
+        if self.armed.load(Ordering::Relaxed) { return Err(io::ErrorKind::PermissionDenied.into()); }
+        self.inner.enable_progress()
+    }
+    fn progress_io(&mut self) -> io::Result<ProgressIo> { self.inner.progress_io() }
+
     fn has_buffered_input(&self) -> bool {
         self.inner.has_buffered_input()
     }

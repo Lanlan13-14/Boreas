@@ -799,11 +799,46 @@ fn prefetched_frame_ready(bytes: &[u8], mtu: usize) -> bool {
     len == 0 || len > mtu || rest.len() >= len
 }
 
-/// None means a refill is required; errors never consume or deliver bytes.
-fn deliver_prefetched<P: PacketIo + ?Sized>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundClass { Host, CoreDns, EdgeDns }
+
+/// One rule for copied and borrowed ingress. Classification is not authority:
+/// DNS leases/transactions are still checked by the original dispatchers.
+fn classify_inbound(
+    policy: &PointToPoint,
+    packet: InspectedPacket<'_>,
+    core_dns: Option<Ipv4Addr>,
+    edge_dns: Option<Ipv4Addr>,
+    replica_only: bool,
+) -> Result<InboundClass, PacketPathError> {
+    let info = packet.info();
+    if core_dns.is_some_and(|vip| info.destination == IpAddr::V4(vip)) {
+        if info.source != IpAddr::V4(policy.peer_vip()) {
+            return Err(PacketPathError::Denied(PacketDeny::SourceNotPeer));
+        }
+        return Ok(InboundClass::CoreDns);
+    }
+    if edge_dns.is_some_and(|vip| info.source == IpAddr::V4(vip)) {
+        if info.destination != IpAddr::V4(policy.local_vip()) {
+            return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
+        }
+        return Ok(InboundClass::EdgeDns);
+    }
+    if replica_only {
+        return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
+    }
+    Ok(InboundClass::Host)
+}
+
+/// None means a refill or the original DNS dispatcher is required. In either
+/// case the plaintext cursor has not moved. Errors never consume bytes.
+fn deliver_prefetched_classified<P: PacketIo + ?Sized>(
     io: &P,
     policy: &PointToPoint,
     bytes: &[u8],
+    core_dns: Option<Ipv4Addr>,
+    edge_dns: Option<Ipv4Addr>,
+    replica_only: bool,
 ) -> Option<Result<(usize, usize), PacketPathError>> {
     let [hi, lo, rest @ ..] = bytes else {
         return None;
@@ -818,22 +853,25 @@ fn deliver_prefetched<P: PacketIo + ?Sized>(
     if rest.len() < length {
         return None;
     }
-    Some(
-        deliver_host_packet(io, policy, &rest[..length])
-            .map(|length| (FRAME_PREFIX_LEN + length, length)),
-    )
+    let packet = match policy.inspect_bytes(&rest[..length]).map_err(PacketPathError::Denied) {
+        Ok(packet) => packet,
+        Err(error) => return Some(Err(error)),
+    };
+    match classify_inbound(policy, packet, core_dns, edge_dns, replica_only) {
+        Err(error) => Some(Err(error)),
+        Ok(InboundClass::CoreDns | InboundClass::EdgeDns) => None,
+        Ok(InboundClass::Host) => Some(
+            deliver_inspected_host_packet(io, policy, packet)
+                .map(|length| (FRAME_PREFIX_LEN + length, length)),
+        ),
+    }
 }
 
-/// The same ordinary host-delivery checks for borrowed and copied packets.
-fn deliver_host_packet<P: PacketIo + ?Sized>(
-    io: &P,
-    policy: &PointToPoint,
-    bytes: &[u8],
-) -> Result<usize, PacketPathError> {
-    let packet = policy
-        .inspect_bytes(bytes)
-        .map_err(PacketPathError::Denied)?;
-    deliver_inspected_host_packet(io, policy, packet)
+#[cfg(all(test, feature = "openssl-inner-tls"))]
+fn deliver_prefetched<P: PacketIo + ?Sized>(
+    io: &P, policy: &PointToPoint, bytes: &[u8],
+) -> Option<Result<(usize, usize), PacketPathError>> {
+    deliver_prefetched_classified(io, policy, bytes, None, None, false)
 }
 
 fn deliver_inspected_host_packet<P: PacketIo + ?Sized>(
@@ -874,6 +912,11 @@ fn read_packet_frame_into<C: Read + ?Sized>(
     Ok(true)
 }
 
+/// Result of a bounded direct-plaintext ingress turn. Pending is NOT EOF:
+/// no packet was published and the owner must service the opposite direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundProgress { Packet(usize), Pending, Closed }
+
 /// A single-owner adapter between one host-side packet endpoint and one
 /// established E2E circuit.
 ///
@@ -900,6 +943,8 @@ pub struct PacketPath<'a, C, P: ?Sized> {
     outbound_batch: Vec<u8>,
     // One initialized high-water allocation; only `used` bytes may be sent.
     outbound_inline: Vec<u8>,
+    outbound_pending: Option<(usize,usize,usize,u64,bool)>,
+    queued_progress:bool,
     // Linux TUN may truncate to the supplied read length; reserve a guard byte.
     outbound_scratch: [u8; MAX_MTU + 1],
     inbound_scratch: Vec<u8>,
@@ -1188,6 +1233,96 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
         Ok(path)
     }
 
+    /// Enable only after role, DNS lease and replica binding are final. This
+    /// is also the assembly entry used by daemon regression tests.
+    pub fn configure_direct_read_ahead(
+        &mut self, real_tun: bool, replica_epoch: bool, admission: &crate::resource::Admission,
+    ) -> bool {
+        #[cfg(feature = "openssl-inner-tls")]
+        if self.dns_replica_only { return false; }
+        self.circuit.as_mut().is_some_and(|circuit| {
+            circuit.direct_read_ahead_eligible(real_tun, replica_epoch)
+                && circuit.enable_direct_read_ahead_admitted(admission)
+        })
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    pub fn configure_queued_progress(&mut self, admission:&crate::resource::Admission)
+        -> Result<bool,PacketPathError>
+    {
+        self.check_open()?;
+        let result=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?
+            .enable_queued_progress(admission);
+        match result {
+            Ok(active)=>{
+                self.queued_progress=active;
+                if active && let Some(dns)=self.private_dns.as_mut() {dns.deferred=true;}
+                Ok(active)
+            },
+            Err(error)=>Err(self.fail(circuit_io(error))),
+        }
+    }
+    pub fn progress_transport(&mut self) -> Result<crate::stream::ProgressIo,PacketPathError> {
+        self.check_open()?;
+        let result=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?.progress_transport();
+        result.map_err(|error|self.fail(circuit_io(error)))
+    }
+
+    /// One plaintext continuation per event-loop turn. This repairs the L3
+    /// prefix/body completion boundary, not incomplete records below E2E TLS.
+    /// All complete packets still traverse the existing DNS/host dispatcher.
+    pub fn step_inbound_progress(&mut self, timeout: std::time::Duration)
+        -> Result<InboundProgress, PacketPathError>
+    {
+        self.check_open()?;
+        #[cfg(feature = "openssl-inner-tls")]
+        if self.dns_replica_only {
+            return self.step_inbound().map(|packet| packet.map_or(InboundProgress::Closed, InboundProgress::Packet));
+        }
+        let mut interrupts = 0;
+        loop {
+            let Some(circuit) = self.circuit.as_mut() else { return Err(PacketPathError::Poisoned); };
+            match circuit.progress_plaintext_frame(self.policy.mtu(), timeout) {
+                Ok(crate::e2e::PlaintextProgress::Pending) => return Ok(InboundProgress::Pending),
+                Ok(crate::e2e::PlaintextProgress::Closed) => {
+                    self.close(); return Ok(InboundProgress::Closed);
+                }
+                Ok(crate::e2e::PlaintextProgress::Ready | crate::e2e::PlaintextProgress::Disabled) => {
+                    return self.step_inbound_prefetched().map(|packet|
+                        packet.map_or(InboundProgress::Closed, InboundProgress::Packet));
+                }
+                Err(error) if error.kind()==io::ErrorKind::WouldBlock => {
+                    return Ok(InboundProgress::Pending);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupts += 1;
+                    if interrupts == MAX_INTERRUPT_RETRIES {
+                        return Err(self.fail(circuit_io(error)));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(self.fail(PacketPathError::TruncatedFrame));
+                }
+                Err(error) => return Err(self.fail(circuit_io(error))),
+            }
+        }
+    }
+
+    /// Partial L3 bytes are not readiness for another socket read. Full frames
+    /// remain immediately actionable; lower-layer pending bytes still count.
+    pub fn has_progress_input(&self) -> bool {
+        self.prefetched_frame_ready() == Some(true)
+            || self.circuit.as_ref().is_some_and(E2eCircuit::has_transport_buffered_input)
+    }
+
+    /// Called even when no new socket event arrives: slow trickles do not
+    /// renew the deadline and cannot retain a partial frame indefinitely.
+    pub fn check_inbound_progress_deadline(&mut self) -> Result<(), PacketPathError> {
+        let expired = self.circuit.as_ref().is_some_and(E2eCircuit::plaintext_deadline_expired);
+        if expired { return Err(self.fail(PacketPathError::CircuitIo(io::ErrorKind::TimedOut))); }
+        Ok(())
+    }
+
     /// Whether inbound bytes are buffered above the raw outer TCP socket.
     /// The daemon combines this with socket readiness before entering a
     /// blocking frame read, avoiding both arbitrary sleeps and missed TLS data.
@@ -1211,16 +1346,47 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
     /// caller's per-packet stop/revocation checks remain outside this call.
     pub fn step_inbound_prefetched(&mut self) -> Result<Option<usize>, PacketPathError> {
         self.check_open()?;
+        // Dedicated replica streams retain authenticated-EOF reads unchanged.
         #[cfg(feature = "openssl-inner-tls")]
-        if self.private_dns.is_some() || self.edge_dns.is_some() || self.dns_replica_only {
+        if self.dns_replica_only {
             return self.step_inbound();
         }
+        #[cfg(feature = "openssl-inner-tls")]
+        let (core_dns, edge_dns) = (
+            self.private_dns.as_ref().map(|dns| dns.service.dns_vip()),
+            self.edge_dns.as_ref().map(|dns| dns.vip),
+        );
+        #[cfg(not(feature = "openssl-inner-tls"))]
+        let (core_dns, edge_dns) = (None, None);
         let Some(circuit) = self.circuit.as_mut() else {
             return Err(PacketPathError::Poisoned);
         };
+        let mut interrupts = 0;
+        loop {
+            match circuit.fill_prefetched_plaintext() {
+                crate::e2e::PrefetchFill::Disabled => return self.step_inbound(),
+                crate::e2e::PrefetchFill::CleanEof => {
+                    self.close();
+                    return Ok(None);
+                }
+                crate::e2e::PrefetchFill::Error(error)
+                    if error.kind() == io::ErrorKind::Interrupted => {
+                        interrupts += 1;
+                        if interrupts == MAX_INTERRUPT_RETRIES {
+                            return Err(self.fail(circuit_io(error)));
+                        }
+                    }
+                crate::e2e::PrefetchFill::Error(error) => {
+                    return Err(self.fail(circuit_io(error)));
+                }
+                crate::e2e::PrefetchFill::HasBytes => break,
+            }
+        }
         let result = circuit
             .prefetched_plaintext()
-            .and_then(|bytes| deliver_prefetched(self.io, &self.policy, bytes));
+            .and_then(|bytes| deliver_prefetched_classified(
+                self.io, &self.policy, bytes, core_dns, edge_dns, false,
+            ));
         match result {
             None => self.step_inbound(),
             Some(Err(error)) => Err(self.fail(error)),
@@ -1252,6 +1418,7 @@ impl<'a, P: PacketIo + ?Sized> PacketPath<'a, E2eCircuit<'a>, P> {
             circuit.close_gracefully();
         }
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
@@ -1286,6 +1453,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             stats: PacketStats::default(),
             outbound_batch: Vec::new(),
             outbound_inline: Vec::new(),
+            outbound_pending:None, queued_progress:false,
             // Keep this independent of the path MTU: the host adapter must read
             // at its own MTU, then policy checks the complete packet below.
             outbound_scratch: [0; MAX_MTU + 1],
@@ -1362,6 +1530,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
             self.state = PathState::Closed;
         }
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
@@ -1422,6 +1591,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         // Preserve the old unbounded-API behavior for callers above the
         // production single-record threshold; ordinary daemon batches use
         // the bounded direct-read storage below.
+        if self.outbound_pending.is_some() { return self.resume_outbound_pending(); }
         if max_bytes > INLINE_BATCH_THRESHOLD {
             return self.step_outbound_batch_legacy(max_packets, max_bytes);
         }
@@ -1535,22 +1705,65 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         if drained == 0 {
             return Ok(0);
         }
-        let result = write_outbound(
-            circuit,
-            &self.outbound_inline[..used],
-            #[cfg(feature = "openssl-inner-tls")]
-            self.edge_dns.as_ref().filter(|_| contains_dns),
-        );
-        if let Err(error) = result {
-            return Err(self.fail(error));
+        if !self.queued_progress {
+            let result=write_outbound(circuit,&self.outbound_inline[..used],
+                #[cfg(feature="openssl-inner-tls")]
+                self.edge_dns.as_ref().filter(|_|contains_dns));
+            if let Err(error)=result {return Err(self.fail(error));}
+            self.stats.outbound_packets=self.stats.outbound_packets.saturating_add(drained as u64);
+            self.stats.outbound_bytes=self.stats.outbound_bytes.saturating_add(payload_bytes);
+            return Ok(drained);
         }
-        self.stats.outbound_packets = self
-            .stats
-            .outbound_packets
-            .saturating_add(u64::try_from(drained).unwrap_or(u64::MAX));
-        self.stats.outbound_bytes = self.stats.outbound_bytes.saturating_add(payload_bytes);
-        Ok(drained)
+        self.outbound_pending=Some((0,used,drained,payload_bytes,
+            { #[cfg(feature="openssl-inner-tls")] {contains_dns}
+              #[cfg(not(feature="openssl-inner-tls"))] {false} }));
+        self.resume_outbound_pending()
     }
+
+    fn resume_outbound_pending(&mut self) -> Result<usize,PacketPathError> {
+        self.check_open()?;
+        let Some((mut cursor,used,count,bytes,dns))=self.outbound_pending else {return Ok(0);};
+        #[cfg(not(feature="openssl-inner-tls"))]
+        let _=dns;
+        let mut interrupts=0;
+        loop {
+            #[cfg(feature="openssl-inner-tls")]
+            {
+                let authorized=self.edge_dns.as_ref().filter(|_|dns).map_or(Ok(()),EdgeDns::check)
+                    .and_then(|()|self.private_dns.as_mut().map_or(Ok(()),|lease|lease.live_utc().map(|_|())));
+                if let Err(error)=authorized {return Err(self.fail(error));}
+            }
+            let circuit=self.circuit.as_mut().ok_or(PacketPathError::Poisoned)?;
+            let result=if cursor<used {
+                circuit.write(&self.outbound_inline[cursor..used]).map(Some)
+            } else {circuit.flush().map(|()|None)};
+            match result {
+                Ok(Some(0))=>return Err(self.fail(PacketPathError::CircuitIo(io::ErrorKind::WriteZero))),
+                Ok(Some(n))=>{interrupts=0;cursor+=n;self.outbound_pending=Some((cursor,used,count,bytes,dns));},
+                Ok(None)=>break,
+                Err(e) if e.kind()==io::ErrorKind::Interrupted=>{
+                    interrupts+=1;
+                    if interrupts>=MAX_INTERRUPT_RETRIES {return Err(self.fail(circuit_io(e)));}
+                }
+                Err(e) if e.kind()==io::ErrorKind::WouldBlock=>{
+                    self.outbound_pending=Some((cursor,used,count,bytes,dns));return Ok(0);
+                }
+                Err(e)=>return Err(self.fail(circuit_io(e))),
+            }
+        }
+        #[cfg(feature="openssl-inner-tls")]
+        {
+            let authorized=self.edge_dns.as_ref().filter(|_|dns).map_or(Ok(()),EdgeDns::check)
+                .and_then(|()|self.private_dns.as_mut().map_or(Ok(()),|lease|lease.live_utc().map(|_|())));
+            if let Err(error)=authorized {return Err(self.fail(error));}
+        }
+        self.outbound_pending=None;
+        self.stats.outbound_packets=self.stats.outbound_packets.saturating_add(count as u64);
+        self.stats.outbound_bytes=self.stats.outbound_bytes.saturating_add(bytes);
+        Ok(count)
+    }
+
+    pub fn has_pending_output(&self) -> bool { self.outbound_pending.is_some() }
 
     fn step_outbound_batch_legacy(
         &mut self,
@@ -1708,6 +1921,23 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
     #[cfg(feature = "openssl-inner-tls")]
     pub fn step_private_dns(&mut self, max_packets: usize) -> Result<usize, PacketPathError> {
         self.check_open()?;
+        if self.queued_progress {
+            // Do not dequeue DNS output while another frame still owns the
+            // E2E write acknowledgement. Ordinary outbound resumes that owner.
+            if self.outbound_pending.is_some() || max_packets==0 {return Ok(0);}
+            let Some(dns)=self.private_dns.as_mut().filter(|dns|dns.deferred) else {return Ok(0);};
+            let now=dns.live_utc()?;
+            if dns.service.poll(now).is_none() {
+                return Err(self.fail(PacketPathError::DnsAuthorizationLost));
+            }
+            let now=dns.live_utc()?;
+            let Some(reply)=dns.service.pop_output(now) else {return Ok(0);};
+            let length=validate_private_dns_reply(&self.policy,dns,&reply,None)?;
+            if self.outbound_inline.is_empty() {self.outbound_inline.resize(INLINE_BATCH_STORAGE,0);}
+            let used=encode_packet_frame_into(&reply,self.policy.mtu(),&mut self.outbound_inline)?;
+            self.outbound_pending=Some((0,used,1,length as u64,true));
+            return self.resume_outbound_pending();
+        }
         let Some(dns) = self.private_dns.as_mut().filter(|dns| dns.deferred) else {
             return Ok(0);
         };
@@ -1731,6 +1961,7 @@ impl<'a, C: Read + Write, P: PacketIo + ?Sized> PacketPath<'a, C, P> {
         self.stats.failures = self.stats.failures.saturating_add(1);
         self.state = PathState::Poisoned(error);
         self.circuit = None;
+        self.outbound_pending=None;
         #[cfg(feature = "openssl-inner-tls")]
         {
             self.private_dns = None;
@@ -1926,12 +2157,13 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
     #[cfg(feature = "openssl-inner-tls")]
     let info = packet.info();
     #[cfg(feature = "openssl-inner-tls")]
-    if let Some(dns) = dns
-        && info.destination == IpAddr::V4(dns.service.dns_vip())
-    {
-        if info.source != IpAddr::V4(policy.peer_vip()) {
-            return Err(PacketPathError::Denied(PacketDeny::SourceNotPeer));
-        }
+    let class = classify_inbound(
+        policy, packet,
+        dns.as_ref().map(|dns| dns.service.dns_vip()),
+        edge_dns.as_ref().map(|dns| dns.vip), dns_replica_only,
+    )?;
+    #[cfg(feature = "openssl-inner-tls")]
+    if let Some(dns) = dns.filter(|_| class == InboundClass::CoreDns) {
         // Never reclassify a DNS VIP packet as host traffic, even when
         // unanswered or authorization expired during the read.
         let reply_len = dispatch_private_dns(circuit, policy, dns, packet)?;
@@ -1941,12 +2173,7 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
         }));
     }
     #[cfg(feature = "openssl-inner-tls")]
-    if let Some(dns) = edge_dns
-        && info.source == IpAddr::V4(dns.vip)
-    {
-        if info.destination != IpAddr::V4(policy.local_vip()) {
-            return Err(PacketPathError::Denied(PacketDeny::DestinationNotLocal));
-        }
+    if let Some(dns) = edge_dns.filter(|_| class == InboundClass::EdgeDns) {
         dns.check()?;
         let expected = if info.protocol == 6 {
             let (port, client, flags) = dns_tcp_segment(packet.bytes(), info)
@@ -1980,10 +2207,6 @@ fn inbound_once<C: Read + Write, P: PacketIo + ?Sized>(
             length: info.packet_len,
             reply_len: None,
         }));
-    }
-    #[cfg(feature = "openssl-inner-tls")]
-    if dns_replica_only {
-        return Err(PacketPathError::Denied(PacketDeny::NotDnsTraffic));
     }
     let length = deliver_inspected_host_packet(io, policy, packet)?;
     Ok(Some(InboundDelivery {
@@ -2127,10 +2350,9 @@ fn poll_private_dns<C: Write>(
 }
 
 #[cfg(feature = "openssl-inner-tls")]
-fn write_private_dns<C: Write>(
-    circuit: &mut C,
+fn validate_private_dns_reply(
     policy: &PointToPoint,
-    dns: &mut PrivateDns<'_>,
+    dns: &PrivateDns<'_>,
     bytes: &[u8],
     udp_client: Option<u16>,
 ) -> Result<usize, PacketPathError> {
@@ -2150,15 +2372,24 @@ fn write_private_dns<C: Write>(
     {
         return Err(PacketPathError::Denied(PacketDeny::BadHeader));
     }
+    Ok(info.packet_len)
+}
+
+#[cfg(feature = "openssl-inner-tls")]
+fn write_private_dns<C: Write>(
+    circuit: &mut C, policy: &PointToPoint, dns: &mut PrivateDns<'_>,
+    bytes: &[u8], udp_client: Option<u16>,
+) -> Result<usize, PacketPathError> {
+    let length=validate_private_dns_reply(policy,dns,bytes,udp_client)?;
     let mut frame = [0; MAX_FRAME_BYTES];
-    let frame_len = encode_packet_frame_into(reply.bytes(), policy.mtu(), &mut frame)?;
+    let frame_len = encode_packet_frame_into(bytes, policy.mtu(), &mut frame)?;
     // Guard each partial write and the flush. On loss, abandon this circuit;
     // bytes already accepted by an underlying blocking write cannot be recalled.
     write_all_guarded(circuit, &frame[..frame_len], || dns.live_utc().map(|_| ()))?;
     dns.live_utc()?;
     circuit.flush().map_err(circuit_io)?;
     dns.live_utc()?;
-    Ok(info.packet_len)
+    Ok(length)
 }
 
 impl PacketPathError {
@@ -2866,6 +3097,56 @@ mod tests {
                         assert!(host.read_packet().unwrap().is_none());
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "openssl-inner-tls")]
+    #[test]
+    fn queued_private_dns_short_write_retains_owner_and_revocation_drops_it() {
+        use crate::dns_packet_service::tests::signed_packet_binding;
+        use crate::dns_runtime::tests::{dns_query,fixture_at,udp_datagram};
+        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+        struct PendingDns {input:InboundSource,output:OutboundSink,left:Rc<Cell<usize>>}
+        impl Read for PendingDns {fn read(&mut self,out:&mut[u8])->io::Result<usize>{self.input.read(out)}}
+        impl Write for PendingDns {
+            fn write(&mut self,bytes:&[u8])->io::Result<usize>{
+                if self.left.get()==0{return Err(io::ErrorKind::WouldBlock.into());}
+                let n=bytes.len().min(self.left.get());self.left.set(self.left.get()-n);self.output.write(&bytes[..n])
+            }
+            fn flush(&mut self)->io::Result<()>{Ok(())}
+        }
+        let fixture=fixture_at(1_000_000);let now=1_500_000_000;let mtu=1280;
+        for revoke in [false,true] {
+            let live=Arc::new(AtomicBool::new(true));let gate=live.clone();
+            let gate:DnsLiveness<'_>=Box::new(move||gate.load(Ordering::SeqCst));
+            let (peer,service)=signed_packet_binding(&fixture,mtu,gate);
+            let endpoints=AuthorizedEndpoints::bind([0x11;16],1,peer,fixture.local,1500).unwrap();
+            let (device,_host)=VirtualTun::try_pair(4,4,mtu).unwrap();
+            let query=udp_datagram([10,20,1,2],[10,20,0,53],40_000,53,&dns_query("host.b.example",1),true);
+            let (output,written)=OutboundSink::new();let left=Rc::new(Cell::new(1));
+            let circuit=PendingDns{input:InboundSource::new(encode_packet_frame(&query,mtu).unwrap()),output,left:left.clone()};
+            let mut path=PacketPath::try_new(&device,circuit,endpoints,mtu).unwrap();
+            path.queued_progress=true;
+            path.private_dns=Some(PrivateDns{service,tcp:false,deferred:true,utc:Box::new(move||Some(now))});
+            assert_eq!(path.step_inbound().unwrap(),Some(query.len()));
+            assert_eq!(path.step_private_dns(4).unwrap(),0);assert!(path.has_pending_output());
+            assert_eq!(written.borrow().len(),1);
+            assert_eq!(path.step_private_dns(4).unwrap(),0);assert_eq!(written.borrow().len(),1);
+            if revoke {live.store(false,Ordering::SeqCst);}
+            left.set(usize::MAX);
+            let result=path.step_outbound_batch(4,14000);
+            if revoke {
+                assert_eq!(result,Err(PacketPathError::DnsAuthorizationLost));
+                assert_eq!(written.borrow().len(),1);assert!(path.circuit.is_none());assert!(!path.has_pending_output());
+                assert_eq!(path.stats().outbound_packets,0);
+            } else {
+                assert_eq!(result,Ok(1));assert!(!path.has_pending_output());
+                let wire=written.borrow();let reply=decode_packet_frame(&wire,mtu).unwrap();
+                assert_eq!(&reply[12..16],&[10,20,0,53]);assert_eq!(&reply[16..20],&[10,20,1,2]);
+                assert_eq!(path.stats().outbound_packets,1);
+                assert_eq!(wire.len(),reply.len()+FRAME_PREFIX_LEN);drop(wire);
+                assert_eq!(path.step_private_dns(4).unwrap(),0);
             }
         }
     }

@@ -17,6 +17,7 @@
 //! frozen protocol. `SessionHello` is the only accepted first frame.
 
 
+use std::{io, time::{Duration, Instant}};
 use boreas_crypto::{NodeRole, Policy};
 use boreas_proto::messages::{
     self, LocalIdentity, PathRole, SessionAccept, SessionHello, SessionParams,
@@ -204,6 +205,9 @@ struct FrameIo {
     decoder: FrameDecoder,
     buffer: Vec<u8>,
     write_buf: Vec<u8>,
+    write_cursor: Option<usize>,
+    progress_enabled: bool,
+    partial_deadline: Option<Instant>,
     // Store each decoded batch in reverse so pop() delivers it in wire order.
     pending: Vec<Frame>,
     failed: bool,
@@ -216,19 +220,32 @@ impl FrameIo {
             decoder: FrameDecoder::new(FRAME_BUFFER_LIMIT),
             buffer: vec![0u8; READ_CHUNK],
             write_buf: Vec::new(),
+            write_cursor:None, progress_enabled:false, partial_deadline:None,
             pending: Vec::new(),
             failed: false,
         }
     }
 
+    /// Return ownership only after the circuit consumed the last byte. Pending
+    /// Frames remain exclusive owners; capacity, not logical length, is charged
+    /// against the existing receive quota. There is no second spare slot.
+    fn recycle_relay_body(&mut self, body: Vec<u8>) -> bool {
+        let used = self.pending.iter().fold(self.decoder.body_capacity(), |used, frame| {
+            used.saturating_add(frame.body.capacity())
+        });
+        self.decoder.recycle_empty_body(body, MAX_PENDING_BYTES.saturating_sub(used))
+    }
+
     fn poison(&mut self) {
         self.failed = true;
         self.pending = Vec::new();
+        // Drop all retained receive storage, including a recycled empty body.
+        self.decoder = FrameDecoder::new(FRAME_BUFFER_LIMIT);
     }
 
     fn has_buffered_input(&self) -> bool {
         !self.pending.is_empty()
-            || self.decoder.buffered_len() > 0
+            || (!self.progress_enabled && self.decoder.buffered_len() > 0)
             || self.stream.has_buffered_input()
     }
 
@@ -267,6 +284,7 @@ impl FrameIo {
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
+        if self.write_cursor.is_some() { return self.send_buffered(); }
         if let Err(error) = self.prepare_frame(kind, body) {
             self.poison();
             return Err(error);
@@ -278,23 +296,44 @@ impl FrameIo {
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
-        // Offer TLS the whole frame, not separate header and body writes.
-        // Short writes are retried; any write or flush error is terminal.
-        let result = self
-            .stream
-            .write_all(&self.write_buf)
-            .and_then(|()| self.stream.flush());
-        if result.is_err() {
+        let result = if self.progress_enabled {
+            let mut cursor=self.write_cursor.unwrap_or(0);
+            loop {
+                if cursor==self.write_buf.len() {
+                    match self.stream.flush() {
+                        Ok(())=>{self.write_cursor=None;break Ok(());},
+                        Err(e)=>{self.write_cursor=Some(cursor);break Err(e);},
+                    }
+                }
+                match self.stream.write(&self.write_buf[cursor..]) {
+                    Ok(0)=>break Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n)=>{cursor+=n;self.write_cursor=Some(cursor);},
+                    Err(e)=>{self.write_cursor=Some(cursor);break Err(e);},
+                }
+            }
+        } else { self.stream.write_all(&self.write_buf).and_then(|()|self.stream.flush()) };
+        if result.as_ref().is_err_and(|e|e.kind()!=io::ErrorKind::WouldBlock || !self.progress_enabled) {
             self.poison();
         }
         #[cfg(any(test, feature = "record-diagnostics"))]
         if result.is_ok() {
             crate::record_diagnostics::observe(crate::record_diagnostics::Layer::Frame, &self.write_buf);
         }
-        result.map_err(TunnelError::from)
+        result.map_err(|error| {
+            if self.progress_enabled && error.kind()==io::ErrorKind::WouldBlock {
+                TunnelError::Io(io::ErrorKind::WouldBlock)
+            } else { TunnelError::from(error) }
+        })
     }
 
+    fn check_partial_deadline(&mut self)->io::Result<()> {
+        if self.partial_deadline.is_some_and(|deadline|Instant::now()>=deadline) {
+            self.poison();return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
     fn recv(&mut self) -> Result<Frame, TunnelError> {
+        self.check_partial_deadline()?;
         if self.failed {
             return Err(TunnelError::Poisoned);
         }
@@ -304,6 +343,9 @@ impl FrameIo {
             }
             let read = match self.stream.read(&mut self.buffer) {
                 Ok(read) => read,
+                Err(error) if self.progress_enabled && error.kind()==io::ErrorKind::WouldBlock => {
+                    return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+                }
                 Err(error) => {
                     self.poison();
                     return Err(error.into());
@@ -317,10 +359,16 @@ impl FrameIo {
                 self.poison();
                 return Err(error.into());
             }
+            if self.progress_enabled && self.decoder.buffered_len()>0 {
+                self.partial_deadline.get_or_insert_with(||Instant::now()+Duration::from_secs(30));
+            } else {self.partial_deadline=None;}
             // Check the full batch before publishing any frame. The decoder's
             // byte limit alone does not bound queued frame metadata.
             if self.pending.len() > MAX_PENDING_FRAMES
                 || self.pending.iter().map(|frame| frame.body.len()).sum::<usize>() > MAX_PENDING_BYTES
+                || self.pending.iter().fold(self.decoder.body_capacity(), |used, frame| {
+                    used.saturating_add(frame.body.capacity())
+                }) > MAX_PENDING_BYTES
             {
                 self.poison();
                 return Err(TunnelError::FrameQuota);
@@ -344,6 +392,21 @@ pub struct EstablishedSession {
 }
 
 impl EstablishedSession {
+    pub(crate) fn enable_progress(&mut self) -> io::Result<bool> {
+        self.io.progress_enabled=self.io.stream.enable_progress()?;
+        Ok(self.io.progress_enabled)
+    }
+    pub(crate) fn output_pending(&self)->bool {
+        self.io.write_cursor.is_some() || self.io.stream.has_pending_output()
+    }
+    pub(crate) fn wait_progress(&self,timeout:std::time::Duration,write:bool)->io::Result<()> {
+        self.io.stream.wait_progress(timeout,write)
+    }
+    pub(crate) fn progress_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        self.io.check_partial_deadline()?;
+        self.io.stream.progress_io()
+    }
+
     pub fn peer(&self) -> PeerIdentity {
         self.authorized.peer
     }
@@ -391,6 +454,20 @@ impl EstablishedSession {
         if body.len() > MAX_BODY_LEN as usize {
             return Err(TunnelError::FrameTooLarge);
         }
+        if self.io.write_cursor.is_some() {
+            let wire = &self.io.write_buf;
+            let header = AppHeader {
+                proto_major: PROTO_MAJOR, kind, flags: 0,
+                body_len: u32::try_from(body.len()).map_err(|_| TunnelError::FrameTooLarge)?,
+            }.encode()?;
+            if wire.len() != header.len() + body.len()
+                || wire[..header.len()] != header
+                || wire[header.len()..] != *body
+            {
+                return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+            }
+            return self.io.send_buffered();
+        }
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
             kind,
@@ -424,6 +501,22 @@ impl EstablishedSession {
             hops_remaining,
             payload.len(),
         )?;
+        if self.io.write_cursor.is_some() {
+            let wire = &self.io.write_buf;
+            let body_len = fragment_header.len() + payload.len();
+            let header = AppHeader {
+                proto_major: PROTO_MAJOR, kind: Kind::RelayCircuit, flags: 0,
+                body_len: u32::try_from(body_len).map_err(|_| TunnelError::FrameTooLarge)?,
+            }.encode()?;
+            if wire.len() != HEADER_LEN + body_len
+                || wire[..HEADER_LEN] != header
+                || wire[HEADER_LEN..HEADER_LEN + fragment_header.len()] != fragment_header
+                || wire[HEADER_LEN + fragment_header.len()..] != *payload
+            {
+                return Err(TunnelError::Io(io::ErrorKind::WouldBlock));
+            }
+            return self.io.send_buffered();
+        }
         let body_len = fragment_header.len() + payload.len();
         let header = AppHeader {
             proto_major: PROTO_MAJOR,
@@ -448,6 +541,11 @@ impl EstablishedSession {
             return Err(error.into());
         }
         self.io.send_buffered()
+    }
+
+    pub(crate) fn recycle_relay_body(&mut self, body: Vec<u8>) -> bool {
+        if self.io.failed { return false; }
+        self.io.recycle_relay_body(body)
     }
 
     /// Receive one application frame and apply the frame-level state machine.
@@ -720,6 +818,67 @@ mod tests {
     }
 
     #[test]
+    fn application_pending_is_not_handshake_timeout_or_terminal_poison() {
+        struct Blocked;
+        impl Read for Blocked {
+            fn read(&mut self,_:&mut[u8])->io::Result<usize>{Err(io::ErrorKind::WouldBlock.into())}
+        }
+        impl Write for Blocked {
+            fn write(&mut self,_:&[u8])->io::Result<usize>{Err(io::ErrorKind::WouldBlock.into())}
+            fn flush(&mut self)->io::Result<()>{Err(io::ErrorKind::WouldBlock.into())}
+        }
+        impl Duplex for Blocked {fn has_buffered_input(&self)->bool{false}}
+        let mut io=FrameIo::new(Box::new(Blocked));
+        io.progress_enabled=true;
+        io.write_buf=vec![1,2,3];
+        for _ in 0..3 {
+            assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            assert_eq!(io.send_buffered(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            assert!(!io.failed);
+            assert_eq!(io.write_buf,[1,2,3]);
+            assert_eq!(io.write_cursor,Some(0));
+        }
+        assert_eq!(TunnelError::from(io::Error::from(io::ErrorKind::WouldBlock)),TunnelError::Timeout);
+    }
+
+    #[test]
+    fn partial_relay_body_yields_reverse_and_expires_without_renewal() {
+        struct Gated { input:io::Cursor<Vec<u8>>, split:usize, release:Arc<std::sync::atomic::AtomicBool>, record:Arc<Mutex<Vec<u8>>> }
+        impl Read for Gated {
+            fn read(&mut self,out:&mut[u8])->io::Result<usize> {
+                let pos=self.input.position() as usize;
+                if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    if pos>=self.split{return Err(io::ErrorKind::WouldBlock.into());}
+                    let n=out.len().min(self.split-pos);return self.input.read(&mut out[..n]);
+                }
+                self.input.read(out)
+            }
+        }
+        impl Write for Gated {
+            fn write(&mut self,bytes:&[u8])->io::Result<usize>{self.record.lock().unwrap().extend_from_slice(bytes);Ok(bytes.len())}
+            fn flush(&mut self)->io::Result<()>{Ok(())}
+        }
+        impl Duplex for Gated {fn has_buffered_input(&self)->bool{false}}
+        for split in [1,10,READ_CHUNK+3] {
+            let body=vec![0x65;READ_CHUNK+50];
+            let header=AppHeader{proto_major:PROTO_MAJOR,kind:Kind::RelayCircuit,flags:0,body_len:body.len() as u32};
+            let mut wire=header.encode().unwrap().to_vec();wire.extend_from_slice(&body);
+            let release=Arc::new(std::sync::atomic::AtomicBool::new(false));let record=Arc::new(Mutex::new(vec![]));
+            let mut io=FrameIo::new(Box::new(Gated{input:io::Cursor::new(wire),split,release:release.clone(),record:record.clone()}));
+            io.progress_enabled=true;
+            assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));
+            let deadline=io.partial_deadline;assert!(deadline.is_some());
+            for _ in 0..3 {assert_eq!(io.recv(),Err(TunnelError::Io(io::ErrorKind::WouldBlock)));assert_eq!(io.partial_deadline,deadline);}
+            io.send(Kind::Control,b"reverse").unwrap();assert!(!record.lock().unwrap().is_empty());
+            release.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(io.recv().unwrap().body,body);assert!(io.partial_deadline.is_none());
+        }
+        let mut io=FrameIo::new(Box::new(io::Cursor::new(vec![0u8;1])));io.progress_enabled=true;
+        io.partial_deadline=Some(Instant::now());assert!(io.check_partial_deadline().is_err());
+        assert!(io.failed);assert!(io.send(Kind::Control,b"forbidden").is_err());
+    }
+
+    #[test]
     fn receive_reuses_one_batch_and_preserves_fifo() {
         let mut batch = Vec::new();
         for value in [1, 2, 3] {
@@ -737,6 +896,30 @@ mod tests {
         let mut io = FrameIo::new(Box::new(std::io::Cursor::new(batch.repeat(MAX_PENDING_FRAMES))));
         assert!(matches!(io.recv(), Err(TunnelError::FrameQuota)));
         assert!(!io.has_buffered_input());
+        assert!(matches!(io.recv(), Err(TunnelError::Poisoned)));
+    }
+
+    #[test]
+    fn recycled_slot_charges_real_capacity_and_preserves_pending_owners() {
+        let mut io = FrameIo::new(Box::new(std::io::Cursor::new(Vec::new())));
+        let pending = Frame {
+            header: AppHeader { proto_major: PROTO_MAJOR, kind: Kind::RelayCircuit,
+                flags: 0, body_len: 1 },
+            body: { let mut body = Vec::with_capacity(MAX_PENDING_BYTES - 16384);
+                body.push(0xa5); body },
+        };
+        let ptr = pending.body.as_ptr();
+        io.pending.push(pending);
+        assert!(!io.recycle_relay_body(Vec::with_capacity(16385)));
+        assert_eq!(io.decoder.body_capacity(), 0);
+        assert!(io.recycle_relay_body(Vec::with_capacity(16384)));
+        assert_eq!(io.pending[0].body.as_ptr(), ptr);
+        assert_eq!(io.pending[0].body, [0xa5]);
+        assert_eq!(io.pending[0].body.capacity() + io.decoder.body_capacity(), MAX_PENDING_BYTES);
+        assert!(!io.recycle_relay_body(Vec::with_capacity(1)));
+        io.poison();
+        assert!(io.pending.is_empty());
+        assert_eq!(io.decoder.body_capacity(), 0);
         assert!(matches!(io.recv(), Err(TunnelError::Poisoned)));
     }
 

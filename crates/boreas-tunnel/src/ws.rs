@@ -209,6 +209,11 @@ const WS_READ_BUFFER_BYTES: usize = 32 * 1024;
 /// `Read` yields payload bytes of binary messages only. `Write` emits one
 /// binary message per call, splitting into frames at
 /// `limits.max_frame_payload`.
+mod incremental;
+#[cfg(test)]
+mod resume_tests;
+use incremental::{Incoming, ReceiveTurn};
+
 pub struct WsStream<T> {
     io: T,
     role: WsRole,
@@ -222,6 +227,14 @@ pub struct WsStream<T> {
     // validated prefix belongs to the current frame and may be exposed.
     pending_len: usize,
     pending_pos: usize,
+    receive_turn: Option<ReceiveTurn>,
+    write_pos: usize,
+    write_active: bool,
+    write_deadline: Option<Instant>,
+    write_payload_len: usize,
+    write_opcode: OpCode,
+    progress_enabled: bool,
+    control_reply: Option<(OpCode,Vec<u8>)>,
     message: MessageState,
     close_sent: bool,
     close_received: bool,
@@ -302,6 +315,9 @@ impl<T: Read + Write> WsStream<T> {
             pending: Vec::new(),
             pending_len: 0,
             pending_pos: 0,
+            receive_turn: None,
+            write_pos:0, write_active:false, write_deadline:None, write_payload_len:0,
+            write_opcode:OpCode::Binary, progress_enabled:false, control_reply:None,
             message: MessageState::default(),
             close_sent: false,
             close_received: false,
@@ -310,36 +326,57 @@ impl<T: Read + Write> WsStream<T> {
     }
 
     fn send_frame(&mut self, opcode: OpCode, payload: &[u8]) -> Result<(), WsError> {
-        let frame = encode_frame_into(
-            self.role == WsRole::Client,
-            true,
-            opcode,
-            payload,
-            &mut self.write_buf,
-        )?;
-        self.io.write_all(frame).map_err(map_io)?;
-        self.io.flush().map_err(map_io)?;
+        if !self.write_active {
+            let frame_len=encode_frame_into(self.role == WsRole::Client, true, opcode, payload, &mut self.write_buf)?.len();
+            self.write_buf.truncate(frame_len);
+            self.write_active=true;
+            self.write_pos=0;
+            self.write_payload_len=payload.len();
+            self.write_opcode=opcode;
+            self.write_deadline=Some(Instant::now()+self.limits.message_deadline);
+        } else if self.write_opcode!=opcode || self.write_payload_len!=payload.len() {
+            return Err(WsError::Poisoned);
+        } else {
+            let header_len = self.write_buf.len().saturating_sub(payload.len());
+            let same = if self.role == WsRole::Client {
+                if header_len < 4 { false } else {
+                    let mask = &self.write_buf[header_len - 4..header_len];
+                    self.write_buf[header_len..].iter().zip(payload)
+                        .enumerate().all(|(i, (wire, plain))| *wire ^ mask[i % 4] == *plain)
+                }
+            } else {
+                self.write_buf[header_len..] == *payload
+            };
+            if !same { return Err(WsError::Poisoned); }
+        }
+        self.pump_wire_frame()?;
+        self.write_active=false;
+        self.write_pos=0;
+        self.write_deadline=None;
         #[cfg(any(test, feature = "record-diagnostics"))]
-        if opcode == OpCode::Binary {
-            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::WebSocket, payload);
+        if opcode==OpCode::Binary {
+            crate::record_diagnostics::observe(crate::record_diagnostics::Layer::WebSocket,payload);
         }
         Ok(())
     }
 
-    fn respond_close(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        if self.close_sent {
-            return Ok(());
+    // Progress the original encoded frame without acknowledging a different
+    // caller. In particular a queued Pong cannot replace a pending Binary.
+    fn pump_wire_frame(&mut self)->Result<(),WsError> {
+        if self.write_deadline.is_some_and(|d|Instant::now()>=d) {return Err(WsError::Timeout);}
+        while self.write_pos<self.write_buf.len() {
+            match self.io.write(&self.write_buf[self.write_pos..]) {
+                Ok(0)=>return Err(WsError::Io(io::ErrorKind::WriteZero)),
+                Ok(n)=>self.write_pos+=n,
+                Err(e) if e.kind()==io::ErrorKind::WouldBlock=>return Err(WsError::Io(io::ErrorKind::WouldBlock)),
+                Err(e)=>return Err(map_io(e)),
+            }
         }
-        if !close_payload_valid(payload) {
-            return Err(WsError::BadCloseFrame);
-        }
-        self.close_sent = true;
-        let echo: &[u8] = if payload.len() >= 2 {
-            &payload[..2]
-        } else {
-            &[]
-        };
-        self.send_frame(OpCode::Close, echo)
+        self.io.flush().map_err(|e|if e.kind()==io::ErrorKind::WouldBlock {
+            WsError::Io(io::ErrorKind::WouldBlock)
+        } else {map_io(e)})?;
+        if self.write_deadline.is_some_and(|d|Instant::now()>=d) {return Err(WsError::Timeout);}
+        Ok(())
     }
 
     fn track_message(&mut self, opcode: OpCode, fin: bool, len: usize) -> Result<(), WsError> {
@@ -382,17 +419,26 @@ impl<T: Read + Write> WsStream<T> {
     /// both control floods and empty binary frames. An empty data frame makes no
     /// progress, so it must not restart the deadline or loop forever.
     fn next_data_payload(&mut self) -> Result<bool, WsError> {
-        let deadline = Instant::now() + self.limits.message_deadline;
-        // The previous payload is fully consumed before this method runs.
-        // Reuse its connection-private allocation for control and data frames.
+        self.receive_turn.get_or_insert_with(|| ReceiveTurn::new(self.limits.message_deadline));
         let mut payload = std::mem::take(&mut self.pending);
-        let mut frames = 0usize;
-        let mut control_frames = 0usize;
-        let mut control_bytes = 0usize;
         loop {
-            frames += 1;
-            if frames > MAX_FRAMES_PER_READ {
-                return Err(WsError::FrameFlood);
+            if let Some((opcode,body))=&self.control_reply {
+                if self.write_active && self.write_opcode==OpCode::Binary {
+                    return Err(WsError::Io(io::ErrorKind::WouldBlock));
+                }
+                let (opcode,body)=(*opcode,body.clone());
+                self.send_frame(opcode,&body)?;
+                self.control_reply=None;
+                if opcode==OpCode::Close {
+                    self.close_sent=true;self.close_received=true;
+                    self.receive_turn=None;return Ok(false);
+                }
+            }
+            let turn = self.receive_turn.as_mut().expect("receive turn installed");
+            if turn.incoming.is_none() {
+                turn.frames += 1;
+                if turn.frames > MAX_FRAMES_PER_READ { return Err(WsError::FrameFlood); }
+                turn.incoming = Some(Incoming::new(payload));
             }
             let frame = {
                 let mut reader = BufferedReader {
@@ -401,25 +447,32 @@ impl<T: Read + Write> WsStream<T> {
                     pos: &mut self.read_pos,
                     len: &mut self.read_len,
                 };
-                read_frame_into(&mut reader, self.role, &self.limits, deadline, payload)?
+                turn.incoming.as_mut().expect("incoming installed")
+                    .receive(&mut reader, self.role, &self.limits, turn.deadline)?
             };
+            turn.incoming = None;
             match frame.opcode {
                 OpCode::Ping | OpCode::Pong | OpCode::Close => {
-                    control_frames += 1;
-                    control_bytes = control_bytes.saturating_add(frame.len);
-                    if control_frames > MAX_CONTROL_FRAMES_PER_READ
-                        || control_bytes > MAX_CONTROL_BYTES_PER_READ
+                    turn.controls += 1;
+                    turn.control_bytes = turn.control_bytes.saturating_add(frame.len);
+                    if turn.controls > MAX_CONTROL_FRAMES_PER_READ
+                        || turn.control_bytes > MAX_CONTROL_BYTES_PER_READ
                     {
                         return Err(WsError::ControlFlood);
                     }
                     match frame.opcode {
-                        OpCode::Ping => self.send_frame(OpCode::Pong, frame.payload())?,
+                        OpCode::Ping => {
+                            self.control_reply = Some((OpCode::Pong, frame.payload().to_vec()));
+                        }
                         OpCode::Close => {
-                            self.close_received = true;
-                            self.respond_close(frame.payload())?;
-                            self.pending = frame.payload;
-                            self.pending_len = 0;
-                            return Ok(false);
+                            if !close_payload_valid(frame.payload()) { return Err(WsError::BadCloseFrame); }
+                            if self.close_sent {
+                                self.close_received = true;
+                                self.receive_turn = None;
+                                return Ok(false);
+                            }
+                            let echo = if frame.len >= 2 { frame.payload()[..2].to_vec() } else { Vec::new() };
+                            self.control_reply = Some((OpCode::Close, echo));
                         }
                         _ => {}
                     }
@@ -433,6 +486,7 @@ impl<T: Read + Write> WsStream<T> {
                     }
                     self.pending_len = frame.len;
                     self.pending = frame.payload;
+                    self.receive_turn = None;
                     return Ok(true);
                 }
                 OpCode::Text => return Err(WsError::TextFrame),
@@ -445,6 +499,40 @@ impl<T: crate::stream::Duplex> WsStream<T> {
     /// Whether payload bytes are buffered above the underlying transport.
     /// A partial WebSocket frame is included conservatively; the event-loop
     /// owner still applies the normal bounded read and protocol checks.
+    pub(crate) fn enable_transport_progress(&mut self) -> io::Result<bool> {
+        self.progress_enabled=self.io.enable_progress()?;
+        Ok(self.progress_enabled)
+    }
+    pub(crate) fn transport_output_pending(&self)->bool {
+        self.write_active || self.control_reply.is_some() || self.io.has_pending_output()
+    }
+    pub(crate) fn wait_transport_progress(&self,timeout:Duration,write:bool)->io::Result<()> {
+        self.io.wait_progress(timeout,write)
+    }
+    pub(crate) fn progress_transport_io(&mut self) -> io::Result<crate::stream::ProgressIo> {
+        if self.failed {return Err(poisoned());}
+        let mut result=self.io.progress_io()?;
+        let before=self.write_pos;
+        let operation=if self.write_active && self.write_opcode==OpCode::Binary {
+            self.pump_wire_frame()
+        } else if let Some((opcode,body))=&self.control_reply {
+            let (opcode,body)=(*opcode,body.clone());
+            self.send_frame(opcode,&body).map(|()| {
+                self.control_reply=None;
+                if opcode==OpCode::Close {
+                    self.close_sent=true;self.close_received=true;self.receive_turn=None;
+                }
+            })
+        } else {Ok(())};
+        match operation {
+            Ok(())=>{},
+            Err(WsError::Io(io::ErrorKind::WouldBlock))=>{},
+            Err(error)=>{self.failed=true;return Err(io::Error::new(io::ErrorKind::InvalidData,error));},
+        }
+        result.advanced|=self.write_pos!=before;
+        Ok(result)
+    }
+
     pub fn has_buffered_input(&self) -> bool {
         self.read_pos < self.read_len
             || self.pending_pos < self.pending_len
@@ -502,7 +590,20 @@ impl<T: Read + Write> Read for WsStream<T> {
             match self.next_data_payload() {
                 Ok(true) => {}
                 Ok(false) => return Ok(0),
+                Err(WsError::Io(io::ErrorKind::WouldBlock)) => {
+                    // Starting an empty nonblocking read is not the beginning
+                    // of a peer frame. Do not expire genuinely idle links.
+                    let idle=self.receive_turn.as_ref().is_some_and(|turn|
+                        turn.frames==1 && turn.controls==0
+                            && turn.incoming.as_ref().is_some_and(|incoming|!incoming.started()));
+                    if idle && let Some(turn)=self.receive_turn.take()
+                        && let Some(incoming)=turn.incoming {
+                        self.pending=incoming.into_storage();
+                    }
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
                 Err(error) => {
+                    self.receive_turn = None;
                     // Any framing/protocol error is fatal: bytes may already be
                     // partially consumed, so a later read must never try to
                     // resynchronise on the same stream.
@@ -534,8 +635,14 @@ impl<T: Read + Write> Write for WsStream<T> {
                 "websocket already closed",
             ));
         }
+        if self.control_reply.is_some() && !(self.write_active && self.write_opcode==OpCode::Binary) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let take = buf.len().min(self.limits.max_frame_payload);
         if let Err(error) = self.send_frame(OpCode::Binary, &buf[..take]) {
+            if error==WsError::Io(io::ErrorKind::WouldBlock) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
             self.failed = true;
             return Err(io::Error::new(io::ErrorKind::InvalidData, error));
         }
@@ -607,6 +714,7 @@ impl RawFrame {
 /// timeout, and a busy loop alone cannot interrupt a blocked syscall. During the
 /// handshake the runtime supplies that transport timeout; the data plane
 /// deliberately has none, so this check bounds progress between reads there.
+#[cfg(test)]
 fn read_exact<T: Read>(io: &mut T, buf: &mut [u8], deadline: Instant) -> Result<(), WsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -638,6 +746,7 @@ fn read_frame<T: Read>(
     read_frame_into(io, role, limits, deadline, Vec::new())
 }
 
+#[cfg(test)]
 fn read_frame_into<T: Read>(
     io: &mut T,
     role: WsRole,
