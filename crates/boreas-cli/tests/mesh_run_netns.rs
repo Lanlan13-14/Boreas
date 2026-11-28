@@ -192,23 +192,35 @@ fn checked(c: &mut Command) {
 struct Network {
     names: [String; 4],
     bridge: String,
+    created_namespaces: Vec<String>,
+    created_hosts: Vec<String>,
+    bridge_created: bool,
 }
 impl Network {
     fn setup() -> Self {
+        static NEXT_NETWORK: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let p = std::process::id();
-        let network = Self {
-            names: std::array::from_fn(|i| format!("bmesh-{p}-{i}")),
-            bridge: format!("bm{p}"),
+        let serial = NEXT_NETWORK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut network = Self {
+            names: std::array::from_fn(|i| format!("bmesh-{p}-{serial}-{i}")),
+            bridge: format!("bm{p:x}{serial:x}"),
+            created_namespaces: Vec::new(),
+            created_hosts: Vec::new(),
+            bridge_created: false,
         };
         checked(Command::new("ip").args(["link", "add", &network.bridge, "type", "bridge"]));
+        network.bridge_created = true;
         checked(Command::new("ip").args(["link", "set", &network.bridge, "up"]));
         for (i, namespace) in network.names.iter().enumerate() {
             checked(Command::new("ip").args(["netns", "add", namespace]));
-            let host = format!("bv{p}{i}");
+            network.created_namespaces.push(namespace.clone());
+            let host = format!("bv{p:x}{serial:x}{i:x}");
             checked(Command::new("ip").args([
                 "link", "add", &host, "type", "veth", "peer", "name", "underlay", "netns",
                 namespace,
             ]));
+            network.created_hosts.push(host.clone());
             checked(Command::new("ip").args(["link", "set", &host, "master", &network.bridge]));
             checked(Command::new("ip").args(["link", "set", &host, "up"]));
             for args in [
@@ -260,12 +272,17 @@ impl Network {
 }
 impl Drop for Network {
     fn drop(&mut self) {
-        for ns in &self.names {
+        for host in self.created_hosts.iter().rev() {
+            let _ = Command::new("ip").args(["link", "del", host]).output();
+        }
+        for ns in self.created_namespaces.iter().rev() {
             let _ = Command::new("ip").args(["netns", "del", ns]).output();
         }
-        let _ = Command::new("ip")
-            .args(["link", "del", &self.bridge])
-            .output();
+        if self.bridge_created {
+            let _ = Command::new("ip")
+                .args(["link", "del", &self.bridge])
+                .output();
+        }
     }
 }
 
