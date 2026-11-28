@@ -140,6 +140,7 @@ impl Fixture {
                 now_us: now,
                 validity_hours: 1,
                 outer_san_dns: Some(NAME.into()),
+                outer_ca_issued: false,
             })
             .unwrap();
             let issuer = format!("test-core-{id}").into_bytes();

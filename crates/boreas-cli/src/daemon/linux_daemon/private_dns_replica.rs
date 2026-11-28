@@ -8,8 +8,8 @@ use boreas_tunnel::{dns_replica::{self, Side}, e2e::open_e2e_until};
 
 use super::{
     AuthenticatedPeer, ClientTarget, HANDSHAKE_TIMEOUT, LinkClient, LiveCounters,
-    OpenSslConnector, OpenSslE2eBackend, OpenSslInnerConnector, PATH_BACKUP, PATH_PRIMARY,
-    PathStop, PeerIdentity, PinnedDns, PkiIdentityExtractor, PolicyWindow, SessionPolicy,
+    PATH_BACKUP, PATH_PRIMARY, PathStop, PeerIdentity, PinnedDns, PkiIdentityExtractor,
+    Policy, PolicyWindow, PqWgE2eBackend, PqWgIdentity, PqWgInnerConnector, SessionPolicy,
     StatusStore, TunEndpoint, VerifiedNodeIdentity, bound_path_io, direct_outer_connector,
     drive_business_path, duplicate_e2e_socket, lock_mutex, may_try_backup, now_utc_us,
     print_path_summary, revocation_slots, status_gate,
@@ -108,8 +108,8 @@ pub(super) struct Run<'a> {
     pub(super) policy_window: PolicyWindow,
     pub(super) store: Arc<Mutex<StatusStore>>,
     pub(super) extractor: Arc<PkiIdentityExtractor>,
-    pub(super) connector: OpenSslConnector,
-    pub(super) backend: OpenSslE2eBackend,
+    pub(super) pq_identity: PqWgIdentity,
+    pub(super) backend: PqWgE2eBackend,
     pub(super) policy: SessionPolicy,
     pub(super) tun: &'a TunEndpoint,
     pub(super) mtu: usize,
@@ -162,10 +162,17 @@ pub(super) fn run(run: Run<'_>) -> Result<(), String> {
         slots: [revocation_slots(run.policy.local, primary)?, revocation_slots(run.policy.local, backup)?],
         sequence: run.counters.status_sequence.load(super::Ordering::Acquire),
     };
-    let client = LinkClient::new(
-        Box::new(direct_outer_connector(run.mat_dir)?),
-        Box::new(OpenSslInnerConnector::new(run.connector, run.extractor.clone())),
-    );
+    let inner = PqWgInnerConnector::new(
+        run.pq_identity,
+        Policy::production_default(),
+        run.extractor.clone(),
+    )
+    .map_err(|_| "daemon: private DNS pq-wg inner connector setup failed".to_string())?;
+    let client = if run.mat_dir.join("outer-ca.pem").exists() {
+        LinkClient::new(Box::new(direct_outer_connector(run.mat_dir)?), Box::new(inner))
+    } else {
+        LinkClient::new_direct(Box::new(inner))
+    };
     let mut ordinal = 0;
     let mut packets_before = 0u64;
     let deadline = run.max_seconds.map(|seconds| {

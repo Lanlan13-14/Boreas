@@ -10,6 +10,9 @@
 pub mod backend;
 
 #[cfg(feature = "openssl-backend")]
+pub mod pq_wg;
+
+#[cfg(feature = "openssl-backend")]
 pub mod ws_stream;
 
 pub mod ws_frame;
@@ -72,6 +75,16 @@ pub struct NegotiatedParameters {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PqWgParameters {
+    pub group: HybridGroup,
+    pub peer_signature: IdentitySignature,
+    pub aead: Aead,
+    pub resumed: bool,
+    pub zero_rtt: bool,
+    pub tls_free: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpectedPeer {
     pub net_id: [u8; 16],
     pub node_id: u16,
@@ -122,6 +135,39 @@ impl Policy {
     /// Caller must additionally rely on backend certificate-chain and CertificateVerify checks.
     pub fn validate_negotiated(&self, negotiated: NegotiatedParameters) -> Result<(), PolicyError> {
         if negotiated.version != TlsVersion::Tls13 {
+            return Err(PolicyError::WrongTlsVersion);
+        }
+        let (group, signature) = match self.suite {
+            Suite::Pq768 => (HybridGroup::X25519MlKem768, IdentitySignature::MlDsa65),
+            Suite::Pq1024 if self.allow_pq1024 => {
+                (HybridGroup::SecP384r1MlKem1024, IdentitySignature::MlDsa87)
+            }
+            Suite::Pq1024 => return Err(PolicyError::Pq1024NotEnabled),
+        };
+        if negotiated.group != group {
+            return Err(PolicyError::HybridGroupRequired);
+        }
+        if negotiated.peer_signature != signature {
+            return Err(PolicyError::WrongMlDsaAlgorithm);
+        }
+        if !matches!(
+            negotiated.aead,
+            Aead::Aes256GcmSha384 | Aead::ChaCha20Poly1305Sha256
+        ) {
+            return Err(PolicyError::AeadNotAllowed);
+        }
+        if negotiated.resumed {
+            return Err(PolicyError::ResumptionForbidden);
+        }
+        if negotiated.zero_rtt {
+            return Err(PolicyError::ZeroRttForbidden);
+        }
+        Ok(())
+    }
+
+    /// Verify policy-relevant facts from a WireGuard-style TLS-less PQ handshake.
+    pub fn validate_pq_wg(&self, negotiated: PqWgParameters) -> Result<(), PolicyError> {
+        if !negotiated.tls_free {
             return Err(PolicyError::WrongTlsVersion);
         }
         let (group, signature) = match self.suite {
@@ -376,6 +422,47 @@ mod tests {
         assert_eq!(
             policy_simulation_decision(E2eMode::Required, true),
             TrafficDecision::PolicyWouldPermit
+        );
+    }
+    #[test]
+    fn pq_wg_policy_requires_tls_free_hybrid_mldsa_and_forbids_downgrade() {
+        let p = Policy::production_default();
+        let valid = PqWgParameters {
+            group: HybridGroup::X25519MlKem768,
+            peer_signature: IdentitySignature::MlDsa65,
+            aead: Aead::ChaCha20Poly1305Sha256,
+            resumed: false,
+            zero_rtt: false,
+            tls_free: true,
+        };
+        assert_eq!(p.validate_pq_wg(valid), Ok(()));
+        assert_eq!(
+            p.validate_pq_wg(PqWgParameters {
+                tls_free: false,
+                ..valid
+            }),
+            Err(PolicyError::WrongTlsVersion)
+        );
+        assert_eq!(
+            p.validate_pq_wg(PqWgParameters {
+                group: HybridGroup::ClassicalOnly,
+                ..valid
+            }),
+            Err(PolicyError::HybridGroupRequired)
+        );
+        assert_eq!(
+            p.validate_pq_wg(PqWgParameters {
+                peer_signature: IdentitySignature::Ed25519,
+                ..valid
+            }),
+            Err(PolicyError::WrongMlDsaAlgorithm)
+        );
+        assert_eq!(
+            p.validate_pq_wg(PqWgParameters {
+                aead: Aead::Other,
+                ..valid
+            }),
+            Err(PolicyError::AeadNotAllowed)
         );
     }
 }

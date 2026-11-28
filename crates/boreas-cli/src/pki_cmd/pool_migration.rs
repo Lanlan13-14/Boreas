@@ -227,6 +227,7 @@ mod tests {
             now_us: now,
             validity_hours: 48,
             outer_san_dns: None,
+            outer_ca_issued: false,
         })
         .unwrap();
 

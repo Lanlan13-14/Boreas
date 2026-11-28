@@ -8,17 +8,14 @@
 
 use std::{net::TcpStream, os::fd::AsRawFd, sync::Arc, time::Instant};
 
-use boreas_crypto::{
-    Policy,
-    backend::{OpenSslAcceptor, OpenSslConnector},
-};
+use boreas_crypto::{Policy, pq_wg::PqWgIdentity};
 use boreas_proto::{
     ControlType, Frame, Kind,
     messages::{CircuitAccept, CircuitClose, CircuitOpen, CircuitReset, RelayFragment},
 };
 
 use crate::{
-    CircuitReject, EstablishedSession, OpenSslE2eBackend, PeerIdentity, PkiIdentityExtractor,
+    CircuitReject, EstablishedSession, PeerIdentity, PkiIdentityExtractor, PqWgE2eBackend,
     TunnelError,
     e2e::{E2eCircuit, accept_e2e, open_e2e},
     mesh_probe::{Adjacency, Core, Error, MeshProbe},
@@ -399,17 +396,15 @@ pub(crate) fn with_fixed_endpoint_io<T>(
         binding.extend_from_slice(&advertisement.0);
     }
     let binding = openssl::sha::sha256(&binding);
-    let pem = probe.endpoint_credential();
-    let connector = OpenSslConnector::from_pem_identity(pem, Policy::production_default())
-        .map_err(|_| Error::Identity)?;
-    let acceptor = OpenSslAcceptor::from_pem_identity(pem, Policy::production_default())
+    let pq_identity = PqWgIdentity::from_private_key_pem(&probe.endpoint_credential().private_key_pem)
         .map_err(|_| Error::Identity)?;
     let remote_expiry = route.expiry(hop.remote_lsa_expiry);
-    let backend = OpenSslE2eBackend::new(
-        Arc::new(connector),
-        Arc::new(acceptor),
+    let backend = PqWgE2eBackend::new(
+        pq_identity,
+        Policy::production_default(),
         Arc::new(PkiIdentityExtractor::new(vec![peer.identity.clone()])?),
-    );
+    )
+    .map_err(|_| Error::Identity)?;
     probe.with_live_identity(&route.members, remote_expiry, &[&hop.socket], || {
         bounded_link_operation(&hop.socket, deadline, || {
             let mut circuit = if initiator {

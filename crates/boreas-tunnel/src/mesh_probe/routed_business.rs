@@ -24,9 +24,12 @@ impl MeshProbe<'_> {
                 .map(|(core, _)| core.identity.clone())
                 .collect(),
         )?);
-        let inner = OpenSslAcceptor::from_pem_identity(self.pem, Policy::production_default())
+        let pq_identity = PqWgIdentity::from_private_key_pem(&self.pem.private_key_pem)
             .map_err(|_| Error::Identity)?;
-        let server = LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner, extractor)));
+        let server = LinkServer::new(Box::new(
+            PqWgInnerAcceptor::new(pq_identity, Policy::production_default(), extractor)
+                .map_err(|_| Error::Identity)?,
+        ));
         let control_socket = tcp.try_clone().map_err(TunnelError::from)?;
         let mut selected = None;
         let accepted = server.accept_tls_stream_with_policy(

@@ -112,13 +112,13 @@ pub(super) fn status_lanes(counters: &LiveCounters) -> String {
 
 pub(super) enum Endpoint {
     Edge(LinkClient, ClientTarget),
-    Core(TcpListener, LinkServer, OpenSslOuterTlsAcceptor),
+    Core(TcpListener, LinkServer, Option<OpenSslOuterTlsAcceptor>),
 }
 
 pub(super) struct Run<'a> {
     pub(super) profile: E2eL3Profile,
     pub(super) policy: SessionPolicy,
-    pub(super) backend: OpenSslE2eBackend,
+    pub(super) backend: PqWgE2eBackend,
     pub(super) tun: &'a TunEndpoint,
     pub(super) mtu: usize,
     pub(super) status_path: &'a Path,
@@ -661,7 +661,13 @@ fn run_lane(
             .connect_preconnected_until(tcp, target, run.policy.clone(), hop_until)
             .map(Hop::Edge),
         Endpoint::Core(_, server, outer) => server
-            .accept_tls_stream_until(tcp, outer, run.policy.clone(), hop_until, ctx.admission)
+            .accept_stream_until(
+                tcp,
+                outer.as_ref().map(|outer| outer as &dyn boreas_tunnel::OuterTlsAcceptor),
+                run.policy.clone(),
+                hop_until,
+                ctx.admission,
+            )
             .map(Hop::Core),
     }
     .map_err(|e| tunnel_failure("WSS + pq768 hop session rejected", e))?;
@@ -1201,7 +1207,7 @@ impl<'scope> Dispatch<'_, 'scope> {
 struct LanePolicy<'a> {
     profile: E2eL3Profile,
     policy: &'a SessionPolicy,
-    backend: &'a OpenSslE2eBackend,
+    backend: &'a PqWgE2eBackend,
     mtu: usize,
     status_path: &'a Path,
     policy_window: PolicyWindow,

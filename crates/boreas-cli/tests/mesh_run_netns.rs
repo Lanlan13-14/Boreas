@@ -110,6 +110,7 @@ impl Fixture {
                 now_us: now,
                 validity_hours: 1,
                 outer_san_dns: Some(NAME.into()),
+                outer_ca_issued: false,
             })
             .unwrap();
             let keys = temp.0.join(format!("operational-{id}"));

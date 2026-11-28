@@ -17,11 +17,13 @@ Boreas connects hosts on different networks into a private IP network. Start wit
 
 ## How do direct TCP and WebSocket fit together?
 
-**The current two-host tunnel uses WSS: WebSocket over TLS, carried by TCP.** The Edge can dial the Core's `IP:port` directly, without a reverse proxy. It still performs a TLS handshake and WebSocket upgrade. Direct dialing is not a separate raw TCP mode, and the current guide does not offer a plaintext `ws://` listener.
+**The default entry is raw TCP: a WireGuard-style TLS-less post-quantum channel (ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305) carried directly on TCP, with no TLS and no WebSocket.** Authentication uses the ML-DSA public key from the provisioned signed identity, not a certificate.
+
+**WSS is enabled only when needed.** When the material directory contains `outer-ca.pem` (client) and `outer.pem`/`outer.key` (server), the same post-quantum channel is carried inside a WebSocket over TLS 1.3 instead. `outer-ca.pem` may be either the private provisioning CA or the root/intermediate of the public CA that issued the server certificate: the client trusts the platform web-PKI roots in addition to it, so a certificate issued by a publicly trusted CA verifies without distributing that CA to every endpoint.
 
 - `--connect` takes the Core's reachable `IP:port`, not its tunnel IP.
-- `--tls-name` is the certificate name. Use `--ws-host` and `--ws-path` for the WebSocket request's Host and path.
-- Boreas is written in Rust. Linux TUN is the IP packet interface; TLS 1.3, WebSocket, and provisioned signed identities provide the tunnel transport and authentication. With `pq768` / `e2e-required`, the traffic endpoints also establish a separate end-to-end encrypted circuit.
+- In WSS mode `--tls-name` is the certificate name, and `--ws-host`/`--ws-path` set the WebSocket request's Host and path. Direct mode ignores all three.
+- Boreas is written in Rust. Linux TUN is the IP packet interface. With `pq768` / `e2e-required`, the traffic endpoints also establish a separate end-to-end encrypted circuit using the same TLS-less post-quantum handshake.
 
 ## Get started
 

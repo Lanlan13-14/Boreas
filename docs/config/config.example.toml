@@ -9,7 +9,16 @@
 #
 # config-check parses the document and applies static policy only. It does not
 # start a daemon, open a socket, read the private-key or trust-anchor contents,
-# resolve an endpoint, authenticate a peer, or establish TLS.
+# resolve an endpoint, authenticate a peer, or establish a session.
+#
+# Transport (material directory, not this file): the hop and E2E channels are
+# always the WireGuard-style TLS-less post-quantum handshake (ML-KEM-768 +
+# ML-DSA-65 + ChaCha20-Poly1305). Direct mode carries it on plain TCP and needs
+# no outer certificate. WSS mode is selected only when the material directory
+# contains outer-ca.pem (client) and outer.pem/outer.key (server); the client
+# trusts the platform web-PKI roots in addition to outer-ca.pem, so a
+# certificate issued by a publicly trusted CA verifies without distributing
+# that CA to every client.
 
 version = 2
 

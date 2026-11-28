@@ -311,6 +311,9 @@ pub struct NodeIssueParams {
     pub now_us: u64,
     pub validity_hours: u32,
     pub outer_san_dns: Option<String>,
+    /// When true, the operator will install a publicly trusted CA certificate at
+    /// `outer.pem`/`outer.key` instead of receiving a private-CA leaf.
+    pub outer_ca_issued: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -655,6 +658,10 @@ pub fn issue_node_dir(
     };
     let _ = OpenSslAcceptor::from_pem_identity(&pem_id, Policy::production_default())
         .map_err(|_| ProvisionError::CryptoIdentity)?;
+    // The hop and E2E channels use the WireGuard-style TLS-less PQ handshake,
+    // which authenticates the raw ML-DSA key directly (no certificate).
+    let _ = boreas_crypto::pq_wg::PqWgIdentity::from_private_key_pem(&node_ml_pem)
+        .map_err(|_| ProvisionError::CryptoIdentity)?;
 
     let body = authority.node_identity_from_csr(
         IdentityTemplate {
@@ -700,6 +707,10 @@ pub fn issue_node_dir(
     if params.role == NodeRole::Core
         && let Some(san_dns) = &params.outer_san_dns
     {
+        if params.outer_ca_issued {
+            // The operator will install a certificate issued by a publicly trusted
+            // CA at outer.pem/outer.key; do not mint a private-CA leaf here.
+        } else {
         let outer_ca_cert = X509::from_pem(&outer_ca_pem)
             .map_err(|_| ProvisionError::OpenSsl("parse outer-ca.pem"))?;
         let outer_ca_key_pem = read_bounded(&ca_dir.join("outer-ca.key"))?;
@@ -726,6 +737,7 @@ pub fn issue_node_dir(
                 .to_pem()
                 .map_err(|_| ProvisionError::OpenSsl("outer leaf cert pem"))?,
         )?;
+        }
     }
 
     // Issue an initial fresh StatusSnapshot (default 1 hour, strictly <= 24h per §3.4).
@@ -1868,6 +1880,7 @@ mod tests {
                 now_us,
                 validity_hours: 48,
                 outer_san_dns: Some("wss.boreas.test".to_string()),
+                outer_ca_issued: false,
             },
         )
         .expect("issue core bundle");
@@ -1885,6 +1898,7 @@ mod tests {
                 now_us,
                 validity_hours: 48,
                 outer_san_dns: None,
+                outer_ca_issued: false,
             },
         )
         .expect("issue edge bundle");

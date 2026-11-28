@@ -17,11 +17,13 @@ Boreas 把分散在不同网络里的主机连成一个私有 IP 网络。最简
 
 ## TCP 直连和 WebSocket 是什么关系？
 
-**当前双机入口是 WSS，也就是 TLS 上的 WebSocket；最底层用 TCP。** 可以把 Edge 直接拨到 Core 的 `IP:端口`，不经过反向代理；这仍然会做 TLS 握手和 WebSocket 升级，并不是跳过 WebSocket 的裸 TCP 模式。当前教程不提供独立的裸 TCP 或明文 `ws://` 入口。
+**默认入口是裸 TCP 直连：TCP 上直接承载 WireGuard 风格的无 TLS 后量子加密通道（ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305），没有 TLS，也没有 WebSocket。** 身份认证靠预配的签名身份里的 ML-DSA 公钥，不靠证书。
+
+**WSS 只在需要时启用。** 当材料目录里存在 `outer-ca.pem`（客户端）和 `outer.pem`/`outer.key`（服务端）时，同一条后量子通道改由 TLS 1.3 上的 WebSocket 承载。`outer-ca.pem` 既可以是自建 CA，也可以是签发服务器证书的公共 CA 根或中间证书：客户端在它之外还信任系统自带的公共 CA 根，因此由公共信任 CA 签发的证书不需要像自建证书那样把 CA 分发到每一端。
 
 - `--connect` 填 Core 可达的底层 `IP:端口`，不是隧道 IP。
-- `--tls-name` 填证书上的名称；`--ws-host` 和 `--ws-path` 分别设定 WebSocket 请求的 Host 和路径。
-- 用 Rust 实现，Linux TUN 接收和送回 IP 包；隧道用 TLS 1.3、WebSocket 和预配的签名身份，在 `pq768` / `e2e-required` 路径上由业务两端另建端到端加密电路。
+- WSS 模式下 `--tls-name` 填证书上的名称；`--ws-host` 和 `--ws-path` 分别设定 WebSocket 请求的 Host 和路径。直连模式忽略这三项。
+- 用 Rust 实现，Linux TUN 接收和送回 IP 包；在 `pq768` / `e2e-required` 路径上由业务两端另建端到端加密电路，使用同一套无 TLS 后量子握手。
 
 ## 从这里开始
 

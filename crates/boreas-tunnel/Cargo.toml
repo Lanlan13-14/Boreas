@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.100"
-description = "Boreas hop-transport runtime (WSS h1 baseline, inner-TLS seam, session authorization, E2E circuit seam) plus pure routing-policy primitives"
+description = "Boreas hop-transport runtime (direct TCP and WSS h1, WireGuard-style TLS-less PQ hop and E2E channels, session authorization, E2E circuit seam) plus pure routing-policy primitives"
 
 [lib]
 path = "src/lib.rs"

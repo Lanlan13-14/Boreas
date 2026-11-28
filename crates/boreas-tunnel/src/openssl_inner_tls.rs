@@ -26,9 +26,13 @@ use std::thread;
 use std::time::Duration;
 
 use boreas_crypto::backend::{BackendError, EstablishedStream, OpenSslAcceptor, OpenSslConnector};
+use boreas_crypto::pq_wg::{
+    PqWgAcceptor, PqWgConnector, PqWgIdentity, PqWgLayer, PqWgPeerResolver, PqWgStream,
+};
 use boreas_crypto::{NodeRole, Policy, PolicyError, Suite};
 use boreas_pki::management::VerifiedObject;
 use boreas_proto::objects::{MldsaParameterSet, NodeRole as ObjectRole, ObjectBody};
+use openssl::sha::sha256;
 use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
 
@@ -40,128 +44,157 @@ use crate::tls::{
     OuterTlsConnector, PeerIdentity, PeerIdentityExtractor,
 };
 
-fn peer_identity(
-    extractor: &Arc<dyn PeerIdentityExtractor>,
-    certificate_der: &[u8],
-) -> Result<crate::tls::PeerIdentity, TunnelError> {
-    extractor
-        .extract(certificate_der)
-        .ok_or(TunnelError::InnerTls("peer identity mapping"))
-}
-
-/// Client side of the hop inner TLS handshake.
-pub struct OpenSslInnerConnector {
-    connector: OpenSslConnector,
+struct ExtractorResolver {
     extractor: Arc<dyn PeerIdentityExtractor>,
 }
 
-impl OpenSslInnerConnector {
-    pub fn new(connector: OpenSslConnector, extractor: Arc<dyn PeerIdentityExtractor>) -> Self {
-        Self {
+impl PqWgPeerResolver for ExtractorResolver {
+    fn resolve_spki_hash(&self, spki_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.extractor
+            .resolve_spki_hash(spki_hash)
+            .map(|(spki, _)| spki)
+    }
+}
+
+fn peer_identity_from_spki(
+    extractor: &Arc<dyn PeerIdentityExtractor>,
+    spki_der: &[u8],
+) -> Result<PeerIdentity, TunnelError> {
+    let hash = sha256(spki_der);
+    let (trusted_spki, peer) = extractor
+        .resolve_spki_hash(&hash)
+        .ok_or(TunnelError::InnerTls("peer identity mapping"))?;
+    if trusted_spki != spki_der {
+        return Err(TunnelError::InnerTls("peer identity mapping"));
+    }
+    Ok(peer)
+}
+
+/// Client side of the WireGuard-style TLS-less PQ hop handshake.
+pub struct PqWgInnerConnector {
+    connector: PqWgConnector,
+    extractor: Arc<dyn PeerIdentityExtractor>,
+}
+
+impl PqWgInnerConnector {
+    pub fn new(
+        identity: PqWgIdentity,
+        policy: Policy,
+        extractor: Arc<dyn PeerIdentityExtractor>,
+    ) -> Result<Self, TunnelError> {
+        let resolver = Arc::new(ExtractorResolver {
+            extractor: Arc::clone(&extractor),
+        });
+        let connector = PqWgConnector::new(identity, resolver, policy, PqWgLayer::Hop)
+            .map_err(|_| TunnelError::InnerTls("pq-wg connector setup"))?;
+        Ok(Self {
             connector,
             extractor,
-        }
+        })
     }
 
     fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         let established = self
             .connector
             .connect(transport)
-            .map_err(|_| TunnelError::InnerTls("handshake"))?;
+            .map_err(|_| TunnelError::InnerTls("pq-wg handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
-        eprintln!("record_chain_tls layer=hop negotiated={negotiated:?}");
-        let certificate = established
-            .peer_certificate()
-            .to_der()
-            .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
-        let peer = peer_identity(&self.extractor, &certificate)?;
+        eprintln!("record_chain_pq_wg layer=hop negotiated={negotiated:?}");
+        let peer = peer_identity_from_spki(&self.extractor, established.peer_spki())?;
         Ok(EstablishedInner::new(
             Box::new(established),
-            InnerTlsSession::from_verified_certificate(peer, negotiated),
+            InnerTlsSession::from_verified_pq_wg(peer, negotiated),
         ))
     }
 }
 
-impl InnerTlsConnector for OpenSslInnerConnector {
+impl InnerTlsConnector for PqWgInnerConnector {
     fn connect(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         self.establish(transport)
     }
 }
 
-/// Server side of the hop inner TLS handshake.
-pub struct OpenSslInnerAcceptor {
-    acceptor: OpenSslAcceptor,
+/// Server side of the WireGuard-style TLS-less PQ hop handshake.
+pub struct PqWgInnerAcceptor {
+    acceptor: PqWgAcceptor,
     extractor: Arc<dyn PeerIdentityExtractor>,
 }
 
-impl OpenSslInnerAcceptor {
-    pub fn new(acceptor: OpenSslAcceptor, extractor: Arc<dyn PeerIdentityExtractor>) -> Self {
-        Self {
+impl PqWgInnerAcceptor {
+    pub fn new(
+        identity: PqWgIdentity,
+        policy: Policy,
+        extractor: Arc<dyn PeerIdentityExtractor>,
+    ) -> Result<Self, TunnelError> {
+        let resolver = Arc::new(ExtractorResolver {
+            extractor: Arc::clone(&extractor),
+        });
+        let acceptor = PqWgAcceptor::new(identity, resolver, policy, PqWgLayer::Hop)
+            .map_err(|_| TunnelError::InnerTls("pq-wg acceptor setup"))?;
+        Ok(Self {
             acceptor,
             extractor,
-        }
+        })
     }
 
     fn establish(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         let established = self
             .acceptor
             .accept(transport)
-            .map_err(|_| TunnelError::InnerTls("handshake"))?;
+            .map_err(|_| TunnelError::InnerTls("pq-wg handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
-        eprintln!("record_chain_tls layer=hop negotiated={negotiated:?}");
-        let certificate = established
-            .peer_certificate()
-            .to_der()
-            .map_err(|_| TunnelError::InnerTls("peer certificate"))?;
-        let peer = peer_identity(&self.extractor, &certificate)?;
+        eprintln!("record_chain_pq_wg layer=hop negotiated={negotiated:?}");
+        let peer = peer_identity_from_spki(&self.extractor, established.peer_spki())?;
         Ok(EstablishedInner::new(
             Box::new(established),
-            InnerTlsSession::from_verified_certificate(peer, negotiated),
+            InnerTlsSession::from_verified_pq_wg(peer, negotiated),
         ))
     }
 }
 
-impl InnerTlsAcceptor for OpenSslInnerAcceptor {
+impl InnerTlsAcceptor for PqWgInnerAcceptor {
     fn accept(&self, transport: Box<dyn Duplex>) -> Result<EstablishedInner, TunnelError> {
         self.establish(transport)
     }
 }
 
-/// E2E TLS over a circuit byte stream, in both roles.
-///
-/// The role is chosen by the caller from node identities
-/// ([`crate::e2e::e2e_tls_role`]); this adapter only runs the handshake.
-pub struct OpenSslE2eBackend {
-    connector: Arc<OpenSslConnector>,
-    acceptor: Arc<OpenSslAcceptor>,
+/// E2E WireGuard-style TLS-less PQ encryption over a circuit byte stream.
+pub struct PqWgE2eBackend {
+    connector: Arc<PqWgConnector>,
+    acceptor: Arc<PqWgAcceptor>,
     extractor: Arc<dyn PeerIdentityExtractor>,
 }
 
-impl OpenSslE2eBackend {
+impl PqWgE2eBackend {
     pub fn new(
-        connector: Arc<OpenSslConnector>,
-        acceptor: Arc<OpenSslAcceptor>,
+        identity: PqWgIdentity,
+        policy: Policy,
         extractor: Arc<dyn PeerIdentityExtractor>,
-    ) -> Self {
-        Self {
-            connector,
-            acceptor,
+    ) -> Result<Self, TunnelError> {
+        let resolver: Arc<dyn PqWgPeerResolver> = Arc::new(ExtractorResolver {
+            extractor: Arc::clone(&extractor),
+        });
+        let connector = PqWgConnector::new(identity.clone(), Arc::clone(&resolver), policy, PqWgLayer::E2e)
+            .map_err(|_| TunnelError::InnerTls("pq-wg e2e connector setup"))?;
+        let acceptor = PqWgAcceptor::new(identity, resolver, policy, PqWgLayer::E2e)
+            .map_err(|_| TunnelError::InnerTls("pq-wg e2e acceptor setup"))?;
+        Ok(Self {
+            connector: Arc::new(connector),
+            acceptor: Arc::new(acceptor),
             extractor,
-        }
+        })
     }
 }
 
-impl E2eStream for EstablishedStream<CircuitStream<'_>> {
+impl E2eStream for PqWgStream<CircuitStream<'_>> {
     fn close_stream(&mut self) -> io::Result<()> {
-        // Send through the owned TLS record layer; the circuit beneath it
-        // carries the notification as ordinary ordered ciphertext fragments.
         self.close_notify()
     }
 
     fn read_with_authenticated_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        EstablishedStream::read_with_authenticated_eof(self, out)
+        PqWgStream::read_with_authenticated_eof(self, out)
     }
 
     #[cfg(target_os = "linux")]
@@ -173,33 +206,27 @@ impl E2eStream for EstablishedStream<CircuitStream<'_>> {
     #[cfg(target_os = "linux")]
     fn wait_dedicated_close(&mut self) -> Result<(), TunnelError> {
         let mut byte = [0u8; 1];
-        match self.read_plaintext(&mut byte) {
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                self.get_mut().wait_close()
-            }
-            Err(error) => Err(error.into()),
+        match self.read_with_authenticated_eof(&mut byte) {
+            Ok(0) => self.get_mut().wait_close(),
             Ok(_) => Err(crate::CircuitReject::UnexpectedFrame.into()),
+            Err(error) => Err(error.into()),
         }
     }
 }
 
-impl E2eTlsBackend for OpenSslE2eBackend {
+impl E2eTlsBackend for PqWgE2eBackend {
     fn connect<'a>(&self, transport: CircuitStream<'a>) -> Result<E2eEstablished<'a>, TunnelError> {
         let established = self
             .connector
             .connect(transport)
-            .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
+            .map_err(|_| TunnelError::InnerTls("pq-wg e2e handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
-        eprintln!("record_chain_tls layer=e2e negotiated={negotiated:?}");
-        let certificate = established
-            .peer_certificate()
-            .to_der()
-            .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
-        let peer = peer_identity(&self.extractor, &certificate)?;
+        eprintln!("record_chain_pq_wg layer=e2e negotiated={negotiated:?}");
+        let peer = peer_identity_from_spki(&self.extractor, established.peer_spki())?;
         Ok(E2eEstablished::new(
             Box::new(established),
-            InnerTlsSession::from_verified_certificate(peer, negotiated),
+            InnerTlsSession::from_verified_pq_wg(peer, negotiated),
         ))
     }
 
@@ -207,18 +234,14 @@ impl E2eTlsBackend for OpenSslE2eBackend {
         let established = self
             .acceptor
             .accept(transport)
-            .map_err(|_| TunnelError::InnerTls("e2e handshake"))?;
+            .map_err(|_| TunnelError::InnerTls("pq-wg e2e handshake"))?;
         let negotiated = established.negotiated();
         #[cfg(feature = "record-diagnostics")]
-        eprintln!("record_chain_tls layer=e2e negotiated={negotiated:?}");
-        let certificate = established
-            .peer_certificate()
-            .to_der()
-            .map_err(|_| TunnelError::InnerTls("e2e peer certificate"))?;
-        let peer = peer_identity(&self.extractor, &certificate)?;
+        eprintln!("record_chain_pq_wg layer=e2e negotiated={negotiated:?}");
+        let peer = peer_identity_from_spki(&self.extractor, established.peer_spki())?;
         Ok(E2eEstablished::new(
             Box::new(established),
-            InnerTlsSession::from_verified_certificate(peer, negotiated),
+            InnerTlsSession::from_verified_pq_wg(peer, negotiated),
         ))
     }
 }
@@ -552,6 +575,30 @@ impl PkiIdentityExtractor {
     }
 }
 
+fn validated_peer_identity(identity: &VerifiedNodeIdentity) -> Option<PeerIdentity> {
+    // Recheck the address under the same authenticated policy used to
+    // construct this identity, not under the legacy fixed overlay.
+    let overlay = match identity.policy {
+        Some(policy) => boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok()?,
+        None => boreas_pki::OverlayPrefix::DEFAULT,
+    };
+    let expected_vip = overlay
+        .vip(
+            identity.home_core_id,
+            identity.vip[3],
+            match identity.role {
+                NodeRole::Edge => boreas_pki::NodeRole::Edge,
+                NodeRole::Core => boreas_pki::NodeRole::Core,
+                NodeRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
+            },
+        )
+        .ok()?;
+    if identity.vip != expected_vip {
+        return None;
+    }
+    Some(identity.peer_identity())
+}
+
 impl PeerIdentityExtractor for PkiIdentityExtractor {
     fn extract(&self, certificate_der: &[u8]) -> Option<PeerIdentity> {
         let certificate = X509::from_der(certificate_der).ok()?;
@@ -565,27 +612,22 @@ impl PeerIdentityExtractor for PkiIdentityExtractor {
                 matched = Some(identity);
             }
         }
-        let identity = matched?;
-        // Recheck the address under the same authenticated policy used to
-        // construct this identity, not under the legacy fixed overlay.
-        let overlay = match identity.policy {
-            Some(policy) => boreas_pki::OverlayPrefix::new(policy.overlay_base(), 16).ok()?,
-            None => boreas_pki::OverlayPrefix::DEFAULT,
-        };
-        let expected_vip = overlay.vip(
-            identity.home_core_id,
-            identity.vip[3],
-            match identity.role {
-                NodeRole::Edge => boreas_pki::NodeRole::Edge,
-                NodeRole::Core => boreas_pki::NodeRole::Core,
-                NodeRole::EnrollmentService => boreas_pki::NodeRole::EnrollmentService,
-            },
-        )
-        .ok()?;
-        if identity.vip != expected_vip {
-            return None;
+        validated_peer_identity(matched?)
+    }
+
+    fn resolve_spki_hash(&self, spki_hash: &[u8; 32]) -> Option<(Vec<u8>, PeerIdentity)> {
+        let mut matched = None;
+        for identity in &self.trusted {
+            if &sha256(&identity.public_key_spki) == spki_hash {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(identity);
+            }
         }
-        Some(identity.peer_identity())
+        let identity = matched?;
+        let peer = validated_peer_identity(identity)?;
+        Some((identity.public_key_spki.clone(), peer))
     }
 }
 
@@ -629,6 +671,40 @@ impl OpenSslOuterTlsConnector {
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
         builder.set_verify(SslVerifyMode::PEER);
+        let roots = X509::stack_from_pem(root_pem)
+            .map_err(|_| TunnelError::InnerTls("root certificate"))?;
+        if roots.is_empty() {
+            return Err(TunnelError::InnerTls("root certificate"));
+        }
+        for root in roots {
+            builder
+                .cert_store_mut()
+                .add_cert(root)
+                .map_err(|_| TunnelError::InnerTls("trust root"))?;
+        }
+        Ok(Self {
+            connector: builder.build(),
+        })
+    }
+
+    /// Trusts the platform web-PKI roots AND the supplied private PEM roots.
+    ///
+    /// Allows a WSS client to verify certificates issued by a publicly trusted
+    /// CA without requiring manual CA distribution on both ends, while still
+    /// accepting an explicitly provisioned private `outer-ca.pem`.
+    pub fn with_web_pki_and_roots(root_pem: &[u8]) -> Result<Self, TunnelError> {
+        let mut builder = SslConnector::builder(SslMethod::tls_client())
+            .map_err(|_| TunnelError::InnerTls("outer tls context"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| TunnelError::InnerTls("outer tls version"))?;
+        builder.set_verify(SslVerifyMode::PEER);
+        builder
+            .set_default_verify_paths()
+            .map_err(|_| TunnelError::InnerTls("web pki roots"))?;
         let roots = X509::stack_from_pem(root_pem)
             .map_err(|_| TunnelError::InnerTls("root certificate"))?;
         if roots.is_empty() {

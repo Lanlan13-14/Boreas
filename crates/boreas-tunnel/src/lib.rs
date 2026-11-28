@@ -87,8 +87,8 @@ pub mod openssl_inner_tls;
 pub use error::{CircuitReject, SessionReject, TunnelError};
 #[cfg(feature = "openssl-inner-tls")]
 pub use openssl_inner_tls::{
-    OpenSslE2eBackend, OpenSslInnerAcceptor, OpenSslInnerConnector, OpenSslOuterTlsAcceptor,
-    OpenSslOuterTlsConnector, PkiIdentityExtractor, VerifiedNodeIdentity,
+    OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PkiIdentityExtractor, PqWgE2eBackend,
+    PqWgInnerAcceptor, PqWgInnerConnector, VerifiedNodeIdentity,
 };
 pub use runtime::{
     AcceptedSession, ClientTarget, LinkClient, LinkServer, RuntimeCapabilities,
@@ -98,7 +98,7 @@ pub use session::{EstablishedSession, SessionPolicy};
 pub use stream::Duplex;
 pub use tls::{
     EstablishedInner, InnerTlsAcceptor, InnerTlsConnector, InnerTlsSession, OuterTlsAcceptor,
-    OuterTlsConnector, PeerIdentity, PeerIdentityExtractor,
+    OuterTlsConnector, PeerIdentity, PeerIdentityExtractor, TransportMode,
 };
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};

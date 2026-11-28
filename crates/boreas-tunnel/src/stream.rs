@@ -131,6 +131,21 @@ impl<S: Duplex> Duplex for EstablishedStream<S> {
     }
 }
 
+#[cfg(feature = "openssl-inner-tls")]
+impl<S: Duplex> Duplex for boreas_crypto::pq_wg::PqWgStream<S> {
+    fn has_buffered_input(&self) -> bool {
+        self.has_buffered_input() || self.get_ref().has_buffered_input()
+    }
+
+    fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.get_ref().set_io_timeout(timeout)
+    }
+
+    fn clear_handshake_deadline(&self) -> io::Result<()> {
+        self.get_ref().clear_handshake_deadline()
+    }
+}
+
 impl Duplex for CircuitStream<'_> {
     fn has_buffered_input(&self) -> bool {
         self.has_buffered_input()

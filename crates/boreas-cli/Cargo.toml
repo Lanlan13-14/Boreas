@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "GPL-3.0-only"
-description = "Boreas CLI foundation plus optional hop-node process behind openssl-inner-tls"
+description = "Boreas CLI foundation plus optional hop-node process behind the WireGuard-style TLS-less PQ transport"
 
 [[bin]]
 name = "boreas"

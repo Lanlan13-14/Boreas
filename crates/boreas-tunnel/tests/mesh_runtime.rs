@@ -34,7 +34,8 @@
 
 use boreas_crypto::{
     Policy,
-    backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
+    backend::PemIdentity,
+    pq_wg::PqWgIdentity,
 };
 use boreas_pki::NodeRole as PkiNodeRole;
 use boreas_pki::management::{
@@ -62,9 +63,9 @@ use boreas_tunnel::relay::{MeshTopology, NodeRef};
 use boreas_tunnel::resource::{Admission, Limits};
 use boreas_tunnel::session::SessionPolicy;
 use boreas_tunnel::{
-    AcceptedSession, ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
-    OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
-    PkiIdentityExtractor, VerifiedNodeIdentity,
+    AcceptedSession, ClientTarget, LinkClient, LinkServer, OpenSslOuterTlsAcceptor,
+    OpenSslOuterTlsConnector, PeerIdentity, PkiIdentityExtractor, PqWgE2eBackend,
+    PqWgInnerAcceptor, PqWgInnerConnector, VerifiedNodeIdentity,
 };
 use openssl::{
     pkey::{Id, KeyType, PKey, Private},
@@ -821,36 +822,37 @@ impl Mesh {
         .map_err(|e| e.to_string())
     }
 
-    fn inner_connector(&self, name: &str) -> Result<OpenSslInnerConnector, String> {
+    fn inner_connector(&self, name: &str) -> Result<PqWgInnerConnector, String> {
         let identity = self.leaf(name).pem();
-        let connector =
-            OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
-                .map_err(|e| e.to_string())?;
-        Ok(OpenSslInnerConnector::new(
-            connector,
+        PqWgInnerConnector::new(
+            PqWgIdentity::from_private_key_pem(&identity.private_key_pem)
+                .map_err(|e| e.to_string())?,
+            Policy::production_default(),
             self.extractor.clone(),
-        ))
+        )
+        .map_err(|e| e.to_string())
     }
 
-    fn inner_acceptor(&self, name: &str) -> Result<OpenSslInnerAcceptor, String> {
+    fn inner_acceptor(&self, name: &str) -> Result<PqWgInnerAcceptor, String> {
         let identity = self.leaf(name).pem();
-        let acceptor = OpenSslAcceptor::from_pem_identity(&identity, Policy::production_default())
-            .map_err(|e| e.to_string())?;
-        Ok(OpenSslInnerAcceptor::new(acceptor, self.extractor.clone()))
+        PqWgInnerAcceptor::new(
+            PqWgIdentity::from_private_key_pem(&identity.private_key_pem)
+                .map_err(|e| e.to_string())?,
+            Policy::production_default(),
+            self.extractor.clone(),
+        )
+        .map_err(|e| e.to_string())
     }
 
-    fn e2e_backend(&self, name: &str) -> Result<OpenSslE2eBackend, String> {
+    fn e2e_backend(&self, name: &str) -> Result<PqWgE2eBackend, String> {
         let identity = self.leaf(name).pem();
-        let connector =
-            OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
-                .map_err(|e| e.to_string())?;
-        let acceptor = OpenSslAcceptor::from_pem_identity(&identity, Policy::production_default())
-            .map_err(|e| e.to_string())?;
-        Ok(OpenSslE2eBackend::new(
-            Arc::new(connector),
-            Arc::new(acceptor),
+        PqWgE2eBackend::new(
+            PqWgIdentity::from_private_key_pem(&identity.private_key_pem)
+                .map_err(|e| e.to_string())?,
+            Policy::production_default(),
             self.extractor.clone(),
-        ))
+        )
+        .map_err(|e| e.to_string())
     }
 }
 

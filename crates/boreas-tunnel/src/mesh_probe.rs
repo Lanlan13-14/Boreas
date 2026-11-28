@@ -10,7 +10,8 @@ use std::{
 
 use boreas_crypto::{
     NodeRole, Policy,
-    backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
+    backend::PemIdentity,
+    pq_wg::PqWgIdentity,
 };
 use boreas_pki::{
     Authority, VerifiedNetworkContext,
@@ -29,8 +30,8 @@ use boreas_proto::{
 };
 
 use crate::{
-    ClientTarget, EstablishedSession, LinkClient, LinkServer, OpenSslInnerAcceptor,
-    OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
+    ClientTarget, EstablishedSession, LinkClient, LinkServer, OpenSslOuterTlsAcceptor,
+    OpenSslOuterTlsConnector, PeerIdentity, PqWgInnerAcceptor, PqWgInnerConnector,
     PeerIdentityExtractor, PkiIdentityExtractor, SessionPolicy, TunnelError, VerifiedNodeIdentity,
     resource::Admission, runtime::bounded_link_operation,
 };
@@ -348,12 +349,13 @@ impl<'a> MeshProbe<'a> {
                 .map_err(|_| Error::Identity)?,
             &policy,
         )?;
-        OpenSslConnector::from_pem_identity(pem, Policy::production_default())
+        let pq_identity = PqWgIdentity::from_private_key_pem(&pem.private_key_pem)
             .map_err(|_| Error::Identity)?;
-        let leaf = openssl::x509::X509::from_pem(&pem.certificate_pem)
-            .and_then(|cert| cert.to_der())
-            .map_err(|_| Error::Identity)?;
-        if extractor(&local)?.extract(&leaf) != Some(local.peer()) {
+        if extractor(&local)?
+            .resolve_spki_hash(&pq_identity.public_spki_hash())
+            .map(|(spki, peer)| spki == pq_identity.public_spki() && peer == local.peer())
+            != Some(true)
+        {
             return Err(Error::Identity);
         }
         let mut remote_lsas = match state {
@@ -536,12 +538,18 @@ impl<'a> MeshProbe<'a> {
             let buffer = admission
                 .reserve_bytes(crate::runtime::CONNECTION_BUFFER_BUDGET)
                 .map_err(TunnelError::from)?;
-            let connector =
-                OpenSslConnector::from_pem_identity(self.pem, Policy::production_default())
-                    .map_err(|_| Error::Identity)?;
+            let pq_identity = PqWgIdentity::from_private_key_pem(&self.pem.private_key_pem)
+                .map_err(|_| Error::Identity)?;
             let client = LinkClient::new(
                 Box::new(outer()?),
-                Box::new(OpenSslInnerConnector::new(connector, extractor(&peer)?)),
+                Box::new(
+                    PqWgInnerConnector::new(
+                        pq_identity,
+                        Policy::production_default(),
+                        extractor(&peer)?,
+                    )
+                    .map_err(|_| Error::Identity)?,
+                ),
             );
             let tcp = match client
                 .connect_tcp(target, deadline.saturating_duration_since(Instant::now()))
@@ -699,12 +707,12 @@ impl<'a> MeshProbe<'a> {
             return Err(Error::Status);
         }
         let socket = tcp.try_clone().map_err(TunnelError::from)?;
-        let inner = OpenSslAcceptor::from_pem_identity(self.pem, Policy::production_default())
+        let pq_identity = PqWgIdentity::from_private_key_pem(&self.pem.private_key_pem)
             .map_err(|_| Error::Identity)?;
-        let server = LinkServer::new(Box::new(OpenSslInnerAcceptor::new(
-            inner,
-            extractor(&peer)?,
-        )));
+        let server = LinkServer::new(Box::new(
+            PqWgInnerAcceptor::new(pq_identity, Policy::production_default(), extractor(&peer)?)
+                .map_err(|_| Error::Identity)?,
+        ));
         let accepted = server.accept_tls_stream_until(
             tcp,
             outer,

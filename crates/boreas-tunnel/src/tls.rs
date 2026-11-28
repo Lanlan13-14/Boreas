@@ -17,7 +17,8 @@
 //! feature; the default build has no backend at all and fails closed.
 
 use boreas_crypto::{
-    ExpectedPeer, NegotiatedParameters, NodeRole, Policy, PresentedPeer, Suite as CryptoSuite,
+    ExpectedPeer, NegotiatedParameters, NodeRole, Policy, PqWgParameters, PresentedPeer,
+    Suite as CryptoSuite,
 };
 #[cfg(feature = "openssl-inner-tls")]
 use boreas_pki::VerifiedNetworkContext;
@@ -25,6 +26,18 @@ use boreas_proto::messages::Suite as MessageSuite;
 
 use crate::error::{SessionReject, TunnelError};
 use crate::stream::Duplex;
+
+/// Outer link encapsulation mode.
+///
+/// * [`TransportMode::Direct`]: TCP directly carries the WireGuard-style
+///   TLS-less PQ hop channel (`PqWg`). No outer TLS and no WebSocket.
+/// * [`TransportMode::Wss`]: TCP carries outer TLS 1.3 + HTTP/1.1 WebSocket,
+///   which carries the WireGuard-style TLS-less PQ hop channel inside binary frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportMode {
+    Direct,
+    Wss,
+}
 
 /// Authenticated peer facts. Values come from the verified certificate chain
 /// (via the PKI layer) and never from a peer-supplied message.
@@ -112,45 +125,53 @@ impl PeerIdentity {
     }
 }
 
-/// A completed inner-TLS session: the authenticated peer plus the negotiated
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSecurity {
+    #[cfg(feature = "openssl-inner-tls")]
+    PqWg(PqWgParameters),
+    Tls(NegotiatedParameters),
+}
+
+/// A completed inner encrypted session (WireGuard-style TLS-less PQ in production;
+/// test fixtures may supply TLS facts): the authenticated peer plus the negotiated
 /// parameters that the policy gate re-checks.
 ///
 /// The fields are private on purpose. A value of this type can only be built by
-/// the reviewed in-tree backend adapter, from a certificate chain that the TLS
-/// backend already verified and a `PeerIdentity` the PKI layer mapped from that
-/// verified leaf. A public struct literal would be a self-reported claim, not an
-/// authorization result.
+/// the reviewed in-tree backend adapter, from a verified peer identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InnerTlsSession {
     peer: PeerIdentity,
-    negotiated: NegotiatedParameters,
+    security: SessionSecurity,
 }
 
 impl InnerTlsSession {
-    /// Constructor for the in-tree backend adapters only.
-    ///
-    /// Callers must pass a certificate-derived [`PeerIdentity`]; the adapter is
-    /// the only code path that holds a verified leaf certificate. Test code uses
-    /// a `#[cfg(test)]` constructor instead.
+    /// Constructor for the WireGuard-style TLS-less PQ adapter.
     #[cfg(feature = "openssl-inner-tls")]
-    pub(crate) fn from_verified_certificate(
-        peer: PeerIdentity,
-        negotiated: NegotiatedParameters,
-    ) -> Self {
-        Self { peer, negotiated }
+    pub(crate) fn from_verified_pq_wg(peer: PeerIdentity, params: PqWgParameters) -> Self {
+        Self {
+            peer,
+            security: SessionSecurity::PqWg(params),
+        }
     }
 
     pub fn peer(&self) -> PeerIdentity {
         self.peer
     }
 
-    pub fn negotiated(&self) -> NegotiatedParameters {
-        self.negotiated
+    pub fn is_tls_free(&self) -> bool {
+        #[cfg(feature = "openssl-inner-tls")]
+        if matches!(self.security, SessionSecurity::PqWg(_)) {
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
     pub(crate) fn test_only(peer: PeerIdentity, negotiated: NegotiatedParameters) -> Self {
-        Self { peer, negotiated }
+        Self {
+            peer,
+            security: SessionSecurity::Tls(negotiated),
+        }
     }
 }
 
@@ -190,6 +211,11 @@ impl EstablishedInner {
 /// PKI mapping the in-tree adapter cannot be constructed.
 pub trait PeerIdentityExtractor: Send + Sync {
     fn extract(&self, certificate_der: &[u8]) -> Option<PeerIdentity>;
+
+    /// Resolve a trusted peer by `SHA256(SPKI)` for WireGuard-style TLS-less PQ handshakes.
+    fn resolve_spki_hash(&self, _spki_hash: &[u8; 32]) -> Option<(Vec<u8>, PeerIdentity)> {
+        None
+    }
 }
 
 /// Client side of the outer HTTPS/WSS TLS layer.
@@ -280,7 +306,11 @@ pub fn check_inner_tls(
         suite: crypto_suite(suite),
         allow_pq1024,
     };
-    policy.validate_negotiated(session.negotiated())?;
+    match session.security {
+        #[cfg(feature = "openssl-inner-tls")]
+        SessionSecurity::PqWg(params) => policy.validate_pq_wg(params)?,
+        SessionSecurity::Tls(negotiated) => policy.validate_negotiated(negotiated)?,
+    }
     Ok(())
 }
 

@@ -291,6 +291,7 @@ fn cmd_issue_node(args: &[String]) -> Result<(), String> {
             now_us: now_utc_us()?,
             validity_hours,
             outer_san_dns,
+            outer_ca_issued: args.iter().any(|a| a == "--outer-ca-issued"),
         },
     )
     .map_err(|e| format!("pki issue-node failed: {e}"))?;

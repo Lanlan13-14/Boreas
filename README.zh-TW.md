@@ -17,11 +17,13 @@ Boreas 可以把分散在不同網路的主機連成私人 IP 網路。最簡單
 
 ## TCP 直連和 WebSocket 有什麼關係？
 
-**目前雙機隧道使用 WSS，也就是 TLS 上的 WebSocket，底層是 TCP。** Edge 可以直接撥到 Core 的 `IP:連接埠`，不經反向代理；這仍會進行 TLS 握手及 WebSocket 升級，並不是略過 WebSocket 的裸 TCP 模式。現行教學沒有獨立的裸 TCP 或明文 `ws://` 入口。
+**預設入口是裸 TCP 直連：TCP 上直接承載 WireGuard 風格的無 TLS 後量子加密通道（ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305），沒有 TLS，也沒有 WebSocket。** 身分認證靠預先配置的簽章身分裡的 ML-DSA 公鑰，不靠憑證。
+
+**WSS 只在需要時啟用。** 當材料目錄裡存在 `outer-ca.pem`（用戶端）和 `outer.pem`/`outer.key`（伺服端）時，同一條後量子通道改由 TLS 1.3 上的 WebSocket 承載。`outer-ca.pem` 可以是自建 CA，也可以是簽發伺服器憑證的公共 CA 根或中繼憑證：用戶端在它之外還信任系統自帶的公共 CA 根，因此由公共信任 CA 簽發的憑證不需要像自建憑證那樣把 CA 分發到每一端。
 
 - `--connect` 指定 Edge 能連上的 Core `IP:連接埠`，不是隧道 IP。
-- `--tls-name` 填寫憑證上的名稱；`--ws-host` 和 `--ws-path` 分別指定 WebSocket 請求的 Host 與路徑。
-- Boreas 以 Rust 實作，透過 Linux TUN 收送 IP 封包，以 TLS 1.3、WebSocket 和預先配置的簽章身分建立隧道；`pq768` / `e2e-required` 模式另由流量兩端建立端對端加密電路。
+- WSS 模式下 `--tls-name` 填寫憑證上的名稱；`--ws-host` 和 `--ws-path` 分別指定 WebSocket 請求的 Host 與路徑。直連模式忽略這三項。
+- Boreas 以 Rust 實作，透過 Linux TUN 收送 IP 封包；`pq768` / `e2e-required` 模式另由流量兩端建立端對端加密電路，使用同一套無 TLS 後量子握手。
 
 ## 從這裡開始
 

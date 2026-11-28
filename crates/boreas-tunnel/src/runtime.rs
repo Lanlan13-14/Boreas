@@ -29,7 +29,7 @@ use crate::resource::{
 };
 use crate::session::{self, EstablishedSession, SessionPolicy};
 use crate::stream::{DeadlineIo, Duplex};
-use crate::tls::{InnerTlsAcceptor, InnerTlsConnector, OuterTlsConnector};
+use crate::tls::{InnerTlsAcceptor, InnerTlsConnector, OuterTlsConnector, TransportMode};
 use crate::ws::{self, MAX_WS_FRAME_PAYLOAD};
 
 /// Application-buffer reservation per accepted connection: the WebSocket frame
@@ -335,15 +335,32 @@ fn handshake_guard_watch(socket: TcpStream, deadline: Instant, state: std::sync:
 }
 
 pub struct LinkClient {
-    outer: Box<dyn OuterTlsConnector>,
+    outer: Option<Box<dyn OuterTlsConnector>>,
     inner: Box<dyn InnerTlsConnector>,
 }
 
 impl LinkClient {
-    /// `outer` terminates the public HTTPS/WSS TLS layer (web PKI); `inner` runs
-    /// the strict pq768 hop session inside the WebSocket byte stream.
+    /// `outer` terminates the public HTTPS/WSS TLS layer; `inner` runs the
+    /// WireGuard-style TLS-less PQ hop session inside the WebSocket byte stream.
     pub fn new(outer: Box<dyn OuterTlsConnector>, inner: Box<dyn InnerTlsConnector>) -> Self {
-        Self { outer, inner }
+        Self {
+            outer: Some(outer),
+            inner,
+        }
+    }
+
+    /// Direct mode without TLS or WebSocket: TCP directly carries the
+    /// WireGuard-style TLS-less PQ hop session.
+    pub fn new_direct(inner: Box<dyn InnerTlsConnector>) -> Self {
+        Self { outer: None, inner }
+    }
+
+    pub fn mode(&self) -> TransportMode {
+        if self.outer.is_some() {
+            TransportMode::Wss
+        } else {
+            TransportMode::Direct
+        }
     }
 
     /// Connect, run outer TLS, upgrade to WebSocket inside it, run the hop inner
@@ -503,22 +520,27 @@ impl LinkClient {
         deadline: Instant,
         diagnostics: bool,
     ) -> Result<EstablishedSession, TunnelError> {
-        let outer = {
-            let _timer = DiagnosticTimer::start("outer_tls", diagnostics);
-            self.outer.connect(tcp, &target.tls_server_name)?
-        };
-        // The guard is the absolute bound; this check keeps an overrun from
-        // being mistaken for a fresh allowance if the backend returns just
-        // before the shutdown lands.
-        remaining_handshake_budget(deadline)?;
-        let transport = DeadlineIo::new(outer, deadline, diagnostics);
-        let websocket = {
-            let _timer = DiagnosticTimer::start("ws_handshake", diagnostics);
-            ws::client_handshake_until(transport, &target.ws_host, &target.path, deadline)?
-        };
-        let inner = {
+        let inner = if let Some(outer_tls) = &self.outer {
+            let outer = {
+                let _timer = DiagnosticTimer::start("outer_tls", diagnostics);
+                outer_tls.connect(tcp, &target.tls_server_name)?
+            };
+            // The guard is the absolute bound; this check keeps an overrun from
+            // being mistaken for a fresh allowance if the backend returns just
+            // before the shutdown lands.
+            remaining_handshake_budget(deadline)?;
+            let transport = DeadlineIo::new(outer, deadline, diagnostics);
+            let websocket = {
+                let _timer = DiagnosticTimer::start("ws_handshake", diagnostics);
+                ws::client_handshake_until(transport, &target.ws_host, &target.path, deadline)?
+            };
             let _timer = DiagnosticTimer::start("inner_tls", diagnostics);
             self.inner.connect(Box::new(websocket))?
+        } else {
+            remaining_handshake_budget(deadline)?;
+            let transport = DeadlineIo::new(tcp, deadline, diagnostics);
+            let _timer = DiagnosticTimer::start("inner_tls", diagnostics);
+            self.inner.connect(Box::new(transport))?
         };
         let (stream, tls) = inner.into_parts();
         let _timer = DiagnosticTimer::start("session_handshake", diagnostics);
@@ -613,6 +635,77 @@ impl LinkServer {
             .checked_add(io_timeout)
             .ok_or_else(handshake_budget_overflow)?;
         self.accept_tls_stream_until(tcp, outer, policy, deadline, admission)
+    }
+
+    /// Explicit absolute-deadline server handshake on an already-accepted
+    /// stream, choosing WSS (`Some(outer)`) or Direct (`None`, no TLS / no WS).
+    pub fn accept_stream_until(
+        &self,
+        tcp: TcpStream,
+        outer: Option<&dyn crate::tls::OuterTlsAcceptor>,
+        policy: SessionPolicy,
+        deadline: Instant,
+        admission: &Admission,
+    ) -> Result<AcceptedSession, TunnelError> {
+        match outer {
+            Some(outer) => self.accept_tls_stream_until(tcp, outer, policy, deadline, admission),
+            None => self.accept_direct_stream_until(tcp, policy, deadline, admission),
+        }
+    }
+
+    /// Direct-mode accept (no outer TLS, no WebSocket): TCP directly carries
+    /// the WireGuard-style TLS-less PQ hop handshake.
+    pub fn accept_direct(
+        &self,
+        listener: &TcpListener,
+        policy: SessionPolicy,
+        io_timeout: Duration,
+        admission: &Admission,
+    ) -> Result<AcceptedSession, TunnelError> {
+        let (tcp, _peer_address) = listener.accept()?;
+        self.accept_direct_stream(tcp, policy, io_timeout, admission)
+    }
+
+    pub fn accept_direct_stream(
+        &self,
+        tcp: TcpStream,
+        policy: SessionPolicy,
+        io_timeout: Duration,
+        admission: &Admission,
+    ) -> Result<AcceptedSession, TunnelError> {
+        let deadline = Instant::now()
+            .checked_add(io_timeout)
+            .ok_or_else(handshake_budget_overflow)?;
+        self.accept_direct_stream_until(tcp, policy, deadline, admission)
+    }
+
+    pub fn accept_direct_stream_until(
+        &self,
+        tcp: TcpStream,
+        policy: SessionPolicy,
+        deadline: Instant,
+        admission: &Admission,
+    ) -> Result<AcceptedSession, TunnelError> {
+        self.accept_direct_stream_with_policy(tcp, deadline, admission, |_| Ok(policy))
+    }
+
+    pub(crate) fn accept_direct_stream_with_policy(
+        &self,
+        tcp: TcpStream,
+        deadline: Instant,
+        admission: &Admission,
+        policy: impl FnOnce(crate::tls::PeerIdentity) -> Result<SessionPolicy, TunnelError>,
+    ) -> Result<AcceptedSession, TunnelError> {
+        let handshake = admission.reserve_handshake()?;
+        let buffer_credit = admission.reserve_bytes(CONNECTION_BUFFER_BUDGET)?;
+        configure(&tcp, Some(remaining_handshake_budget(deadline)?))?;
+        let mut guard = arm_handshake_guard(&tcp, deadline)?;
+        let result = (|| {
+            remaining_handshake_budget(deadline)?;
+            let transport = DeadlineIo::new(tcp, deadline, diagnostic_timing_enabled());
+            self.accept_established_raw(transport, handshake, buffer_credit, policy)
+        })();
+        guard.finish(result, deadline)
     }
 
     /// Explicit absolute-deadline server handshake on an already-accepted
@@ -717,7 +810,17 @@ impl LinkServer {
         deadline: Instant,
     ) -> Result<AcceptedSession, TunnelError> {
         let websocket = ws::server_handshake_until(transport, deadline)?;
-        let inner = self.tls.accept(Box::new(websocket))?;
+        self.accept_established_raw(websocket, handshake, buffer_credit, policy)
+    }
+
+    fn accept_established_raw<T: Duplex + 'static>(
+        &self,
+        transport: T,
+        handshake: HandshakeCredit,
+        buffer_credit: ByteCredit,
+        policy: impl FnOnce(crate::tls::PeerIdentity) -> Result<SessionPolicy, TunnelError>,
+    ) -> Result<AcceptedSession, TunnelError> {
+        let inner = self.tls.accept(Box::new(transport))?;
         let (stream, tls) = inner.into_parts();
         let policy = policy(tls.peer())?;
         let session = session::server_handshake(stream, &tls, policy)?;

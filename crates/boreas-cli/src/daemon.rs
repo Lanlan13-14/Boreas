@@ -249,10 +249,7 @@ mod linux_daemon {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use boreas_crypto::{
-        Policy,
-        backend::{OpenSslAcceptor, OpenSslConnector},
-    };
+    use boreas_crypto::Policy;
     use boreas_pki::{
         Authority,
         authority_revocation::AuthorityRevocationTrust,
@@ -273,9 +270,9 @@ mod linux_daemon {
         linux::{LinuxTunDevice, LinuxTunError, LinuxTunQueue, TunConfig},
     };
     use boreas_tunnel::{
-        ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
-        OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
-        PeerIdentityExtractor, PkiIdentityExtractor, TunnelError, VerifiedNodeIdentity,
+        ClientTarget, LinkClient, LinkServer, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector,
+        PeerIdentity, PeerIdentityExtractor, PkiIdentityExtractor, PqWgE2eBackend,
+        PqWgInnerAcceptor, PqWgInnerConnector, TunnelError, VerifiedNodeIdentity,
         e2e::{E2eCircuit, E2eL3Profile, accept_e2e_with_l3_profile_until, open_e2e_with_l3_profile_until},
         failover,
         packet_path::{PacketPath, PacketPathError, PacketStats, PrivateDnsProvision},
@@ -1309,7 +1306,7 @@ mod linux_daemon {
             let pem = fs::read(&outer_ca_path).map_err(|_| {
                 StandbyDialFailure::Protocol("standby: cannot read outer-ca.pem".to_string())
             })?;
-            OpenSslOuterTlsConnector::with_root_certificates(&pem).map_err(|_| {
+            OpenSslOuterTlsConnector::with_web_pki_and_roots(&pem).map_err(|_| {
                 StandbyDialFailure::Protocol("standby: invalid outer-ca.pem".to_string())
             })?
         } else {
@@ -1317,22 +1314,18 @@ mod linux_daemon {
                 StandbyDialFailure::Protocol("standby: web-PKI roots unavailable".to_string())
             })?
         };
-        let inner = OpenSslConnector::from_pem_files(
-            config.mat_dir.join("identity.pem"),
-            &config.key_path,
-            config.mat_dir.join("identity-ca.pem"),
+        let pq_identity = PqWgIdentity::from_private_key_file(&config.key_path).map_err(|_| {
+            StandbyDialFailure::Protocol("standby: pq-wg identity setup failed".to_string())
+        })?;
+        let inner = PqWgInnerConnector::new(
+            pq_identity,
             Policy::production_default(),
+            Arc::clone(&config.extractor) as Arc<dyn PeerIdentityExtractor>,
         )
         .map_err(|_| {
-            StandbyDialFailure::Protocol("standby: pq768 inner connector setup failed".to_string())
+            StandbyDialFailure::Protocol("standby: pq-wg inner connector setup failed".to_string())
         })?;
-        let link = LinkClient::new(
-            Box::new(outer),
-            Box::new(OpenSslInnerConnector::new(
-                inner,
-                Arc::clone(&config.extractor) as Arc<dyn PeerIdentityExtractor>,
-            )),
-        );
+        let link = LinkClient::new(Box::new(outer), Box::new(inner));
         let tcp = link
             .connect_tcp(&config.target, HANDSHAKE_TIMEOUT)
             .map_err(|_| StandbyDialFailure::Transport)?;
@@ -2375,40 +2368,13 @@ mod linux_daemon {
                 .map_err(|_| "daemon: duplicate or invalid SPKIs".to_string())?,
         );
 
-        let id_pem = mat_dir.join("identity.pem");
-        let id_ca_pem = mat_dir.join("identity-ca.pem");
+        let id_key = mat_dir.join("identity.key");
         let tls_policy = Policy::production_default();
-        let inner_conn = OpenSslConnector::from_pem_files(
-            &id_pem,
-            &config.identity.private_key,
-            &id_ca_pem,
-            tls_policy,
-        )
-        .map_err(|_| "daemon: inner pq768 connector setup failed".to_string())?;
-        let inner_acc = OpenSslAcceptor::from_pem_files(
-            &id_pem,
-            &config.identity.private_key,
-            &id_ca_pem,
-            tls_policy,
-        )
-        .map_err(|_| "daemon: inner pq768 acceptor setup failed".to_string())?;
-
-        let e2e_conn = OpenSslConnector::from_pem_files(
-            &id_pem,
-            &config.identity.private_key,
-            &id_ca_pem,
-            tls_policy,
-        )
-        .map_err(|_| "daemon: E2E pq768 connector setup failed".to_string())?;
-        let e2e_acc = OpenSslAcceptor::from_pem_files(
-            &id_pem,
-            &config.identity.private_key,
-            &id_ca_pem,
-            tls_policy,
-        )
-        .map_err(|_| "daemon: E2E pq768 acceptor setup failed".to_string())?;
+        let pq_identity = PqWgIdentity::from_private_key_file(&id_key)
+            .map_err(|_| "daemon: pq-wg identity setup failed".to_string())?;
         let e2e_backend =
-            OpenSslE2eBackend::new(Arc::new(e2e_conn), Arc::new(e2e_acc), extractor.clone());
+            PqWgE2eBackend::new(pq_identity.clone(), tls_policy, extractor.clone())
+                .map_err(|_| "daemon: pq-wg E2E backend setup failed".to_string())?;
 
         // Offline admission and both durable locks precede any TUN, control
         // socket, bind or dial. Only Resume may proceed past this boundary.
@@ -2427,9 +2393,14 @@ mod linux_daemon {
         let cutover = plan.as_ref().zip(bound.as_ref());
         let mut status_store = if let Some((plan, bound)) = cutover {
             if mode == Mode::Serve {
-                OpenSslOuterTlsAcceptor::from_pem_files(mat_dir.join("outer.pem"), mat_dir.join("outer.key"))
+                if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
+                    OpenSslOuterTlsAcceptor::from_pem_files(
+                        mat_dir.join("outer.pem"),
+                        mat_dir.join("outer.key"),
+                    )
                     .map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?;
-            } else {
+                }
+            } else if mat_dir.join("outer-ca.pem").exists() {
                 direct_outer_connector(&mat_dir)?;
             }
             if plan.action == CutoverAction::Resume {
@@ -2581,18 +2552,24 @@ mod linux_daemon {
             let endpoint = match mode {
                 Mode::Serve => {
                     let spec = listen_spec.ok_or("daemon serve: `--listen` is required")?;
-                    let outer = OpenSslOuterTlsAcceptor::from_pem_files(
-                        mat_dir.join("outer.pem"),
-                        mat_dir.join("outer.key"),
-                    )
-                    .map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?;
+                    let outer = if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
+                        Some(OpenSslOuterTlsAcceptor::from_pem_files(
+                            mat_dir.join("outer.pem"),
+                            mat_dir.join("outer.key"),
+                        ).map_err(|_| "daemon serve: outer.pem/outer.key setup failed")?)
+                    } else {
+                        None
+                    };
                     let listener = TcpListener::bind(resolve_addr(&spec)?)
                         .map_err(|e| format!("daemon serve: cannot bind TCP listener: {e}"))?;
                     listener
                         .set_nonblocking(true)
                         .map_err(|e| format!("daemon serve: listener nonblocking failed: {e}"))?;
-                    let server =
-                        LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
+                    let server = LinkServer::new(Box::new(PqWgInnerAcceptor::new(
+                        pq_identity.clone(),
+                        tls_policy,
+                        extractor,
+                    ).map_err(|_| "daemon serve: pq-wg inner acceptor setup failed")?));
                     multi_active::Endpoint::Core(listener, server, outer)
                 }
                 Mode::Connect => {
@@ -2613,10 +2590,20 @@ mod linux_daemon {
                         tls_server_name: server_name,
                         path: ws_path,
                     };
-                    let client = LinkClient::new(
-                        Box::new(direct_outer_connector(&mat_dir)?),
-                        Box::new(OpenSslInnerConnector::new(inner_conn, extractor)),
-                    );
+                    let inner = PqWgInnerConnector::new(
+                        pq_identity.clone(),
+                        tls_policy,
+                        extractor,
+                    )
+                    .map_err(|_| "daemon connect: pq-wg inner connector setup failed")?;
+                    let client = if mat_dir.join("outer-ca.pem").exists() {
+                        LinkClient::new(
+                            Box::new(direct_outer_connector(&mat_dir)?),
+                            Box::new(inner),
+                        )
+                    } else {
+                        LinkClient::new_direct(Box::new(inner))
+                    };
                     multi_active::Endpoint::Edge(client, target)
                 }
             };
@@ -2660,7 +2647,8 @@ mod linux_daemon {
                 &status_path,
                 policy_window,
                 status_store,
-                inner_acc,
+                pq_identity,
+                tls_policy,
                 extractor,
                 e2e_backend,
                 session_policy,
@@ -3086,9 +3074,10 @@ mod linux_daemon {
         status_path: &Path,
         policy_window: PolicyWindow,
         status_store: Arc<Mutex<StatusStore>>,
-        inner_acc: OpenSslAcceptor,
+        pq_identity: PqWgIdentity,
+        tls_policy: Policy,
         extractor: Arc<PkiIdentityExtractor>,
-        e2e_backend: OpenSslE2eBackend,
+        e2e_backend: PqWgE2eBackend,
         session_policy: SessionPolicy,
         remote_peer: PeerIdentity,
         tun: &TunEndpoint,
@@ -3106,11 +3095,14 @@ mod linux_daemon {
         } else {
             resolve_addr(&listen_spec)?
         };
-        let outer_acc = OpenSslOuterTlsAcceptor::from_pem_files(
-            mat_dir.join("outer.pem"),
-            mat_dir.join("outer.key"),
-        )
-        .map_err(|_| "daemon serve: outer.pem/outer.key setup failed".to_string())?;
+        let outer_acc = if mat_dir.join("outer.pem").exists() && mat_dir.join("outer.key").exists() {
+            Some(OpenSslOuterTlsAcceptor::from_pem_files(
+                mat_dir.join("outer.pem"),
+                mat_dir.join("outer.key"),
+            ).map_err(|_| "daemon serve: outer.pem/outer.key setup failed".to_string())?)
+        } else {
+            None
+        };
         let listener = TcpListener::bind(listen_addr)
             .map_err(|_| "daemon serve: cannot bind TCP listener".to_string())?;
         listener
@@ -3204,12 +3196,20 @@ mod linux_daemon {
             authenticated_per_peer: 2,
             bytes_global: 16 * 1024 * 1024,
         });
-        let link_server =
-            LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner_acc, extractor)));
+        let link_server = LinkServer::new(Box::new(
+            PqWgInnerAcceptor::new(pq_identity, tls_policy, extractor)
+                .map_err(|_| "daemon serve: pq-wg inner acceptor setup failed".to_string())?,
+        ));
         // The transport's hop deadline is disarmed before the E2E phase.
         let mut accepted = link_server
-            .accept_tls_stream_until(tcp, &outer_acc, session_policy, phase_deadline(), &admission)
-            .map_err(|e| format!("daemon serve: WSS + pq768 hop session rejected: {e}"))?;
+            .accept_stream_until(
+                tcp,
+                outer_acc.as_ref().map(|outer| outer as &dyn boreas_tunnel::OuterTlsAcceptor),
+                session_policy,
+                phase_deadline(),
+                &admission,
+            )
+            .map_err(|e| format!("daemon serve: hop session rejected: {e}"))?;
 
         // The peer authenticated, but status or the signed policy may have
         // expired during the blocking handshake. Recheck before running the E2E
@@ -3315,7 +3315,7 @@ mod linux_daemon {
 
     /// Connect, then keep business on one authenticated circuit at a time.
     ///
-    /// The initial dial keeps the pre-authorization fallback: only a transport
+    /// The initial dial keep// The initial dial keeps the pre-authorization fallback: only a transport
     /// refusal or timeout on the primary may advance to the backup endpoint, and
     /// a policy or handshake rejection still stops everything. Once business is
     /// running on the primary, the same backup endpoint becomes a *standby path*:
@@ -3348,8 +3348,9 @@ mod linux_daemon {
         status_path: &Path,
         policy_window: PolicyWindow,
         status_store: Arc<Mutex<StatusStore>>,
-        inner_conn: OpenSslConnector,
-        e2e_backend: OpenSslE2eBackend,
+        pq_identity: PqWgIdentity,
+        tls_policy: Policy,
+        e2e_backend: PqWgE2eBackend,
         session_policy: SessionPolicy,
         remote_peer: PeerIdentity,
         tun: &TunEndpoint,
@@ -3361,15 +3362,22 @@ mod linux_daemon {
         l3_profile: E2eL3Profile,
     ) -> Result<(), String> {
         let slots = revocation_slots(session_policy.local, remote_peer)?;
-        let outer_conn = direct_outer_connector(mat_dir)?;
         let budget = Arc::new(ConnectionBudget::new());
-        let link_client = LinkClient::new(
-            Box::new(outer_conn),
-            Box::new(OpenSslInnerConnector::new(
-                inner_conn,
-                Arc::clone(&extractor) as Arc<dyn PeerIdentityExtractor>,
-            )),
-        );
+        let inner_connector = PqWgInnerConnector::new(
+            pq_identity,
+            tls_policy,
+            Arc::clone(&extractor) as Arc<dyn PeerIdentityExtractor>,
+        )
+        .map_err(|_| "daemon connect: pq-wg inner connector setup failed".to_string())?;
+        let wss = mat_dir.join("outer-ca.pem").exists();
+        let link_client = if wss {
+            LinkClient::new(
+                Box::new(direct_outer_connector(mat_dir)?),
+                Box::new(inner_connector),
+            )
+        } else {
+            LinkClient::new_direct(Box::new(inner_connector))
+        };
         let endpoints = connect_endpoints(primary_spec, backup_spec);
         let mut link: Option<(usize, HopLink)> = None;
         for (index, endpoint) in endpoints.iter().enumerate() {
@@ -5246,4 +5254,6 @@ mod linux_daemon {
             }
         }
     }
+}
+
 }

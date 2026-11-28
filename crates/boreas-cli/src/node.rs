@@ -251,34 +251,34 @@ fn serve_backend(
     use std::time::Duration;
 
     use boreas_crypto::Policy;
-    use boreas_crypto::backend::{OpenSslAcceptor, PemIdentity};
+    use boreas_crypto::pq_wg::PqWgIdentity;
     use boreas_proto::SecurityMode;
     use boreas_proto::messages::{PathRole, Suite as MessageSuite};
     use boreas_tunnel::resource::{Admission, Limits};
     use boreas_tunnel::runtime::LinkServer;
     use boreas_tunnel::{
-        OpenSslInnerAcceptor, OpenSslOuterTlsAcceptor, PkiIdentityExtractor, SessionPolicy,
+        OpenSslOuterTlsAcceptor, PkiIdentityExtractor, PqWgInnerAcceptor, SessionPolicy,
     };
 
     let identities = load_verified_identities(prepared, material_dir)?;
-    let identity = PemIdentity::from_pem_files(
-        material_dir.join("identity.pem"),
-        material_dir.join("identity.key"),
-        material_dir.join("identity-ca.pem"),
-    )
-    .map_err(|error| format!("error: local identity PEM rejected: {error}"))?;
-    let inner = OpenSslAcceptor::from_pem_identity(&identity, Policy::production_default())
-        .map_err(|error| format!("error: inner TLS acceptor rejected: {error}"))?;
+    let pq_identity = PqWgIdentity::from_private_key_file(material_dir.join("identity.key"))
+        .map_err(|error| format!("error: local pq-wg identity rejected: {error}"))?;
     let extractor = Arc::new(
         PkiIdentityExtractor::new(vec![identities.local.clone(), identities.peer.clone()])
             .map_err(|error| format!("error: peer extractor rejected: {error}"))?,
     );
-    let server = LinkServer::new(Box::new(OpenSslInnerAcceptor::new(inner, extractor)));
-    let outer = OpenSslOuterTlsAcceptor::from_pem_files(
-        material_dir.join("outer.pem"),
-        material_dir.join("outer.key"),
-    )
-    .map_err(|error| format!("error: outer TLS acceptor rejected: {error}"))?;
+    let server = LinkServer::new(Box::new(
+        PqWgInnerAcceptor::new(pq_identity, Policy::production_default(), extractor)
+            .map_err(|error| format!("error: pq-wg acceptor rejected: {error}"))?,
+    ));
+    let outer = if material_dir.join("outer.pem").exists() && material_dir.join("outer.key").exists() {
+        Some(OpenSslOuterTlsAcceptor::from_pem_files(
+            material_dir.join("outer.pem"),
+            material_dir.join("outer.key"),
+        ).map_err(|error| format!("error: outer TLS acceptor rejected: {error}"))?)
+    } else {
+        None
+    };
     let listener = std::net::TcpListener::bind(address)
         .map_err(|error| format!("error: cannot listen on {address}: {error}"))?;
     let admission = Admission::new(Limits {
@@ -303,11 +303,11 @@ fn serve_backend(
         .validate()
         .map_err(|error| format!("error: session policy rejected: {error}"))?;
     let accepted = server
-        .accept_tls(
-            &listener,
-            &outer,
+        .accept_stream_until(
+            listener.accept().map_err(|e| format!("error: accept failed: {e}"))?.0,
+            outer.as_ref().map(|o| o as &dyn boreas_tunnel::OuterTlsAcceptor),
             policy,
-            Duration::from_secs(20),
+            std::time::Instant::now() + Duration::from_secs(20),
             &admission,
         )
         .map_err(|error| format!("error: hop session failed: {error}"))?;
@@ -325,35 +325,35 @@ fn connect_backend(
     use std::time::Duration;
 
     use boreas_crypto::Policy;
-    use boreas_crypto::backend::{OpenSslConnector, PemIdentity};
+    use boreas_crypto::pq_wg::PqWgIdentity;
     use boreas_proto::SecurityMode;
     use boreas_proto::messages::{PathRole, Suite as MessageSuite};
     use boreas_tunnel::runtime::{ClientTarget, LinkClient};
     use boreas_tunnel::{
-        OpenSslInnerConnector, OpenSslOuterTlsConnector, PkiIdentityExtractor, SessionPolicy,
+        OpenSslOuterTlsConnector, PkiIdentityExtractor, PqWgInnerConnector, SessionPolicy,
     };
 
     let identities = load_verified_identities(prepared, material_dir)?;
-    let identity = PemIdentity::from_pem_files(
-        material_dir.join("identity.pem"),
-        material_dir.join("identity.key"),
-        material_dir.join("identity-ca.pem"),
-    )
-    .map_err(|error| format!("error: local identity PEM rejected: {error}"))?;
-    let inner = OpenSslConnector::from_pem_identity(&identity, Policy::production_default())
-        .map_err(|error| format!("error: inner TLS connector rejected: {error}"))?;
+    let pq_identity = PqWgIdentity::from_private_key_file(material_dir.join("identity.key"))
+        .map_err(|error| format!("error: local pq-wg identity rejected: {error}"))?;
     let extractor = Arc::new(
         PkiIdentityExtractor::new(vec![identities.local.clone(), identities.peer.clone()])
             .map_err(|error| format!("error: peer extractor rejected: {error}"))?,
     );
-    let outer_ca = read_bounded(material_dir, "outer-ca.pem", MAX_MATERIAL_FILE)?;
-    let client = LinkClient::new(
-        Box::new(
-            OpenSslOuterTlsConnector::with_root_certificates(&outer_ca)
-                .map_err(|error| format!("error: outer TLS connector rejected: {error}"))?,
-        ),
-        Box::new(OpenSslInnerConnector::new(inner, extractor)),
-    );
+    let inner = PqWgInnerConnector::new(pq_identity, Policy::production_default(), extractor)
+        .map_err(|error| format!("error: pq-wg connector rejected: {error}"))?;
+    let client = if material_dir.join("outer-ca.pem").exists() {
+        let outer_ca = read_bounded(material_dir, "outer-ca.pem", MAX_MATERIAL_FILE)?;
+        LinkClient::new(
+            Box::new(
+                OpenSslOuterTlsConnector::with_web_pki_and_roots(&outer_ca)
+                    .map_err(|error| format!("error: outer TLS connector rejected: {error}"))?,
+            ),
+            Box::new(inner),
+        )
+    } else {
+        LinkClient::new_direct(Box::new(inner))
+    };
     let target = ClientTarget {
         address,
         ws_host: format!("{tls_name}:{}", address.port()),

@@ -6,7 +6,8 @@
 //! not CDN support or independent implementation interop.
 use boreas_crypto::{
     Policy,
-    backend::{OpenSslAcceptor, OpenSslConnector, PemIdentity},
+    backend::PemIdentity,
+    pq_wg::PqWgIdentity,
 };
 use boreas_pki::NodeRole as PkiNodeRole;
 use boreas_pki::management::{
@@ -19,8 +20,8 @@ use boreas_proto::{
     objects::{NodeRole as ObjectRole, ObjectBody},
 };
 use boreas_tunnel::{
-    ClientTarget, LinkClient, LinkServer, OpenSslE2eBackend, OpenSslInnerAcceptor,
-    OpenSslInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
+    ClientTarget, LinkClient, LinkServer, PqWgE2eBackend, PqWgInnerAcceptor,
+    PqWgInnerConnector, OpenSslOuterTlsAcceptor, OpenSslOuterTlsConnector, PeerIdentity,
     PkiIdentityExtractor, VerifiedNodeIdentity,
     e2e::{accept_circuit, accept_e2e, open_e2e},
     resource::{Admission, Limits},
@@ -745,14 +746,14 @@ fn target(address: SocketAddr, name: &str) -> ClientTarget {
 
 struct ServerSide {
     hop: Box<dyn boreas_tunnel::InnerTlsAcceptor>,
-    e2e: OpenSslE2eBackend,
+    e2e: PqWgE2eBackend,
     outer: OpenSslOuterTlsAcceptor,
     local: PeerIdentity,
     peer: PeerIdentity,
 }
 struct ClientSide {
     hop: Box<dyn boreas_tunnel::InnerTlsConnector>,
-    e2e: OpenSslE2eBackend,
+    e2e: PqWgE2eBackend,
     outer: OpenSslOuterTlsConnector,
     local: PeerIdentity,
     peer: PeerIdentity,
@@ -765,47 +766,39 @@ fn sides(t: &Temp) -> (ClientSide, ServerSide) {
     let extractor = extractor(&obj_edge, &obj_core);
     let edge_pem = pem(t, "edge", "id");
     let core_pem = pem(t, "core", "id");
-    let edge_connector = || {
-        OpenSslConnector::from_pem_identity(&edge_pem, Policy::production_default())
-            .expect("pq768 Edge connector")
+    let edge_identity = || {
+        PqWgIdentity::from_private_key_pem(&edge_pem.private_key_pem).expect("edge pq-wg identity")
     };
-    let edge_acceptor = || {
-        OpenSslAcceptor::from_pem_identity(&edge_pem, Policy::production_default())
-            .expect("pq768 Edge acceptor")
-    };
-    let core_connector = || {
-        OpenSslConnector::from_pem_identity(&core_pem, Policy::production_default())
-            .expect("pq768 Core connector")
-    };
-    let core_acceptor = || {
-        OpenSslAcceptor::from_pem_identity(&core_pem, Policy::production_default())
-            .expect("pq768 Core acceptor")
+    let core_identity = || {
+        PqWgIdentity::from_private_key_pem(&core_pem.private_key_pem).expect("core pq-wg identity")
     };
     let client = ClientSide {
-        hop: Box::new(OpenSslInnerConnector::new(
-            edge_connector(),
-            extractor.clone(),
-        )),
-        e2e: OpenSslE2eBackend::new(
-            Arc::new(edge_connector()),
-            Arc::new(edge_acceptor()),
-            extractor.clone(),
+        hop: Box::new(
+            PqWgInnerConnector::new(
+                edge_identity(),
+                Policy::production_default(),
+                extractor.clone(),
+            )
+            .expect("pq-wg Edge connector"),
         ),
+        e2e: PqWgE2eBackend::new(edge_identity(), Policy::production_default(), extractor.clone())
+            .expect("pq-wg Edge e2e"),
         outer: OpenSslOuterTlsConnector::with_root_certificates(&read(t, "outer-ca.pem"))
             .expect("private web-PKI root"),
         local: edge,
         peer: core,
     };
     let server = ServerSide {
-        hop: Box::new(OpenSslInnerAcceptor::new(
-            core_acceptor(),
-            extractor.clone(),
-        )),
-        e2e: OpenSslE2eBackend::new(
-            Arc::new(core_connector()),
-            Arc::new(core_acceptor()),
-            extractor,
+        hop: Box::new(
+            PqWgInnerAcceptor::new(
+                core_identity(),
+                Policy::production_default(),
+                extractor.clone(),
+            )
+            .expect("pq-wg Core acceptor"),
         ),
+        e2e: PqWgE2eBackend::new(core_identity(), Policy::production_default(), extractor)
+            .expect("pq-wg Core e2e"),
         outer: OpenSslOuterTlsAcceptor::from_pem_files(t.path("outer.pem"), t.path("outer.key"))
             .expect("public origin cert"),
         local: core,
@@ -841,7 +834,7 @@ fn accept_session(
 ) -> Result<
     (
         boreas_tunnel::AcceptedSession,
-        OpenSslE2eBackend,
+        PqWgE2eBackend,
         PeerIdentity,
     ),
     String,
@@ -1108,10 +1101,14 @@ fn inner_wrong_ca_is_rejected_without_hop_only_fallback() {
         trust_anchor_pem: read(&t, "rogue-ca.pem"),
         ..pem(&t, "edge", "id")
     };
-    client_side.hop = Box::new(OpenSslInnerConnector::new(
-        OpenSslConnector::from_pem_identity(&rogue, Policy::production_default()).unwrap(),
-        extractor(&obj_edge, &obj_core),
-    ));
+    client_side.hop = Box::new(
+        PqWgInnerConnector::new(
+            PqWgIdentity::from_private_key_pem(&rogue.private_key_pem).unwrap(),
+            Policy::production_default(),
+            extractor(&obj_edge, &obj_core),
+        )
+        .unwrap(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || accept_session(&listener, server_side).map(|_| ()));
@@ -1134,10 +1131,14 @@ fn valid_ca_unknown_certificate_identity_is_rejected() {
     let obj_edge = verified_identity(&t, "edge", 2, 4, ObjectRole::Edge);
     let obj_core = verified_identity(&t, "core", 1, 9, ObjectRole::Core);
     let unknown = pem(&t, "unknown", "id");
-    client_side.hop = Box::new(OpenSslInnerConnector::new(
-        OpenSslConnector::from_pem_identity(&unknown, Policy::production_default()).unwrap(),
-        extractor(&obj_edge, &obj_core),
-    ));
+    client_side.hop = Box::new(
+        PqWgInnerConnector::new(
+            PqWgIdentity::from_private_key_pem(&unknown.private_key_pem).unwrap(),
+            Policy::production_default(),
+            extractor(&obj_edge, &obj_core),
+        )
+        .unwrap(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || accept_session(&listener, server_side).map(|_| ()));
